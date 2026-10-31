@@ -15,7 +15,7 @@ cargo install --path . --locked
 Or install from Git:
 
 ```bash
-cargo install --git https://github.com/agoodway/goodci.git --locked
+cargo install --git https://github.com/agoodway/goodflows.git --locked
 ```
 
 Supported platforms are Linux and macOS. Jobs require `sh` unless `shell = false`.
@@ -27,7 +27,7 @@ each project's own tools and dependencies before running its checks.
 
 Tagged releases produce archives for Linux and macOS on x86_64 and aarch64.
 After a release is published, download the matching archive and its checksum from
-[GitHub Releases](https://github.com/agoodway/goodci/releases), then:
+[GitHub Releases](https://github.com/agoodway/goodflows/releases), then:
 
 ```bash
 shasum -a 256 -c goodflows-v<VERSION>-<TARGET>.tar.gz.sha256
@@ -125,7 +125,7 @@ if ! command -v goodflows >/dev/null 2>&1; then
     *) echo "unsupported architecture: $(uname -m)" >&2; exit 1 ;;
   esac
   release_url=$(curl -fsSL -o /dev/null -w '%{url_effective}' \
-    https://github.com/agoodway/goodci/releases/latest) || {
+    https://github.com/agoodway/goodflows/releases/latest) || {
     echo "no published goodflows release; push a v<version> tag first" >&2
     exit 1
   }
@@ -135,7 +135,7 @@ if ! command -v goodflows >/dev/null 2>&1; then
     *) echo "unexpected release URL: $release_url" >&2; exit 1 ;;
   esac
   archive="goodflows-${tag}-${target}.tar.gz"
-  base="https://github.com/agoodway/goodci/releases/download/${tag}"
+  base="https://github.com/agoodway/goodflows/releases/download/${tag}"
   tmp=$(mktemp -d)
   trap 'rm -rf "$tmp"' EXIT
   curl -fsSL "$base/$archive" -o "$tmp/$archive"
