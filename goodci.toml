@@ -11,15 +11,15 @@ command = "cargo fmt --check"
 
 [[jobs]]
 name = "clippy"
-command = "cargo clippy --all-targets -- -D warnings"
+command = "cargo clippy --locked --all-targets -- -D warnings"
 depends_on = ["fmt"]
 
 [[jobs]]
 name = "test"
-command = "cargo test --all"
+command = "cargo test --locked --all"
 depends_on = ["fmt"]
 
 [[jobs]]
 name = "doc"
-command = "cargo doc --no-deps"
+command = "cargo doc --locked --no-deps"
 depends_on = ["fmt"]
