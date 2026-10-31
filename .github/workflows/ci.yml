@@ -30,5 +30,12 @@ jobs:
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
       - run: cargo build --release --locked
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+      - name: Build CLI for plugin integration tests
+        run: cargo build --locked
+      - name: Test Amp plugin
+        run: node --test tests/amp-plugin.test.mjs
       - name: Run goodci's own checks
         run: ./target/release/goodci

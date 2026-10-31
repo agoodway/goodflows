@@ -203,6 +203,51 @@ amp -ox "Run goodci and fix failures until the summary succeeds." \
 `.agents/resume` runs again each time the orb wakes. Ampcode waits about 10
 seconds for it. Keep installation in `.agents/setup`.
 
+## Amp plugin command
+
+The bundled [Amp plugin](.amp/plugins/goodci.ts) adds **GoodCI: Run** to Amp's
+command palette. Choose it when you want checks and a repair pass. It runs only
+when invoked explicitly.
+
+In this repository, the plugin is already in `.amp/plugins/`. For another
+project, copy the single file into that project's `.amp/plugins/goodci.ts`.
+For all local projects, copy it into `~/.config/amp/plugins/goodci.ts` (or
+`$XDG_CONFIG_HOME/amp/plugins/goodci.ts` when set). To use it in orbs, include
+the project plugin in the repository or distribute it through Amp's personal or
+workspace plugins. See [Amp's plugin guide](https://ampcode.com/docs/customize/plugins).
+Run **plugins: reload** from Amp's command palette after installing or changing
+the file. `amp plugins list` verifies that Amp can load it.
+
+Install `goodci` and the project's check dependencies on the executor's `PATH`
+first. Start an Amp thread, then choose **GoodCI: Run**:
+
+1. The command looks for `goodci.toml`, then `.goodci.toml`, in Amp's project
+   working directory. It does not search parent directories or initialize files.
+2. It runs the default workflow if defined. Otherwise it offers a workflow
+   picker; cancelling the picker runs no jobs.
+3. It sends the results to the thread that invoked the command. On failure,
+   the message includes failed jobs, commands, exit codes, bounded log excerpts,
+   and the exact command to rerun. It asks the agent to fix failures and rerun
+   that config and workflow until checks pass or a blocker prevents progress.
+
+The plugin does not attach an `agent.end` hook. Once it hands off failures,
+the agent handles repairs and reruns through its normal shell tools. A passing
+run sends a verification summary instead of repair instructions. Missing tools,
+invalid configuration, and invalid runner output are reported as blockers for
+the agent to investigate. Missing configuration produces a notification.
+
+Choose **GoodCI: Cancel** to terminate a check currently running through the
+plugin without starting repairs. Once repairs have been handed to the agent,
+use Amp's **Stop** control. Only one plugin run can execute at a time per plugin
+instance. The diagnostic handoff is capped; rerun GoodCI directly for full output.
+
+To run plugin tests, use Node **22.18 or newer** (built-in TypeScript stripping):
+
+```bash
+cargo build --locked
+node --test tests/amp-plugin.test.mjs
+```
+
 ## Configuration
 
 ```toml
