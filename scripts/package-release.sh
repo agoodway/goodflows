@@ -81,7 +81,7 @@ build_linux() {
     --build-arg "RUST_VERSION=${rust_version}" \
     -t "$image" \
     scripts
-  docker run --rm \
+  docker run --rm -i \
     --platform "$platform" \
     -v "$PWD":/work:ro \
     -v "$staging":/out \
