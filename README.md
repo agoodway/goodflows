@@ -564,5 +564,5 @@ To exercise packaging locally, Linux targets need Docker and produce a Debian 12
 binary. macOS targets build natively:
 
 ```bash
-bash scripts/package-release.sh x86_64-unknown-linux-gnu v0.1.1
+bash scripts/package-release.sh x86_64-unknown-linux-gnu v0.2.0
 ```
