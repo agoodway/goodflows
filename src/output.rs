@@ -18,6 +18,7 @@ struct Request {
 #[derive(Clone)]
 pub struct Output {
     pub json: bool,
+    workflow: Option<String>,
     sender: mpsc::Sender<Request>,
     cancel: watch::Receiver<Option<i32>>,
     suppressed: Arc<AtomicBool>,
@@ -45,13 +46,23 @@ impl Output {
             })?;
         Ok(Self {
             json,
+            workflow: None,
             sender,
             cancel,
             suppressed: Arc::new(AtomicBool::new(false)),
         })
     }
 
-    pub async fn emit(&self, event: Value) -> Result<()> {
+    pub fn with_workflow(&self, name: &str) -> Self {
+        let mut output = self.clone();
+        output.workflow = Some(name.into());
+        output
+    }
+
+    pub async fn emit(&self, mut event: Value) -> Result<()> {
+        if let Some(workflow) = &self.workflow {
+            event["workflow"] = json!(workflow);
+        }
         if self.suppressed.load(Ordering::Relaxed) {
             return Ok(());
         }
@@ -110,10 +121,11 @@ fn render(json: bool, mut event: Value, out: &mut impl Write, err: &mut impl Wri
         match event["type"].as_str().unwrap_or_default() {
             "run_started" => writeln!(
                 out,
-                "goodci  parallelism={}  fail_fast={}  jobs={}\nworkdir: {}",
+                "goodci  parallelism={}  fail_fast={}  jobs={}\nworkflow: {}\nworkdir: {}",
                 event["parallelism"],
                 event["fail_fast"],
                 event["jobs"],
+                text(&event, "workflow"),
                 text(&event, "workdir")
             )?,
             "job_started" => writeln!(out, "→ {}", text(&event, "name").cyan())?,
@@ -186,6 +198,24 @@ fn render(json: bool, mut event: Value, out: &mut impl Write, err: &mut impl Wri
                 }
             }
             "config_valid" => {
+                if let Some(workflows) = event["workflows"].as_array() {
+                    writeln!(
+                        out,
+                        "Config valid ({} workflows / {} defined jobs)",
+                        workflows.len(),
+                        event["total_defined_jobs"]
+                    )?;
+                    for workflow in workflows {
+                        writeln!(
+                            out,
+                            "  {}: {} jobs",
+                            text(workflow, "name"),
+                            workflow["jobs"]
+                        )?;
+                    }
+                    out.flush()?;
+                    return Ok(());
+                }
                 writeln!(
                     out,
                     "Config valid ({} selected / {} defined jobs)",
@@ -204,6 +234,7 @@ fn render(json: bool, mut event: Value, out: &mut impl Write, err: &mut impl Wri
                 writeln!(out, "  selected: {}", names(&event["selected_jobs"]))?;
             }
             "jobs" => {
+                writeln!(out, "Workflow: {}", text(&event, "workflow"))?;
                 let settings = &event["settings"];
                 writeln!(
                     out,
@@ -249,6 +280,24 @@ fn render(json: bool, mut event: Value, out: &mut impl Write, err: &mut impl Wri
                 text(&event, "template")
             )?,
             "init_cancelled" => writeln!(out, "Kept existing {}", text(&event, "path"))?,
+            "workflows" => {
+                writeln!(
+                    out,
+                    "Workflows (default: {})",
+                    event["default_workflow"].as_str().unwrap_or("none")
+                )?;
+                for workflow in event["workflows"].as_array().into_iter().flatten() {
+                    writeln!(
+                        out,
+                        "  {}: {} jobs  parallelism={} fail_fast={}\n    workdir: {}",
+                        text(workflow, "name"),
+                        workflow["jobs"],
+                        workflow["settings"]["parallelism"],
+                        workflow["settings"]["fail_fast"],
+                        text(&workflow["settings"], "workdir")
+                    )?;
+                }
+            }
             "error" => {
                 writeln!(err, "Error: {}", text(&event, "message"))?;
             }

@@ -49,11 +49,17 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Run checks (default)
-    Run,
+    Run { workflow: Option<String> },
     /// Validate config and selections without executing commands
-    Validate,
+    Validate { workflow: Option<String> },
     /// List jobs and dependencies
-    List,
+    List {
+        #[arg(conflicts_with = "workflows")]
+        workflow: Option<String>,
+        /// List available workflows rather than jobs
+        #[arg(long, conflicts_with = "jobs")]
+        workflows: bool,
+    },
     /// Generate a project config
     Init {
         /// Override project detection
@@ -62,7 +68,24 @@ enum Commands {
         /// Overwrite an existing config without prompting
         #[arg(long)]
         force: bool,
+        /// Generate jobs inside this named workflow
+        #[arg(long)]
+        workflow: Option<String>,
     },
+}
+
+impl Cli {
+    fn workflow(&self) -> Option<&str> {
+        match &self.command {
+            Some(
+                Commands::Run { workflow }
+                | Commands::List { workflow, .. }
+                | Commands::Validate { workflow }
+                | Commands::Init { workflow, .. },
+            ) => workflow.as_deref(),
+            None => None,
+        }
+    }
 }
 
 #[tokio::main]
@@ -88,7 +111,8 @@ async fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let (_signal_sender, cancel) = match if matches!(cli.command, None | Some(Commands::Run)) {
+    let (_signal_sender, cancel) = match if matches!(cli.command, None | Some(Commands::Run { .. }))
+    {
         cancellation()
     } else {
         // Keep the OS default signal behavior for commands that do not spawn jobs,
@@ -101,14 +125,19 @@ async fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let output = match Output::new(json_requested, cancel.clone()) {
+    let output = match Output::new(cli.json, cancel.clone()) {
         Ok(output) => output,
         Err(error) => {
             eprintln!("failed to initialize output: {error}");
             return ExitCode::FAILURE;
         }
     };
-    match run(&cli, &output, cancel.clone()).await {
+    let mut output = if let Some(name) = cli.workflow() {
+        output.with_workflow(name)
+    } else {
+        output
+    };
+    match run(&cli, &mut output, cancel.clone()).await {
         Ok(code) => ExitCode::from(code),
         Err(error) => {
             let _ = output
@@ -119,32 +148,74 @@ async fn main() -> ExitCode {
     }
 }
 
-async fn run(cli: &Cli, output: &Output, cancel: watch::Receiver<Option<i32>>) -> Result<u8> {
-    if let Some(Commands::Init { template, force }) = &cli.command {
-        init::generate(cli.config.as_deref(), *template, *force, output).await?;
+async fn run(cli: &Cli, output: &mut Output, cancel: watch::Receiver<Option<i32>>) -> Result<u8> {
+    if let Some(Commands::Init {
+        template,
+        force,
+        workflow,
+    }) = &cli.command
+    {
+        init::generate(
+            cli.config.as_deref(),
+            *template,
+            *force,
+            workflow.as_deref(),
+            output,
+        )
+        .await?;
         return Ok(0);
     }
-    let (mut config, _) = Config::load(cli.config.as_deref())?;
+    let (document, _) = Config::load(cli.config.as_deref())?;
+    let fail_fast_override = if cli.fail_fast {
+        Some(true)
+    } else if cli.no_fail_fast {
+        Some(false)
+    } else {
+        None
+    };
+    let aggregate_validation = matches!(cli.command, Some(Commands::Validate { workflow: None }))
+        && !document.workflows.is_empty();
+    let list_workflows = matches!(
+        cli.command,
+        Some(Commands::List {
+            workflows: true,
+            ..
+        })
+    );
+    if aggregate_validation || list_workflows {
+        if !cli.jobs.is_empty() {
+            anyhow::bail!("--jobs requires an explicit workflow for aggregate validation");
+        }
+        let mut workflows = Vec::new();
+        let mut total = 0;
+        for name in document.workflow_names() {
+            let (_, config) = document.workflow(Some(&name))?;
+            total += config.jobs.len();
+            workflows.push(json!({"name":name, "jobs":config.jobs.len(), "selected_jobs":config.jobs.iter().map(|j| &j.name).collect::<Vec<_>>(), "requested_jobs":[], "total_defined_jobs":config.jobs.len(), "settings":config.settings.resolve(cli.parallelism, fail_fast_override)?}));
+        }
+        output.emit(if list_workflows {
+            json!({"type":"workflows", "workflows":workflows, "default_workflow":document.default_workflow()})
+        } else {
+            json!({"type":"config_valid", "workflows":workflows, "jobs":total, "total_defined_jobs":total, "requested_jobs":[], "selected_jobs":[]})
+        }).await?;
+        return Ok(0);
+    }
+    let legacy_default = !document.jobs.is_empty();
+    let (name, mut config) = document.workflow(cli.workflow())?;
+    *output = output.with_workflow(&name);
     let total_defined_jobs = config.jobs.len();
     config.select(&cli.jobs)?;
-    let settings = config.settings.resolve(
-        cli.parallelism,
-        if cli.fail_fast {
-            Some(true)
-        } else if cli.no_fail_fast {
-            Some(false)
-        } else {
-            None
-        },
-    )?;
-    match cli.command.as_ref().unwrap_or(&Commands::Run) {
-        Commands::Validate => {
+    let settings = config
+        .settings
+        .resolve(cli.parallelism, fail_fast_override)?;
+    match cli.command.as_ref() {
+        Some(Commands::Validate { .. }) => {
             output
                 .emit(json!({"type":"config_valid", "jobs":config.jobs.len(), "total_defined_jobs":total_defined_jobs, "requested_jobs":cli.jobs, "selected_jobs":config.jobs.iter().map(|j| &j.name).collect::<Vec<_>>()}))
                 .await?;
             return Ok(0);
         }
-        Commands::List => {
+        Some(Commands::List { .. }) => {
             output
                 .emit(json!({"type":"jobs", "jobs":config.jobs, "settings":settings}))
                 .await?;
@@ -158,7 +229,13 @@ async fn run(cli: &Cli, output: &Output, cancel: watch::Receiver<Option<i32>>) -
         parallelism,
         fail_fast,
         workdir: settings.workdir,
-        log_dir: cli.log_dir.clone(),
+        log_dir: cli.log_dir.as_ref().map(|dir| {
+            if legacy_default && name == "default" {
+                dir.clone()
+            } else {
+                dir.join(config::workflow_log_component(&name))
+            }
+        }),
         output: output.clone(),
     };
     output.emit(json!({"type":"run_started", "parallelism":parallelism, "fail_fast":fail_fast, "jobs":config.jobs.len(), "workdir":options.workdir})).await?;

@@ -20,8 +20,9 @@ cargo install --git https://github.com/agoodway/goodci.git --locked
 
 Supported platforms are Linux and macOS. Jobs require `sh` unless `shell = false`.
 Linux release binaries use glibc and are built on Ubuntu 24.04; build from source
-for older distributions or musl-based systems. Install each project's own tools
-and dependencies before running its checks.
+for older distributions or musl-based systems. Ampcode orbs run Debian 12, so
+build there from source; see [Ampcode orbs](#ampcode-orbs). Install each
+project's own tools and dependencies before running its checks.
 
 Tagged releases produce archives for Linux and macOS on x86_64 and aarch64.
 After a release is published, download the matching archive and its checksum from
@@ -60,6 +61,7 @@ goodci init --template node
 goodci init --template go
 goodci init --template generic
 goodci init --config ci/checks.toml
+goodci init --template rust --workflow ci  # Generate a named workflow starter
 goodci init --force                     # Replace an existing config without asking
 ```
 
@@ -85,6 +87,96 @@ Node initialization uses the package manager indicated by `package-lock.json`,
 `format:check`, `lint`, `typecheck`, `check`, `test`, and `build` scripts become jobs;
 no check scripts produces an error. The Node template requires `package.json`.
 Elixir jobs use `MIX_ENV=test`.
+
+## Ampcode orbs
+
+Commit `goodci.toml`, install the binary from an executable `.agents/setup`, and
+name `goodci` in `AGENTS.md`. Ampcode runs `.agents/setup` from the repository
+root while preparing an orb, then saves that disk as a project snapshot. Later
+threads for the same project and orb size restore the snapshot, so `goodci` is
+already on `PATH`.
+
+Create an Ampcode project for the repository. Generate the config and commit it
+at the repository root:
+
+```bash
+goodci init
+goodci validate
+```
+
+Ampcode orbs run Debian 12 with Git, Node.js, Python, `gh`, and `amp` already
+installed. Install Rust, Go, or Elixir in `.agents/setup` when jobs call them.
+Release archives are built on Ubuntu 24.04 and need glibc 2.39, so build goodci
+on the orb. Copy `goodci` to `/usr/local/bin`. Jobs inherit the runner's
+environment, so copy the commands they call onto that same default `PATH`.
+
+This `.agents/setup` covers a Rust project and is safe to run again:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+if ! command -v rustup >/dev/null 2>&1 && [ ! -x "$HOME/.cargo/bin/rustup" ]; then
+  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --default-toolchain stable
+fi
+. "$HOME/.cargo/env"
+rustup component add rustfmt clippy
+
+if [ ! -x "$HOME/.cargo/bin/goodci" ]; then
+  cargo install --git https://github.com/agoodway/goodci.git --locked
+fi
+
+sudo install -m 755 "$HOME/.cargo/bin/goodci" /usr/local/bin/goodci
+for tool in cargo rustc rustfmt cargo-clippy; do
+  sudo ln -sfn "$HOME/.cargo/bin/$tool" "/usr/local/bin/$tool"
+done
+```
+
+```bash
+chmod +x .agents/setup
+git add .agents/setup goodci.toml
+```
+
+Put any other job tools in that script. Node and Python jobs can use the image's
+existing commands. Compiling goodci still needs Rust. Ampcode stops setup after
+20 minutes and still starts the orb. It publishes a snapshot only when setup
+exits 0. The setup log is `/home/user/.cache/amp/logs/setup.log`.
+
+After changing `.agents/setup`, delete the cached snapshots so the next thread
+runs the new script:
+
+```bash
+amp projects snapshots list <project>
+amp projects snapshots delete <project>
+```
+
+Omit `parallelism`, or set it to `0`, to use the orb's logical CPU count. The
+sample config pins `4`, which matches an `a1.medium` orb (4 CPUs). Choose the
+size in the project settings, or pass `--orb-size` when starting a thread.
+
+Tell the agent to run the same checks:
+
+```markdown
+## Checks
+
+Run `goodci` from the repository root before finishing.
+`goodci --jobs test` runs `test` and its prerequisites.
+`goodci --json` prints JSON Lines. The final `summary` event reports `success`.
+Fix failures and run `goodci` again until `success` is true.
+```
+
+Run `goodci` from the thread's Terminal tab. From your own machine, start an
+orb thread:
+
+```bash
+amp -ox "Run goodci and fix failures until the summary succeeds." \
+  --project <project> \
+  --orb-size a1.medium
+```
+
+`.agents/resume` runs again each time the orb wakes. Ampcode waits about 10
+seconds for it. Keep installation in `.agents/setup`.
 
 ## Configuration
 
@@ -140,6 +232,74 @@ explicit defaults and nullable timeouts even though generated TOML omits them.
 dependency closure in config order), and `total_defined_jobs`. Human output also
 distinguishes selected and defined counts and lists the names.
 
+## Named workflows
+
+Put independently runnable workflows in one config:
+
+```toml
+[settings]
+parallelism = 4
+fail_fast = true
+
+[[workflows.ci.jobs]]
+name = "fmt"
+command = "cargo fmt --check"
+
+[[workflows.ci.jobs]]
+name = "test"
+command = "cargo test --locked"
+depends_on = ["fmt"]
+
+[workflows.release.settings]
+parallelism = 1
+
+[[workflows.release.jobs]]
+name = "build"
+command = "cargo build --release --locked"
+```
+
+```bash
+goodci list --workflows         # Discover workflow names, counts, and settings
+goodci run ci                  # Run ci's jobs
+goodci run ci --jobs test       # Include ci's fmt prerequisite
+goodci run release
+goodci list ci                 # Inspect ci's jobs and effective settings
+goodci validate ci --jobs test  # Report the selected closure inside ci
+goodci validate                # Validate every workflow
+```
+
+Settings precedence is **CLI overrides > workflow settings > shared settings >
+built-in defaults**. A workflow inherits each omitted field independently;
+`fail_fast = false` and `parallelism = 0` are explicit overrides. Both shared and
+workflow-relative `workdir` values resolve from the config file's directory.
+
+Job names and dependencies are scoped to their workflow. For example, both ci and
+integration can have a job named test. Dependencies must refer to local jobs;
+cross-workflow dependencies are not supported. The entire config, including every
+workflow's graph and effective workdir, is validated before anything runs.
+
+Existing top-level `[[jobs]]` are the **default** workflow. They work unchanged
+with `goodci`, `goodci run`, and `goodci run default`. A config with named workflows
+can instead define `[[workflows.default.jobs]]`; combining that with top-level jobs
+is an error. Without either default, bare run/list requires you to specify a
+workflow—even if there is only one. Goodci never chooses an arbitrary workflow.
+
+Workflow names are case sensitive, nonempty, at most 64 UTF-8 bytes, and cannot
+contain control characters. `init --workflow ci` generates a whole config with
+the chosen template's jobs under ci. It follows the usual overwrite confirmation
+and `--force` rules; it does not append to an existing config.
+
+In JSON mode, `list --workflows` emits a `workflows` event containing sorted
+entries with name, job count, and effective settings, plus nullable
+`default_workflow`. Bare `validate` on a config containing named workflows emits
+one `config_valid` event with combined counts and a `workflows` array containing
+each workflow's count, selected names, and settings. Its top-level requested and
+selected name arrays are empty because names are scoped to workflows. Use an
+explicit workflow with `--jobs`; aggregate validation does not filter job names.
+Legacy single-workflow validation retains its existing fields.
+For an explicitly selected workflow, count/name fields describe that workflow;
+the entire config is still validated first.
+
 ## Scheduling and failures
 
 Jobs become ready as soon as **all** prerequisites pass. Unrelated work can run
@@ -192,7 +352,12 @@ goodci --log-dir .goodci-logs
 ```
 
 Files use indexed, sanitized job names such as `001-fmt.stdout.log` and
-`001-fmt.stderr.log`. Indexes follow the selected jobs' config order; files from
+`001-fmt.stderr.log`. Named workflows get their own subdirectory, for example
+`.goodci-logs/ci/001-fmt.stdout.log`. Workflow names are encoded as safe path
+components: lowercase ASCII letters, digits, `_`, and `-` remain unchanged;
+other UTF-8 bytes are percent-encoded (including uppercase letters, avoiding
+collisions on case-insensitive filesystems). Legacy top-level jobs keep their
+existing flat log paths. Indexes follow the selected jobs' config order; files from
 the same selection are overwritten on subsequent runs. Use a fresh directory for
 each run to keep historical logs. Add your log directory to your project's
 `.gitignore` if desired.
@@ -207,7 +372,9 @@ goodci list --jobs test --json
 
 `--json` produces JSON Lines only on stdout. Each event includes `schema_version: 1`
 and `type`. Types are `run_started`, `job_started`, `job_output`, `job_finished`,
-`summary`, `config_valid`, `jobs`, `config_written`, `init_cancelled`, and `error`.
+`summary`, `config_valid`, `jobs`, `workflows`, `config_written`, `init_cancelled`, and `error`.
+Events for a selected workflow include `workflow`, including the default workflow.
+Discovery/aggregate-validation events and errors before selection may omit it.
 An interactive init confirmation goes to stderr in JSON mode. Help/version remain
 human-readable even with `--json`. Argument errors produce an `error` event.
 

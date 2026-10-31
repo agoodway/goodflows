@@ -1,4 +1,4 @@
-use crate::config::{Config, Job, Settings};
+use crate::config::{Config, Job, Settings, Workflow, WorkflowSettings};
 use crate::output::Output;
 use anyhow::{bail, Context, Result};
 use clap::ValueEnum;
@@ -32,6 +32,7 @@ pub async fn generate(
     destination: Option<&Path>,
     template: Option<Template>,
     force: bool,
+    workflow: Option<&str>,
     output: &Output,
 ) -> Result<()> {
     let root = std::env::current_dir()?.canonicalize()?;
@@ -80,13 +81,23 @@ pub async fn generate(
     std::fs::create_dir_all(parent)
         .with_context(|| format!("failed to create {}", parent.display()))?;
     let parent = parent.canonicalize()?;
-    let config = Config {
+    let mut config = Config {
         settings: Settings {
             workdir: Some(relative_path(&parent, &root)),
             ..Settings::default()
         },
         jobs,
+        workflows: Default::default(),
     };
+    if let Some(name) = workflow {
+        config.workflows.insert(
+            name.into(),
+            Workflow {
+                settings: WorkflowSettings::default(),
+                jobs: std::mem::take(&mut config.jobs),
+            },
+        );
+    }
     config.validate()?;
     let content = format!("# goodci.toml — {} project checks\n# Commands run relative to settings.workdir (resolved from this file).\n# Omitted parallelism uses every logical CPU.\n# Set parallelism to the machine size before a run.\n\n{}", template.name(), generated_toml(&config)?);
     let mut file = std::fs::OpenOptions::new()
@@ -169,7 +180,20 @@ fn jobs(template: Template, root: &Path) -> Result<Vec<Job>> {
 // Only generated TOML omits default values. JSON inspection retains every field.
 fn generated_toml(config: &Config) -> Result<String> {
     let mut document = toml::Value::try_from(config)?;
-    if let Some(jobs) = document.get_mut("jobs").and_then(toml::Value::as_array_mut) {
+    clean_jobs(document.get_mut("jobs"));
+    if let Some(workflows) = document
+        .get_mut("workflows")
+        .and_then(toml::Value::as_table_mut)
+    {
+        for (_, workflow) in workflows {
+            clean_jobs(workflow.get_mut("jobs"));
+        }
+    }
+    Ok(toml::to_string_pretty(&document)?)
+}
+
+fn clean_jobs(value: Option<&mut toml::Value>) {
+    if let Some(jobs) = value.and_then(toml::Value::as_array_mut) {
         for job in jobs {
             if let Some(table) = job.as_table_mut() {
                 table.retain(|key, value| match key {
@@ -181,7 +205,6 @@ fn generated_toml(config: &Config) -> Result<String> {
             }
         }
     }
-    Ok(toml::to_string_pretty(&document)?)
 }
 
 // A readiness check followed by read_line can still block on a partial line.
