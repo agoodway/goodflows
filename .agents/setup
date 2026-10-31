@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
+TIMEFORMAT='Step completed in %3R seconds'
+
+echo 'Checking system build and packaging prerequisites'
+time {
+  missing=()
+  for package in build-essential ca-certificates curl python3 libdigest-sha-perl; do
+    if [[ "$(dpkg-query -W -f='${Status}' "$package" 2>/dev/null || true)" != 'install ok installed' ]]; then
+      missing+=("$package")
+    fi
+  done
+  if ((${#missing[@]})); then
+    sudo apt-get update
+    sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y "${missing[@]}"
+  fi
+}
+
+echo 'Preparing Rust 1.88.0 (matching release CI), rustfmt, and Clippy'
+time {
+  export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
+  export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
+  export PATH="$CARGO_HOME/bin:$PATH"
+  if ! command -v rustup >/dev/null 2>&1; then
+    installer="$(mktemp)"
+    trap 'rm -f "$installer"' EXIT
+    curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs -o "$installer"
+    bash "$installer" -y --no-modify-path --profile minimal --default-toolchain none
+    rm -f "$installer"
+    trap - EXIT
+  fi
+  # Avoid syncing toolchain manifests or downloading components on warm runs.
+  if ! rustup run 1.88.0 rustc --version >/dev/null 2>&1 ||
+     ! rustup component list --toolchain 1.88.0 --installed | grep -q '^rustfmt-' ||
+     ! rustup component list --toolchain 1.88.0 --installed | grep -q '^clippy-'; then
+    rustup toolchain install 1.88.0 --profile minimal --component rustfmt --component clippy
+  fi
+  rustup override set 1.88.0
+
+  # Amp and supervised services start separate non-interactive login shells.
+  marker='# goodci orb Cargo environment'
+  if ! grep -Fqx "$marker" "$HOME/.bash_profile" 2>/dev/null; then
+    cat >> "$HOME/.bash_profile" <<'EOF'
+
+# goodci orb Cargo environment
+if [ -f "${CARGO_HOME:-$HOME/.cargo}/env" ]; then
+  . "${CARGO_HOME:-$HOME/.cargo}/env"
+fi
+EOF
+  fi
+  rustc --version
+  cargo --version
+}
+
+echo 'Caching locked dependencies and compiling development/test targets'
+time {
+  cargo fetch --locked
+  cargo build --locked --all-targets
+}
+echo 'Orb setup ready; run cargo test --locked or ./target/debug/goodci'
