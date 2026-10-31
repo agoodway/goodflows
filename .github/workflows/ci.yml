@@ -37,5 +37,5 @@ jobs:
         run: cargo build --locked
       - name: Test Amp plugin
         run: node --test tests/amp-plugin.test.mjs
-      - name: Run goodci's own checks
-        run: ./target/release/goodci
+      - name: Run goodflows's own checks
+        run: ./target/release/goodflows

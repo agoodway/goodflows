@@ -33,7 +33,7 @@ impl Output {
         // Blocking terminal/pipe writes must never occupy Tokio workers. This thread
         // is detached so a stopped downstream reader cannot prevent signal shutdown.
         std::thread::Builder::new()
-            .name("goodci-output".into())
+            .name("goodflows-output".into())
             .spawn(move || {
                 while let Some(request) = receiver.blocking_recv() {
                     let result =
@@ -121,7 +121,7 @@ fn duplicate_stdio(fd: i32) -> io::Result<File> {
 }
 
 #[cfg(not(unix))]
-compile_error!("goodci currently supports Linux and macOS (Unix process groups required)");
+compile_error!("goodflows currently supports Linux and macOS (Unix process groups required)");
 
 fn render(json: bool, mut event: Value, out: &mut impl Write, err: &mut impl Write) -> Result<()> {
     event["schema_version"] = json!(1);
@@ -140,7 +140,7 @@ fn render(json: bool, mut event: Value, out: &mut impl Write, err: &mut impl Wri
         match event["type"].as_str().unwrap_or_default() {
             "run_started" => writeln!(
                 out,
-                "goodci  parallelism={}  fail_fast={}  jobs={}\nworkflow: {}\nworkdir: {}",
+                "goodflows  parallelism={}  fail_fast={}  jobs={}\nworkflow: {}\nworkdir: {}",
                 event["parallelism"],
                 event["fail_fast"],
                 event["jobs"],

@@ -19,12 +19,13 @@ fn init_requires_confirmation_to_overwrite() {
     .iter()
     .enumerate()
     {
-        let dir = std::env::temp_dir().join(format!("goodci-init-{}-{index}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("goodflows-init-{}-{index}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let config = dir.join("goodci.toml");
+        let config = dir.join("goodflows.toml");
         std::fs::write(&config, "existing config\n").unwrap();
         std::fs::write(dir.join("answer"), answer).unwrap();
-        let child = Command::new(env!("CARGO_BIN_EXE_goodci"))
+        let child = Command::new(env!("CARGO_BIN_EXE_goodflows"))
             .arg("init")
             .current_dir(&dir)
             .stdin(Stdio::from(
@@ -46,25 +47,25 @@ fn init_requires_confirmation_to_overwrite() {
         );
         if *overwrite {
             assert!(content.contains("[[jobs]]"));
-            assert!(stdout.contains("Wrote goodci.toml"));
+            assert!(stdout.contains("Wrote goodflows.toml"));
         } else {
             assert_eq!(content, "existing config\n", "answer: {answer:?}");
-            assert!(!stdout.contains("Wrote goodci.toml"));
+            assert!(!stdout.contains("Wrote goodflows.toml"));
         }
     }
 }
 
 #[test]
 fn init_creates_new_config_without_prompting() {
-    let dir = std::env::temp_dir().join(format!("goodci-init-new-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("goodflows-init-new-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_goodci"))
+    let output = Command::new(env!("CARGO_BIN_EXE_goodflows"))
         .arg("init")
         .current_dir(&dir)
         .stdin(Stdio::null())
         .output()
         .unwrap();
-    let content = std::fs::read_to_string(dir.join("goodci.toml")).unwrap();
+    let content = std::fs::read_to_string(dir.join("goodflows.toml")).unwrap();
     std::fs::remove_dir_all(&dir).unwrap();
     assert!(output.status.success());
     assert!(content.contains("[[jobs]]"));
@@ -82,7 +83,7 @@ fn init_detects_projects_and_explicit_templates_override_detection() {
         ("", "generic", "Replace this command"),
     ] {
         let p = Project::new("");
-        std::fs::remove_file(p.dir.join("goodci.toml")).unwrap();
+        std::fs::remove_file(p.dir.join("goodflows.toml")).unwrap();
         if !marker.is_empty() {
             std::fs::write(p.dir.join(marker), "").unwrap();
         }
@@ -90,10 +91,10 @@ fn init_detects_projects_and_explicit_templates_override_detection() {
         success(&output);
         let event: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(event["template"], template);
-        assert!(p.read("goodci.toml").contains(command));
+        assert!(p.read("goodflows.toml").contains(command));
         success(&p.run(&["validate"]));
         success(&p.run(&["init", "--template", "elixir", "--force"]));
-        assert!(p.read("goodci.toml").contains("mix test"));
+        assert!(p.read("goodflows.toml").contains("mix test"));
     }
 }
 
@@ -105,7 +106,7 @@ fn init_rejects_ambiguous_projects_without_writing_config() {
     let output = p.run(&["init", "--force"]);
     assert!(!output.status.success());
     assert!(stderr(&output).contains("--template"));
-    assert_eq!(p.read("goodci.toml"), "keep");
+    assert_eq!(p.read("goodflows.toml"), "keep");
 }
 
 #[test]
@@ -119,7 +120,7 @@ fn init_honors_custom_path_force_and_generated_workdir() {
         "nested/config/checks.toml",
     ]);
     success(&output);
-    assert_eq!(p.read("goodci.toml"), "keep root");
+    assert_eq!(p.read("goodflows.toml"), "keep root");
     success(&p.run(&["validate", "--config", "nested/config/checks.toml"]));
     let mut config: toml::Value = toml::from_str(&p.read("nested/config/checks.toml")).unwrap();
     config["jobs"][0]["command"] = toml::Value::String("pwd > location".into());
@@ -155,7 +156,7 @@ fn json_init_declines_existing_config_without_polluting_stdout() {
         .output()
         .unwrap();
     success(&output);
-    assert_eq!(p.read("goodci.toml"), "keep");
+    assert_eq!(p.read("goodflows.toml"), "keep");
     let event: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(event["type"], "init_cancelled");
 }
@@ -176,7 +177,7 @@ fn node_init_uses_declared_scripts_and_lockfile_package_manager() {
         .unwrap();
         std::fs::write(p.dir.join(lock), "").unwrap();
         success(&p.run(&["init", "--force"]));
-        let config = p.read("goodci.toml");
+        let config = p.read("goodflows.toml");
         assert!(config.contains(&format!("{manager} run lint")));
         assert!(config.contains(&format!("{manager} run test")));
         assert!(!config.contains("run build"));
@@ -191,7 +192,7 @@ fn node_init_rejects_malformed_manifest_or_missing_check_scripts() {
         let p = Project::new("keep");
         std::fs::write(p.dir.join("package.json"), manifest).unwrap();
         assert!(!p.run(&["init", "--force"]).status.success());
-        assert_eq!(p.read("goodci.toml"), "keep");
+        assert_eq!(p.read("goodflows.toml"), "keep");
     }
 }
 
@@ -201,7 +202,7 @@ fn node_template_requires_a_manifest_and_rejects_conflicting_lockfiles() {
     let output = p.run(&["init", "--template", "node", "--force"]);
     assert!(!output.status.success());
     assert!(stderr(&output).contains("package.json"));
-    assert_eq!(p.read("goodci.toml"), "keep");
+    assert_eq!(p.read("goodflows.toml"), "keep");
     std::fs::write(p.dir.join("package.json"), r#"{"scripts":{"test":"test"}}"#).unwrap();
     for lock in ["package-lock.json", "pnpm-lock.yaml"] {
         std::fs::write(p.dir.join(lock), "").unwrap();
@@ -209,7 +210,7 @@ fn node_template_requires_a_manifest_and_rejects_conflicting_lockfiles() {
     let output = p.run(&["init", "--force"]);
     assert!(!output.status.success());
     assert!(stderr(&output).contains("conflicting"));
-    assert_eq!(p.read("goodci.toml"), "keep");
+    assert_eq!(p.read("goodflows.toml"), "keep");
 }
 
 #[cfg(unix)]
@@ -219,12 +220,16 @@ fn init_through_symlink_preserves_project_workdir() {
     let p = Project::new("");
     std::fs::create_dir(p.dir.join("elsewhere")).unwrap();
     std::fs::write(p.dir.join("elsewhere/checks.toml"), "keep").unwrap();
-    std::fs::remove_file(p.dir.join("goodci.toml")).unwrap();
-    symlink("elsewhere/checks.toml", p.dir.join("goodci.toml")).unwrap();
+    std::fs::remove_file(p.dir.join("goodflows.toml")).unwrap();
+    symlink("elsewhere/checks.toml", p.dir.join("goodflows.toml")).unwrap();
     success(&p.run(&["init", "--template", "generic", "--force"]));
-    let mut config: toml::Value = toml::from_str(&p.read("goodci.toml")).unwrap();
+    let mut config: toml::Value = toml::from_str(&p.read("goodflows.toml")).unwrap();
     config["jobs"][0]["command"] = toml::Value::String("pwd > location".into());
-    std::fs::write(p.dir.join("goodci.toml"), toml::to_string(&config).unwrap()).unwrap();
+    std::fs::write(
+        p.dir.join("goodflows.toml"),
+        toml::to_string(&config).unwrap(),
+    )
+    .unwrap();
     success(&p.run(&[]));
     assert!(p.dir.join("location").exists());
     assert_eq!(
@@ -291,7 +296,7 @@ fn nonterminal_init_never_waits_for_unavailable_or_incomplete_input() {
                 "init_cancelled"
             }
         );
-        assert_eq!(p.read("goodci.toml") != "keep", overwrite);
+        assert_eq!(p.read("goodflows.toml") != "keep", overwrite);
     }
 }
 
@@ -330,7 +335,7 @@ fn terminal_init_still_prompts_and_accepts_confirmation() {
     let output = child.wait_with_output().unwrap();
     success(&output);
     assert!(stdout(&output).contains("Overwrite? [y/N]"));
-    assert_ne!(p.read("goodci.toml"), "keep");
+    assert_ne!(p.read("goodflows.toml"), "keep");
 }
 
 #[test]
@@ -361,7 +366,7 @@ fn nonterminal_decline_does_not_require_valid_project_detection() {
         .output()
         .unwrap();
     success(&output);
-    assert_eq!(p.read("goodci.toml"), "keep");
+    assert_eq!(p.read("goodflows.toml"), "keep");
     let event: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(event["type"], "init_cancelled");
 }
@@ -371,7 +376,7 @@ fn generated_toml_omits_defaults_and_explains_parallelism() {
     let p = Project::new("");
     for template in ["rust", "elixir"] {
         success(&p.run(&["init", "--force", "--template", template]));
-        let text = p.read("goodci.toml");
+        let text = p.read("goodflows.toml");
         let config: toml::Value = toml::from_str(&text).unwrap();
         assert!(!text.contains("depends_on = []"));
         assert!(!text.contains("[jobs.env]\n\n"));

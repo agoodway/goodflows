@@ -194,7 +194,7 @@ fn named_log_paths_are_separate_and_cannot_escape_the_log_directory() {
 fn init_can_generate_a_clean_named_workflow_starter() {
     let p = Project::new("");
     success(&p.run(&["init", "--template", "rust", "--workflow", "ci", "--force"]));
-    let content = p.read("goodci.toml");
+    let content = p.read("goodflows.toml");
     let value: toml::Value = toml::from_str(&content).unwrap();
     assert!(value.get("jobs").is_none());
     assert_eq!(
@@ -278,7 +278,7 @@ fn named_init_nested_workdir_and_name_validation_are_preserved() {
         "--force",
     ]);
     assert!(!output.status.success());
-    assert_eq!(p.read("goodci.toml"), "keep");
+    assert_eq!(p.read("goodflows.toml"), "keep");
 }
 
 #[test]
@@ -286,7 +286,11 @@ fn workflow_name_matching_a_flag_does_not_enable_that_flag() {
     let p = Project::new("[[workflows.'--json'.jobs]]\nname='a'\ncommand='true'");
     let output = p.run(&["run", "--", "--json"]);
     success(&output);
-    assert!(stdout(&output).starts_with("goodci"), "{}", stdout(&output));
+    assert!(
+        stdout(&output).starts_with("goodflows"),
+        "{}",
+        stdout(&output)
+    );
     let output = p.run(&["run", "--json", "--", "--json"]);
     success(&output);
     let summary: serde_json::Value =
@@ -446,5 +450,5 @@ fn invalid_and_unknown_environments_fail_before_running_jobs() {
     let p = Project::new("keep");
     let output = p.run(&["init", "--env", "orb", "--template", "generic", "--force"]);
     assert!(!output.status.success());
-    assert_eq!(p.read("goodci.toml"), "keep");
+    assert_eq!(p.read("goodflows.toml"), "keep");
 }

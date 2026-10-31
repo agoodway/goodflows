@@ -13,17 +13,17 @@ pub struct Project {
 impl Project {
     pub fn new(config: &str) -> Self {
         let dir = std::env::temp_dir().join(format!(
-            "goodci test {} {}",
+            "goodflows test {} {}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("goodci.toml"), config).unwrap();
+        std::fs::write(dir.join("goodflows.toml"), config).unwrap();
         Self { dir }
     }
 
     pub fn command(&self) -> Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_goodci"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_goodflows"));
         command.current_dir(&self.dir).env("NO_COLOR", "1");
         command
     }

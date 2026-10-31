@@ -1,4 +1,4 @@
-# goodci.toml — example for a Rust project
+# goodflows.toml — example for a Rust project
 # Adjust parallelism to match your Amp orb size
 
 [settings]

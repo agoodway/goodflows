@@ -75,7 +75,7 @@ build_linux() {
     echo "Docker is required to link Linux release binaries on Debian 12." >&2
     exit 1
   fi
-  image="goodci-debian12-builder:${rust_version}"
+  image="goodflows-debian12-builder:${rust_version}"
   docker build \
     -f scripts/debian12-builder.Dockerfile \
     --build-arg "RUST_VERSION=${rust_version}" \
@@ -95,24 +95,24 @@ cargo build --release --locked \
   --manifest-path /work/Cargo.toml \
   --target "$TARGET" \
   --target-dir /tmp/target
-install -m 755 "/tmp/target/$TARGET/release/goodci" /out/goodci
-chown "$HOST_UID:$HOST_GID" /out/goodci
+install -m 755 "/tmp/target/$TARGET/release/goodflows" /out/goodflows
+chown "$HOST_UID:$HOST_GID" /out/goodflows
 EOS
-  verify_glibc "$staging/goodci" "$glibc_max"
+  verify_glibc "$staging/goodflows" "$glibc_max"
 }
 
 case "$target" in
   *-unknown-linux-gnu) build_linux ;;
   *)
     cargo build --release --locked --target "$target"
-    cp "target/$target/release/goodci" "$staging/goodci"
+    cp "target/$target/release/goodflows" "$staging/goodflows"
     ;;
 esac
 
-"$staging/goodci" --version
+"$staging/goodflows" --version
 cp README.md LICENSE "$staging/"
-archive="goodci-$tag-$target.tar.gz"
-tar -czf "dist/$archive" -C "$staging" goodci README.md LICENSE
+archive="goodflows-$tag-$target.tar.gz"
+tar -czf "dist/$archive" -C "$staging" goodflows README.md LICENSE
 (
   cd dist
   shasum -a 256 "$archive" > "$archive.sha256"

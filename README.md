@@ -1,7 +1,7 @@
-# goodci
+# goodflows
 
 A small, config-driven CI runner for local development, agent environments, and
-Ampcode orbs. Define shell commands in TOML; goodci runs ready jobs in parallel,
+Ampcode orbs. Define shell commands in TOML; goodflows runs ready jobs in parallel,
 respects dependencies, and reports exactly what passed, failed, or was skipped.
 
 ## Install
@@ -30,9 +30,9 @@ After a release is published, download the matching archive and its checksum fro
 [GitHub Releases](https://github.com/agoodway/goodci/releases), then:
 
 ```bash
-shasum -a 256 -c goodci-v<VERSION>-<TARGET>.tar.gz.sha256
-tar -xzf goodci-v<VERSION>-<TARGET>.tar.gz
-install -m 755 goodci ~/.local/bin/goodci
+shasum -a 256 -c goodflows-v<VERSION>-<TARGET>.tar.gz.sha256
+tar -xzf goodflows-v<VERSION>-<TARGET>.tar.gz
+install -m 755 goodflows ~/.local/bin/goodflows
 ```
 
 Create `~/.local/bin` first if needed and include it in your `PATH`.
@@ -42,11 +42,11 @@ Create `~/.local/bin` first if needed and include it in your `PATH`.
 Run from your project's root:
 
 ```bash
-goodci init          # Detect the project and generate goodci.toml
-goodci validate      # Check the config without executing commands
-goodci list          # Show jobs and dependencies
-goodci               # Run all checks; equivalent to goodci run
-goodci --jobs test   # Run test and its transitive prerequisites
+goodflows init          # Detect the project and generate goodflows.toml
+goodflows validate      # Check the config without executing commands
+goodflows list          # Show jobs and dependencies
+goodflows               # Run all checks; equivalent to goodflows run
+goodflows --jobs test   # Run test and its transitive prerequisites
 ```
 
 `init` detects `Cargo.toml`, `mix.exs`, `package.json`, or `go.mod`. Multiple
@@ -56,14 +56,14 @@ itself succeeds, but the checks cannot pass until you replace that command. You
 can always choose explicitly:
 
 ```bash
-goodci init --template elixir
-goodci init --template rust
-goodci init --template node
-goodci init --template go
-goodci init --template generic
-goodci init --config ci/checks.toml
-goodci init --template rust --workflow ci  # Generate a named workflow starter
-goodci init --force                     # Replace an existing config without asking
+goodflows init --template elixir
+goodflows init --template rust
+goodflows init --template node
+goodflows init --template go
+goodflows init --template generic
+goodflows init --config ci/checks.toml
+goodflows init --template rust --workflow ci  # Generate a named workflow starter
+goodflows init --force                     # Replace an existing config without asking
 ```
 
 Without `--force`, an existing file triggers an `Overwrite? [y/N]` prompt when
@@ -91,23 +91,23 @@ Elixir jobs use `MIX_ENV=test`.
 
 ## Ampcode orbs
 
-Commit `goodci.toml`, install the binary from an executable `.agents/setup`, and
-name `goodci` in `AGENTS.md`. Ampcode runs `.agents/setup` from the repository
+Commit `goodflows.toml`, install the binary from an executable `.agents/setup`, and
+name `goodflows` in `AGENTS.md`. Ampcode runs `.agents/setup` from the repository
 root while preparing an orb, then saves that disk as a project snapshot. Later
-threads for the same project and orb size restore the snapshot, so `goodci` is
+threads for the same project and orb size restore the snapshot, so `goodflows` is
 already on `PATH`.
 
 Create an Ampcode project for the repository. Generate the config and commit it
 at the repository root:
 
 ```bash
-goodci init
-goodci validate
+goodflows init
+goodflows validate
 ```
 
 Ampcode orbs run Debian 12 with Git, Node.js, Python, `gh`, and `amp` already
 installed. Install Rust, Go, or Elixir in `.agents/setup` when jobs call them.
-Install goodci from a published release archive into `/usr/local/bin`. Jobs
+Install goodflows from a published release archive into `/usr/local/bin`. Jobs
 inherit the runner's environment, so copy the commands they call onto that
 same default `PATH`.
 
@@ -118,7 +118,7 @@ expects a published `v*` release:
 #!/usr/bin/env bash
 set -euo pipefail
 
-if ! command -v goodci >/dev/null 2>&1; then
+if ! command -v goodflows >/dev/null 2>&1; then
   case "$(uname -m)" in
     x86_64) target=x86_64-unknown-linux-gnu ;;
     aarch64 | arm64) target=aarch64-unknown-linux-gnu ;;
@@ -126,7 +126,7 @@ if ! command -v goodci >/dev/null 2>&1; then
   esac
   release_url=$(curl -fsSL -o /dev/null -w '%{url_effective}' \
     https://github.com/agoodway/goodci/releases/latest) || {
-    echo "no published goodci release; push a v<version> tag first" >&2
+    echo "no published goodflows release; push a v<version> tag first" >&2
     exit 1
   }
   tag=${release_url##*/}
@@ -134,7 +134,7 @@ if ! command -v goodci >/dev/null 2>&1; then
     v*) ;;
     *) echo "unexpected release URL: $release_url" >&2; exit 1 ;;
   esac
-  archive="goodci-${tag}-${target}.tar.gz"
+  archive="goodflows-${tag}-${target}.tar.gz"
   base="https://github.com/agoodway/goodci/releases/download/${tag}"
   tmp=$(mktemp -d)
   trap 'rm -rf "$tmp"' EXIT
@@ -142,7 +142,7 @@ if ! command -v goodci >/dev/null 2>&1; then
   curl -fsSL "$base/$archive.sha256" -o "$tmp/$archive.sha256"
   (cd "$tmp" && sha256sum --check "$archive.sha256")
   tar -xzf "$tmp/$archive" -C "$tmp"
-  sudo install -m 755 "$tmp/goodci" /usr/local/bin/goodci
+  sudo install -m 755 "$tmp/goodflows" /usr/local/bin/goodflows
   rm -rf "$tmp"
   trap - EXIT
 fi
@@ -160,11 +160,11 @@ done
 
 ```bash
 chmod +x .agents/setup
-git add .agents/setup goodci.toml
+git add .agents/setup goodflows.toml
 ```
 
 Put any other job tools in that script. Node and Python jobs can use the image's
-existing commands. goodci itself comes from the release archive. Ampcode stops
+existing commands. goodflows itself comes from the release archive. Ampcode stops
 setup after 20 minutes and still starts the orb. It publishes a snapshot only
 when setup exits 0. The setup log is `/home/user/.cache/amp/logs/setup.log`.
 
@@ -185,17 +185,17 @@ Tell the agent to run the same checks:
 ```markdown
 ## Checks
 
-Run `goodci` from the repository root before finishing.
-`goodci --jobs test` runs `test` and its prerequisites.
-`goodci --json` prints JSON Lines. The final `summary` event reports `success`.
-Fix failures and run `goodci` again until `success` is true.
+Run `goodflows` from the repository root before finishing.
+`goodflows --jobs test` runs `test` and its prerequisites.
+`goodflows --json` prints JSON Lines. The final `summary` event reports `success`.
+Fix failures and run `goodflows` again until `success` is true.
 ```
 
-Run `goodci` from the thread's Terminal tab. From your own machine, start an
+Run `goodflows` from the thread's Terminal tab. From your own machine, start an
 orb thread:
 
 ```bash
-amp -ox "Run goodci and fix failures until the summary succeeds." \
+amp -ox "Run goodflows and fix failures until the summary succeeds." \
   --project <project> \
   --orb-size a1.medium
 ```
@@ -205,23 +205,23 @@ seconds for it. Keep installation in `.agents/setup`.
 
 ## Amp plugin command
 
-The bundled [Amp plugin](.amp/plugins/goodci.ts) adds **GoodCI: Run** to Amp's
+The bundled [Amp plugin](.amp/plugins/goodflows.ts) adds **GoodFlows: Run** to Amp's
 command palette. Choose it when you want checks and a repair pass. It runs only
 when invoked explicitly.
 
 In this repository, the plugin is already in `.amp/plugins/`. For another
-project, copy the single file into that project's `.amp/plugins/goodci.ts`.
-For all local projects, copy it into `~/.config/amp/plugins/goodci.ts` (or
-`$XDG_CONFIG_HOME/amp/plugins/goodci.ts` when set). To use it in orbs, include
+project, copy the single file into that project's `.amp/plugins/goodflows.ts`.
+For all local projects, copy it into `~/.config/amp/plugins/goodflows.ts` (or
+`$XDG_CONFIG_HOME/amp/plugins/goodflows.ts` when set). To use it in orbs, include
 the project plugin in the repository or distribute it through Amp's personal or
 workspace plugins. See [Amp's plugin guide](https://ampcode.com/docs/customize/plugins).
 Run **plugins: reload** from Amp's command palette after installing or changing
 the file. `amp plugins list` verifies that Amp can load it.
 
-Install `goodci` and the project's check dependencies on the executor's `PATH`
-first. Start an Amp thread, then choose **GoodCI: Run**:
+Install `goodflows` and the project's check dependencies on the executor's `PATH`
+first. Start an Amp thread, then choose **GoodFlows: Run**:
 
-1. The command looks for `goodci.toml`, then `.goodci.toml`, in Amp's project
+1. The command looks for `goodflows.toml`, then `.goodflows.toml`, in Amp's project
    working directory. It does not search parent directories or initialize files.
 2. It runs the default workflow if defined. Otherwise it offers a workflow
    picker; cancelling the picker runs no jobs.
@@ -236,10 +236,10 @@ run sends a verification summary instead of repair instructions. Missing tools,
 invalid configuration, and invalid runner output are reported as blockers for
 the agent to investigate. Missing configuration produces a notification.
 
-Choose **GoodCI: Cancel** to terminate a check currently running through the
+Choose **GoodFlows: Cancel** to terminate a check currently running through the
 plugin without starting repairs. Once repairs have been handed to the agent,
 use Amp's **Stop** control. Only one plugin run can execute at a time per plugin
-instance. The diagnostic handoff is capped; rerun GoodCI directly for full output.
+instance. The diagnostic handoff is capped; rerun GoodFlows directly for full output.
 
 To run plugin tests, use Node **22.18 or newer** (built-in TypeScript stripping):
 
@@ -279,10 +279,10 @@ directly; quoted arguments work, but variables, pipes, and globbing are not expa
 Jobs inherit the runner's environment plus their own `env` entries. Job stdin is
 closed, so checks must run noninteractively.
 
-Without `--config`, goodci looks in the current directory for `goodci.toml`, then
-`.goodci.toml`. Commands default to that file's directory. A configured relative
+Without `--config`, goodflows looks in the current directory for `goodflows.toml`, then
+`.goodflows.toml`. Commands default to that file's directory. A configured relative
 `workdir` is also resolved from that directory, regardless of where you invoke
-goodci. `--log-dir` is resolved from the invocation directory.
+goodflows. `--log-dir` is resolved from the invocation directory.
 
 The whole config is validated before any command runs—even when selecting a subset.
 Unknown fields, duplicate/empty names, empty commands, missing or duplicate
@@ -329,13 +329,13 @@ command = "cargo build --release --locked"
 ```
 
 ```bash
-goodci list --workflows         # Discover workflow names, counts, and settings
-goodci run ci                  # Run ci's jobs
-goodci run ci --jobs test       # Include ci's fmt prerequisite
-goodci run release
-goodci list ci                 # Inspect ci's jobs and effective settings
-goodci validate ci --jobs test  # Report the selected closure inside ci
-goodci validate                # Validate every workflow
+goodflows list --workflows         # Discover workflow names, counts, and settings
+goodflows run ci                  # Run ci's jobs
+goodflows run ci --jobs test       # Include ci's fmt prerequisite
+goodflows run release
+goodflows list ci                 # Inspect ci's jobs and effective settings
+goodflows validate ci --jobs test  # Report the selected closure inside ci
+goodflows validate                # Validate every workflow
 ```
 
 Settings precedence is **CLI overrides > environment settings (when selected) >
@@ -350,10 +350,10 @@ cross-workflow dependencies are not supported. The entire config, including ever
 workflow's graph and effective workdir, is validated before anything runs.
 
 Existing top-level `[[jobs]]` are the **default** workflow. They work unchanged
-with `goodci`, `goodci run`, and `goodci run default`. A config with named workflows
+with `goodflows`, `goodflows run`, and `goodflows run default`. A config with named workflows
 can instead define `[[workflows.default.jobs]]`; combining that with top-level jobs
 is an error. Without either default, bare run/list requires you to specify a
-workflow—even if there is only one. Goodci never chooses an arbitrary workflow.
+workflow—even if there is only one. Goodflows never chooses an arbitrary workflow.
 
 Workflow names are case sensitive, nonempty, at most 64 UTF-8 bytes, and cannot
 contain control characters. `init --workflow ci` generates a whole config with
@@ -396,17 +396,17 @@ command = "cargo test --locked"
 ```
 
 ```bash
-goodci --env local                 # Run the default workflow with local settings
-goodci run ci --env orb             # Apply orb settings to a named ci workflow
-goodci list ci --env orb            # Inspect effective jobs and settings
-goodci list --workflows --env ci    # Inspect all workflows with ci settings
-goodci validate --env ci            # Validate without running jobs
-goodci --env ci --parallelism 2     # Explicit CLI flags still take precedence
+goodflows --env local                 # Run the default workflow with local settings
+goodflows run ci --env orb             # Apply orb settings to a named ci workflow
+goodflows list ci --env orb            # Inspect effective jobs and settings
+goodflows list --workflows --env ci    # Inspect all workflows with ci settings
+goodflows validate --env ci            # Validate without running jobs
+goodflows --env ci --parallelism 2     # Explicit CLI flags still take precedence
 ```
 
 The named-workflow examples require a workflow named `ci` in your config.
 Environment and workflow names are independent: `--env ci` does not select a
-workflow. Without `--env`, no profile is applied; goodci does not detect the
+workflow. Without `--env`, no profile is applied; goodflows does not detect the
 machine or read an environment variable to select one. The Amp plugin likewise
 uses no environment profile.
 
@@ -437,10 +437,10 @@ launched in config order. `--jobs` automatically includes every prerequisite and
 rejects unknown names; the same selection works with `list` and `validate`.
 
 ```bash
-goodci --parallelism 2
-goodci --no-fail-fast
-goodci --jobs fmt,test
-goodci --config ci/checks.toml
+goodflows --parallelism 2
+goodflows --no-fail-fast
+goodflows --jobs fmt,test
+goodflows --config ci/checks.toml
 ```
 
 Fail-fast stops launching jobs after the first observed failure. Already-running
@@ -477,12 +477,12 @@ Human output prefixes each stdout/stderr line with its job name and stream:
 Optionally save raw stdout and stderr separately:
 
 ```bash
-goodci --log-dir .goodci-logs
+goodflows --log-dir .goodflows-logs
 ```
 
 Files use indexed, sanitized job names such as `001-fmt.stdout.log` and
 `001-fmt.stderr.log`. Named workflows get their own subdirectory, for example
-`.goodci-logs/ci/001-fmt.stdout.log`. Workflow names are encoded as safe path
+`.goodflows-logs/ci/001-fmt.stdout.log`. Workflow names are encoded as safe path
 components: lowercase ASCII letters, digits, `_`, and `-` remain unchanged;
 other UTF-8 bytes are percent-encoded (including uppercase letters, avoiding
 collisions on case-insensitive filesystems). Legacy top-level jobs keep their
@@ -494,9 +494,9 @@ each run to keep historical logs. Add your log directory to your project's
 For agents and CI integrations:
 
 ```bash
-goodci --json > results.jsonl
-goodci validate --json
-goodci list --jobs test --json
+goodflows --json > results.jsonl
+goodflows validate --json
+goodflows list --jobs test --json
 ```
 
 `--json` produces JSON Lines only on stdout. Each event includes `schema_version: 1`
@@ -529,10 +529,10 @@ Output is streamed with bounded buffers; long lines can span multiple events.
 concatenate data per job/stream to reconstruct text. Non-UTF-8 bytes use replacement
 characters; saved log files retain the original bytes. Output order between
 concurrent jobs or separate stdout/stderr streams is not guaranteed. Logs can
-contain secrets emitted by your commands; goodci does not redact them.
+contain secrets emitted by your commands; goodflows does not redact them.
 
 Output backpressure never blocks timeout or signal handling. On interruption, if
-the downstream consumer stops reading, goodci allows 250 ms for pending output
+the downstream consumer stops reading, goodflows allows 250 ms for pending output
 before discarding further events so it can exit. A final summary cannot be
 guaranteed when the output pipe is blocked or closed.
 
@@ -543,11 +543,11 @@ cargo fmt --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
 cargo build --release --locked
-./target/release/goodci
+./target/release/goodflows
 ```
 
 `Cargo.lock` is committed for reproducible dependency resolution. CI runs formatting,
-Clippy, tests, a release build, and goodci's own checks on Linux/macOS with Rust 1.88
+Clippy, tests, a release build, and goodflows's own checks on Linux/macOS with Rust 1.88
 and stable. Release builds run checks on all four native platform/architecture
 combinations before packaging. Linux archives are then compiled with Rust 1.88.0
 in a Debian 12 container so the binary runs on Ampcode orbs (glibc 2.36).
@@ -558,7 +558,7 @@ The Release workflow can be dispatched manually to build artifacts without publi
 Pushing a `v<version>` tag matching `Cargo.toml` builds and publishes archives,
 individual SHA-256 checksums, and `SHA256SUMS`. Maintainers should bump the package
 version, update the lockfile, and review CI before pushing a release tag. No release
-is published merely by running `goodci` or pushing a regular branch.
+is published merely by running `goodflows` or pushing a regular branch.
 
 To exercise packaging locally, Linux targets need Docker and produce a Debian 12
 binary. macOS targets build natively:

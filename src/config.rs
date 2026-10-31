@@ -160,11 +160,11 @@ impl Config {
     pub fn load(explicit: Option<&Path>) -> Result<(Self, PathBuf)> {
         let path = match explicit {
             Some(path) => path.to_path_buf(),
-            None => ["goodci.toml", ".goodci.toml"]
+            None => ["goodflows.toml", ".goodflows.toml"]
                 .into_iter()
                 .map(PathBuf::from)
                 .find(|p| p.exists())
-                .context("no config found (looked for goodci.toml and .goodci.toml)")?,
+                .context("no config found (looked for goodflows.toml and .goodflows.toml)")?,
         };
         let path = path
             .canonicalize()
@@ -266,7 +266,7 @@ impl Config {
     ) -> Result<(String, Config)> {
         let available = self.workflow_names().join(", ");
         let name = requested.or_else(|| self.default_workflow())
-            .with_context(|| format!("no default workflow; choose a workflow with 'goodci run <workflow>' (available: {available})"))?;
+            .with_context(|| format!("no default workflow; choose a workflow with 'goodflows run <workflow>' (available: {available})"))?;
         let (settings, jobs) = if name == "default" && !self.jobs.is_empty() {
             (self.settings.clone(), self.jobs.clone())
         } else {

@@ -16,14 +16,14 @@ use tokio::sync::watch;
 
 #[derive(Parser)]
 #[command(
-    name = "goodci",
+    name = "goodflows",
     about = "Run project checks with dependency-aware parallelism",
     version
 )]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
-    /// Config file (default: goodci.toml or .goodci.toml)
+    /// Config file (default: goodflows.toml or .goodflows.toml)
     #[arg(short, long, global = true)]
     config: Option<PathBuf>,
     /// Apply a named environment's settings (no automatic selection)

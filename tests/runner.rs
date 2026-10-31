@@ -134,7 +134,7 @@ fn commands_inherit_env_and_direct_spawn_failure_preserves_diagnostics() {
     success(&p.run(&[]));
     assert_eq!(p.read("value"), "hello world");
     let p = Project::new(
-        "[[jobs]]\nname='spawn'\ncommand='goodci-nonexistent-program-7f98'\nshell=false",
+        "[[jobs]]\nname='spawn'\ncommand='goodflows-nonexistent-program-7f98'\nshell=false",
     );
     let output = p.run(&["--json"]);
     assert!(!output.status.success());

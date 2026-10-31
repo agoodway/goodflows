@@ -1,7 +1,7 @@
 # CLI reliability and usability
 
-Implement all eight improvements requested after reviewing goodci. Preserve the
-TOML job format and default `goodci` invocation. Support Linux and macOS.
+Implement all eight improvements requested after reviewing goodflows. Preserve the
+TOML job format and default `goodflows` invocation. Support Linux and macOS.
 
 ## Approach
 
@@ -68,4 +68,4 @@ in prerequisites; failed dependencies never execute; ready jobs avoid unrelated
 barriers; concurrency is bounded; fail-fast stops queued work; JSON stdout parses
 line by line; file logs preserve stream contents; timeout and signals prevent a
 descendant from performing a delayed side effect. Run fmt, full tests, Clippy,
-release build, and this repository's own goodci config before completion.
+release build, and this repository's own goodflows config before completion.

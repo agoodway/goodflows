@@ -24,7 +24,7 @@ All eight recommendations are implemented on `feat/cli-improvements`.
 - Native archive SHA-256, exact contents (binary/README/LICENSE), extracted
   `--version`, generic init, validate, and JSON run: passed.
 - Packaging rejects unsupported target and mismatched version tag: passed.
-- `./target/release/goodci --json --log-dir /tmp/goodci-self-check-logs`:
+- `./target/release/goodflows --json --log-dir /tmp/goodflows-self-check-logs`:
   fmt, clippy, test, doc all passed (summary: 4 passed, 0 failed).
 - `go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 -color`: passed.
 - `bash -n scripts/package-release.sh` and `git diff --check`: passed.

@@ -34,7 +34,7 @@ existing modules. Work continues on the clean `feat/cli-improvements` branch.
 - Write and run failing inspection/cycle regressions for 4/5/6, then implement.
 - Write and run failing result/tail regressions for 3, then implement.
 - Update README with exact new behavior and JSON fields. Run full tests, Rust 1.88
-  fmt/Clippy/tests, release build, goodci self-check, native packaging smoke checks.
+  fmt/Clippy/tests, release build, goodflows self-check, native packaging smoke checks.
 - Obtain an independent review as required by requesting-code-review; reproduce
   and fix substantive findings. Audit every numbered requirement before completion.
 
@@ -68,7 +68,7 @@ Final verification:
 - Default toolchain and Rust 1.88.0: **45 integration tests passed** on each.
 - Rust 1.88 fmt and Clippy (`--locked --all-targets -- -D warnings`): passed.
 - Rust 1.88 locked release build: passed.
-- Goodci's own config: fmt, clippy, test, and doc all passed.
+- Goodflows's own config: fmt, clippy, test, and doc all passed.
 - Native x86_64 Linux release packaging, archive checksum, extracted CLI init,
   validation/list, failed-placeholder/successful replacement, and ambiguous-project
   cancellation checks: passed.

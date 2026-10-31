@@ -64,12 +64,12 @@ Interfaces: init takes destination, optional Template, force, and Output.
 ## Task 5: Documentation and release confidence
 
 Files: `README.md`, `.gitignore`, `Cargo.toml`, `Cargo.lock`,
-`.github/workflows/ci.yml`, `.github/workflows/release.yml`, `goodci.toml`.
+`.github/workflows/ci.yml`, `.github/workflows/release.yml`, `goodflows.toml`.
 - [x] Track lockfile, configure CI and tag-triggered release archives/checksums.
 - [x] Document all commands, statuses, templates, logs, JSON, platform/toolchain
   support and migration behavior; validate workflow structure and release steps.
 - [x] Run cargo fmt --check, cargo test --locked, cargo clippy --locked
-  --all-targets -- -D warnings, cargo build --release --locked, and goodci itself.
+  --all-targets -- -D warnings, cargo build --release --locked, and goodflows itself.
 - [x] Request an independent whole-change review and fix substantive findings.
 
 ## Progress

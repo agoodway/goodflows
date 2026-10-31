@@ -40,11 +40,11 @@ time {
   rustup override set 1.88.0
 
   # Amp and supervised services start separate non-interactive login shells.
-  marker='# goodci orb Cargo environment'
+  marker='# goodflows orb Cargo environment'
   if ! grep -Fqx "$marker" "$HOME/.bash_profile" 2>/dev/null; then
     cat >> "$HOME/.bash_profile" <<'EOF'
 
-# goodci orb Cargo environment
+# goodflows orb Cargo environment
 if [ -f "${CARGO_HOME:-$HOME/.cargo}/env" ]; then
   . "${CARGO_HOME:-$HOME/.cargo}/env"
 fi
@@ -59,4 +59,4 @@ time {
   cargo fetch --locked
   cargo build --locked --all-targets
 }
-echo 'Orb setup ready; run cargo test --locked or ./target/debug/goodci'
+echo 'Orb setup ready; run cargo test --locked or ./target/debug/goodflows'

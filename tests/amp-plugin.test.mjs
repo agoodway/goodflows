@@ -5,16 +5,16 @@ import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { test } from 'node:test'
 import { promisify } from 'node:util'
-import install from '../.amp/plugins/goodci.ts'
+import install from '../.amp/plugins/goodflows.ts'
 
 const exec = promisify(execFile)
-const binary = resolve('target/debug/goodci')
+const binary = resolve('target/debug/goodflows')
 
-// Only Amp's host is simulated: config discovery and GoodCI execution are real.
+// Only Amp's host is simulated: config discovery and GoodFlows execution are real.
 async function host(t, config = '[[jobs]]\nname = "check"\ncommand = "true"\n', options = {}) {
-  const cwd = await mkdtemp(join(tmpdir(), "goodci amp ' "))
+  const cwd = await mkdtemp(join(tmpdir(), "goodflows amp ' "))
   t.after(() => rm(cwd, { recursive: true, force: true }))
-  if (config !== null) await writeFile(join(cwd, options.hidden ? '.goodci.toml' : 'goodci.toml'), config)
+  if (config !== null) await writeFile(join(cwd, options.hidden ? '.goodflows.toml' : 'goodflows.toml'), config)
   const commands = new Map()
   const notifications = []
   const messages = []
@@ -39,23 +39,23 @@ async function host(t, config = '[[jobs]]\nname = "check"\ncommand = "true"\n', 
   const { mkdir, symlink } = await import('node:fs/promises')
   await mkdir(binDir)
   if (options.fake) {
-    await writeFile(join(binDir, 'goodci'), `#!/bin/sh\n${options.fake}\n`, { mode: 0o755 })
+    await writeFile(join(binDir, 'goodflows'), `#!/bin/sh\n${options.fake}\n`, { mode: 0o755 })
   } else if (!options.missingBinary) {
-    await symlink(binary, join(binDir, 'goodci'))
+    await symlink(binary, join(binDir, 'goodflows'))
   }
   process.env.PATH = options.missingBinary ? binDir : `${binDir}:${originalPath}`
   t.after(() => { process.env.PATH = originalPath })
   return {
     cwd, ctx, commands, notifications, messages, choices,
-    run: () => commands.get('goodci-run').handler(ctx),
-    cancel: () => commands.get('goodci-cancel').handler(ctx),
+    run: () => commands.get('goodflows-run').handler(ctx),
+    cancel: () => commands.get('goodflows-cancel').handler(ctx),
   }
 }
 
 test('registers an explicit command without running anything at load', async (t) => {
   const h = await host(t)
-  assert.deepEqual(h.commands.get('goodci-run').metadata, {
-    title: 'Run', category: 'GoodCI', description: 'Run project checks and send failures to the agent to fix.',
+  assert.deepEqual(h.commands.get('goodflows-run').metadata, {
+    title: 'Run', category: 'GoodFlows', description: 'Run project checks and send failures to the agent to fix.',
   })
   assert.equal(h.messages.length, 0)
   assert.equal(h.notifications.length, 0)
@@ -88,11 +88,11 @@ test('hands the agent failing commands, exit codes, tails, and a literal rerun c
   assert.match(await readFile(join(h.cwd, 'rerun.json'), 'utf8'), /"type":"summary"/)
 })
 
-test('supports hidden config but prefers goodci.toml when both exist', async (t) => {
+test('supports hidden config but prefers goodflows.toml when both exist', async (t) => {
   const h = await host(t, undefined, { hidden: true })
   await h.run()
-  assert.match(h.messages[0].content, /\.goodci\.toml/)
-  await writeFile(join(h.cwd, 'goodci.toml'), '[[jobs]]\nname = "preferred"\ncommand = "exit 1"\n')
+  assert.match(h.messages[0].content, /\.goodflows\.toml/)
+  await writeFile(join(h.cwd, 'goodflows.toml'), '[[jobs]]\nname = "preferred"\ncommand = "exit 1"\n')
   await h.run()
   assert.match(h.messages[1].content, /preferred/)
 })
@@ -110,7 +110,7 @@ test('missing configuration does not initialize the project', async (t) => {
   const h = await host(t, null)
   await h.run()
   assert.match(h.notifications.join('\n'), /no.*config/i)
-  await assert.rejects(readFile(join(h.cwd, 'goodci.toml')), { code: 'ENOENT' })
+  await assert.rejects(readFile(join(h.cwd, 'goodflows.toml')), { code: 'ENOENT' })
 })
 
 test('missing executable is handed to the agent as a blocker', async (t) => {
@@ -142,10 +142,10 @@ test('workflow names starting with a dash remain positional arguments', async (t
   assert.match(h.messages[0].content, /checks passed/i)
 })
 
-test('a directory named goodci.toml is reported as an error instead of falling back', async (t) => {
+test('a directory named goodflows.toml is reported as an error instead of falling back', async (t) => {
   const h = await host(t, undefined, { hidden: true })
   const { mkdir } = await import('node:fs/promises')
-  await mkdir(join(h.cwd, 'goodci.toml'))
+  await mkdir(join(h.cwd, 'goodflows.toml'))
   await h.run()
   assert.doesNotMatch(h.messages[0].content, /checks passed/i)
   assert.match(h.messages[0].content, /directory/i)

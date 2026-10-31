@@ -36,7 +36,7 @@ pub async fn generate(
     output: &Output,
 ) -> Result<()> {
     let root = std::env::current_dir()?.canonicalize()?;
-    let path = destination.unwrap_or(Path::new("goodci.toml"));
+    let path = destination.unwrap_or(Path::new("goodflows.toml"));
     let exists = path.try_exists()?;
     if exists && !force {
         let terminal = io::stdin().is_terminal();
@@ -100,7 +100,7 @@ pub async fn generate(
         );
     }
     config.validate()?;
-    let content = format!("# goodci.toml — {} project checks\n# Commands run relative to settings.workdir (resolved from this file).\n# Omitted parallelism uses every logical CPU.\n# Set parallelism to the machine size before a run.\n\n{}", template.name(), generated_toml(&config)?);
+    let content = format!("# goodflows.toml — {} project checks\n# Commands run relative to settings.workdir (resolved from this file).\n# Omitted parallelism uses every logical CPU.\n# Set parallelism to the machine size before a run.\n\n{}", template.name(), generated_toml(&config)?);
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create(exists)

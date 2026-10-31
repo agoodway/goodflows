@@ -8,7 +8,7 @@ Retain existing configs and execution behavior; no cross-workflow dependencies.
 
 - `[[workflows.ci.jobs]]` defines jobs; `[workflows.ci.settings]` overrides shared
   `[settings]` values field by field (including false and parallelism=0).
-- `goodci run ci`, `goodci list ci`, `goodci validate ci` select ci. `--jobs` selects
+- `goodflows run ci`, `goodflows list ci`, `goodflows validate ci` select ci. `--jobs` selects
   the dependency closure inside that workflow. Repeated job names across workflows
   are valid. All config graphs are validated before any job runs.
 - Existing root `[[jobs]]` form the default workflow and preserve legacy log paths.
@@ -70,7 +70,7 @@ Verification completed:
 - Default toolchain and Rust 1.88.0: 59 integration tests passed on each.
 - Rust 1.88 fmt and Clippy --locked --all-targets -- -D warnings: passed.
 - Rust 1.88 locked release build: passed.
-- Existing root-job goodci self-check: fmt/clippy/test/doc all passed with default
+- Existing root-job goodflows self-check: fmt/clippy/test/doc all passed with default
   workflow context and legacy log layout.
 - Native x86_64 Linux archive checksum and extracted binary: named discovery,
   aggregate validation, selected dependency execution, isolated logs, refusing an
