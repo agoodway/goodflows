@@ -153,6 +153,23 @@ fn render(json: bool, mut event: Value, out: &mut impl Write, err: &mut impl Wri
                 if let Some(error) = result["error"].as_str() {
                     writeln!(out, "  {error}")?;
                 }
+                if matches!(text(result, "status"), "failed" | "timed_out") {
+                    writeln!(out, "  command: {}", text(result, "command"))?;
+                    for stream in ["stdout", "stderr"] {
+                        let tail = text(result, &format!("{stream}_tail"));
+                        if !tail.is_empty() {
+                            let truncated = if result[format!("{stream}_truncated")] == true {
+                                " (truncated)"
+                            } else {
+                                ""
+                            };
+                            writeln!(out, "  {stream} tail{truncated}:")?;
+                            for line in tail.lines() {
+                                writeln!(out, "    {line}")?;
+                            }
+                        }
+                    }
+                }
             }
             "summary" => {
                 writeln!(
@@ -168,8 +185,33 @@ fn render(json: bool, mut event: Value, out: &mut impl Write, err: &mut impl Wri
                     writeln!(out, "All jobs passed")?;
                 }
             }
-            "config_valid" => writeln!(out, "Config valid ({} jobs)", event["jobs"])?,
+            "config_valid" => {
+                writeln!(
+                    out,
+                    "Config valid ({} selected / {} defined jobs)",
+                    event["jobs"], event["total_defined_jobs"]
+                )?;
+                let requested = names(&event["requested_jobs"]);
+                writeln!(
+                    out,
+                    "  requested: {}",
+                    if requested.is_empty() {
+                        "(all)"
+                    } else {
+                        &requested
+                    }
+                )?;
+                writeln!(out, "  selected: {}", names(&event["selected_jobs"]))?;
+            }
             "jobs" => {
+                let settings = &event["settings"];
+                writeln!(
+                    out,
+                    "Settings: fail_fast={} parallelism={}\nworkdir: {}",
+                    settings["fail_fast"],
+                    settings["parallelism"],
+                    text(settings, "workdir")
+                )?;
                 writeln!(out, "Jobs")?;
                 for job in event["jobs"].as_array().into_iter().flatten() {
                     let deps: Vec<_> = job["depends_on"]
@@ -189,6 +231,15 @@ fn render(json: bool, mut event: Value, out: &mut impl Write, err: &mut impl Wri
                         },
                         text(job, "command")
                     )?;
+                    let timeout = job["timeout_secs"]
+                        .as_u64()
+                        .map(|n| n.to_string())
+                        .unwrap_or_else(|| "none".into());
+                    writeln!(
+                        out,
+                        "    timeout_secs={} shell={} env={}",
+                        timeout, job["shell"], job["env"]
+                    )?;
                 }
             }
             "config_written" => writeln!(
@@ -206,6 +257,16 @@ fn render(json: bool, mut event: Value, out: &mut impl Write, err: &mut impl Wri
     }
     out.flush()?;
     Ok(())
+}
+
+fn names(value: &Value) -> String {
+    value
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn text<'a>(event: &'a Value, key: &str) -> &'a str {

@@ -37,32 +37,38 @@ pub async fn generate(
     let root = std::env::current_dir()?.canonicalize()?;
     let path = destination.unwrap_or(Path::new("goodci.toml"));
     let exists = path.try_exists()?;
-    let template = match template {
-        Some(t) => t,
-        None => detect(&root)?,
-    };
-    // Resolve the template before touching an existing file or making directories.
-    let jobs = jobs(template, &root)?;
     if exists && !force {
-        if output.json {
-            if io::stdin().is_terminal() {
+        let terminal = io::stdin().is_terminal();
+        if terminal {
+            if output.json {
                 eprint!("{} already exists. Overwrite? [y/N] ", path.display());
                 io::stderr().flush()?;
+            } else {
+                print!("{} already exists. Overwrite? [y/N] ", path.display());
+                io::stdout().flush()?;
             }
-        } else {
-            print!("{} already exists. Overwrite? [y/N] ", path.display());
-            io::stdout().flush()?;
         }
-        let mut answer = String::new();
-        io::stdin()
-            .read_line(&mut answer)
-            .context("failed to read overwrite confirmation")?;
+        let answer = if terminal {
+            let mut answer = String::new();
+            io::stdin()
+                .read_line(&mut answer)
+                .context("failed to read overwrite confirmation")?;
+            answer
+        } else {
+            available_confirmation().context("failed to read overwrite confirmation")?
+        };
         if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
             return output
                 .emit(json!({"type":"init_cancelled", "path":path}))
                 .await;
         }
     }
+    let template = match template {
+        Some(t) => t,
+        None => detect(&root)?,
+    };
+    // Resolve the template before touching an existing file or making directories.
+    let jobs = jobs(template, &root)?;
     let absolute = if exists {
         path.canonicalize()?
     } else {
@@ -82,7 +88,7 @@ pub async fn generate(
         jobs,
     };
     config.validate()?;
-    let content = format!("# goodci.toml — {} project checks\n# Commands run relative to settings.workdir (resolved from this file).\n\n{}", template.name(), toml::to_string_pretty(&config)?);
+    let content = format!("# goodci.toml — {} project checks\n# Commands run relative to settings.workdir (resolved from this file).\n# Omitted parallelism uses every logical CPU.\n# Set parallelism to the machine size before a run.\n\n{}", template.name(), generated_toml(&config)?);
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create(exists)
@@ -155,9 +161,70 @@ fn jobs(template: Template, root: &Path) -> Result<Vec<Job>> {
             job("vet", "go vet ./...", &["fmt"]),
             job("test", "go test ./...", &["fmt"]),
         ],
-        Template::Generic => vec![job("check", "echo 'Replace this command with your project checks'", &[])],
+        Template::Generic => vec![job("check", "printf '%s\\n' 'Replace this command with your project checks' >&2; exit 1", &[])],
         Template::Node => node_jobs(root)?,
     })
+}
+
+// Only generated TOML omits default values. JSON inspection retains every field.
+fn generated_toml(config: &Config) -> Result<String> {
+    let mut document = toml::Value::try_from(config)?;
+    if let Some(jobs) = document.get_mut("jobs").and_then(toml::Value::as_array_mut) {
+        for job in jobs {
+            if let Some(table) = job.as_table_mut() {
+                table.retain(|key, value| match key {
+                    "depends_on" => !value.as_array().is_some_and(Vec::is_empty),
+                    "env" => !value.as_table().is_some_and(toml::map::Map::is_empty),
+                    "shell" => value.as_bool() != Some(true),
+                    _ => true,
+                });
+            }
+        }
+    }
+    Ok(toml::to_string_pretty(&document)?)
+}
+
+// A readiness check followed by read_line can still block on a partial line.
+// Use nonblocking reads, restoring the inherited open-file status flags on exit.
+fn available_confirmation() -> io::Result<String> {
+    struct RestoreFlags(i32);
+    impl Drop for RestoreFlags {
+        fn drop(&mut self) {
+            // SAFETY: restore the original flags of the inherited stdin descriptor.
+            unsafe {
+                libc::fcntl(0, libc::F_SETFL, self.0);
+            }
+        }
+    }
+    // SAFETY: fcntl validates stdin and reports an error if it is closed.
+    let flags = unsafe { libc::fcntl(0, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if unsafe { libc::fcntl(0, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let _restore = RestoreFlags(flags);
+    let mut answer = Vec::new();
+    while answer.len() < 4096 {
+        let mut byte = 0u8;
+        // SAFETY: byte is a writable one-byte buffer; no other code reads stdin.
+        match unsafe { libc::read(0, (&mut byte as *mut u8).cast(), 1) } {
+            0 => return Ok(String::from_utf8_lossy(&answer).into_owned()),
+            1 => {
+                if byte == b'\n' {
+                    return Ok(String::from_utf8_lossy(&answer).into_owned());
+                }
+                answer.push(byte);
+            }
+            _ => match io::Error::last_os_error() {
+                error if error.kind() == io::ErrorKind::WouldBlock => return Ok(String::new()),
+                error if error.kind() == io::ErrorKind::Interrupted => continue,
+                error => return Err(error),
+            },
+        }
+    }
+    Ok(String::new())
 }
 
 fn node_jobs(root: &Path) -> Result<Vec<Job>> {

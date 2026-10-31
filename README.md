@@ -49,7 +49,9 @@ goodci --jobs test   # Run test and its transitive prerequisites
 
 `init` detects `Cargo.toml`, `mix.exs`, `package.json`, or `go.mod`. Multiple
 project types require `--template`; an unrecognized project gets a generic example
-whose placeholder command you must edit. You can always choose explicitly:
+whose placeholder prints a replacement instruction to stderr and exits 1. Init
+itself succeeds, but the checks cannot pass until you replace that command. You
+can always choose explicitly:
 
 ```bash
 goodci init --template elixir
@@ -61,9 +63,21 @@ goodci init --config ci/checks.toml
 goodci init --force                     # Replace an existing config without asking
 ```
 
-Without `--force`, an existing file triggers an `Overwrite? [y/N]` prompt. Only `y`
-or `yes` (case insensitive) replaces it. Other responses, Enter, and end-of-input
-keep it. A newly generated nested config points `workdir` back to the project root.
+Without `--force`, an existing file triggers an `Overwrite? [y/N]` prompt when
+stdin is a terminal. Only `y` or `yes` (case insensitive) replaces it. Other
+responses, Enter, and empty end-of-input keep it.
+
+When stdin is not a terminal, init never prompts or waits for more input. It
+accepts an immediately available complete `y`/`yes` line, or `y`/`yes` followed by
+end-of-input. An open pipe with no data or an incomplete line cancels immediately,
+as does input exceeding the 4 KiB response limit. Cancellation exits 0 and emits
+`init_cancelled` in JSON mode. Piped confirmation is timing-dependent: use
+`--force` for reliable automation. A newly generated nested config points `workdir`
+back to the project root.
+
+Generated TOML omits empty dependency/environment entries, `shell = true`, and
+unset timeouts. Its comments explain that omitted parallelism uses every logical
+CPU and recommend setting it to the machine size before running checks.
 
 Node initialization uses the package manager indicated by `package-lock.json`,
 `npm-shrinkwrap.json`, `pnpm-lock.yaml`, `yarn.lock`, or `bun.lock`/`bun.lockb`
@@ -112,6 +126,19 @@ The whole config is validated before any command runs—even when selecting a su
 Unknown fields, duplicate/empty names, empty commands, missing or duplicate
 dependencies, self-dependencies, cycles, invalid environment entries, malformed
 direct-command quoting, zero timeouts, and nonexistent workdirs are errors.
+Cycle errors include an actual cycle path, such as `a -> b -> a`.
+
+`list` displays every job field: name, command, dependencies, timeout, configured
+environment, and shell mode. It also shows effective `fail_fast`, `parallelism`,
+and the resolved `workdir`, applying the same CLI overrides and CPU-count default
+as a run. In JSON, these values are under `jobs` and `settings`; job fields retain
+explicit defaults and nullable timeouts even though generated TOML omits them.
+
+`validate` always checks the entire file before applying selection. Its
+`config_valid` JSON event retains `jobs` as the selected count, and includes
+`requested_jobs` (explicit CLI names; empty means all), `selected_jobs` (the
+dependency closure in config order), and `total_defined_jobs`. Human output also
+distinguishes selected and defined counts and lists the names.
 
 ## Scheduling and failures
 
@@ -189,8 +216,16 @@ human-readable even with `--json`. Argument errors produce an `error` event.
 ```
 
 The final `summary` contains `success`, counts for every status, and `results` in
-config order. Each result contains `name`, `status`, `duration_ms`, nullable
-`exit_code`, and nullable `error`. Configuration/runtime failures produce an
+config order. Each result contains `name`, `command`, `status`, `duration_ms`,
+nullable `exit_code`, and nullable `error`. Failed and timed-out results also
+include `stdout_tail`, `stderr_tail`, `stdout_truncated`, and `stderr_truncated`.
+The tails are captured incrementally and capped at **4096 UTF-8 bytes per stream**,
+with truncation flags indicating omitted leading content. Non-UTF-8 bytes are
+decoded lossily and character boundaries are preserved when trimming the tails.
+Empty output produces empty tails with false truncation flags; other statuses
+omit the tail fields. Human failure output shows the command and nonempty tails.
+Full output remains available in the events and optional raw log files.
+Configuration/runtime failures produce an
 `error` event instead of a completed summary.
 
 Output is streamed with bounded buffers; long lines can span multiple events.

@@ -131,3 +131,119 @@ fn log_write_failure_stops_the_process_without_waiting_for_its_command() {
         .unwrap()
         .contains("output"));
 }
+
+#[test]
+fn failed_results_include_command_and_separate_bounded_output_tails() {
+    let p = Project::new(
+        r#"[[jobs]]
+name = "fail"
+command = """printf 'EARLY'; head -c 10000 /dev/zero | tr '\\000' x; printf 'OUT-END'; head -c 10000 /dev/zero | tr '\\000' y >&2; printf 'ERR-END' >&2; exit 7"""
+"#,
+    );
+    let output = p.run(&["--json", "--log-dir", "logs"]);
+    assert_eq!(output.status.code(), Some(1));
+    let events = events(&output);
+    let result = &events.last().unwrap()["results"][0];
+    assert!(result["command"].as_str().unwrap().contains("exit 7"));
+    assert_eq!(
+        result["stdout_tail"].as_str().unwrap(),
+        format!("{}OUT-END", "x".repeat(4089))
+    );
+    assert_eq!(
+        result["stderr_tail"].as_str().unwrap(),
+        format!("{}ERR-END", "y".repeat(4089))
+    );
+    assert_eq!(result["stdout_truncated"], true);
+    assert_eq!(result["stderr_truncated"], true);
+    let finished = events.iter().find(|e| e["type"] == "job_finished").unwrap();
+    assert_eq!(&finished["result"], result);
+    assert!(p.read("logs/001-fail.stdout.log").starts_with("EARLY"));
+    let full: String = events
+        .iter()
+        .filter(|e| e["type"] == "job_output" && e["stream"] == "stdout")
+        .map(|e| e["data"].as_str().unwrap())
+        .collect();
+    assert_eq!(full.len(), 10012);
+    assert!(full.starts_with("EARLY"));
+    let output = p.run(&[]);
+    for label in [
+        "command:",
+        "stdout tail",
+        "stderr tail",
+        "OUT-END",
+        "ERR-END",
+    ] {
+        assert!(stdout(&output).contains(label));
+    }
+}
+
+#[test]
+fn commands_are_in_all_results_and_timeout_tails_keep_short_output() {
+    let p = Project::new(
+        r#"
+[settings]
+fail_fast = false
+[[jobs]]
+name = "fail"
+command = "exit 1"
+[[jobs]]
+name = "skip"
+command = "touch skipped"
+depends_on = ["fail"]
+[[jobs]]
+name = "pass"
+command = "true"
+[[jobs]]
+name = "timeout"
+command = "printf before; printf error >&2; sleep 5"
+timeout_secs = 1
+"#,
+    );
+    let output = p.run(&["--json"]);
+    assert_eq!(output.status.code(), Some(1));
+    let events = events(&output);
+    let results = events.last().unwrap()["results"].as_array().unwrap();
+    for (result, command) in results.iter().zip([
+        "exit 1",
+        "touch skipped",
+        "true",
+        "printf before; printf error >&2; sleep 5",
+    ]) {
+        assert_eq!(result["command"], command);
+    }
+    assert_eq!(results[0]["stdout_tail"], "");
+    assert_eq!(results[0]["stdout_truncated"], false);
+    for index in [1, 2] {
+        assert!(results[index].get("stdout_tail").is_none());
+    }
+    assert_eq!(results[3]["status"], "timed_out");
+    assert_eq!(results[3]["stdout_tail"], "before");
+    assert_eq!(results[3]["stderr_tail"], "error");
+    assert_eq!(results[3]["stdout_truncated"], false);
+    assert_eq!(results[3]["stderr_truncated"], false);
+}
+
+#[test]
+fn tails_bound_lossy_utf8_bytes_without_cutting_valid_characters() {
+    let p = Project::new(
+        r#"[[jobs]]
+name = "bytes"
+command = """head -c 6000 /dev/zero | tr '\\000' '\\377'; i=0; while [ $i -lt 2000 ]; do printf '€' >&2; i=$((i+1)); done; exit 1"""
+"#,
+    );
+    let output = p.run(&["--json"]);
+    assert_eq!(output.status.code(), Some(1));
+    let events = events(&output);
+    let result = &events.last().unwrap()["results"][0];
+    for key in ["stdout_tail", "stderr_tail"] {
+        assert!(result[key].as_str().unwrap().len() <= 4096);
+    }
+    assert!(result["stdout_tail"]
+        .as_str()
+        .unwrap()
+        .chars()
+        .all(|c| c == '\u{fffd}'));
+    assert_eq!(result["stderr_tail"].as_str().unwrap(), "€".repeat(1365));
+    assert_eq!(result["stdout_truncated"], true);
+    assert_eq!(result["stderr_truncated"], true);
+}

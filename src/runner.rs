@@ -1,3 +1,4 @@
+use crate::tail::{SharedTails, Tails};
 use crate::{config::Job, output::Output};
 use anyhow::{Context, Result};
 use serde::Serialize;
@@ -5,6 +6,7 @@ use serde_json::json;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
@@ -24,20 +26,34 @@ pub enum Status {
 #[derive(Clone, Debug, Serialize)]
 pub struct JobResult {
     pub name: String,
+    pub command: String,
     pub status: Status,
     pub duration_ms: u128,
     pub exit_code: Option<i32>,
     pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stdout_tail: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stderr_tail: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stdout_truncated: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stderr_truncated: Option<bool>,
 }
 
 impl JobResult {
     fn new(job: &Job, status: Status, error: Option<String>) -> Self {
         Self {
             name: job.name.clone(),
+            command: job.command.clone(),
             status,
             duration_ms: 0,
             exit_code: None,
             error,
+            stdout_tail: None,
+            stderr_tail: None,
+            stdout_truncated: None,
+            stderr_truncated: None,
         }
     }
 }
@@ -189,11 +205,21 @@ async fn run_job(
     cancel: watch::Receiver<Option<i32>>,
 ) -> JobResult {
     let start = Instant::now();
-    let mut result = match run_process(index, job, workdir, log_dir, output, cancel).await {
-        Ok(result) => result,
-        Err(error) => JobResult::new(job, Status::Failed, Some(format!("{error:#}"))),
-    };
+    let tails = Arc::new(Mutex::new(Tails::default()));
+    let mut result =
+        match run_process(index, job, workdir, log_dir, output, cancel, tails.clone()).await {
+            Ok(result) => result,
+            Err(error) => JobResult::new(job, Status::Failed, Some(format!("{error:#}"))),
+        };
     result.duration_ms = start.elapsed().as_millis();
+    if matches!(result.status, Status::Failed | Status::TimedOut) {
+        let [(stdout, stdout_truncated), (stderr, stderr_truncated)] =
+            tails.lock().expect("tail mutex poisoned").snapshot();
+        result.stdout_tail = Some(stdout);
+        result.stderr_tail = Some(stderr);
+        result.stdout_truncated = Some(stdout_truncated);
+        result.stderr_truncated = Some(stderr_truncated);
+    }
     result
 }
 
@@ -229,6 +255,7 @@ async fn run_process(
     log_dir: Option<&Path>,
     output: Output,
     mut cancel: watch::Receiver<Option<i32>>,
+    tails: SharedTails,
 ) -> Result<JobResult> {
     if cancel.borrow().is_some() {
         return Ok(JobResult::new(
@@ -290,10 +317,24 @@ async fn run_process(
     let mut readers = JoinSet::new();
     let name = job.name.clone();
     let pipe = child.stdout.take().context("missing stdout pipe")?;
-    readers.spawn(drain(pipe, name, "stdout", stdout_log, output.clone()));
+    readers.spawn(drain(
+        pipe,
+        name,
+        "stdout",
+        stdout_log,
+        output.clone(),
+        tails.clone(),
+    ));
     let name = job.name.clone();
     let pipe = child.stderr.take().context("missing stderr pipe")?;
-    readers.spawn(drain(pipe, name, "stderr", stderr_log, output.clone()));
+    readers.spawn(drain(
+        pipe,
+        name,
+        "stderr",
+        stderr_log,
+        output.clone(),
+        tails,
+    ));
 
     let deadline = async {
         if let Some(secs) = job.timeout_secs {
@@ -363,6 +404,7 @@ async fn drain<R: AsyncRead + Unpin>(
     stream: &'static str,
     mut log: Option<tokio::fs::File>,
     output: Output,
+    tails: SharedTails,
 ) -> Result<()> {
     let mut chunk = [0u8; 4096];
     let mut pending = Vec::new();
@@ -371,6 +413,10 @@ async fn drain<R: AsyncRead + Unpin>(
         if count == 0 {
             break;
         }
+        tails
+            .lock()
+            .expect("tail mutex poisoned")
+            .append(stream, &chunk[..count]);
         if let Some(file) = log.as_mut() {
             file.write_all(&chunk[..count]).await?;
         }

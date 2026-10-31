@@ -31,6 +31,35 @@ impl Default for Settings {
     }
 }
 
+#[derive(Debug, Serialize)]
+pub struct EffectiveSettings {
+    pub parallelism: usize,
+    pub fail_fast: bool,
+    pub workdir: PathBuf,
+}
+
+impl Settings {
+    pub fn resolve(
+        &self,
+        parallelism: Option<usize>,
+        fail_fast: Option<bool>,
+    ) -> Result<EffectiveSettings> {
+        Ok(EffectiveSettings {
+            parallelism: match parallelism.or(self.parallelism) {
+                Some(n) if n > 0 => n,
+                _ => std::thread::available_parallelism()
+                    .map(usize::from)
+                    .unwrap_or(1),
+            },
+            fail_fast: fail_fast.unwrap_or(self.fail_fast),
+            workdir: self
+                .workdir
+                .clone()
+                .context("config workdir has not been resolved")?,
+        })
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct Job {
@@ -150,9 +179,48 @@ impl Config {
             }
         }
         if visited != self.jobs.len() {
-            bail!("dependency cycle detected");
+            bail!("dependency cycle detected: {}", self.cycle_path(&names));
         }
         Ok(())
+    }
+
+    fn cycle_path(&self, names: &HashMap<&str, usize>) -> String {
+        // Iterative DFS avoids stack overflow on deep graphs. Only the segment
+        // between two visits to an active node is a cycle; downstream jobs aren't.
+        let mut state = vec![0u8; self.jobs.len()];
+        for root in 0..self.jobs.len() {
+            if state[root] != 0 {
+                continue;
+            }
+            let mut stack = vec![(root, 0usize)];
+            state[root] = 1;
+            while let Some(&(node, next)) = stack.last() {
+                if next == self.jobs[node].depends_on.len() {
+                    state[node] = 2;
+                    stack.pop();
+                    continue;
+                }
+                stack.last_mut().expect("stack is not empty").1 += 1;
+                let dep = names[self.jobs[node].depends_on[next].as_str()];
+                if state[dep] == 1 {
+                    let start = stack
+                        .iter()
+                        .position(|&(index, _)| index == dep)
+                        .expect("active node is on stack");
+                    let mut path: Vec<_> = stack[start..]
+                        .iter()
+                        .map(|&(index, _)| self.jobs[index].name.as_str())
+                        .collect();
+                    path.push(&self.jobs[dep].name);
+                    return path.join(" -> ");
+                }
+                if state[dep] == 0 {
+                    state[dep] = 1;
+                    stack.push((dep, 0));
+                }
+            }
+        }
+        unreachable!("topological validation proved that a cycle exists")
     }
 
     pub fn select(&mut self, selected: &[String]) -> Result<()> {

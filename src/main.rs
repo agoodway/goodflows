@@ -2,6 +2,7 @@ mod config;
 mod init;
 mod output;
 mod runner;
+mod tail;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -124,40 +125,39 @@ async fn run(cli: &Cli, output: &Output, cancel: watch::Receiver<Option<i32>>) -
         return Ok(0);
     }
     let (mut config, _) = Config::load(cli.config.as_deref())?;
+    let total_defined_jobs = config.jobs.len();
     config.select(&cli.jobs)?;
+    let settings = config.settings.resolve(
+        cli.parallelism,
+        if cli.fail_fast {
+            Some(true)
+        } else if cli.no_fail_fast {
+            Some(false)
+        } else {
+            None
+        },
+    )?;
     match cli.command.as_ref().unwrap_or(&Commands::Run) {
         Commands::Validate => {
             output
-                .emit(json!({"type":"config_valid", "jobs":config.jobs.len()}))
+                .emit(json!({"type":"config_valid", "jobs":config.jobs.len(), "total_defined_jobs":total_defined_jobs, "requested_jobs":cli.jobs, "selected_jobs":config.jobs.iter().map(|j| &j.name).collect::<Vec<_>>()}))
                 .await?;
             return Ok(0);
         }
         Commands::List => {
-            output.emit(json!({"type":"jobs", "jobs":config.jobs.iter().map(|j| json!({"name":j.name, "command":j.command, "depends_on":j.depends_on})).collect::<Vec<_>>()})).await?;
+            output
+                .emit(json!({"type":"jobs", "jobs":config.jobs, "settings":settings}))
+                .await?;
             return Ok(0);
         }
         _ => {}
     }
-    let parallelism = match cli.parallelism.or(config.settings.parallelism) {
-        Some(n) if n > 0 => n,
-        _ => std::thread::available_parallelism()
-            .map(usize::from)
-            .unwrap_or(1),
-    };
-    let fail_fast = if cli.fail_fast {
-        true
-    } else if cli.no_fail_fast {
-        false
-    } else {
-        config.settings.fail_fast
-    };
+    let parallelism = settings.parallelism;
+    let fail_fast = settings.fail_fast;
     let options = Options {
         parallelism,
         fail_fast,
-        workdir: config
-            .settings
-            .workdir
-            .expect("validated config has workdir"),
+        workdir: settings.workdir,
         log_dir: cli.log_dir.clone(),
         output: output.clone(),
     };

@@ -5,31 +5,46 @@ use common::*;
 
 #[test]
 fn init_requires_confirmation_to_overwrite() {
-    for (index, answer) in ["n\n", "\n", "", "maybe\n", "y\n", "YES\n"]
-        .iter()
-        .enumerate()
+    for (index, (answer, overwrite)) in [
+        ("n\n", false),
+        ("\n", false),
+        ("", false),
+        ("maybe\n", false),
+        ("y\n", true),
+        ("YES\n", true),
+        ("y", true),
+        ("yes", true),
+        (" YeS \r\n", true),
+    ]
+    .iter()
+    .enumerate()
     {
         let dir = std::env::temp_dir().join(format!("goodci-init-{}-{index}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let config = dir.join("goodci.toml");
         std::fs::write(&config, "existing config\n").unwrap();
-        let mut child = Command::new(env!("CARGO_BIN_EXE_goodci"))
+        std::fs::write(dir.join("answer"), answer).unwrap();
+        let child = Command::new(env!("CARGO_BIN_EXE_goodci"))
             .arg("init")
             .current_dir(&dir)
-            .stdin(Stdio::piped())
+            .stdin(Stdio::from(
+                std::fs::File::open(dir.join("answer")).unwrap(),
+            ))
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
-        let _ = child.stdin.take().unwrap().write_all(answer.as_bytes());
         let output = child.wait_with_output().unwrap();
         let content = std::fs::read_to_string(&config).unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
 
         assert!(output.status.success(), "{output:?}");
         let stdout = String::from_utf8(output.stdout).unwrap();
-        assert!(stdout.contains("Overwrite? [y/N]"), "{stdout}");
-        if matches!(*answer, "y\n" | "YES\n") {
+        assert!(
+            !stdout.contains("Overwrite?"),
+            "nonterminal input should not prompt: {stdout}"
+        );
+        if *overwrite {
             assert!(content.contains("[[jobs]]"));
             assert!(stdout.contains("Wrote goodci.toml"));
         } else {
@@ -210,4 +225,165 @@ fn init_through_symlink_preserves_project_workdir() {
     success(&p.run(&[]));
     assert!(p.dir.join("location").exists());
     assert_eq!(p.read("location").trim(), p.dir.to_str().unwrap());
+}
+
+#[cfg(unix)]
+#[test]
+fn nonterminal_init_never_waits_for_unavailable_or_incomplete_input() {
+    use std::os::fd::{AsRawFd, OwnedFd};
+    use std::os::unix::net::UnixStream;
+    use std::time::{Duration, Instant};
+    let overlong = format!("yes{}\n", " ".repeat(5000));
+    for (input, overwrite) in [
+        (overlong.as_str(), false),
+        ("", false),
+        ("ye", false),
+        ("yes", false),
+        ("y\n", true),
+        ("YES\n", true),
+        ("n\n", false),
+    ] {
+        let p = Project::new("keep");
+        let (reader, mut writer) = UnixStream::pair().unwrap();
+        writer.write_all(input.as_bytes()).unwrap();
+        // SAFETY: reader owns this live descriptor. A clone shares its status flags.
+        let flags = unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_GETFL) };
+        let mut child = p
+            .command()
+            .args(["init", "--json"])
+            .stdin(Stdio::from(OwnedFd::from(reader.try_clone().unwrap())))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let start = Instant::now();
+        let mut done = false;
+        while start.elapsed() < Duration::from_secs(1) {
+            if child.try_wait().unwrap().is_some() {
+                done = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        if !done {
+            child.kill().unwrap();
+        }
+        let output = child.wait_with_output().unwrap();
+        assert!(done, "blocked with available input {input:?}");
+        success(&output);
+        assert!(output.stderr.is_empty());
+        assert_eq!(
+            unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_GETFL) },
+            flags
+        );
+        let event: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            event["type"],
+            if overwrite {
+                "config_written"
+            } else {
+                "init_cancelled"
+            }
+        );
+        assert_eq!(p.read("goodci.toml") != "keep", overwrite);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn terminal_init_still_prompts_and_accepts_confirmation() {
+    use std::fs::File;
+    use std::os::fd::FromRawFd;
+    let p = Project::new("keep");
+    let mut master = -1;
+    let mut slave = -1;
+    // SAFETY: openpty initializes both descriptor outputs; optional arguments are null.
+    assert_eq!(
+        unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null(),
+            )
+        },
+        0
+    );
+    let mut master = unsafe { File::from_raw_fd(master) };
+    let slave = unsafe { File::from_raw_fd(slave) };
+    let child = p
+        .command()
+        .args(["init"])
+        .stdin(Stdio::from(slave))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    master.write_all(b"yes\n").unwrap();
+    let output = child.wait_with_output().unwrap();
+    success(&output);
+    assert!(stdout(&output).contains("Overwrite? [y/N]"));
+    assert_ne!(p.read("goodci.toml"), "keep");
+}
+
+#[test]
+fn generic_placeholder_fails_until_replaced() {
+    let p = Project::new("");
+    success(&p.run(&["init", "--force", "--template", "generic"]));
+    let output = p.run(&["--json"]);
+    assert_eq!(output.status.code(), Some(1));
+    let events: Vec<serde_json::Value> = stdout(&output)
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert!(events.iter().any(|e| e["type"] == "job_output"
+        && e["stream"] == "stderr"
+        && e["data"].as_str().unwrap().contains("Replace this command")));
+    assert_eq!(events.last().unwrap()["success"], false);
+}
+
+#[test]
+fn nonterminal_decline_does_not_require_valid_project_detection() {
+    let p = Project::new("keep");
+    std::fs::write(p.dir.join("Cargo.toml"), "").unwrap();
+    std::fs::write(p.dir.join("package.json"), "invalid manifest").unwrap();
+    let output = p
+        .command()
+        .args(["init", "--json"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    success(&output);
+    assert_eq!(p.read("goodci.toml"), "keep");
+    let event: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(event["type"], "init_cancelled");
+}
+
+#[test]
+fn generated_toml_omits_defaults_and_explains_parallelism() {
+    let p = Project::new("");
+    for template in ["rust", "elixir"] {
+        success(&p.run(&["init", "--force", "--template", template]));
+        let text = p.read("goodci.toml");
+        let config: toml::Value = toml::from_str(&text).unwrap();
+        assert!(!text.contains("depends_on = []"));
+        assert!(!text.contains("[jobs.env]\n\n"));
+        for job in config["jobs"].as_array().unwrap() {
+            assert!(job.get("shell").is_none());
+            assert!(job.get("timeout_secs").is_none());
+            if let Some(env) = job.get("env") {
+                assert!(!env.as_table().unwrap().is_empty());
+            }
+        }
+        assert!(config["jobs"][1]["depends_on"]
+            .as_array()
+            .is_some_and(|v| !v.is_empty()));
+        if template == "elixir" {
+            assert_eq!(config["jobs"][0]["env"]["MIX_ENV"].as_str(), Some("test"));
+        }
+        assert!(text.contains("every logical CPU"));
+        assert!(text.contains("machine size"));
+        success(&p.run(&["validate"]));
+    }
 }
