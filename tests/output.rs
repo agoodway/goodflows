@@ -225,10 +225,11 @@ timeout_secs = 1
 
 #[test]
 fn tails_bound_lossy_utf8_bytes_without_cutting_valid_characters() {
+    // macOS tr is locale-aware; force byte translation rather than U+00FF encoding.
     let p = Project::new(
         r#"[[jobs]]
 name = "bytes"
-command = """head -c 6000 /dev/zero | tr '\\000' '\\377'; i=0; while [ $i -lt 2000 ]; do printf '€' >&2; i=$((i+1)); done; exit 1"""
+command = """head -c 6000 /dev/zero | LC_ALL=C tr '\\000' '\\377'; i=0; while [ $i -lt 2000 ]; do printf '€' >&2; i=$((i+1)); done; exit 1"""
 "#,
     );
     let output = p.run(&["--json"]);
@@ -238,11 +239,10 @@ command = """head -c 6000 /dev/zero | tr '\\000' '\\377'; i=0; while [ $i -lt 20
     for key in ["stdout_tail", "stderr_tail"] {
         assert!(result[key].as_str().unwrap().len() <= 4096);
     }
-    assert!(result["stdout_tail"]
-        .as_str()
-        .unwrap()
-        .chars()
-        .all(|c| c == '\u{fffd}'));
+    assert_eq!(
+        result["stdout_tail"].as_str().unwrap(),
+        "\u{fffd}".repeat(1365)
+    );
     assert_eq!(result["stderr_tail"].as_str().unwrap(), "€".repeat(1365));
     assert_eq!(result["stdout_truncated"], true);
     assert_eq!(result["stderr_truncated"], true);
