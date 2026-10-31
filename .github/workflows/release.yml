@@ -23,7 +23,8 @@ jobs:
           - os: macos-15
             target: aarch64-apple-darwin
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
+    # Linux packaging compiles inside Debian 12, so allow time to build that image.
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v6
       - name: Install Rust
@@ -36,6 +37,7 @@ jobs:
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
       - name: Build and package
+        # Linux targets link in Debian 12. See scripts/package-release.sh.
         env:
           TARGET: ${{ matrix.target }}
           REF_NAME: ${{ github.ref_name }}

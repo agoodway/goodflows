@@ -19,10 +19,11 @@ cargo install --git https://github.com/agoodway/goodci.git --locked
 ```
 
 Supported platforms are Linux and macOS. Jobs require `sh` unless `shell = false`.
-Linux release binaries use glibc and are built on Ubuntu 24.04; build from source
-for older distributions or musl-based systems. Ampcode orbs run Debian 12, so
-build there from source; see [Ampcode orbs](#ampcode-orbs). Install each
-project's own tools and dependencies before running its checks.
+Linux release binaries are glibc builds linked on Debian 12 (glibc 2.36), so
+they run on Ampcode orbs and on systems with glibc 2.36 or newer. Build from
+source for older glibc or for musl-based systems. See
+[Ampcode orbs](#ampcode-orbs) to install a published archive in an orb. Install
+each project's own tools and dependencies before running its checks.
 
 Tagged releases produce archives for Linux and macOS on x86_64 and aarch64.
 After a release is published, download the matching archive and its checksum from
@@ -106,15 +107,45 @@ goodci validate
 
 Ampcode orbs run Debian 12 with Git, Node.js, Python, `gh`, and `amp` already
 installed. Install Rust, Go, or Elixir in `.agents/setup` when jobs call them.
-Release archives are built on Ubuntu 24.04 and need glibc 2.39, so build goodci
-on the orb. Copy `goodci` to `/usr/local/bin`. Jobs inherit the runner's
-environment, so copy the commands they call onto that same default `PATH`.
+Install goodci from a published release archive into `/usr/local/bin`. Jobs
+inherit the runner's environment, so copy the commands they call onto that
+same default `PATH`.
 
-This `.agents/setup` covers a Rust project and is safe to run again:
+This `.agents/setup` covers a Rust project. It is safe to run again, and it
+expects a published `v*` release:
 
 ```bash
 #!/usr/bin/env bash
 set -euo pipefail
+
+if ! command -v goodci >/dev/null 2>&1; then
+  case "$(uname -m)" in
+    x86_64) target=x86_64-unknown-linux-gnu ;;
+    aarch64 | arm64) target=aarch64-unknown-linux-gnu ;;
+    *) echo "unsupported architecture: $(uname -m)" >&2; exit 1 ;;
+  esac
+  release_url=$(curl -fsSL -o /dev/null -w '%{url_effective}' \
+    https://github.com/agoodway/goodci/releases/latest) || {
+    echo "no published goodci release; push a v<version> tag first" >&2
+    exit 1
+  }
+  tag=${release_url##*/}
+  case "$tag" in
+    v*) ;;
+    *) echo "unexpected release URL: $release_url" >&2; exit 1 ;;
+  esac
+  archive="goodci-${tag}-${target}.tar.gz"
+  base="https://github.com/agoodway/goodci/releases/download/${tag}"
+  tmp=$(mktemp -d)
+  trap 'rm -rf "$tmp"' EXIT
+  curl -fsSL "$base/$archive" -o "$tmp/$archive"
+  curl -fsSL "$base/$archive.sha256" -o "$tmp/$archive.sha256"
+  (cd "$tmp" && sha256sum --check "$archive.sha256")
+  tar -xzf "$tmp/$archive" -C "$tmp"
+  sudo install -m 755 "$tmp/goodci" /usr/local/bin/goodci
+  rm -rf "$tmp"
+  trap - EXIT
+fi
 
 if ! command -v rustup >/dev/null 2>&1 && [ ! -x "$HOME/.cargo/bin/rustup" ]; then
   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
@@ -122,12 +153,6 @@ if ! command -v rustup >/dev/null 2>&1 && [ ! -x "$HOME/.cargo/bin/rustup" ]; th
 fi
 . "$HOME/.cargo/env"
 rustup component add rustfmt clippy
-
-if [ ! -x "$HOME/.cargo/bin/goodci" ]; then
-  cargo install --git https://github.com/agoodway/goodci.git --locked
-fi
-
-sudo install -m 755 "$HOME/.cargo/bin/goodci" /usr/local/bin/goodci
 for tool in cargo rustc rustfmt cargo-clippy; do
   sudo ln -sfn "$HOME/.cargo/bin/$tool" "/usr/local/bin/$tool"
 done
@@ -139,9 +164,9 @@ git add .agents/setup goodci.toml
 ```
 
 Put any other job tools in that script. Node and Python jobs can use the image's
-existing commands. Compiling goodci still needs Rust. Ampcode stops setup after
-20 minutes and still starts the orb. It publishes a snapshot only when setup
-exits 0. The setup log is `/home/user/.cache/amp/logs/setup.log`.
+existing commands. goodci itself comes from the release archive. Ampcode stops
+setup after 20 minutes and still starts the orb. It publishes a snapshot only
+when setup exits 0. The setup log is `/home/user/.cache/amp/logs/setup.log`.
 
 After changing `.agents/setup`, delete the cached snapshots so the next thread
 runs the new script:
@@ -420,7 +445,9 @@ cargo build --release --locked
 `Cargo.lock` is committed for reproducible dependency resolution. CI runs formatting,
 Clippy, tests, a release build, and goodci's own checks on Linux/macOS with Rust 1.88
 and stable. Release builds run checks on all four native platform/architecture
-combinations before packaging. Workflows use GitHub's documented
+combinations before packaging. Linux archives are then compiled with Rust 1.88.0
+in a Debian 12 container so the binary runs on Ampcode orbs (glibc 2.36).
+Workflows use GitHub's documented
 [runner labels](https://docs.github.com/en/actions/reference/runners/github-hosted-runners).
 
 The Release workflow can be dispatched manually to build artifacts without publishing.
@@ -429,8 +456,9 @@ individual SHA-256 checksums, and `SHA256SUMS`. Maintainers should bump the pack
 version, update the lockfile, and review CI before pushing a release tag. No release
 is published merely by running `goodci` or pushing a regular branch.
 
-To exercise packaging locally for your host target:
+To exercise packaging locally, Linux targets need Docker and produce a Debian 12
+binary. macOS targets build natively:
 
 ```bash
-bash scripts/package-release.sh x86_64-unknown-linux-gnu v0.1.0
+bash scripts/package-release.sh x86_64-unknown-linux-gnu v0.1.1
 ```
