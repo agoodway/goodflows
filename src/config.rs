@@ -12,6 +12,8 @@ pub struct Config {
     pub jobs: Vec<Job>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub workflows: BTreeMap<String, Workflow>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub environments: BTreeMap<String, Environment>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -79,21 +81,28 @@ pub struct Job {
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Workflow {
-    #[serde(default, skip_serializing_if = "WorkflowSettings::is_empty")]
-    pub settings: WorkflowSettings,
+    #[serde(default, skip_serializing_if = "SettingsOverrides::is_empty")]
+    pub settings: SettingsOverrides,
     #[serde(default)]
     pub jobs: Vec<Job>,
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Environment {
+    #[serde(default, skip_serializing_if = "SettingsOverrides::is_empty")]
+    pub settings: SettingsOverrides,
+}
+
 #[derive(Debug, Default, Deserialize, Serialize, Clone)]
 #[serde(deny_unknown_fields)]
-pub struct WorkflowSettings {
+pub struct SettingsOverrides {
     pub parallelism: Option<usize>,
     pub fail_fast: Option<bool>,
     pub workdir: Option<PathBuf>,
 }
 
-impl WorkflowSettings {
+impl SettingsOverrides {
     fn is_empty(&self) -> bool {
         self.parallelism.is_none() && self.fail_fast.is_none() && self.workdir.is_none()
     }
@@ -108,8 +117,12 @@ impl WorkflowSettings {
 }
 
 pub fn validate_workflow_name(name: &str) -> Result<()> {
+    validate_name(name, "workflow")
+}
+
+fn validate_name(name: &str, kind: &str) -> Result<()> {
     if name.trim().is_empty() || name.len() > 64 || name.chars().any(char::is_control) {
-        bail!("workflow name must be nonempty, at most 64 UTF-8 bytes, and contain no control characters");
+        bail!("{kind} name must be nonempty, at most 64 UTF-8 bytes, and contain no control characters");
     }
     Ok(())
 }
@@ -178,6 +191,14 @@ impl Config {
                 .with_context(|| format!("workflow '{name}'"))?,
             );
         }
+        for (name, environment) in &mut config.environments {
+            if let Some(workdir) = &environment.settings.workdir {
+                environment.settings.workdir = Some(
+                    resolve_workdir(base, Some(workdir))
+                        .with_context(|| format!("environment '{name}'"))?,
+                );
+            }
+        }
         config.validate()?;
         Ok((config, path))
     }
@@ -196,7 +217,29 @@ impl Config {
             validate_workflow_name(name)?;
             validate_jobs(&workflow.jobs).with_context(|| format!("workflow '{name}'"))?;
         }
+        for name in self.environments.keys() {
+            validate_name(name, "environment")?;
+        }
         Ok(())
+    }
+
+    pub fn environment(&self, requested: Option<&str>) -> Result<Option<&SettingsOverrides>> {
+        requested
+            .map(|name| {
+                self.environments
+                    .get(name)
+                    .map(|environment| &environment.settings)
+                    .with_context(|| {
+                        let available = self
+                            .environments
+                            .keys()
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        format!("unknown environment '{name}' (available: {available})")
+                    })
+            })
+            .transpose()
     }
 
     pub fn workflow_names(&self) -> Vec<String> {
@@ -216,7 +259,11 @@ impl Config {
         }
     }
 
-    pub fn workflow(&self, requested: Option<&str>) -> Result<(String, Config)> {
+    pub fn workflow(
+        &self,
+        requested: Option<&str>,
+        environment: Option<&SettingsOverrides>,
+    ) -> Result<(String, Config)> {
         let available = self.workflow_names().join(", ");
         let name = requested.or_else(|| self.default_workflow())
             .with_context(|| format!("no default workflow; choose a workflow with 'goodci run <workflow>' (available: {available})"))?;
@@ -235,9 +282,13 @@ impl Config {
         Ok((
             name.to_owned(),
             Config {
-                settings,
+                settings: match environment {
+                    Some(overrides) => overrides.apply(&settings),
+                    None => settings,
+                },
                 jobs,
                 workflows: BTreeMap::new(),
+                environments: BTreeMap::new(),
             },
         ))
     }

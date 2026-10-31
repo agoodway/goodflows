@@ -338,10 +338,11 @@ goodci validate ci --jobs test  # Report the selected closure inside ci
 goodci validate                # Validate every workflow
 ```
 
-Settings precedence is **CLI overrides > workflow settings > shared settings >
-built-in defaults**. A workflow inherits each omitted field independently;
-`fail_fast = false` and `parallelism = 0` are explicit overrides. Both shared and
-workflow-relative `workdir` values resolve from the config file's directory.
+Settings precedence is **CLI overrides > environment settings (when selected) >
+workflow settings > shared settings > built-in defaults**. A workflow inherits
+each omitted field independently; `fail_fast = false` and `parallelism = 0` are
+explicit overrides. Both shared and workflow-relative `workdir` values resolve
+from the config file's directory.
 
 Job names and dependencies are scoped to their workflow. For example, both ci and
 integration can have a job named test. Dependencies must refer to local jobs;
@@ -369,6 +370,64 @@ explicit workflow with `--jobs`; aggregate validation does not filter job names.
 Legacy single-workflow validation retains its existing fields.
 For an explicitly selected workflow, count/name fields describe that workflow;
 the entire config is still validated first.
+
+## Environment profiles
+
+Share jobs across machines while overriding runner settings for local development,
+orbs, or CI:
+
+```toml
+[settings]
+fail_fast = true
+
+[environments.local.settings]
+parallelism = 2
+
+[environments.orb.settings]
+parallelism = 4
+
+[environments.ci.settings]
+parallelism = 8
+fail_fast = false
+
+[[jobs]]
+name = "test"
+command = "cargo test --locked"
+```
+
+```bash
+goodci --env local                 # Run the default workflow with local settings
+goodci run ci --env orb             # Apply orb settings to a named ci workflow
+goodci list ci --env orb            # Inspect effective jobs and settings
+goodci list --workflows --env ci    # Inspect all workflows with ci settings
+goodci validate --env ci            # Validate without running jobs
+goodci --env ci --parallelism 2     # Explicit CLI flags still take precedence
+```
+
+The named-workflow examples require a workflow named `ci` in your config.
+Environment and workflow names are independent: `--env ci` does not select a
+workflow. Without `--env`, no profile is applied; goodci does not detect the
+machine or read an environment variable to select one. The Amp plugin likewise
+uses no environment profile.
+
+Each profile can override `parallelism`, `fail_fast`, and `workdir`. Omitted fields
+inherit independently, with precedence **CLI overrides > environment settings >
+workflow settings > shared settings > built-in defaults**. Explicit `false` and
+`0` values are preserved (`parallelism = 0` uses the logical CPU count). Relative
+profile workdirs resolve from the config file's directory, not the inherited
+workdir. Profiles do not change jobs, dependencies, or job environment variables.
+
+Unknown profile names fail with the available names before jobs run. Names follow
+the same case-sensitive, nonempty, 64-byte, no-control-character rules as workflow
+names. Every declared profile, including its workdir, is validated even when not
+selected. `--env` works with run, list, and validate, but not init. Log paths stay
+unchanged; use separate `--log-dir` values to retain logs from different profiles.
+
+Human output identifies the selected environment. JSON events include
+`environment` when `--env` is supplied and omit it otherwise. Selected-workflow
+`config_valid` events also include effective `settings`; aggregate validation and
+workflow discovery report each workflow's settings with the selected profile and
+CLI overrides applied.
 
 ## Scheduling and failures
 

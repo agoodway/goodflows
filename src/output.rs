@@ -19,6 +19,7 @@ struct Request {
 pub struct Output {
     pub json: bool,
     workflow: Option<String>,
+    environment: Option<String>,
     sender: mpsc::Sender<Request>,
     cancel: watch::Receiver<Option<i32>>,
     suppressed: Arc<AtomicBool>,
@@ -47,6 +48,7 @@ impl Output {
         Ok(Self {
             json,
             workflow: None,
+            environment: None,
             sender,
             cancel,
             suppressed: Arc::new(AtomicBool::new(false)),
@@ -59,9 +61,18 @@ impl Output {
         output
     }
 
+    pub fn with_environment(&self, name: &str) -> Self {
+        let mut output = self.clone();
+        output.environment = Some(name.into());
+        output
+    }
+
     pub async fn emit(&self, mut event: Value) -> Result<()> {
         if let Some(workflow) = &self.workflow {
             event["workflow"] = json!(workflow);
+        }
+        if let Some(environment) = &self.environment {
+            event["environment"] = json!(environment);
         }
         if self.suppressed.load(Ordering::Relaxed) {
             return Ok(());
@@ -118,6 +129,14 @@ fn render(json: bool, mut event: Value, out: &mut impl Write, err: &mut impl Wri
         serde_json::to_writer(&mut *out, &event)?;
         writeln!(out)?;
     } else {
+        if matches!(
+            event["type"].as_str(),
+            Some("run_started" | "jobs" | "workflows" | "config_valid")
+        ) {
+            if let Some(environment) = event["environment"].as_str() {
+                writeln!(out, "Environment: {environment}")?;
+            }
+        }
         match event["type"].as_str().unwrap_or_default() {
             "run_started" => writeln!(
                 out,

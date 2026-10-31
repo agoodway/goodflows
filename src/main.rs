@@ -26,6 +26,9 @@ struct Cli {
     /// Config file (default: goodci.toml or .goodci.toml)
     #[arg(short, long, global = true)]
     config: Option<PathBuf>,
+    /// Apply a named environment's settings (no automatic selection)
+    #[arg(long, global = true, value_name = "NAME")]
+    env: Option<String>,
     /// Maximum concurrent jobs (0 uses logical CPU count)
     #[arg(short, long, global = true)]
     parallelism: Option<usize>,
@@ -137,6 +140,9 @@ async fn main() -> ExitCode {
     } else {
         output
     };
+    if let Some(name) = &cli.env {
+        output = output.with_environment(name);
+    }
     match run(&cli, &mut output, cancel.clone()).await {
         Ok(code) => ExitCode::from(code),
         Err(error) => {
@@ -155,6 +161,11 @@ async fn run(cli: &Cli, output: &mut Output, cancel: watch::Receiver<Option<i32>
         workflow,
     }) = &cli.command
     {
+        if cli.env.is_some() {
+            anyhow::bail!(
+                "--env cannot be used with init; define environment profiles in the config"
+            );
+        }
         init::generate(
             cli.config.as_deref(),
             *template,
@@ -166,6 +177,7 @@ async fn run(cli: &Cli, output: &mut Output, cancel: watch::Receiver<Option<i32>
         return Ok(0);
     }
     let (document, _) = Config::load(cli.config.as_deref())?;
+    let environment = document.environment(cli.env.as_deref())?;
     let fail_fast_override = if cli.fail_fast {
         Some(true)
     } else if cli.no_fail_fast {
@@ -189,7 +201,7 @@ async fn run(cli: &Cli, output: &mut Output, cancel: watch::Receiver<Option<i32>
         let mut workflows = Vec::new();
         let mut total = 0;
         for name in document.workflow_names() {
-            let (_, config) = document.workflow(Some(&name))?;
+            let (_, config) = document.workflow(Some(&name), environment)?;
             total += config.jobs.len();
             workflows.push(json!({"name":name, "jobs":config.jobs.len(), "selected_jobs":config.jobs.iter().map(|j| &j.name).collect::<Vec<_>>(), "requested_jobs":[], "total_defined_jobs":config.jobs.len(), "settings":config.settings.resolve(cli.parallelism, fail_fast_override)?}));
         }
@@ -201,7 +213,7 @@ async fn run(cli: &Cli, output: &mut Output, cancel: watch::Receiver<Option<i32>
         return Ok(0);
     }
     let legacy_default = !document.jobs.is_empty();
-    let (name, mut config) = document.workflow(cli.workflow())?;
+    let (name, mut config) = document.workflow(cli.workflow(), environment)?;
     *output = output.with_workflow(&name);
     let total_defined_jobs = config.jobs.len();
     config.select(&cli.jobs)?;
@@ -211,7 +223,7 @@ async fn run(cli: &Cli, output: &mut Output, cancel: watch::Receiver<Option<i32>
     match cli.command.as_ref() {
         Some(Commands::Validate { .. }) => {
             output
-                .emit(json!({"type":"config_valid", "jobs":config.jobs.len(), "total_defined_jobs":total_defined_jobs, "requested_jobs":cli.jobs, "selected_jobs":config.jobs.iter().map(|j| &j.name).collect::<Vec<_>>()}))
+                .emit(json!({"type":"config_valid", "jobs":config.jobs.len(), "total_defined_jobs":total_defined_jobs, "requested_jobs":cli.jobs, "selected_jobs":config.jobs.iter().map(|j| &j.name).collect::<Vec<_>>(), "settings":settings}))
                 .await?;
             return Ok(0);
         }

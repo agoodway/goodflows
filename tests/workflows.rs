@@ -294,3 +294,157 @@ fn workflow_name_matching_a_flag_does_not_enable_that_flag() {
     assert_eq!(summary["workflow"], "--json");
     assert_eq!(summary["success"], true);
 }
+
+#[test]
+fn environment_settings_override_workflows_field_by_field_and_cli_wins() {
+    let p = Project::new(&format!(
+        "{MULTI}\n[environments.orb.settings]\nparallelism=7\n[environments.local.settings]\nparallelism=0\nfail_fast=false\n"
+    ));
+    let baseline = event(&p.run(&["list", "release", "--json"]));
+    assert_eq!(baseline["settings"]["parallelism"], 1);
+    assert!(baseline.get("environment").is_none());
+    let orb = event(&p.run(&["list", "release", "--env", "orb", "--json"]));
+    assert_eq!(orb["environment"], "orb");
+    assert_eq!(orb["settings"]["parallelism"], 7);
+    assert_eq!(orb["settings"]["fail_fast"], true);
+    let local = event(&p.run(&["list", "release", "--env", "local", "--json"]));
+    assert_eq!(local["settings"]["fail_fast"], false);
+    assert_eq!(
+        local["settings"]["parallelism"],
+        std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(1)
+    );
+    let overridden = event(&p.run(&[
+        "--env",
+        "local",
+        "list",
+        "release",
+        "--parallelism",
+        "2",
+        "--fail-fast",
+        "--json",
+    ]));
+    assert_eq!(overridden["settings"]["parallelism"], 2);
+    assert_eq!(overridden["settings"]["fail_fast"], true);
+    for command in [vec!["list", "--workflows"], vec!["validate"]] {
+        let mut args = command;
+        args.extend(["--env", "orb", "--json"]);
+        let aggregate = event(&p.run(&args));
+        assert_eq!(aggregate["environment"], "orb");
+        let workflows = aggregate["workflows"].as_array().unwrap();
+        assert_eq!(workflows[0]["settings"]["parallelism"], 7);
+        assert_eq!(workflows[0]["settings"]["fail_fast"], false);
+        assert_eq!(workflows[1]["settings"]["parallelism"], 7);
+        assert_eq!(workflows[1]["settings"]["fail_fast"], true);
+    }
+    let selected = event(&p.run(&["validate", "ci", "--env", "orb", "--jobs", "test", "--json"]));
+    assert_eq!(
+        selected["selected_jobs"],
+        serde_json::json!(["setup", "test"])
+    );
+    assert_eq!(selected["settings"]["parallelism"], 7);
+    assert!(!p.dir.join("order").exists());
+}
+
+#[test]
+fn environment_workdir_is_config_relative_and_execution_uses_profile_settings() {
+    for jobs in ["jobs", "workflows.ci.jobs"] {
+        let p = Project::new("");
+        std::fs::create_dir_all(p.dir.join("ci/base")).unwrap();
+        std::fs::create_dir_all(p.dir.join("ci/orb")).unwrap();
+        std::fs::write(p.dir.join("ci/checks.toml"), format!(
+            "[settings]\nparallelism=1\nfail_fast=true\nworkdir='base'\n[environments.orb.settings]\nworkdir='orb'\nfail_fast=false\n[[{jobs}]]\nname='fail'\ncommand='exit 1'\n[[{jobs}]]\nname='queued'\ncommand='pwd > continued'\n"
+        )).unwrap();
+        let workflow = if jobs == "jobs" { "default" } else { "ci" };
+        let output = p.run(&[
+            "run",
+            workflow,
+            "--config",
+            "ci/checks.toml",
+            "--env",
+            "orb",
+            "--json",
+        ]);
+        assert!(!output.status.success());
+        assert_eq!(
+            p.read("ci/orb/continued").trim(),
+            p.dir
+                .join("ci/orb")
+                .canonicalize()
+                .unwrap()
+                .to_str()
+                .unwrap()
+        );
+        assert!(!p.dir.join("ci/base/continued").exists());
+        for line in stdout(&output).lines() {
+            let event: serde_json::Value = serde_json::from_str(line).unwrap();
+            assert_eq!(event["environment"], "orb");
+            assert_eq!(event["workflow"], workflow);
+        }
+        std::fs::remove_file(p.dir.join("ci/orb/continued")).unwrap();
+        let output = p.run(&[
+            "run",
+            workflow,
+            "--config",
+            "ci/checks.toml",
+            "--env",
+            "orb",
+            "--fail-fast",
+        ]);
+        assert!(!output.status.success());
+        assert!(!p.dir.join("ci/orb/continued").exists());
+        assert!(stdout(&output).contains("Environment: orb"));
+    }
+}
+
+#[test]
+fn invalid_and_unknown_environments_fail_before_running_jobs() {
+    for (profile, expected) in [
+        (
+            "[environments.orb.settings]\nparallelism=2",
+            "unknown environment 'typo'",
+        ),
+        (
+            "[environments.orb.settings]\nworkdir='missing'",
+            "workdir does not exist",
+        ),
+        (
+            "[environments.orb.settings]\nfail_fats=true",
+            "unknown field",
+        ),
+        ("[environments.orb]\nparallelism=2", "unknown field"),
+        (
+            "[environments.''.settings]\nparallelism=2",
+            "environment name",
+        ),
+        (
+            &format!(
+                "[environments.'{}'.settings]\nparallelism=2",
+                "a".repeat(65)
+            ),
+            "environment name",
+        ),
+    ] {
+        let p = Project::new(&format!(
+            "[[jobs]]\nname='a'\ncommand='touch ran'\n{profile}\n"
+        ));
+        let output = p.run(&["--env", "typo", "--json"]);
+        assert!(!output.status.success());
+        let error: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert!(
+            error["message"].as_str().unwrap().contains(expected),
+            "{error}"
+        );
+        assert_eq!(error["environment"], "typo");
+        assert!(!p.dir.join("ran").exists());
+        // All declared profiles are validated even when none is selected.
+        if expected != "unknown environment 'typo'" {
+            assert!(!p.run(&["validate"]).status.success());
+        }
+    }
+    let p = Project::new("keep");
+    let output = p.run(&["init", "--env", "orb", "--template", "generic", "--force"]);
+    assert!(!output.status.success());
+    assert_eq!(p.read("goodci.toml"), "keep");
+}

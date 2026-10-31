@@ -1,4 +1,4 @@
-use crate::config::{Config, Job, Settings, Workflow, WorkflowSettings};
+use crate::config::{Config, Job, Settings, SettingsOverrides, Workflow};
 use crate::output::Output;
 use anyhow::{bail, Context, Result};
 use clap::ValueEnum;
@@ -88,12 +88,13 @@ pub async fn generate(
         },
         jobs,
         workflows: Default::default(),
+        environments: Default::default(),
     };
     if let Some(name) = workflow {
         config.workflows.insert(
             name.into(),
             Workflow {
-                settings: WorkflowSettings::default(),
+                settings: SettingsOverrides::default(),
                 jobs: std::mem::take(&mut config.jobs),
             },
         );
