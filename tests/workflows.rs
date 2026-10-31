@@ -80,7 +80,12 @@ fn relative_workdirs_use_config_directory_and_inherit() {
         success(&p.run(&["run", workflow, "--config", "ci/checks.toml"]));
         assert_eq!(
             p.read(&format!("ci/{dir}/here")).trim(),
-            p.dir.join(format!("ci/{dir}")).to_str().unwrap()
+            p.dir
+                .join(format!("ci/{dir}"))
+                .canonicalize()
+                .unwrap()
+                .to_str()
+                .unwrap()
         );
     }
 }
@@ -260,7 +265,10 @@ fn named_init_nested_workdir_and_name_validation_are_preserved() {
     )
     .unwrap();
     success(&p.run(&["run", "ci", "--config", "ci/checks.toml"]));
-    assert_eq!(p.read("here").trim(), p.dir.to_str().unwrap());
+    assert_eq!(
+        p.read("here").trim(),
+        p.dir.canonicalize().unwrap().to_str().unwrap()
+    );
     let output = p.run(&[
         "init",
         "--workflow",

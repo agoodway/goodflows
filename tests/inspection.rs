@@ -33,7 +33,10 @@ shell = false
     let event: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(event["settings"]["parallelism"], 2);
     assert_eq!(event["settings"]["fail_fast"], false);
-    assert_eq!(event["settings"]["workdir"], p.dir.to_str().unwrap());
+    assert_eq!(
+        event["settings"]["workdir"],
+        p.dir.canonicalize().unwrap().to_str().unwrap()
+    );
     let jobs = event["jobs"].as_array().unwrap();
     assert_eq!(jobs.len(), 2);
     assert_eq!(jobs[1]["timeout_secs"], 30);

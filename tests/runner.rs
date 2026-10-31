@@ -87,7 +87,12 @@ fn nested_config_resolves_relative_workdir_from_config_directory() {
     success(&p.run(&["--config", "ci/checks.toml"]));
     assert_eq!(
         p.read("ci/app/location").trim(),
-        p.dir.join("ci/app").to_str().unwrap()
+        p.dir
+            .join("ci/app")
+            .canonicalize()
+            .unwrap()
+            .to_str()
+            .unwrap()
     );
     std::fs::write(
         p.dir.join("ci/checks.toml"),
