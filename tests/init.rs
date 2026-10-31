@@ -129,7 +129,10 @@ fn init_honors_custom_path_force_and_generated_workdir() {
     )
     .unwrap();
     success(&p.run(&["--config", "nested/config/checks.toml"]));
-    assert_eq!(p.read("location").trim(), p.dir.to_str().unwrap());
+    assert_eq!(
+        p.read("location").trim(),
+        p.dir.canonicalize().unwrap().to_str().unwrap()
+    );
     success(&p.run(&[
         "init",
         "--template",
@@ -224,7 +227,10 @@ fn init_through_symlink_preserves_project_workdir() {
     std::fs::write(p.dir.join("goodci.toml"), toml::to_string(&config).unwrap()).unwrap();
     success(&p.run(&[]));
     assert!(p.dir.join("location").exists());
-    assert_eq!(p.read("location").trim(), p.dir.to_str().unwrap());
+    assert_eq!(
+        p.read("location").trim(),
+        p.dir.canonicalize().unwrap().to_str().unwrap()
+    );
 }
 
 #[cfg(unix)]
