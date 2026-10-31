@@ -1,0 +1,25 @@
+# goodci.toml — example for a Rust project
+# Adjust parallelism to match your Amp orb size
+
+[settings]
+parallelism = 4
+fail_fast = true
+
+[[jobs]]
+name = "fmt"
+command = "cargo fmt --check"
+
+[[jobs]]
+name = "clippy"
+command = "cargo clippy --all-targets -- -D warnings"
+depends_on = ["fmt"]
+
+[[jobs]]
+name = "test"
+command = "cargo test --all"
+depends_on = ["fmt"]
+
+[[jobs]]
+name = "doc"
+command = "cargo doc --no-deps"
+depends_on = ["fmt"]
