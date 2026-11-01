@@ -2,6 +2,7 @@ mod config;
 mod expression;
 mod init;
 mod output;
+mod reporting;
 mod runner;
 mod tail;
 
@@ -76,6 +77,23 @@ enum Commands {
         #[arg(long)]
         workflow: Option<String>,
     },
+    /// Manage saved test timing reports
+    Reports {
+        #[command(subcommand)]
+        command: ReportsCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum ReportsCommand {
+    /// Retry publishing a saved invocation's finalized reports without running jobs
+    Upload {
+        /// Run directory under the reporting spool (contains manifest.json)
+        run_directory: PathBuf,
+        /// Total publishing budget in seconds (default 30), for large reports on slow links
+        #[arg(long, value_name = "SECONDS", value_parser = clap::value_parser!(u64).range(1..=3600))]
+        budget: Option<u64>,
+    },
 }
 
 impl Cli {
@@ -87,7 +105,7 @@ impl Cli {
                 | Commands::Validate { workflow }
                 | Commands::Init { workflow, .. },
             ) => workflow.as_deref(),
-            None => None,
+            Some(Commands::Reports { .. }) | None => None,
         }
     }
 }
@@ -115,8 +133,10 @@ async fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let (_signal_sender, cancel) = match if matches!(cli.command, None | Some(Commands::Run { .. }))
-    {
+    let (_signal_sender, cancel) = match if matches!(
+        cli.command,
+        None | Some(Commands::Run { .. } | Commands::Reports { .. })
+    ) {
         cancellation()
     } else {
         // Keep the OS default signal behavior for commands that do not spawn jobs,
@@ -177,6 +197,29 @@ async fn run(cli: &Cli, output: &mut Output, cancel: watch::Receiver<Option<i32>
         .await?;
         return Ok(0);
     }
+    if let Some(Commands::Reports {
+        command: ReportsCommand::Upload {
+            run_directory,
+            budget,
+        },
+    }) = &cli.command
+    {
+        for (set, flag) in [
+            (cli.config.is_some(), "--config"),
+            (cli.env.is_some(), "--env"),
+            (cli.parallelism.is_some(), "--parallelism"),
+            (cli.fail_fast, "--fail-fast"),
+            (cli.no_fail_fast, "--no-fail-fast"),
+            (!cli.jobs.is_empty(), "--jobs"),
+            (cli.log_dir.is_some(), "--log-dir"),
+        ] {
+            if set {
+                anyhow::bail!("{flag} cannot be used with reports upload");
+            }
+        }
+        let budget = budget.map(std::time::Duration::from_secs);
+        return reporting::replay::upload(run_directory, output, cancel, budget).await;
+    }
     let (document, _) = Config::load(cli.config.as_deref())?;
     let environment = document.environment(cli.env.as_deref())?;
     let fail_fast_override = if cli.fail_fast {
@@ -229,15 +272,31 @@ async fn run(cli: &Cli, output: &mut Output, cancel: watch::Receiver<Option<i32>
             return Ok(0);
         }
         Some(Commands::List { .. }) => {
-            output
-                .emit(json!({"type":"jobs", "jobs":config.jobs, "settings":settings}))
-                .await?;
+            let mut event = json!({"type":"jobs", "jobs":config.jobs, "settings":settings});
+            if let Some(reporting) = &config.reporting {
+                // Only nonsecret configuration: env variable names, never their values.
+                event["reporting"] = json!(reporting);
+            }
+            output.emit(event).await?;
             return Ok(0);
         }
         _ => {}
     }
     let parallelism = settings.parallelism;
     let fail_fast = settings.fail_fast;
+    let mut session = match &config.reporting {
+        Some(reporting) => Some(
+            reporting::Session::start(
+                reporting,
+                &name,
+                cli.env.as_deref(),
+                &config.jobs,
+                &settings.workdir,
+            )
+            .await,
+        ),
+        None => None,
+    };
     let options = Options {
         parallelism,
         fail_fast,
@@ -246,13 +305,32 @@ async fn run(cli: &Cli, output: &mut Output, cancel: watch::Receiver<Option<i32>
             if legacy_default && name == "default" {
                 dir.clone()
             } else {
-                dir.join(config::workflow_log_component(&name))
+                dir.join(config::path_component(&name))
             }
         }),
         output: output.clone(),
+        reporting: session
+            .as_ref()
+            .map(reporting::Session::runner_env)
+            .unwrap_or_default(),
     };
     output.emit(json!({"type":"run_started", "parallelism":parallelism, "fail_fast":fail_fast, "jobs":config.jobs.len(), "workdir":options.workdir})).await?;
-    let results = runner::execute(&config.jobs, &options, cancel.clone()).await?;
+    if let Some(session) = &session {
+        session.announce(output).await;
+    }
+    let results = match runner::execute(&config.jobs, &options, cancel.clone()).await {
+        Ok(results) => results,
+        Err(error) => {
+            if let Some(session) = &mut session {
+                session.abort();
+            }
+            return Err(error);
+        }
+    };
+    // Reporting runs after every job finished and before the summary, which stays last.
+    if let Some(session) = &mut session {
+        session.finish(&results, cancel.clone(), output).await;
+    }
     let count = |status| results.iter().filter(|r| r.status == status).count();
     let success = results
         .iter()

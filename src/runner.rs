@@ -1,6 +1,6 @@
 use crate::tail::{SharedTails, Tails};
 use crate::{
-    config::{Condition, Job},
+    config::{self, Condition, Job},
     expression::{Expression, Reference},
     output::Output,
 };
@@ -10,6 +10,7 @@ use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
@@ -46,6 +47,9 @@ pub struct JobResult {
     pub stdout_truncated: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stderr_truncated: Option<bool>,
+    /// Whether the job started (as opposed to being skipped or cancelled before launch).
+    #[serde(skip)]
+    pub executed: bool,
 }
 
 impl JobResult {
@@ -79,6 +83,7 @@ impl JobResult {
             stderr_tail: None,
             stdout_truncated: None,
             stderr_truncated: None,
+            executed: false,
         }
     }
 
@@ -130,6 +135,56 @@ pub struct Options {
     pub workdir: PathBuf,
     pub log_dir: Option<PathBuf>,
     pub output: Output,
+    pub reporting: Arc<ReportingEnv>,
+}
+
+/// Environment adjustments for reporting. Applied after job/step overrides.
+#[derive(Debug, Default)]
+pub struct ReportingEnv {
+    /// A `[reporting]` block exists. The reserved names are then removed from
+    /// every command and expression (even when inherited from the CLI's own
+    /// environment) and set only for report-producing jobs with a spool.
+    pub active: bool,
+    /// The publisher's credential variable, removed from every child and expression.
+    pub scrub: Option<String>,
+    /// Reserved variables injected into report-producing jobs.
+    pub jobs: HashMap<String, Vec<(String, String)>>,
+}
+
+impl ReportingEnv {
+    fn reserved(&self, job: &str) -> &[(String, String)] {
+        self.jobs.get(job).map(Vec::as_slice).unwrap_or_default()
+    }
+
+    /// Remove the token and the reserved names. Conditions see only this view:
+    /// they decide whether the job runs, so they are not report producers.
+    fn scrub(&self, env: &mut HashMap<String, String>) {
+        if let Some(token) = &self.scrub {
+            env.remove(token);
+        }
+        if self.active {
+            for key in config::RESERVED_ENV {
+                env.remove(key);
+            }
+        }
+    }
+
+    /// The scrubbed view plus the reserved values, for the job's own commands.
+    fn inject(&self, job: &str, env: &HashMap<String, String>) -> HashMap<String, String> {
+        let mut env = env.clone();
+        for (key, value) in self.reserved(job) {
+            env.insert(key.clone(), value.clone());
+        }
+        env
+    }
+}
+
+/// Per-invocation state shared by every job task.
+struct Shared {
+    workdir: PathBuf,
+    log_dir: Option<PathBuf>,
+    output: Output,
+    reporting: Arc<ReportingEnv>,
 }
 
 async fn record(
@@ -168,6 +223,12 @@ pub async fn execute(
     let mut started = vec![false; jobs.len()];
     let mut running = JoinSet::new();
     let mut failed = false;
+    let shared = Arc::new(Shared {
+        workdir: options.workdir.clone(),
+        log_dir: options.log_dir.clone(),
+        output: options.output.clone(),
+        reporting: options.reporting.clone(),
+    });
 
     loop {
         // Consume completed jobs before deciding whether to launch queued work.
@@ -229,9 +290,7 @@ pub async fn execute(
             }
             started[index] = true;
             let job = job.clone();
-            let workdir = options.workdir.clone();
-            let log_dir = options.log_dir.clone();
-            let output = options.output.clone();
+            let shared = shared.clone();
             let cancel = cancel.clone();
             let needs = deps[index]
                 .iter()
@@ -241,16 +300,7 @@ pub async fn execute(
                 })
                 .collect();
             running.spawn(async move {
-                let result = run_job(
-                    index,
-                    &job,
-                    &workdir,
-                    log_dir.as_deref(),
-                    output,
-                    cancel,
-                    needs,
-                )
-                .await;
+                let result = run_job(index, &job, &shared, cancel, needs).await;
                 (index, result)
             });
         }
@@ -280,15 +330,17 @@ pub async fn execute(
 async fn run_job(
     index: usize,
     job: &Job,
-    workdir: &Path,
-    log_dir: Option<&Path>,
-    output: Output,
+    shared: &Shared,
     cancel: watch::Receiver<Option<i32>>,
     needs: DependencyOutputs,
 ) -> JobResult {
+    let (workdir, log_dir, output) = (&shared.workdir, shared.log_dir.as_deref(), &shared.output);
+    let reporting = &*shared.reporting;
     let start = Instant::now();
     let tails = Arc::new(Mutex::new(Tails::default()));
     let mut result = JobResult::new(job, Status::Passed, None);
+    // Set only when the main command or a step command spawns, never by a condition.
+    let spawned = AtomicBool::new(false);
     let execution: Result<()> = async {
         let safe_name: String = job
             .name
@@ -310,11 +362,13 @@ async fn run_job(
         let mut execution = JobExecution {
             job,
             workdir,
-            output: &output,
+            output,
             cancel,
             tails: tails.clone(),
             logs,
             needs,
+            reporting,
+            spawned: &spawned,
             deadline: job.timeout_secs.and_then(|secs| {
                 tokio::time::Instant::now().checked_add(Duration::from_secs(secs))
             }),
@@ -322,10 +376,12 @@ async fn run_job(
         output
             .emit(json!({"type":"job_started", "name":job.name}))
             .await?;
-        let env: HashMap<String, String> = std::env::vars_os()
+        let mut env: HashMap<String, String> = std::env::vars_os()
             .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
             .chain(job.env.clone())
             .collect();
+        // Expressions read this map, so the token must be gone before any evaluation.
+        reporting.scrub(&mut env);
         let condition = execution
             .condition(job.condition.as_ref(), &env, &[], None)
             .await?;
@@ -333,20 +389,23 @@ async fn run_job(
             result.finish(condition);
             return Ok(());
         }
+        let job_env = reporting.inject(&job.name, &env);
         if let Some(command) = &job.command {
             let outcome = execution
-                .command(command, job.shell, &env, None, false)
+                .command(command, job.shell, &job_env, None, false)
                 .await?;
             result.finish(outcome);
             return Ok(());
         }
         for (index, step) in job.steps.iter().enumerate() {
             let step_start = Instant::now();
-            let env = env
+            let mut condition_env = env
                 .iter()
                 .chain(step.env.iter())
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect();
+            reporting.scrub(&mut condition_env);
+            let step_env = reporting.inject(&job.name, &condition_env);
             output
                 .emit(json!({"type":"step_started", "name":job.name, "step":step.id}))
                 .await?;
@@ -354,7 +413,7 @@ async fn run_job(
                 let condition = execution
                     .condition(
                         step.condition.as_ref(),
-                        &env,
+                        &condition_env,
                         &result.steps[..index],
                         Some(&step.id),
                     )
@@ -366,7 +425,7 @@ async fn run_job(
                     .command(
                         &step.command,
                         step.shell.unwrap_or(job.shell),
-                        &env,
+                        &step_env,
                         Some(&step.id),
                         false,
                     )
@@ -406,7 +465,7 @@ async fn run_job(
         }
         for (key, source) in &job.outputs {
             let value = execution
-                .evaluate(source, &env, &result.steps)
+                .evaluate(source, &job_env, &result.steps)
                 .with_context(|| format!("job output '{key}'"))?;
             if !matches!(value, Value::Bool(_) | Value::Number(_) | Value::String(_)) {
                 bail!("job output '{key}' must be a boolean, number, or string");
@@ -419,6 +478,7 @@ async fn run_job(
     if let Err(error) = execution {
         result.finish(CommandResult::failed(error));
     }
+    result.executed = spawned.load(Ordering::Relaxed);
     result.duration_ms = start.elapsed().as_millis();
     if matches!(result.status, Status::Failed | Status::TimedOut) {
         let [(stdout, stdout_truncated), (stderr, stderr_truncated)] =
@@ -439,6 +499,8 @@ struct JobExecution<'a> {
     tails: SharedTails,
     logs: [Option<tokio::fs::File>; 2],
     needs: DependencyOutputs,
+    reporting: &'a ReportingEnv,
+    spawned: &'a AtomicBool,
     deadline: Option<tokio::time::Instant>,
 }
 
@@ -603,6 +665,21 @@ impl JobExecution<'_> {
             .kill_on_drop(true);
         #[cfg(unix)]
         command.process_group(0);
+        // .envs() only adds to the inherited CLI environment, so the token and any
+        // inherited reserved values (from an enclosing goodflows run) must be removed.
+        if let Some(token) = &self.reporting.scrub {
+            command.env_remove(token);
+        }
+        if self.reporting.active {
+            for key in config::RESERVED_ENV {
+                command.env_remove(key);
+            }
+        }
+        if !is_condition {
+            for (key, value) in self.reporting.reserved(&job.name) {
+                command.env(key, value);
+            }
+        }
         if let Some(file) = &output_file {
             command.env("GOODFLOWS_OUTPUT", file.path());
         } else {
@@ -615,6 +692,9 @@ impl JobExecution<'_> {
         let mut child = command
             .spawn()
             .with_context(|| format!("failed to spawn '{}'", job.name))?;
+        if !is_condition {
+            self.spawned.store(true, Ordering::Relaxed);
+        }
         let mut group = ProcessGroup {
             id: Some(child.id().context("child has no PID")?),
         };

@@ -285,6 +285,16 @@ fn render(json: bool, mut event: Value, out: &mut impl Write, err: &mut impl Wri
                     settings["parallelism"],
                     text(settings, "workdir")
                 )?;
+                if let Some(reporting) = event.get("reporting") {
+                    writeln!(
+                        out,
+                        "Reporting: project={} url_env={} token_env={}\nspool_dir: {}",
+                        text(reporting, "project"),
+                        text(reporting, "url_env"),
+                        text(reporting, "token_env"),
+                        text(reporting, "spool_dir")
+                    )?;
+                }
                 writeln!(out, "Jobs")?;
                 for job in event["jobs"].as_array().into_iter().flatten() {
                     let deps: Vec<_> = job["depends_on"]
@@ -320,6 +330,9 @@ fn render(json: bool, mut event: Value, out: &mut impl Write, err: &mut impl Wri
                     }
                     if let Some(outputs) = job.get("outputs") {
                         writeln!(out, "    outputs: {outputs}")?;
+                    }
+                    if job.get("reports").is_some() {
+                        writeln!(out, "    reports: {}", names(&job["reports"]))?;
                     }
                     for step in job["steps"].as_array().into_iter().flatten() {
                         let shell = step["shell"]
@@ -362,6 +375,69 @@ fn render(json: bool, mut event: Value, out: &mut impl Write, err: &mut impl Wri
                     )?;
                 }
             }
+            "reports_collected" => {
+                write!(
+                    out,
+                    "reports {}: {} collected ({})",
+                    text(&event, "job"),
+                    event["reports"],
+                    text(&event, "outcome").replace('_', " ")
+                )?;
+                if let Some(rejected) = event["rejected"].as_object().filter(|r| !r.is_empty()) {
+                    let codes: Vec<_> = rejected
+                        .iter()
+                        .map(|(code, n)| format!("{code}={n}"))
+                        .collect();
+                    write!(out, "  rejected: {}", codes.join(", "))?;
+                }
+                writeln!(out)?;
+                if event["reports"].as_u64().is_some_and(|n| n > 0) {
+                    writeln!(out, "  saved in {}", text(&event, "run_dir"))?;
+                }
+            }
+            "report_uploaded" => writeln!(
+                out,
+                "report {}/{} uploaded{}",
+                text(&event, "job"),
+                text(&event, "report_id"),
+                if event["duplicate"] == true {
+                    " (already stored)"
+                } else {
+                    ""
+                }
+            )?,
+            "report_upload_pending" => {
+                write!(
+                    out,
+                    "report {}/{} pending: {}",
+                    text(&event, "job"),
+                    text(&event, "report_id"),
+                    text(&event, "reason").replace('_', " ")
+                )?;
+                if let Some(status) = event["http_status"].as_u64() {
+                    write!(out, " (HTTP {status})")?;
+                }
+                if event["terminal"] == true {
+                    write!(out, ", not retried by reports upload")?;
+                }
+                writeln!(out)?;
+            }
+            "reporting_skipped" => {
+                write!(
+                    out,
+                    "reporting skipped: {}",
+                    text(&event, "reason").replace('_', " ")
+                )?;
+                if let Some(pending) = event["pending"].as_u64() {
+                    write!(out, " ({pending} reports kept locally)")?;
+                }
+                writeln!(out)?;
+            }
+            "reports_upload_summary" => writeln!(
+                out,
+                "\nReports: {} acknowledged, {} pending, {} rejected, {} invalid",
+                event["acknowledged"], event["pending"], event["rejected"], event["invalid"]
+            )?,
             "error" => {
                 writeln!(err, "Error: {}", text(&event, "message"))?;
             }

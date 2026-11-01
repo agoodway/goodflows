@@ -15,6 +15,109 @@ pub struct Config {
     pub workflows: BTreeMap<String, Workflow>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub environments: BTreeMap<String, Environment>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reporting: Option<Reporting>,
+}
+
+pub const REPORT_FORMAT: &str = crate::reporting::contract::REPORT_FORMAT;
+pub const RESERVED_ENV: [&str; 2] = ["GOODFLOWS_RUN_ID", "GOODFLOWS_REPORT_DIR"];
+const DEFAULT_SPOOL_DIR: &str = ".goodflows/reports";
+
+/// Opt-in publishing of job reports. Only environment variable *names* are
+/// configured; the endpoint and key values are read by the publisher at runtime.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct Reporting {
+    pub project: String,
+    #[serde(default = "default_url_env")]
+    pub url_env: String,
+    #[serde(default = "default_token_env")]
+    pub token_env: String,
+    /// Resolved to an absolute path by `Config::load`.
+    pub spool_dir: Option<PathBuf>,
+    // Present only to reject credentials written inline with a clear message.
+    #[serde(default, skip_serializing)]
+    token: Option<toml::Value>,
+    #[serde(default, skip_serializing)]
+    api_key: Option<toml::Value>,
+    #[serde(default, skip_serializing)]
+    url: Option<toml::Value>,
+}
+
+fn default_url_env() -> String {
+    "GOODFLOWS_URL".into()
+}
+
+fn default_token_env() -> String {
+    "GOODFLOWS_API_KEY".into()
+}
+
+impl Reporting {
+    pub fn spool_dir(&self) -> &Path {
+        self.spool_dir
+            .as_deref()
+            .unwrap_or(Path::new(DEFAULT_SPOOL_DIR))
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.token.is_some() || self.api_key.is_some() || self.url.is_some() {
+            bail!("reporting credentials must not be written inline; name environment variables with url_env and token_env");
+        }
+        if !valid_project_slug(&self.project) {
+            bail!("reporting project must be 1-64 bytes matching [a-z0-9][a-z0-9_-]*");
+        }
+        validate_credential_env_names(&self.url_env, &self.token_env)?;
+        if self
+            .spool_dir
+            .as_ref()
+            .is_some_and(|dir| dir.as_os_str().is_empty())
+        {
+            bail!("reporting spool_dir must not be empty");
+        }
+        Ok(())
+    }
+}
+
+/// Rules for the credential variable names, shared by config validation and
+/// by replay, which reads the names back from a saved manifest.
+pub fn validate_credential_env_names(url_env: &str, token_env: &str) -> Result<()> {
+    for (field, name) in [("url_env", url_env), ("token_env", token_env)] {
+        if !valid_env_name(name) {
+            bail!("reporting {field} must be an environment variable name matching [A-Za-z_][A-Za-z0-9_]*");
+        }
+        if RESERVED_ENV.contains(&name) || name == "GOODFLOWS_OUTPUT" {
+            bail!("reporting {field} must not name a reserved goodflows variable");
+        }
+    }
+    if url_env == token_env {
+        bail!("reporting url_env and token_env must name different variables");
+    }
+    Ok(())
+}
+
+/// The server's workflow/job/environment name rule: 1-64 UTF-8 bytes, no control characters.
+pub fn valid_report_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= crate::reporting::contract::MAX_NAME_BYTES
+        && !name.chars().any(char::is_control)
+}
+
+pub fn valid_project_slug(slug: &str) -> bool {
+    let bytes = slug.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= 64
+        && (bytes[0].is_ascii_lowercase() || bytes[0].is_ascii_digit())
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'_' | b'-'))
+}
+
+pub fn valid_env_name(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    bytes
+        .next()
+        .is_some_and(|b| b.is_ascii_alphabetic() || b == b'_')
+        && bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_')
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -82,6 +185,8 @@ pub struct Job {
     pub env: HashMap<String, String>,
     #[serde(default = "default_true")]
     pub shell: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reports: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -152,9 +257,11 @@ fn validate_name(name: &str, kind: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn workflow_log_component(name: &str) -> String {
-    // Encode uppercase too so distinct workflow names never alias on macOS's
-    // commonly case-insensitive filesystem. Percent itself is always encoded.
+/// Reversibly encode a name as one path component. Used for workflow log
+/// directories and reporting spool directories.
+pub fn path_component(name: &str) -> String {
+    // Encode uppercase too so distinct names never alias on macOS's commonly
+    // case-insensitive filesystem. Percent itself is always encoded.
     name.bytes()
         .map(|b| {
             if b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'_' | b'-') {
@@ -224,6 +331,16 @@ impl Config {
                 );
             }
         }
+        if let Some(reporting) = &mut config.reporting {
+            // Joining an empty path would yield `base` and hide the empty value from validate().
+            if reporting
+                .spool_dir
+                .as_ref()
+                .is_none_or(|dir| !dir.as_os_str().is_empty())
+            {
+                reporting.spool_dir = Some(base.join(reporting.spool_dir()));
+            }
+        }
         config.validate()?;
         Ok((config, path))
     }
@@ -232,15 +349,20 @@ impl Config {
         if self.jobs.is_empty() && self.workflows.is_empty() {
             bail!("no jobs defined");
         }
+        if let Some(reporting) = &self.reporting {
+            reporting.validate().context("reporting")?;
+        }
+        let reporting = self.reporting.as_ref();
         if !self.jobs.is_empty() {
             if self.workflows.contains_key("default") {
                 bail!("root jobs conflict with named workflow 'default'");
             }
-            validate_jobs(&self.jobs)?;
+            validate_jobs(&self.jobs, reporting)?;
         }
         for (name, workflow) in &self.workflows {
             validate_workflow_name(name)?;
-            validate_jobs(&workflow.jobs).with_context(|| format!("workflow '{name}'"))?;
+            validate_jobs(&workflow.jobs, reporting)
+                .with_context(|| format!("workflow '{name}'"))?;
         }
         for name in self.environments.keys() {
             validate_name(name, "environment")?;
@@ -314,6 +436,7 @@ impl Config {
                 jobs,
                 workflows: BTreeMap::new(),
                 environments: BTreeMap::new(),
+                reporting: self.reporting.clone(),
             },
         ))
     }
@@ -354,7 +477,7 @@ impl Config {
     }
 }
 
-fn validate_jobs(jobs: &[Job]) -> Result<()> {
+fn validate_jobs(jobs: &[Job], reporting: Option<&Reporting>) -> Result<()> {
     if jobs.is_empty() {
         bail!("no jobs defined");
     }
@@ -366,7 +489,7 @@ fn validate_jobs(jobs: &[Job]) -> Result<()> {
         if names.insert(job.name.as_str(), index).is_some() {
             bail!("duplicate job name '{}'", job.name);
         }
-        validate_job(job).with_context(|| format!("job '{}'", job.name))?;
+        validate_job(job, reporting).with_context(|| format!("job '{}'", job.name))?;
         if job.timeout_secs == Some(0) {
             bail!("job '{}' timeout_secs must be greater than zero", job.name);
         }
@@ -432,10 +555,17 @@ fn validate_command(command: &str, shell: bool) -> Result<()> {
     Ok(())
 }
 
-fn validate_env(env: &HashMap<String, String>) -> Result<()> {
+fn validate_env(env: &HashMap<String, String>, reporting: Option<&Reporting>) -> Result<()> {
     for (key, value) in env {
         if key.is_empty() || key.contains(['=', '\0']) || value.contains('\0') {
             bail!("invalid environment variable");
+        }
+        if RESERVED_ENV.contains(&key.as_str()) {
+            bail!("env must not set reserved variable {key}; goodflows sets it for reporting jobs");
+        }
+        if reporting.is_some_and(|r| r.token_env == *key) {
+            // The token is removed from every command, so an explicit value would be silently dropped.
+            bail!("env must not set {key}: it is the reporting token_env, which goodflows removes from every command");
         }
     }
     Ok(())
@@ -477,7 +607,35 @@ fn validate_condition(
     Ok(())
 }
 
-fn validate_job(job: &Job) -> Result<()> {
+fn validate_reports(job: &Job, reporting: bool) -> Result<()> {
+    if job.reports.is_empty() {
+        return Ok(());
+    }
+    if !reporting {
+        bail!("reports requires a top-level [reporting] block");
+    }
+    let mut seen = HashSet::new();
+    for format in &job.reports {
+        if format != REPORT_FORMAT {
+            bail!(
+                "reports: unsupported format '{}' (supported: {REPORT_FORMAT})",
+                format.escape_debug()
+            );
+        }
+        if !seen.insert(format) {
+            bail!("reports: duplicate format '{format}'");
+        }
+    }
+    if !valid_report_name(&job.name) {
+        bail!(
+            "reporting job name must be at most 64 UTF-8 bytes and contain no control characters"
+        );
+    }
+    Ok(())
+}
+
+fn validate_job(job: &Job, reporting: Option<&Reporting>) -> Result<()> {
+    validate_reports(job, reporting.is_some())?;
     match (&job.command, job.steps.is_empty()) {
         (Some(command), true) => {
             validate_command(command, job.shell)?;
@@ -488,7 +646,7 @@ fn validate_job(job: &Job) -> Result<()> {
         (None, false) => {}
         _ => bail!("define either a command or nonempty steps, never both"),
     }
-    validate_env(&job.env)?;
+    validate_env(&job.env, reporting)?;
     validate_condition(job.condition.as_ref(), &job.depends_on, &[])?;
     let mut steps = Vec::new();
     for step in &job.steps {
@@ -498,7 +656,7 @@ fn validate_job(job: &Job) -> Result<()> {
                 bail!("duplicate step id '{}'", step.id);
             }
             validate_command(&step.command, step.shell.unwrap_or(job.shell))?;
-            validate_env(&step.env)?;
+            validate_env(&step.env, reporting)?;
             validate_condition(step.condition.as_ref(), &job.depends_on, &steps)
         })()
         .with_context(|| format!("step '{}'", step.id))?;

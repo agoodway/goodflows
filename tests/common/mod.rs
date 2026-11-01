@@ -25,6 +25,15 @@ impl Project {
     pub fn command(&self) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_goodflows"));
         command.current_dir(&self.dir).env("NO_COLOR", "1");
+        // Tests must never reach a real reporting endpoint through inherited variables.
+        for name in [
+            "GOODFLOWS_URL",
+            "GOODFLOWS_API_KEY",
+            "GOODFLOWS_RUN_ID",
+            "GOODFLOWS_REPORT_DIR",
+        ] {
+            command.env_remove(name);
+        }
         command
     }
 
@@ -58,4 +67,221 @@ pub fn success(output: &Output) {
         stdout(output),
         stderr(output)
     );
+}
+
+/// Minimal threaded HTTP/1.1 server for reporting tests. One request per connection.
+pub mod mock {
+    use std::collections::HashMap;
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::TcpListener;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    #[derive(Clone, Debug)]
+    pub struct Request {
+        pub method: String,
+        pub path: String,
+        pub headers: HashMap<String, String>,
+        pub body: Vec<u8>,
+    }
+
+    impl Request {
+        pub fn json(&self) -> serde_json::Value {
+            serde_json::from_slice(&self.body).unwrap()
+        }
+    }
+
+    pub enum Reply {
+        Status(u16, Vec<(String, String)>, String),
+        Hang(Duration),
+        Close,
+    }
+
+    type Handler = dyn Fn(&Request, usize) -> Reply + Send + Sync;
+
+    pub struct Mock {
+        pub url: String,
+        pub requests: Arc<Mutex<Vec<Request>>>,
+        pub connections: Arc<Mutex<usize>>,
+    }
+
+    impl Mock {
+        pub fn start(handler: impl Fn(&Request, usize) -> Reply + Send + Sync + 'static) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let connections = Arc::new(Mutex::new(0));
+            let handler: Arc<Handler> = Arc::new(handler);
+            let (log, count) = (requests.clone(), connections.clone());
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(mut stream) = stream else { break };
+                    *count.lock().unwrap() += 1;
+                    let (log, handler) = (log.clone(), handler.clone());
+                    std::thread::spawn(move || {
+                        let Some(request) = read(&mut stream) else {
+                            return;
+                        };
+                        let index = {
+                            let mut log = log.lock().unwrap();
+                            log.push(request.clone());
+                            log.len() - 1
+                        };
+                        match handler(&request, index) {
+                            Reply::Status(code, headers, body) => {
+                                let mut head = format!(
+                                    "HTTP/1.1 {code} Mock\r\nContent-Length: {}\r\nConnection: close\r\n",
+                                    body.len()
+                                );
+                                for (k, v) in headers {
+                                    head.push_str(&format!("{k}: {v}\r\n"));
+                                }
+                                let _ = write!(stream, "{head}\r\n{body}");
+                            }
+                            Reply::Hang(duration) => std::thread::sleep(duration),
+                            Reply::Close => {}
+                        }
+                    });
+                }
+            });
+            Self {
+                url,
+                requests,
+                connections,
+            }
+        }
+
+        /// Emulates the server's idempotent store: 201 new, 200 exact retry, 409 different payload.
+        pub fn store() -> Self {
+            let rows: Mutex<HashMap<String, (Vec<u8>, String)>> = Mutex::new(HashMap::new());
+            let next = Mutex::new(0u32);
+            Self::start(move |request, _| store_reply(&rows, &next, request))
+        }
+
+        pub fn requests(&self) -> Vec<Request> {
+            self.requests.lock().unwrap().clone()
+        }
+
+        pub fn connections(&self) -> usize {
+            *self.connections.lock().unwrap()
+        }
+    }
+
+    pub fn store_reply(
+        rows: &Mutex<HashMap<String, (Vec<u8>, String)>>,
+        next: &Mutex<u32>,
+        request: &Request,
+    ) -> Reply {
+        let body = request.json();
+        let report_id = body["report"]["report_id"].as_str().unwrap().to_owned();
+        let key = format!(
+            "{}|{}|{}|{}",
+            request.path, body["workflow_run_id"], body["job"], report_id
+        );
+        let mut rows = rows.lock().unwrap();
+        let (code, id, duplicate) = match rows.get(&key) {
+            Some((stored, id)) if stored == &request.body => (200, id.clone(), true),
+            Some(_) => {
+                return Reply::Status(409, vec![], r#"{"errors":{"detail":"conflict"}}"#.into())
+            }
+            None => {
+                let mut next = next.lock().unwrap();
+                *next += 1;
+                let id = format!("00000000-0000-4000-8000-{:012}", *next);
+                rows.insert(key, (request.body.clone(), id.clone()));
+                (201, id, false)
+            }
+        };
+        Reply::Status(code, vec![], ack(&id, &report_id, duplicate))
+    }
+
+    pub fn ack(id: &str, report_id: &str, duplicate: bool) -> String {
+        format!(
+            r#"{{"data":{{"id":"{id}","report_id":"{report_id}","status":"complete","duplicate":{duplicate}}}}}"#
+        )
+    }
+
+    fn read(stream: &mut std::net::TcpStream) -> Option<Request> {
+        let mut reader = BufReader::new(stream.try_clone().ok()?);
+        let mut line = String::new();
+        reader.read_line(&mut line).ok()?;
+        let mut parts = line.split_whitespace();
+        let method = parts.next()?.to_owned();
+        let path = parts.next()?.to_owned();
+        let mut headers = HashMap::new();
+        loop {
+            let mut header = String::new();
+            reader.read_line(&mut header).ok()?;
+            let header = header.trim_end();
+            if header.is_empty() {
+                break;
+            }
+            let (key, value) = header.split_once(':')?;
+            headers.insert(key.trim().to_ascii_lowercase(), value.trim().to_owned());
+        }
+        let length = headers
+            .get("content-length")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        let mut body = vec![0; length];
+        reader.read_exact(&mut body).ok()?;
+        Some(Request {
+            method,
+            path,
+            headers,
+            body,
+        })
+    }
+}
+
+/// One complete synthetic `exunit-timings` report as JSONL.
+pub fn timing_report(report_id: &str, partition: Option<&str>) -> String {
+    let partition = serde_json::json!(partition);
+    [
+        serde_json::json!({"event":"suite_started","run_id":"suite-1","report_id":report_id,"received_offset_us":0,
+            "format":"exunit-timings","started_at":"2026-11-01T00:00:00Z","partition":partition,"partition_count":3,
+            "seed":1,"max_cases":2,"schedulers":2,"elixir_version":"1.18.0","otp_release":"27",
+            "filters":{"include":[],"exclude":[]}}),
+        serde_json::json!({"event":"test_finished","run_id":"suite-1","report_id":report_id,"received_offset_us":10,
+            "module":"MyTest","name":"test works","description":null,"file":"test/my_test.exs","line":3,
+            "describe":null,"async":true,"parameter_id":null,"execution_id":1,"started_offset_us":5,
+            "duration_us":42,"outcome":"passed"}),
+        serde_json::json!({"event":"suite_finished","run_id":"suite-1","report_id":report_id,"received_offset_us":99,
+            "aborted":false,"unfinished_tests":0,"unfinished_modules":0,"counts":{"passed":1},"files":[],
+            "times_us":{"run":100,"async":60,"sync":40,"load":null,"total":100}}),
+    ]
+    .iter()
+    .map(|r| format!("{r}\n"))
+    .collect()
+}
+
+pub fn events(output: &Output) -> Vec<serde_json::Value> {
+    stdout(output)
+        .lines()
+        .map(|line| {
+            let event: serde_json::Value = serde_json::from_str(line)
+                .unwrap_or_else(|e| panic!("invalid JSON line {line:?}: {e}"));
+            assert_eq!(event["schema_version"], 1);
+            event
+        })
+        .collect()
+}
+
+/// Recursively list regular files under a directory.
+pub fn files_under(dir: &std::path::Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            let kind = entry.file_type().unwrap();
+            if kind.is_dir() {
+                stack.push(path);
+            } else if kind.is_file() {
+                files.push(path);
+            }
+        }
+    }
+    files.sort();
+    files
 }

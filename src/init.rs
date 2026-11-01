@@ -89,6 +89,7 @@ pub async fn generate(
         jobs,
         workflows: Default::default(),
         environments: Default::default(),
+        reporting: None,
     };
     if let Some(name) = workflow {
         config.workflows.insert(
@@ -151,6 +152,7 @@ fn job(name: &str, command: &str, deps: &[&str]) -> Job {
         timeout_secs: None,
         env: HashMap::new(),
         shell: true,
+        reports: Vec::new(),
     }
 }
 

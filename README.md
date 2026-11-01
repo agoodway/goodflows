@@ -287,7 +287,8 @@ goodflows. `--log-dir` is resolved from the invocation directory.
 The whole config is validated before any command runs—even when selecting a subset.
 Unknown fields, duplicate/empty names, empty commands, missing or duplicate
 dependencies, self-dependencies, cycles, invalid environment entries, malformed
-direct-command quoting, zero timeouts, and nonexistent workdirs are errors.
+direct-command quoting, zero timeouts, nonexistent workdirs, and job or step `env`
+entries for the reserved `GOODFLOWS_RUN_ID`/`GOODFLOWS_REPORT_DIR` are errors.
 Cycle errors include an actual cycle path, such as `a -> b -> a`.
 
 `list` displays every job field: name, command or steps, conditions, output mappings,
@@ -590,6 +591,199 @@ queued work and emits a final summary.
 | `130` | Interrupted by Ctrl+C / SIGINT |
 | `143` | Terminated by SIGTERM |
 
+## Test timing reports
+
+goodflows can publish per-test timing reports (the `exunit-timings` JSONL format)
+to GoodFlows. Reporting is opt-in: configs without a `[reporting]` block behave
+exactly as before, create no spool directory, and make no network requests.
+
+```toml
+[reporting]
+project = "goodcases"            # Existing GoodFlows project slug (required)
+url_env = "GOODFLOWS_URL"        # Default; names the variable holding the server origin
+token_env = "GOODFLOWS_API_KEY"  # Default; names the variable holding the private API key
+spool_dir = ".goodflows/reports" # Default; relative to this config file's directory
+
+[[jobs]]
+name = "test"
+command = "mix test.parallel"
+reports = ["exunit-timings"]
+```
+
+- `project` must be 1-64 bytes matching `[a-z0-9][a-z0-9_-]*`. It is the slug of a
+  project that **already exists** on the GoodFlows account owning the API key;
+  goodflows never creates projects. Reports for an unknown project stay pending
+  with reason `project_not_found`.
+- `url_env` and `token_env` are environment variable *names*. Credentials are never
+  written in TOML: `token`, `api_key` and `url` keys are rejected. Provide values
+  to the goodflows process from your shell or CI secret store, for example
+  `GOODFLOWS_URL=https://flows.example.com GOODFLOWS_API_KEY=... goodflows`. Sample
+  env files should contain empty placeholders only.
+- `GOODFLOWS_URL` must be an origin only (`https://host[:port]`), with no path,
+  user info, query or fragment. Plain `http://` is accepted only for `localhost`
+  and loopback addresses.
+- `spool_dir` is resolved against the config file's directory, independent of
+  `workdir` and of where goodflows is invoked. Add it to your project's
+  `.gitignore` (for the default, `/.goodflows/`).
+- `reports` currently supports only `exunit-timings`. Unknown or duplicate formats,
+  `reports` without a `[reporting]` block, and reporting job names longer than 64
+  UTF-8 bytes or containing control characters are validation errors.
+- `GOODFLOWS_RUN_ID` and `GOODFLOWS_REPORT_DIR` are reserved: setting either in any
+  job or step `env` is a validation error. `url_env` and `token_env` must differ and
+  must not name a reserved variable or `GOODFLOWS_OUTPUT`, and no job or step `env`
+  may set the `token_env` variable (it is removed from every command).
+
+`validate` and `list` never read credentials, create spool directories or contact
+the server. `list --json` includes the nonsecret `reporting` block (project, env
+variable names and resolved spool path).
+
+### What happens during a run
+
+When at least one selected job declares `reports`, goodflows:
+
+1. Creates a unique invocation directory `<spool_dir>/<workflow_run_id>/` (a
+   lowercase v4 UUID) and captures source context (`git rev-parse HEAD`, the
+   current branch and a tracked-files dirty flag) in the resolved `workdir` with a
+   2-second limit. Outside Git, or on any failure, those fields are null.
+2. Runs report-producing jobs with `GOODFLOWS_RUN_ID` (the UUID) and an absolute
+   `GOODFLOWS_REPORT_DIR` pointing to that job's own empty `reports/` directory.
+   Producers (and parallel workers that inherit the variable) write `*.jsonl` there.
+   Job and step condition commands and expressions do not receive either variable:
+   a condition decides whether the job runs and is never a report producer. Values
+   of these names inherited from the environment that launched goodflows (for
+   example an enclosing goodflows run) are removed from every command whenever a
+   `[reporting]` block exists. The run directory and each job's `reports/`,
+   `pending/` and `acks/` directories are created private (mode 0700) before any job
+   starts.
+3. Removes the `token_env` variable from **every** job, step and condition command,
+   and from `${{ env.* }}` expression lookups, even when it is exported in the shell
+   that launched goodflows. Only the publisher holds the key. On Linux goodflows also
+   marks itself non-dumpable once it has read the key, so other processes of the
+   same user (including jobs) cannot read it from `/proc/<pid>/environ`. This is a
+   mitigation, not isolation: other platforms, privileged processes and the shell
+   that exported the key are unaffected.
+4. After all jobs finish (including failed ones), reads only direct, regular
+   `*.jsonl` files from each executed reporting job's directory. Symlinks,
+   subdirectories and files elsewhere (including older runs and the producer's
+   default history directory) are never read. A job counts as executed only once
+   its command or a step command spawns; jobs skipped by a dependency or their own
+   condition, or cancelled before a command spawns, produce no report
+   (`not_executed`).
+5. Freezes each valid report as an immutable request snapshot, then publishes the
+   snapshots one request per report to
+   `<origin>/api/v1/projects/<project>/test-reports` with
+   `Authorization: Bearer <key>`, before the final `summary` event.
+
+Publishing is best-effort and never changes check results or the exit status:
+
+- **Uploaded**: a 200/201 acknowledgement with a valid server id and the matching
+  `report_id` marks the report acknowledged (`report_uploaded`).
+- **Pending**: anything else (offline server, TLS failure `tls_error`, 401/403, 404
+  `project_not_found`, other 4xx, redirects, malformed acknowledgements, or
+  exhausted budget) leaves the report pending (`report_upload_pending` with a
+  structural `reason` and optional `http_status`). Redirects are never followed, so
+  the key is never sent to another origin.
+- **Rejected by the server**: 400, 409 (immutable conflict), 413, 415 and 422 refuse
+  the frozen bytes themselves, so resending them cannot succeed. They are reported
+  as `report_upload_pending` with `terminal: true` and recorded in
+  `<job>/acks/NNN.rejected.json`; `reports upload` does not resend them.
+- **Local only**: without both credential variables, an invalid origin, or after a
+  signal, nothing is sent (`reporting_skipped` with reason
+  `credentials_unavailable` or `invalid_url`, or `report_upload_pending` with reason
+  `cancelled`). If the spool cannot be created, checks run normally without
+  reporting variables and `reporting_skipped` reports `spool_unavailable`.
+
+All publishing in one invocation shares a **30-second budget**, with a 3-second
+connect timeout and a per-request limit of 10 seconds plus 1 second per started MiB
+of body, each clipped to the remaining budget. Transport errors, 429 and 5xx
+(including 503) are retried up to three attempts with 1- and 2-second backoffs. A
+`Retry-After` in seconds replaces the backoff; if it is not shorter than the
+remaining budget the report is left pending at once. An HTTP-date `Retry-After`
+falls back to the normal backoff. Each snapshot is re-read (never through a
+symlink) and re-validated against the contract and the run's identity right before
+it is sent. HTTPS trusts both the bundled WebPKI roots and the operating system's
+certificate store. Other 4xx responses and redirects are not retried. A signal stops waits and
+requests immediately and preserves the signal exit code. Job `duration_ms` never
+includes reporting time.
+
+Collection is bounded: at most 256 reports and 256 MiB of source data per job,
+100,000 records and 32 MiB encoded per report. Source files over 33 MiB are
+rejected (`request_too_large`) without being parsed, and each valid report is
+frozen as soon as it is built, so only one report body is held in memory. An invalid final unterminated line
+(for example a worker killed mid-write) is dropped and the report is sent with
+`truncated: true`; an invalid earlier line, a disallowed field, mismatched
+suite/report identities, an invalid partition, U+0000, an oversized field, a
+duplicate object key, nesting deeper than the server's 16-level body limit, a
+number with a fraction or exponent (or an integer above 2^53-1), a filter tag
+outside the server allowlist or a non-boolean filter value, or a `report_id`
+reused by two reports in the same job rejects that report locally. Only regular
+files that were read count toward the 256-report limit.
+Rejections appear only as codes and counts in `reports_collected.rejected`; source
+files are never modified and record contents are never printed.
+
+The field, event and filter-tag allowlists mirror the GoodFlows server contract and
+live in one versioned module (`src/reporting/contract.rs`). A report using
+vocabulary a newer server accepts but this goodflows does not know (for example a
+new filter tag) is rejected locally and is not replayable; upgrade goodflows before
+producers emit new vocabulary. A signal that arrives while reports are being
+collected stops collection between files (`collection_interrupted`).
+
+### Spool layout and retention
+
+```text
+.goodflows/reports/<workflow_run_id>/
+  manifest.json              # running -> finalized (or aborted)
+  <job>/reports/*.jsonl      # raw producer output, kept as written
+  <job>/pending/000.json     # frozen request snapshots, written before any HTTP
+  <job>/acks/000.json        # server acknowledgement, written atomically on success
+  <job>/acks/000.rejected.json  # terminal server rejection (400/409/413/415/422)
+```
+
+Job directory names use the same reversible encoding as workflow log directories
+(`Test` becomes `%54est`). The manifest stores only structural metadata: project,
+workflow, environment, the credential variable *names*, source context, job
+statuses, collection outcomes and each report's id and snapshot index (file
+locations are derived from the job directory and index, never stored as paths). It
+never stores the endpoint, the key or other environment values.
+
+The manifest is `running` while jobs execute and becomes `finalized` once every
+snapshot is written; a scheduler error marks it `aborted`. If goodflows is killed
+before finalizing, the raw files and unfinished manifest remain for diagnosis but
+cannot be replayed. Nothing is pruned automatically: after every report in a run is
+acknowledged, delete its directory manually (for example
+`rm -rf .goodflows/reports/<workflow_run_id>`).
+
+### Retrying a saved invocation
+
+```bash
+GOODFLOWS_URL=https://flows.example.com GOODFLOWS_API_KEY=... \
+  goodflows reports upload .goodflows/reports/67f7946d-136b-4608-ab01-e1f251a09754
+```
+
+`reports upload` reads only the finalized manifest and its frozen snapshots. It
+validates the manifest first (version, a lowercase canonical run id, the project
+slug and credential variable name rules, and job names) and refuses a tampered one
+without contacting the server. Because the manifest chooses which of your
+environment variables become the endpoint and key, only replay run directories
+produced by your own invocations. It does
+not need the project checkout or config, runs no jobs and does not read current Git
+state, so the run directory can be copied elsewhere. Credentials are read from the
+variable names saved in the manifest. Already acknowledged reports are skipped; the
+same immutable request is resent for every other report, so a retry after a lost
+acknowledgement completes as an idempotent duplicate. Concurrent retries are safe:
+each acknowledgement is recorded in its own file. Reports the server rejected
+permanently are skipped (`rejected_by_server`); delete the matching
+`acks/NNN.rejected.json` to send one again. `--budget <seconds>` (1-3600) replaces
+the 30-second publishing budget for large reports on slow links.
+
+It uses the same budget, retry and validation rules as a run, ends with a
+`reports_upload_summary` event (`acknowledged`, `pending`, `rejected`, `invalid`),
+and exits 0 only when every frozen report is acknowledged, none was rejected by the
+server and collection rejected no files; otherwise it exits 1 (including missing
+credentials or an invalid origin, and for every replay of a run whose collection
+rejected a file). A signal exits with its signal code. Only the
+global `--json` flag applies.
+
 ## Logs and machine output
 
 Human output prefixes each stdout/stderr line with its job name and stream:
@@ -627,6 +821,9 @@ goodflows list --jobs test --json
 `--json` produces JSON Lines only on stdout. Each event includes `schema_version: 1`
 and `type`. Types are `run_started`, `job_started`, `step_started`, `step_finished`, `job_output`, `job_finished`,
 `summary`, `config_valid`, `jobs`, `workflows`, `config_written`, `init_cancelled`, and `error`.
+Runs with reporting jobs also emit `reports_collected`, `report_uploaded`,
+`report_upload_pending` and `reporting_skipped` before the final `summary`, and
+`reports upload` ends with `reports_upload_summary` (see Test timing reports).
 Events for a selected workflow include `workflow`, including the default workflow.
 Discovery/aggregate-validation events and errors before selection may omit it.
 An interactive init confirmation goes to stderr in JSON mode. Help/version remain
@@ -676,7 +873,12 @@ cargo build --release --locked
 ./target/release/goodflows
 ```
 
-`Cargo.lock` is committed for reproducible dependency resolution. CI runs formatting,
+`Cargo.lock` is committed for reproducible dependency resolution. Edition 2021 does
+not make the resolver MSRV-aware, so `.cargo/config.toml` sets
+`[resolver] incompatible-rust-versions = "fallback"`; a plain `cargo update` then
+prefers versions compatible with `rust-version` (1.88). Confirm with
+`cargo +1.88.0 check --locked`. HTTPS uses rustls on the ring provider, so release
+binaries need no OpenSSL. CI runs formatting,
 Clippy, tests, a release build, and goodflows's own checks on Linux/macOS with Rust 1.88
 and stable. Release builds run checks on all four native platform/architecture
 combinations before packaging. Linux archives are then compiled with Rust 1.88.0

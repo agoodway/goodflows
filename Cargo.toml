@@ -15,12 +15,16 @@ path = "src/main.rs"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 colored = "2"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "rustls-tls-native-roots"] }
+# Direct dependency only to recognize TLS failures in reqwest error chains; reqwest selects the ring provider.
+rustls = { version = "0.23", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 shell-words = "1"
 tempfile = "3"
 tokio = { version = "1", features = ["full"] }
 toml = "0.8"
+uuid = { version = "1", features = ["v4", "serde"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

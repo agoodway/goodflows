@@ -1,0 +1,35 @@
+# Tasks
+
+## 1. Reporting configuration
+
+- [x] 1.1 Add optional top-level reporting and per-job report format declarations in `src/config.rs`, retaining them through workflow/environment resolution (including the `Config` rebuilt by `Config::workflow`) and resolving relative `spool_dir` against the config directory in `Config::load`; verify existing config fixtures plus new default/named workflow and selected-job cases pass in `cargo test --locked`.
+- [x] 1.2 Validate the project slug rule, env variable names, formats, duplicate declarations, `reports` without a reporting block, inline tokens, reporting job names over 64 UTF-8 bytes or containing control characters, and reserved `GOODFLOWS_RUN_ID`/`GOODFLOWS_REPORT_DIR` overrides in every job/step env via `validate_env`; add inspection tests proving invalid config fails before execution and `validate`/`list` neither create spools nor contact a mock endpoint.
+- [x] 1.3 Document the TOML contract, opt-in behavior, reserved variables, credential placeholders, the requirement that the project already exist in GoodFlows, spool path resolution and adding the spool directory to `.gitignore` in README (and add `/.goodflows/` to this repo's `.gitignore`); verify the example with the built CLI's validate command without runtime credentials.
+
+## 2. Invocation capture and persistent collection
+
+- [ ] 2.1 Add a reporting module and Rust-1.88-compatible UUID/async HTTP dependencies (`reqwest` 0.12 without default features, rustls on ring; `uuid` 1 with v4/serde) with a lock generated using `CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS=fallback`; verify `cargo +1.88.0 check --locked` and the release packaging glibc check. Strip `GOODFLOWS_URL`, `GOODFLOWS_API_KEY`, `GOODFLOWS_RUN_ID` and `GOODFLOWS_REPORT_DIR` from the spawned CLI in `tests/common/mod.rs` so tests never reach a real endpoint.
+- [x] 2.2 Capture workflow invocation/source context and atomically create persistent manifests and collision-free job directories using the reversible path-component encoder for job names; capture Git context in the resolved workdir with a 2-second bound; integration-test concurrent invocations, distinct encoded job names, non-Git directories and an unwritable spool without changing check exit status.
+- [x] 2.3 Extend runner environment construction to inject absolute GOODFLOWS_REPORT_DIR/GOODFLOWS_RUN_ID and remove the reporting token after job/step overrides using `Command::env_remove` in `JobExecution::command` and by deleting it from the merged env map before expression evaluation; test shell/non-shell commands, conditions and steps against a synthetic secret exported in the parent CLI environment, verifying no secret enters child environments, `${{ env.* }}` expressions, job outputs, events or persisted state.
+- [x] 2.4 Collect only executed jobs' regular direct JSONL files after runner completion; test failed jobs, skipped dependencies, stale default-directory files, symlink escapes, missing reports, parallel producers, process cleanup before collection, aborted manifests when `runner::execute` errors, and local-only snapshotting after a signal.
+- [x] 2.5 Implement bounded parsing and immutable request snapshots following the server design D1; add full-contract synthetic fixtures (no `project`/`account_id` keys, lowercase UUID, job_status including `unknown`) and tests for valid complete/failed/partial reports, matching identities, duplicate `report_id` within a job, invalid partition strings, U+0000 and byte-length limits, overlong branch names, valid unterminated final lines, truncated final fragments, malformed earlier records, unsupported fields and byte/record/report-count limits.
+- [x] 2.6 Document spool layout, pending/finalized states, raw-file retention, incomplete-manifest limitation and manual cleanup; verify fixture-generated manifests contain only captured structural metadata and env-variable names.
+
+## 3. Delivery and result-preserving integration
+
+- [x] 3.1 Implement origin URL validation, private-key auth and the project-scoped endpoint `/api/v1/projects/<project>/test-reports` with redirects disabled; use a local mock HTTP server to verify request shape, TLS policy/loopback exception, invalid origins, unavailable credentials and no sensitive response/request data in diagnostics.
+- [x] 3.2 Implement bounded requests, retry classification/backoff and the invocation-wide publishing deadline; test transport errors, 429/Retry-After, 5xx including 503 with Retry-After, terminal 4xx including 404 `project_not_found`, redirects, exhausted budgets and cancellation with controlled mock responses.
+- [x] 3.3 Validate 200/201 acknowledgement bodies and atomically record per-report success; test duplicate acknowledgements, mismatched ids, malformed success bodies, 409 conflicts, lost acknowledgements and local state-write failures without discarding snapshots.
+- [x] 3.4 Integrate collect/publish before the final summary in `src/main.rs` and structural status events in `src/output.rs`; add text-mode render arms for each new event in `output::render`; verify text output and `--json`, final-summary position, unchanged job durations, preserved passing/failing/signal exit codes, and byte-compatible unconfigured event behavior where existing tests require it.
+- [x] 3.5 Document automatic local-only/pending/uploaded behavior and the 30-second budget; verify documented failure behavior through integration tests that never require a real endpoint or API key.
+
+## 4. Retry command
+
+- [x] 4.1 Add `goodflows reports upload <run-directory>` dispatch before normal workflow loading (like `init`), registered in the `cancellation()` match so signals are handled, returning `None` from `Cli::workflow()`, and rejecting non-applicable global flags other than `--json`; test operation outside the original checkout using only finalized snapshots and environment-provided endpoint/key values, with no job execution or current-Git reads.
+- [x] 4.2 Handle acknowledged reports, concurrent replay and unfinished/invalid manifests; test no duplicate server rows under repeated requests, no lost local acknowledgements, replay nonzero on remaining failures and signal-code precedence.
+- [x] 4.3 Add README replay examples and credential/retention notes; verify the documented command against a saved synthetic invocation and mock server, including a retry after an acknowledgement-loss response.
+
+## 5. Coordinated verification
+
+- [x] 5.1 Run `cargo fmt --check`, `cargo test --locked` and the repository's Goodflows checks, inspecting logs for failures; completion requires all CLI regression and publishing tests to pass without real external services.
+- [ ] 5.2 After the companion server (with `scope-recipes-by-project` applied) and producer implementations exist, create the project on the account, then run a synthetic three-partition upload and exact replay, then verify three stored reports under that project via `/api/v1/projects/<project>/test-reports` and stable ids; record the first release supporting the new config before enabling the GoodCases companion change.
