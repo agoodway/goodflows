@@ -18,6 +18,9 @@ impl Project {
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&dir).unwrap();
+        // Resolve symlinked temp dirs (macOS /var -> /private/var) so paths the
+        // CLI prints compare equal to paths the tests build.
+        let dir = std::fs::canonicalize(&dir).unwrap();
         std::fs::write(dir.join("goodflows.toml"), config).unwrap();
         Self { dir }
     }
