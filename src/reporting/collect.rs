@@ -10,7 +10,7 @@ use super::Source;
 use serde::de::{DeserializeSeed, Deserializer, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde_json::{json, Map, Value};
 use std::cell::Cell;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BinaryHeap, HashMap};
 use std::fmt;
 use std::io::Read;
 #[cfg(unix)]
@@ -22,6 +22,8 @@ pub use contract::{MAX_RECORDS, MAX_REQUEST_BYTES};
 pub const MAX_REPORTS_PER_JOB: usize = 256;
 /// Bounds the work spent on `*.jsonl` names that are not readable regular files.
 pub const MAX_ENTRIES_PER_JOB: usize = 16 * MAX_REPORTS_PER_JOB;
+/// Directory entries enumerated between cancellation checks.
+const STOP_CHECK_INTERVAL: usize = 256;
 pub const MAX_JOB_SOURCE_BYTES: u64 = 256 * 1024 * 1024;
 /// Compact formatter output re-serializes to about its own size, so a source
 /// file more than this allowance over the request limit cannot fit one request
@@ -111,11 +113,29 @@ pub fn collect_dir(
         collection.reject("unreadable_directory");
         return collection;
     };
-    let mut names = Vec::new();
-    for entry in entries.flatten() {
+    // Keep only the lowest MAX_ENTRIES_PER_JOB names while enumerating, so a
+    // directory flooded with entries bounds memory and sorting work, and the
+    // examined set does not depend on directory order.
+    let mut kept: BinaryHeap<String> = BinaryHeap::new();
+    for (seen, entry) in entries.flatten().enumerate() {
+        if seen > 0 && seen % STOP_CHECK_INTERVAL == 0 && stop() {
+            collection.outcome = "interrupted";
+            collection.reject_n("collection_interrupted", kept.len());
+            return collection;
+        }
         let name = entry.file_name();
         match name.to_str() {
-            Some(name) if name.ends_with(".jsonl") => names.push(name.to_owned()),
+            Some(name) if name.ends_with(".jsonl") => {
+                if kept.len() < MAX_ENTRIES_PER_JOB {
+                    kept.push(name.to_owned());
+                } else if kept.peek().is_some_and(|max| name < max.as_str()) {
+                    kept.pop();
+                    kept.push(name.to_owned());
+                    collection.reject("entry_limit");
+                } else {
+                    collection.reject("entry_limit");
+                }
+            }
             Some(_) => {}
             None => {
                 if name.as_encoded_bytes().ends_with(b".jsonl") {
@@ -124,7 +144,7 @@ pub fn collect_dir(
             }
         }
     }
-    names.sort();
+    let names = kept.into_sorted_vec();
     let mut used: u64 = 0;
     let mut read = 0;
     // Every parsed identity, frozen or not, so a duplicate is never chosen.
@@ -134,10 +154,6 @@ pub fn collect_dir(
             collection.outcome = "interrupted";
             collection.reject_n("collection_interrupted", names.len() - index);
             break;
-        }
-        if index >= MAX_ENTRIES_PER_JOB {
-            collection.reject("entry_limit");
-            continue;
         }
         let path = dir.join(name);
         // Only regular files that were read count toward the report cap, so
@@ -1339,6 +1355,40 @@ mod tests {
         assert!(collection.reports.is_empty());
         assert_eq!(collection.rejected["symlink"], MAX_ENTRIES_PER_JOB);
         assert_eq!(collection.rejected["entry_limit"], 3);
+    }
+
+    #[test]
+    fn entry_limit_keeps_the_lowest_names_regardless_of_directory_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = Source::default();
+        for i in 0..MAX_ENTRIES_PER_JOB {
+            std::os::unix::fs::symlink("/nonexistent", dir.path().join(format!("b{i:05}.jsonl")))
+                .unwrap();
+        }
+        // Created last, so it is not among the first entries enumerated.
+        std::fs::write(dir.path().join("a.jsonl"), complete("a")).unwrap();
+        let (collection, _) = collect(dir.path(), &ctx(&source, "passed"));
+        assert_eq!(collection.reports.len(), 1);
+        assert_eq!(collection.rejected["symlink"], MAX_ENTRIES_PER_JOB - 1);
+        assert_eq!(collection.rejected["entry_limit"], 1);
+    }
+
+    #[test]
+    fn enumeration_stops_when_asked() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = Source::default();
+        for i in 0..STOP_CHECK_INTERVAL + 1 {
+            std::fs::write(dir.path().join(format!("{i:05}.jsonl")), complete("x")).unwrap();
+        }
+        let mut sink = MemorySink::default();
+        let collection = collect_dir(dir.path(), &ctx(&source, "passed"), &mut sink, &|| true);
+        assert_eq!(collection.outcome, "interrupted");
+        assert!(collection.reports.is_empty());
+        assert_eq!(
+            collection.rejected["collection_interrupted"],
+            STOP_CHECK_INTERVAL
+        );
+        assert!(sink.bodies.is_empty());
     }
 
     #[test]
