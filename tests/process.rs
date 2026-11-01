@@ -80,11 +80,14 @@ command = "touch later"
     assert_eq!(job["steps"][0]["status"], "passed");
     assert_eq!(job["steps"][1]["status"], "timed_out");
     assert_eq!(job["steps"][2]["status"], "skipped");
-    assert_eq!(job["stdout_tail"], "firstconditionsecond");
-    assert_eq!(
-        p.read("logs/001-timeout.stdout.log"),
-        "firstconditionsecond"
-    );
+    // Process startup also consumes the shared budget. The second step may
+    // time out before its condition or command gets to print.
+    let tail = job["stdout_tail"].as_str().unwrap();
+    assert!(matches!(
+        tail,
+        "first" | "firstcondition" | "firstconditionsecond"
+    ));
+    assert_eq!(p.read("logs/001-timeout.stdout.log"), tail);
     std::thread::sleep(Duration::from_millis(600));
     assert!(!p.dir.join("escaped").exists());
     assert!(!p.dir.join("later").exists());
