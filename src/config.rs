@@ -1,3 +1,4 @@
+use crate::expression::{Expression, Reference};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -68,7 +69,12 @@ impl Settings {
 #[serde(deny_unknown_fields)]
 pub struct Job {
     pub name: String,
-    pub command: String,
+    pub command: Option<String>,
+    pub condition: Option<Condition>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub steps: Vec<Step>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub outputs: BTreeMap<String, String>,
     #[serde(default)]
     pub depends_on: Vec<String>,
     pub timeout_secs: Option<u64>,
@@ -76,6 +82,25 @@ pub struct Job {
     pub env: HashMap<String, String>,
     #[serde(default = "default_true")]
     pub shell: bool,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(untagged, deny_unknown_fields)]
+pub enum Condition {
+    LegacyShell(String),
+    Expression { expression: String },
+    Shell { shell: String },
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct Step {
+    pub id: String,
+    pub command: String,
+    pub condition: Option<Condition>,
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+    pub shell: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -341,25 +366,11 @@ fn validate_jobs(jobs: &[Job]) -> Result<()> {
         if names.insert(job.name.as_str(), index).is_some() {
             bail!("duplicate job name '{}'", job.name);
         }
-        if job.command.trim().is_empty() {
-            bail!("job '{}' has an empty command", job.name);
-        }
+        validate_job(job).with_context(|| format!("job '{}'", job.name))?;
         if job.timeout_secs == Some(0) {
             bail!("job '{}' timeout_secs must be greater than zero", job.name);
         }
-        if !job.shell {
-            let args = shell_words::split(&job.command)
-                .with_context(|| format!("job '{}' has invalid command quoting", job.name))?;
-            if args.first().is_none_or(|arg| arg.is_empty()) {
-                bail!("job '{}' has an empty command executable", job.name);
-            }
-        }
-        for (key, value) in &job.env {
-            if key.is_empty() || key.contains(['=', '\0']) || value.contains('\0') {
-                bail!("job '{}' has an invalid environment variable", job.name);
-            }
-        }
-        if job.name.contains(['\n', '\r', '\0']) || job.command.contains('\0') {
+        if job.name.contains(['\n', '\r', '\0']) {
             bail!(
                 "job '{}' contains invalid control characters",
                 job.name.escape_debug()
@@ -401,6 +412,102 @@ fn validate_jobs(jobs: &[Job]) -> Result<()> {
     }
     if visited != jobs.len() {
         bail!("dependency cycle detected: {}", cycle_path(jobs, &names));
+    }
+    Ok(())
+}
+
+fn validate_command(command: &str, shell: bool) -> Result<()> {
+    if command.trim().is_empty() {
+        bail!("empty command");
+    }
+    if command.contains('\0') {
+        bail!("command contains invalid control characters");
+    }
+    if !shell {
+        let args = shell_words::split(command).context("invalid command quoting")?;
+        if args.first().is_none_or(|arg| arg.is_empty()) {
+            bail!("empty command executable");
+        }
+    }
+    Ok(())
+}
+
+fn validate_env(env: &HashMap<String, String>) -> Result<()> {
+    for (key, value) in env {
+        if key.is_empty() || key.contains(['=', '\0']) || value.contains('\0') {
+            bail!("invalid environment variable");
+        }
+    }
+    Ok(())
+}
+
+fn validate_expression(source: &str, needs: &[String], steps: &[String]) -> Result<()> {
+    let expression = Expression::parse(source)?;
+    for reference in expression.references() {
+        match reference {
+            Reference::Needs { job, .. } if !needs.contains(job) => {
+                bail!("output reference requires declared dependency '{job}'");
+            }
+            Reference::Step { step, .. } if !steps.contains(step) => {
+                bail!("output reference requires an earlier step '{step}'");
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn validate_condition(
+    condition: Option<&Condition>,
+    needs: &[String],
+    steps: &[String],
+) -> Result<()> {
+    match condition {
+        Some(Condition::Expression { expression }) => {
+            validate_expression(expression, needs, steps)
+                .context("invalid condition expression")?;
+        }
+        Some(Condition::LegacyShell(shell) | Condition::Shell { shell }) => {
+            if shell.trim().is_empty() || shell.contains('\0') {
+                bail!("condition must be nonempty and contain no NUL bytes");
+            }
+        }
+        None => {}
+    }
+    Ok(())
+}
+
+fn validate_job(job: &Job) -> Result<()> {
+    match (&job.command, job.steps.is_empty()) {
+        (Some(command), true) => {
+            validate_command(command, job.shell)?;
+            if !job.outputs.is_empty() {
+                bail!("command-only jobs publish outputs directly; output mappings require steps");
+            }
+        }
+        (None, false) => {}
+        _ => bail!("define either a command or nonempty steps, never both"),
+    }
+    validate_env(&job.env)?;
+    validate_condition(job.condition.as_ref(), &job.depends_on, &[])?;
+    let mut steps = Vec::new();
+    for step in &job.steps {
+        (|| {
+            validate_name(&step.id, "step")?;
+            if steps.contains(&step.id) {
+                bail!("duplicate step id '{}'", step.id);
+            }
+            validate_command(&step.command, step.shell.unwrap_or(job.shell))?;
+            validate_env(&step.env)?;
+            validate_condition(step.condition.as_ref(), &job.depends_on, &steps)
+        })()
+        .with_context(|| format!("step '{}'", step.id))?;
+        steps.push(step.id.clone());
+    }
+    for (key, source) in &job.outputs {
+        validate_name(key, "output")?;
+        validate_expression(source, &job.depends_on, &steps)
+            .with_context(|| format!("output '{key}'"))?;
     }
     Ok(())
 }

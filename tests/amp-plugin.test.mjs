@@ -71,6 +71,40 @@ test('runs default workflow and appends success to the invoking thread', async (
   assert.equal(h.choices.length, 0)
 })
 
+test('conditional skips in a named workflow do not request repairs', async (t) => {
+  const h = await host(t, '[[workflows.ci.jobs]]\nname = "optional"\ncommand = "touch ran"\ncondition = "exit 1"\n', { selection: 'ci' })
+  await h.run()
+  assert.equal(h.messages.length, 1)
+  assert.match(h.messages[0].content, /checks passed/i)
+  assert.match(h.messages[0].content, /no repair is needed/i)
+  assert.match(h.messages[0].content, /skipped/)
+  await assert.rejects(readFile(join(h.cwd, 'ran')), { code: 'ENOENT' })
+})
+
+test('step failures identify the failed step and its command in the repair handoff', async (t) => {
+  const h = await host(t, `[[jobs]]
+name = "checks"
+[[jobs.steps]]
+id = "optional"
+condition = { expression = "false" }
+command = "touch skipped"
+[[jobs.steps]]
+id = "lint"
+command = "echo step-detail >&2; exit 7"
+[[jobs.steps]]
+id = "later"
+command = "touch later"
+`)
+  await h.run()
+  const message = h.messages[0].content
+  assert.match(message, /step 'lint'/)
+  assert.match(message, /echo step-detail >&2; exit 7/)
+  assert.match(message, /step-detail/)
+  assert.match(message, /exit_code.*7/)
+  assert.doesNotMatch(message, /checks passed/i)
+  for (const path of ['skipped', 'later']) await assert.rejects(readFile(join(h.cwd, path)), { code: 'ENOENT' })
+})
+
 test('hands the agent failing commands, exit codes, tails, and a literal rerun command', async (t) => {
   const h = await host(t, '[[jobs]]\nname = "lint"\ncommand = "echo lint-detail >&2; exit 7"\n')
   await h.run()

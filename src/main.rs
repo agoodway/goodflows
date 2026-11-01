@@ -1,4 +1,5 @@
 mod config;
+mod expression;
 mod init;
 mod output;
 mod runner;
@@ -253,7 +254,9 @@ async fn run(cli: &Cli, output: &mut Output, cancel: watch::Receiver<Option<i32>
     output.emit(json!({"type":"run_started", "parallelism":parallelism, "fail_fast":fail_fast, "jobs":config.jobs.len(), "workdir":options.workdir})).await?;
     let results = runner::execute(&config.jobs, &options, cancel.clone()).await?;
     let count = |status| results.iter().filter(|r| r.status == status).count();
-    let success = results.iter().all(|r| r.status == Status::Passed);
+    let success = results
+        .iter()
+        .all(|r| matches!(r.status, Status::Passed | Status::Skipped));
     output.emit(json!({"type":"summary", "success":success, "passed":count(Status::Passed), "failed":count(Status::Failed), "timed_out":count(Status::TimedOut), "skipped":count(Status::Skipped), "cancelled":count(Status::Cancelled), "results":results})).await?;
     let signal = *cancel.borrow();
     Ok(signal

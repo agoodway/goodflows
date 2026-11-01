@@ -290,8 +290,8 @@ dependencies, self-dependencies, cycles, invalid environment entries, malformed
 direct-command quoting, zero timeouts, and nonexistent workdirs are errors.
 Cycle errors include an actual cycle path, such as `a -> b -> a`.
 
-`list` displays every job field: name, command, dependencies, timeout, configured
-environment, and shell mode. It also shows effective `fail_fast`, `parallelism`,
+`list` displays every job field: name, command or steps, conditions, output mappings,
+dependencies, timeout, configured environment, and shell mode. It also shows effective `fail_fast`, `parallelism`,
 and the resolved `workdir`, applying the same CLI overrides and CPU-count default
 as a run. In JSON, these values are under `jobs` and `settings`; job fields retain
 explicit defaults and nullable timeouts even though generated TOML omits them.
@@ -370,6 +370,131 @@ explicit workflow with `--jobs`; aggregate validation does not filter job names.
 Legacy single-workflow validation retains its existing fields.
 For an explicitly selected workflow, count/name fields describe that workflow;
 the entire config is still validated first.
+
+## Conditional jobs
+
+Use expression conditions for environment checks and typed outputs from dependencies.
+An expression must return a boolean: `true` runs the job; `false` skips it.
+
+```toml
+[[jobs]]
+name = "integration"
+condition = { expression = '(env.RUN_INTEGRATION ?? "0") == "1"' }
+command = "cargo test --test integration"
+
+[[jobs]]
+name = "web-tests"
+condition = { shell = "test -f package.json" }
+command = "npm test"
+```
+
+Conditions run once, after all dependencies pass and a parallelism slot is available.
+Omitting `condition` runs the job normally. `list` and `validate` check syntax and
+reference scopes without evaluating expressions or running shell commands. Runtime
+type errors and missing referenced output keys fail the job instead of skipping it.
+
+Expression values are booleans, strings, numbers, and `null`. There is no implicit
+truthiness or type conversion: environment values such as `"false"` remain strings.
+The supported references are:
+
+- `env.NAME`: inherited environment plus job overrides (and step overrides inside
+  a step). An unset or non-UTF-8 variable is `null`; use `??` for a fallback.
+- `needs.JOB.outputs.KEY`: published outputs from a job explicitly listed in
+  `depends_on`. There are no implicit dependencies or cross-workflow references.
+- `steps.ID.outputs.KEY`: an earlier step's outputs, inside a step condition.
+  Job conditions cannot read their own steps. Job output mappings can read all steps.
+
+Hyphens work in dot names. Quoted brackets support other names, for example
+`needs["build job"].outputs["release.version"]`. References are case sensitive.
+Missing output keys, including outputs of skipped steps, are errors even with
+`??`; only unset environment variables become `null`.
+
+Operators, from highest to lowest precedence, are `!`, `< <= > >=`, `== !=`,
+`&&`, `||`, and `??`. Parentheses override precedence. `&&`, `||`, and `??`
+short-circuit; an unevaluated branch performs no output lookup. Comparisons require
+compatible types; ordering supports numbers and case-sensitive strings. Equality
+with `null` is allowed. Strings use JSON escapes and either quote style. Integer
+literals fit signed/unsigned 64-bit ranges; decimal/exponent numbers use finite
+floating point. Expressions are limited to 16 KiB and nesting/tree depth 64.
+
+Use `{ shell = "..." }` for external checks. Existing string conditions such as
+`condition = "test -f package.json"` remain shell commands, not expressions.
+Shell conditions always use `sh -c`, even when `shell = false`. Exit **0** runs
+the command; any normal nonzero exit skips it, retaining the exit code and reason.
+This includes missing executables and shell syntax errors. Timeouts, cancellation,
+signal termination, spawn errors, and output I/O errors retain their normal failure
+statuses. Empty shell conditions and NUL bytes are rejected.
+
+Shell conditions inherit the effective environment, use the effective workdir,
+and have closed stdin. They run in separate processes: exports and `cd` do not
+carry into subsequent commands, but filesystem changes do.
+
+A condition does not override dependency or fail-fast rules. A skipped job skips
+its dependents transitively; their conditions are not evaluated. Unrelated jobs
+continue, and intentional skips do not trigger fail-fast or make the run fail.
+A run containing only passed/skipped jobs succeeds, including when all jobs skip.
+
+## Steps and outputs
+
+A job defines either `command` or nonempty sequential `steps`, never both. This
+works for top-level jobs and named workflows. Steps have unique, nonempty `id`s
+(at most 64 UTF-8 bytes, no control characters), a required `command`, and optional
+`condition`, `env`, and `shell`. Step environment entries override job entries;
+an omitted step `shell` inherits the job's value.
+
+```toml
+[[jobs]]
+name = "detect"
+outputs = { backend_changed = "steps.scan.outputs.backend_changed" }
+
+[[jobs.steps]]
+id = "scan"
+command = '''
+changed=false
+if test -d src; then changed=true; fi
+printf '{"backend_changed":%s}\n' "$changed" > "$GOODFLOWS_OUTPUT"
+'''
+
+[[jobs.steps]]
+id = "report"
+condition = { expression = "steps.scan.outputs.backend_changed" }
+command = "echo Backend checks are needed"
+
+[[jobs]]
+name = "backend-tests"
+depends_on = ["detect"]
+condition = { expression = '(env.RUN_TESTS ?? "1") == "1" && needs.detect.outputs.backend_changed' }
+command = "cargo test"
+```
+
+Each command receives a fresh, private temporary file path in `GOODFLOWS_OUTPUT`.
+Write one JSON object to it to publish outputs. Values must be booleans, numbers,
+or strings; arrays, nested objects, and `null` values are rejected. A command that
+leaves the file untouched publishes no outputs. Invalid/missing/non-regular files
+or files exceeding **64 KiB** fail the command. Files are cleaned up automatically;
+outputs are read only after the command succeeds and its process group is cleaned
+up. Stdout remains logs and is never parsed for outputs. `GOODFLOWS_OUTPUT` is
+runner-controlled, overrides any configured value, and is not supplied to shell
+conditions.
+
+Successful steps expose their outputs to later steps. Step outputs stay internal
+unless explicitly promoted using the job's `outputs` mapping, whose values are
+expressions evaluated after all steps complete successfully. Mapping errors fail
+the job without publishing partial job outputs. Command-only jobs publish their
+output-file keys directly as job outputs and cannot define output mappings.
+Outputs appear in JSON results without secret redaction; do not publish secrets.
+
+Steps share the job's workdir and filesystem, but each command has its own process:
+shell exports and `cd` do not persist. A skipped step does not block later steps.
+A failed/timed-out/cancelled step stops the job; remaining steps do not run.
+Failed jobs publish no job outputs. A job with only skipped steps still passes
+unless an output mapping fails. Summary counts count jobs, not steps.
+
+The job condition, step conditions, and all commands share **one parallelism slot
+and one `timeout_secs` budget**, with the usual signal/process-group cleanup.
+Logs and bounded failure tails are shared across all steps in execution order.
+Human output identifies the job and step; JSON `job_output` events include `step`
+when produced by a step. Raw log paths remain per-job.
 
 ## Environment profiles
 
@@ -459,7 +584,7 @@ queued work and emits a final summary.
 
 | Exit code | Meaning |
 |---|---|
-| `0` | All selected jobs passed; or successful init/list/validate (including declined overwrite) |
+| `0` | All selected jobs passed or were skipped; or successful init/list/validate (including declined overwrite) |
 | `1` | A job failed/timed out, or config/runtime error |
 | `2` | Invalid command-line arguments |
 | `130` | Interrupted by Ctrl+C / SIGINT |
@@ -500,7 +625,7 @@ goodflows list --jobs test --json
 ```
 
 `--json` produces JSON Lines only on stdout. Each event includes `schema_version: 1`
-and `type`. Types are `run_started`, `job_started`, `job_output`, `job_finished`,
+and `type`. Types are `run_started`, `job_started`, `step_started`, `step_finished`, `job_output`, `job_finished`,
 `summary`, `config_valid`, `jobs`, `workflows`, `config_written`, `init_cancelled`, and `error`.
 Events for a selected workflow include `workflow`, including the default workflow.
 Discovery/aggregate-validation events and errors before selection may omit it.
@@ -513,7 +638,12 @@ human-readable even with `--json`. Argument errors produce an `error` event.
 
 The final `summary` contains `success`, counts for every status, and `results` in
 config order. Each result contains `name`, `command`, `status`, `duration_ms`,
-nullable `exit_code`, and nullable `error`. Failed and timed-out results also
+nullable `exit_code`, nullable `error`, and `outputs`. Stepped jobs additionally
+include `steps` in config order, each with `id`, `command`, `status`, `duration_ms`,
+nullable `exit_code`, nullable `error`, and `outputs`. Their job-level `command` is
+null unless a step failed, in which case it identifies that step's command.
+`step_started` includes `name` (job) and `step`; `step_finished` includes `name`
+and the step `result`. Failed and timed-out job results also
 include `stdout_tail`, `stderr_tail`, `stdout_truncated`, and `stderr_truncated`.
 The tails are captured incrementally and capped at **4096 UTF-8 bytes per stream**,
 with truncation flags indicating omitted leading content. Non-UTF-8 bytes are

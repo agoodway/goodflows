@@ -148,15 +148,30 @@ fn render(json: bool, mut event: Value, out: &mut impl Write, err: &mut impl Wri
                 text(&event, "workdir")
             )?,
             "job_started" => writeln!(out, "→ {}", text(&event, "name").cyan())?,
+            "step_started" => {
+                writeln!(out, "  → {}/{}", text(&event, "name"), text(&event, "step"))?
+            }
+            "step_finished" => {
+                let result = &event["result"];
+                writeln!(
+                    out,
+                    "  {}/{} {}  {}ms",
+                    text(&event, "name"),
+                    text(result, "id"),
+                    text(result, "status").to_uppercase(),
+                    result["duration_ms"]
+                )?;
+                if let Some(error) = result["error"].as_str() {
+                    writeln!(out, "    {error}")?;
+                }
+            }
             "job_output" => {
                 let data = text(&event, "data");
-                write!(
-                    out,
-                    "[{} {}] {}",
-                    text(&event, "name"),
-                    text(&event, "stream"),
-                    data
-                )?;
+                let name = match event["step"].as_str() {
+                    Some(step) => format!("{}/{step}", text(&event, "name")),
+                    None => text(&event, "name").to_owned(),
+                };
+                write!(out, "[{} {}] {}", name, text(&event, "stream"), data)?;
                 if !data.ends_with('\n') {
                     writeln!(out)?;
                 }
@@ -213,7 +228,15 @@ fn render(json: bool, mut event: Value, out: &mut impl Write, err: &mut impl Wri
                     event["cancelled"]
                 )?;
                 if event["success"] == true {
-                    writeln!(out, "All jobs passed")?;
+                    writeln!(
+                        out,
+                        "{}",
+                        if event["skipped"] == 0 {
+                            "All jobs passed"
+                        } else {
+                            "All checks succeeded (some jobs skipped)"
+                        }
+                    )?;
                 }
             }
             "config_valid" => {
@@ -290,6 +313,28 @@ fn render(json: bool, mut event: Value, out: &mut impl Write, err: &mut impl Wri
                         "    timeout_secs={} shell={} env={}",
                         timeout, job["shell"], job["env"]
                     )?;
+                    if let Some(condition) = job["condition"].as_str() {
+                        writeln!(out, "    condition: {condition}")?;
+                    } else if !job["condition"].is_null() {
+                        writeln!(out, "    condition: {}", job["condition"])?;
+                    }
+                    if let Some(outputs) = job.get("outputs") {
+                        writeln!(out, "    outputs: {outputs}")?;
+                    }
+                    for step in job["steps"].as_array().into_iter().flatten() {
+                        let shell = step["shell"]
+                            .as_bool()
+                            .unwrap_or(job["shell"].as_bool().unwrap_or(true));
+                        writeln!(
+                            out,
+                            "    step {}: {}\n      shell={} env={} condition={}",
+                            text(step, "id"),
+                            text(step, "command"),
+                            shell,
+                            step["env"],
+                            step["condition"]
+                        )?;
+                    }
                 }
             }
             "config_written" => writeln!(

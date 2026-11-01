@@ -14,6 +14,7 @@ command = "true"
 [[jobs]]
 name = "test"
 command = "printf '%s' 'hello world'"
+condition = "touch evaluated"
 depends_on = ["setup"]
 timeout_secs = 30
 env = { FOO = "bar" }
@@ -42,7 +43,9 @@ shell = false
     assert_eq!(jobs[1]["timeout_secs"], 30);
     assert_eq!(jobs[1]["env"]["FOO"], "bar");
     assert_eq!(jobs[1]["shell"], false);
+    assert_eq!(jobs[1]["condition"], "touch evaluated");
     for (key, value) in [
+        ("condition", serde_json::Value::Null),
         ("timeout_secs", serde_json::Value::Null),
         ("env", serde_json::json!({})),
         ("shell", serde_json::json!(true)),
@@ -61,9 +64,12 @@ shell = false
         "shell=false",
         "FOO",
         "bar",
+        "condition: touch evaluated",
     ] {
         assert!(text.contains(field), "missing {field}: {text}");
     }
+    success(&p.run(&["validate"]));
+    assert!(!p.dir.join("evaluated").exists());
 }
 
 #[test]
@@ -86,6 +92,49 @@ fn automatic_parallelism_is_resolved_for_list_as_for_run() {
     );
     for field in ["parallelism", "fail_fast", "workdir"] {
         assert_eq!(list["settings"][field], run[field]);
+    }
+}
+
+#[test]
+fn inspection_includes_steps_conditions_and_output_mappings_without_execution() {
+    let p = Project::new(
+        r#"
+[[jobs]]
+name = "checks"
+condition = { expression = 'env.ENABLED == "1"' }
+outputs = { flag = "steps.scan.outputs.flag" }
+[[jobs.steps]]
+id = "scan"
+command = "touch evaluated"
+env = { MODE = "scan" }
+shell = false
+condition = { shell = "touch evaluated" }
+"#,
+    );
+    for args in [vec!["list", "--json"], vec!["list"], vec!["validate"]] {
+        let output = p.run(&args);
+        success(&output);
+        if args.contains(&"--json") {
+            let event: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert!(event["jobs"][0]["command"].is_null());
+            assert_eq!(
+                event["jobs"][0]["outputs"]["flag"],
+                "steps.scan.outputs.flag"
+            );
+            assert_eq!(event["jobs"][0]["steps"][0]["env"]["MODE"], "scan");
+            assert_eq!(event["jobs"][0]["steps"][0]["shell"], false);
+        } else if args[0] == "list" {
+            for field in [
+                "step scan",
+                "env.ENABLED",
+                "steps.scan.outputs.flag",
+                "MODE",
+                "shell=false",
+            ] {
+                assert!(stdout(&output).contains(field));
+            }
+        }
+        assert!(!p.dir.join("evaluated").exists());
     }
 }
 

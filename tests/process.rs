@@ -19,9 +19,105 @@ fn timeout_kills_descendants_and_reports_timeout() {
 }
 
 #[test]
+fn condition_timeout_cleans_up_and_command_shares_the_timeout_budget() {
+    for (condition, command, expected_tail) in [
+        (
+            "printf condition; (sleep 1.3; touch escaped) & wait",
+            "touch ran",
+            "condition",
+        ),
+        (
+            "printf condition; sleep 0.6",
+            "printf command; touch started; sleep 0.7; touch ran",
+            "conditioncommand",
+        ),
+    ] {
+        let p = Project::new(&format!(
+            "[[jobs]]\nname='timeout'\ncondition='{condition}'\ncommand='{command}'\ntimeout_secs=1"
+        ));
+        let output = p.run(&["--json", "--log-dir", "logs"]);
+        assert_eq!(output.status.code(), Some(1));
+        let summary: serde_json::Value =
+            serde_json::from_str(stdout(&output).lines().last().unwrap()).unwrap();
+        assert_eq!(summary["results"][0]["status"], "timed_out");
+        assert_eq!(summary["results"][0]["stdout_tail"], expected_tail);
+        assert_eq!(p.read("logs/001-timeout.stdout.log"), expected_tail);
+        assert!(!p.dir.join("ran").exists());
+        assert_eq!(
+            p.dir.join("started").exists(),
+            expected_tail == "conditioncommand"
+        );
+        std::thread::sleep(Duration::from_millis(450));
+        assert!(!p.dir.join("escaped").exists());
+    }
+}
+
+#[test]
+fn steps_and_their_conditions_share_one_timeout_and_cleanup_descendants() {
+    let p = Project::new(
+        r#"
+[[jobs]]
+name = "timeout"
+timeout_secs = 1
+[[jobs.steps]]
+id = "first"
+command = "sleep 0.6; printf first"
+[[jobs.steps]]
+id = "second"
+condition = { shell = "sleep 0.1; printf condition" }
+command = "printf second; (sleep 0.7; touch escaped) & wait"
+[[jobs.steps]]
+id = "later"
+command = "touch later"
+"#,
+    );
+    let output = p.run(&["--json", "--log-dir", "logs"]);
+    assert_eq!(output.status.code(), Some(1));
+    let summary: serde_json::Value =
+        serde_json::from_str(stdout(&output).lines().last().unwrap()).unwrap();
+    let job = &summary["results"][0];
+    assert_eq!(job["status"], "timed_out");
+    assert_eq!(job["steps"][0]["status"], "passed");
+    assert_eq!(job["steps"][1]["status"], "timed_out");
+    assert_eq!(job["steps"][2]["status"], "skipped");
+    assert_eq!(job["stdout_tail"], "firstconditionsecond");
+    assert_eq!(
+        p.read("logs/001-timeout.stdout.log"),
+        "firstconditionsecond"
+    );
+    std::thread::sleep(Duration::from_millis(600));
+    assert!(!p.dir.join("escaped").exists());
+    assert!(!p.dir.join("later").exists());
+}
+
+#[test]
 fn interrupt_and_termination_kill_descendants_and_emit_summary() {
-    for (signal, code) in [(libc::SIGINT, 130), (libc::SIGTERM, 143)] {
-        let p = Project::new("[settings]\nparallelism=1\n[[jobs]]\nname='running'\ncommand='touch started; (sleep 0.5; touch escaped) & wait'\n[[jobs]]\nname='queued'\ncommand='touch queued'");
+    for (signal, code, field) in [
+        (libc::SIGINT, 130, "command"),
+        (libc::SIGTERM, 143, "command"),
+        (libc::SIGINT, 130, "condition"),
+        (libc::SIGTERM, 143, "condition"),
+        (libc::SIGINT, 130, "step-command"),
+        (libc::SIGTERM, 143, "step-condition"),
+    ] {
+        let is_step = field.starts_with("step-");
+        let field = field.strip_prefix("step-").unwrap_or(field);
+        let command = if field == "condition" {
+            "command='touch ran'\n"
+        } else {
+            ""
+        };
+        let step = if is_step {
+            "[[jobs.steps]]\nid='running'\n"
+        } else {
+            ""
+        };
+        let later = if is_step {
+            "[[jobs.steps]]\nid='later'\ncommand='touch later'\n"
+        } else {
+            ""
+        };
+        let p = Project::new(&format!("[settings]\nparallelism=1\n[[jobs]]\nname='running'\n{step}{command}{field}='touch started; (sleep 0.5; touch escaped) & wait'\n{later}[[jobs]]\nname='queued'\ncommand='touch queued'"));
         let mut child = p
             .command()
             .arg("--json")
@@ -52,6 +148,12 @@ fn interrupt_and_termination_kill_descendants_and_emit_summary() {
         std::thread::sleep(Duration::from_millis(600));
         assert!(!p.dir.join("escaped").exists());
         assert!(!p.dir.join("queued").exists());
+        assert!(!p.dir.join("ran").exists());
+        assert!(!p.dir.join("later").exists());
+        if is_step {
+            assert_eq!(summary["results"][0]["steps"][0]["status"], "cancelled");
+            assert_eq!(summary["results"][0]["steps"][1]["status"], "cancelled");
+        }
     }
 }
 

@@ -143,7 +143,10 @@ fn detect(root: &Path) -> Result<Template> {
 fn job(name: &str, command: &str, deps: &[&str]) -> Job {
     Job {
         name: name.into(),
-        command: command.into(),
+        command: Some(command.into()),
+        condition: None,
+        steps: Vec::new(),
+        outputs: Default::default(),
         depends_on: deps.iter().map(|s| (*s).into()).collect(),
         timeout_secs: None,
         env: HashMap::new(),

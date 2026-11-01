@@ -2,6 +2,108 @@ mod common;
 use common::*;
 
 #[test]
+fn conditions_run_after_dependencies_and_skips_are_successful() {
+    let p = Project::new(
+        r#"
+[settings]
+parallelism = 1
+[[jobs]]
+name = "conditional"
+command = "touch ran"
+condition = "test -f ready && test \"$ENABLED\" = yes && printf checked"
+env = { ENABLED = "yes" }
+shell = false
+depends_on = ["setup"]
+[[jobs]]
+name = "setup"
+command = "touch ready"
+[[jobs]]
+name = "disabled"
+command = "touch disabled"
+condition = "exit 7"
+[[jobs]]
+name = "dependent"
+command = "touch dependent"
+depends_on = ["disabled"]
+[[jobs]]
+name = "transitive"
+command = "touch transitive"
+depends_on = ["dependent"]
+[[jobs]]
+name = "unrelated"
+command = "touch unrelated"
+"#,
+    );
+    let output = p.run(&["--json", "--log-dir", "logs"]);
+    success(&output);
+    assert!(p.dir.join("ran").exists());
+    assert!(p.dir.join("unrelated").exists());
+    for name in ["disabled", "dependent", "transitive"] {
+        assert!(!p.dir.join(name).exists());
+    }
+    let events: Vec<serde_json::Value> = stdout(&output)
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let summary = events.last().unwrap();
+    assert_eq!(summary["success"], true);
+    assert_eq!(summary["passed"], 3);
+    assert_eq!(summary["skipped"], 3);
+    assert_eq!(summary["failed"], 0);
+    assert_eq!(summary["results"][2]["status"], "skipped");
+    assert_eq!(summary["results"][2]["exit_code"], 7);
+    assert!(summary["results"][2]["error"]
+        .as_str()
+        .unwrap()
+        .contains("condition"));
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| e["type"] == "job_started" && e["name"] == "conditional")
+            .count(),
+        1
+    );
+    assert_eq!(p.read("logs/001-conditional.stdout.log"), "checked");
+
+    let output = p.run(&["--jobs", "disabled"]);
+    success(&output);
+    assert!(stdout(&output).contains("SKIPPED"));
+    assert!(!stdout(&output).contains("All jobs passed"));
+}
+
+#[test]
+fn blocked_or_fail_fast_jobs_do_not_evaluate_conditions() {
+    for args in [
+        vec!["--parallelism", "1"],
+        vec!["--parallelism", "1", "--no-fail-fast"],
+    ] {
+        let p = Project::new(
+            r#"
+[[jobs]]
+name = "fail"
+command = "exit 1"
+[[jobs]]
+name = "blocked"
+command = "touch blocked"
+condition = "touch evaluated"
+depends_on = ["fail"]
+[[jobs]]
+name = "queued"
+command = "touch queued"
+condition = "touch unrelated_condition"
+"#,
+        );
+        assert_eq!(p.run(&args).status.code(), Some(1));
+        assert!(!p.dir.join("evaluated").exists());
+        assert!(!p.dir.join("blocked").exists());
+        assert_eq!(
+            p.dir.join("unrelated_condition").exists(),
+            args.contains(&"--no-fail-fast")
+        );
+    }
+}
+
+#[test]
 fn failed_dependencies_skip_transitively_but_unrelated_jobs_continue() {
     let p = Project::new(
         r#"
@@ -91,6 +193,14 @@ command = "touch queued"
     for name in ["a", "b", "c"] {
         config.push_str(&format!(
             "[[jobs]]\nname='{name}'\ncommand='mkdir exclusive && sleep 0.02 && rmdir exclusive'\n"
+        ));
+    }
+    success(&Project::new(&config).run(&[]));
+
+    let mut config = "[settings]\nparallelism=1\n".to_owned();
+    for name in ["a", "b", "c"] {
+        config.push_str(&format!(
+            "[[jobs]]\nname='{name}'\n[[jobs.steps]]\nid='acquire'\ncommand='mkdir exclusive && sleep 0.02'\n[[jobs.steps]]\nid='release'\ncommand='rmdir exclusive'\n"
         ));
     }
     success(&Project::new(&config).run(&[]));

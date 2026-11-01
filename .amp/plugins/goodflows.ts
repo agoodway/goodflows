@@ -211,7 +211,7 @@ export default function (amp: PluginAPI) {
           throw new Error(`Missing or invalid GoodFlows summary. Exit code: ${result.exitCode}.${result.error}`)
         }
         passed = result.exitCode === 0 && !result.error && summary.success === true &&
-          summary.results.every((entry) => entry.status === 'passed')
+          summary.results.every((entry) => entry.status === 'passed' || entry.status === 'skipped')
         message = [
           passed ? 'GoodFlows checks passed.' : 'GoodFlows checks failed.',
           `Config: ${config}\nWorkflow: ${workflow}`,
