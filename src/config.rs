@@ -467,12 +467,12 @@ fn validate_condition(
             validate_expression(expression, needs, steps)
                 .context("invalid condition expression")?;
         }
-        Some(Condition::LegacyShell(shell) | Condition::Shell { shell }) => {
-            if shell.trim().is_empty() || shell.contains('\0') {
-                bail!("condition must be nonempty and contain no NUL bytes");
-            }
+        Some(Condition::LegacyShell(shell) | Condition::Shell { shell })
+            if shell.trim().is_empty() || shell.contains('\0') =>
+        {
+            bail!("condition must be nonempty and contain no NUL bytes");
         }
-        None => {}
+        _ => {}
     }
     Ok(())
 }

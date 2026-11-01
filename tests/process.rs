@@ -117,7 +117,9 @@ fn interrupt_and_termination_kill_descendants_and_emit_summary() {
         } else {
             ""
         };
-        let p = Project::new(&format!("[settings]\nparallelism=1\n[[jobs]]\nname='running'\n{step}{command}{field}='touch started; (sleep 0.5; touch escaped) & wait'\n{later}[[jobs]]\nname='queued'\ncommand='touch queued'"));
+        // Signal only after the descendant starts, and let it escape only after
+        // the CLI exits. A fixed sleep can finish before cancellation on busy CI.
+        let p = Project::new(&format!("[settings]\nparallelism=1\n[[jobs]]\nname='running'\n{step}{command}{field}='(touch started; while ! test -f release; do sleep 0.01; done; touch escaped) >/dev/null 2>&1 & wait'\n{later}[[jobs]]\nname='queued'\ncommand='touch queued'"));
         let mut child = p
             .command()
             .arg("--json")
@@ -145,8 +147,12 @@ fn interrupt_and_termination_kill_descendants_and_emit_summary() {
             .unwrap()
             .iter()
             .all(|r| r["status"] == "cancelled"));
+        std::fs::write(p.dir.join("release"), "").unwrap();
         std::thread::sleep(Duration::from_millis(600));
-        assert!(!p.dir.join("escaped").exists());
+        assert!(
+            !p.dir.join("escaped").exists(),
+            "descendant escaped cancellation: signal={signal}, field={field}, step={is_step}"
+        );
         assert!(!p.dir.join("queued").exists());
         assert!(!p.dir.join("ran").exists());
         assert!(!p.dir.join("later").exists());
