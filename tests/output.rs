@@ -477,7 +477,7 @@ fn text_output_names_instances_and_the_summary_counts_them() {
     }
     // The tail belongs to the failed instance's block.
     let failed = text.find("test (2/3) FAILED").unwrap();
-    assert!(text[failed..].find("  stderr tail:").is_some(), "{text}");
+    assert!(text[failed..].contains("  stderr tail:"), "{text}");
 
     let p = Project::new(PARTITIONED);
     let text = stdout(&p.run(&["--jobs", "stepped"]));
