@@ -147,16 +147,14 @@ fn render(json: bool, mut event: Value, out: &mut impl Write, err: &mut impl Wri
                 text(&event, "workflow"),
                 text(&event, "workdir")
             )?,
-            "job_started" => writeln!(out, "→ {}", text(&event, "name").cyan())?,
-            "step_started" => {
-                writeln!(out, "  → {}/{}", text(&event, "name"), text(&event, "step"))?
-            }
+            "job_started" => writeln!(out, "→ {}", instance(&event).cyan())?,
+            "step_started" => writeln!(out, "  → {}/{}", instance(&event), text(&event, "step"))?,
             "step_finished" => {
                 let result = &event["result"];
                 writeln!(
                     out,
                     "  {}/{} {}  {}ms",
-                    text(&event, "name"),
+                    instance(&event),
                     text(result, "id"),
                     text(result, "status").to_uppercase(),
                     result["duration_ms"]
@@ -168,8 +166,8 @@ fn render(json: bool, mut event: Value, out: &mut impl Write, err: &mut impl Wri
             "job_output" => {
                 let data = text(&event, "data");
                 let name = match event["step"].as_str() {
-                    Some(step) => format!("{}/{step}", text(&event, "name")),
-                    None => text(&event, "name").to_owned(),
+                    Some(step) => format!("{}/{step}", instance(&event)),
+                    None => instance(&event),
                 };
                 write!(out, "[{} {}] {}", name, text(&event, "stream"), data)?;
                 if !data.ends_with('\n') {
@@ -188,7 +186,7 @@ fn render(json: bool, mut event: Value, out: &mut impl Write, err: &mut impl Wri
                 write!(
                     out,
                     "{} {}  {}ms",
-                    text(result, "name"),
+                    instance(result),
                     label,
                     result["duration_ms"]
                 )?;
@@ -285,6 +283,16 @@ fn render(json: bool, mut event: Value, out: &mut impl Write, err: &mut impl Wri
                     settings["parallelism"],
                     text(settings, "workdir")
                 )?;
+                if let Some(reporting) = event.get("reporting") {
+                    writeln!(
+                        out,
+                        "Reporting: project={} url_env={} token_env={}\nspool_dir: {}",
+                        text(reporting, "project"),
+                        text(reporting, "url_env"),
+                        text(reporting, "token_env"),
+                        text(reporting, "spool_dir")
+                    )?;
+                }
                 writeln!(out, "Jobs")?;
                 for job in event["jobs"].as_array().into_iter().flatten() {
                     let deps: Vec<_> = job["depends_on"]
@@ -320,6 +328,17 @@ fn render(json: bool, mut event: Value, out: &mut impl Write, err: &mut impl Wri
                     }
                     if let Some(outputs) = job.get("outputs") {
                         writeln!(out, "    outputs: {outputs}")?;
+                    }
+                    if let Some(partitions) = job.get("partitions") {
+                        writeln!(
+                            out,
+                            "    partitions: {} (strategy={})",
+                            partitions["count"],
+                            text(partitions, "strategy")
+                        )?;
+                    }
+                    if job.get("reports").is_some() {
+                        writeln!(out, "    reports: {}", names(&job["reports"]))?;
                     }
                     for step in job["steps"].as_array().into_iter().flatten() {
                         let shell = step["shell"]
@@ -362,6 +381,69 @@ fn render(json: bool, mut event: Value, out: &mut impl Write, err: &mut impl Wri
                     )?;
                 }
             }
+            "reports_collected" => {
+                write!(
+                    out,
+                    "reports {}: {} collected ({})",
+                    instance_of(&event, "job"),
+                    event["reports"],
+                    text(&event, "outcome").replace('_', " ")
+                )?;
+                if let Some(rejected) = event["rejected"].as_object().filter(|r| !r.is_empty()) {
+                    let codes: Vec<_> = rejected
+                        .iter()
+                        .map(|(code, n)| format!("{code}={n}"))
+                        .collect();
+                    write!(out, "  rejected: {}", codes.join(", "))?;
+                }
+                writeln!(out)?;
+                if event["reports"].as_u64().is_some_and(|n| n > 0) {
+                    writeln!(out, "  saved in {}", text(&event, "run_dir"))?;
+                }
+            }
+            "report_uploaded" => writeln!(
+                out,
+                "report {}/{} uploaded{}",
+                instance_of(&event, "job"),
+                text(&event, "report_id"),
+                if event["duplicate"] == true {
+                    " (already stored)"
+                } else {
+                    ""
+                }
+            )?,
+            "report_upload_pending" => {
+                write!(
+                    out,
+                    "report {}/{} pending: {}",
+                    instance_of(&event, "job"),
+                    text(&event, "report_id"),
+                    text(&event, "reason").replace('_', " ")
+                )?;
+                if let Some(status) = event["http_status"].as_u64() {
+                    write!(out, " (HTTP {status})")?;
+                }
+                if event["terminal"] == true {
+                    write!(out, ", not retried by reports upload")?;
+                }
+                writeln!(out)?;
+            }
+            "reporting_skipped" => {
+                write!(
+                    out,
+                    "reporting skipped: {}",
+                    text(&event, "reason").replace('_', " ")
+                )?;
+                if let Some(pending) = event["pending"].as_u64() {
+                    write!(out, " ({pending} reports kept locally)")?;
+                }
+                writeln!(out)?;
+            }
+            "reports_upload_summary" => writeln!(
+                out,
+                "\nReports: {} acknowledged, {} pending, {} rejected, {} invalid",
+                event["acknowledged"], event["pending"], event["rejected"], event["invalid"]
+            )?,
             "error" => {
                 writeln!(err, "Error: {}", text(&event, "message"))?;
             }
@@ -382,6 +464,65 @@ fn names(value: &Value) -> String {
         .join(", ")
 }
 
+/// A job's display name: `name`, or `name (i/N)` for a partition instance.
+fn instance(value: &Value) -> String {
+    instance_of(value, "name")
+}
+
+/// [`instance`] for events that name the job under `key`.
+fn instance_of(value: &Value, key: &str) -> String {
+    let name = text(value, key);
+    match (
+        value["partition"]["index"].as_u64(),
+        value["partition"]["count"].as_u64(),
+    ) {
+        (Some(index), Some(count)) => format!("{name} ({index}/{count})"),
+        _ => name.to_owned(),
+    }
+}
+
 fn text<'a>(event: &'a Value, key: &str) -> &'a str {
     event[key].as_str().unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rendered(event: Value) -> String {
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        render(false, event, &mut out, &mut err).unwrap();
+        assert!(err.is_empty());
+        String::from_utf8(out).unwrap()
+    }
+
+    /// Text for reporting events with and without a partition instance.
+    #[test]
+    fn reporting_events_name_the_instance_in_text() {
+        let partition = json!({"index": 2, "count": 3});
+        for (tag, job) in [(None, "test"), (Some(partition), "test (2/3)")] {
+            let with = |mut event: Value| {
+                if let Some(partition) = &tag {
+                    event["partition"] = partition.clone();
+                }
+                rendered(event)
+            };
+            assert_eq!(
+                with(json!({"type":"reports_collected", "job":"test", "outcome":"collected", "reports":1, "run_dir":"/spool/run", "rejected":{"duplicate_report_id":1}})),
+                format!("reports {job}: 1 collected (collected)  rejected: duplicate_report_id=1\n  saved in /spool/run\n")
+            );
+            assert_eq!(
+                with(
+                    json!({"type":"report_uploaded", "job":"test", "report_id":"r1", "duplicate":true})
+                ),
+                format!("report {job}/r1 uploaded (already stored)\n")
+            );
+            assert_eq!(
+                with(
+                    json!({"type":"report_upload_pending", "job":"test", "report_id":"r1", "reason":"state_write_failed", "http_status":null})
+                ),
+                format!("report {job}/r1 pending: state write failed\n")
+            );
+        }
+    }
 }

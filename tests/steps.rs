@@ -278,3 +278,101 @@ fn step_structure_and_expression_scopes_are_validated_without_running_anything()
         }
     }
 }
+
+#[test]
+fn command_only_instances_get_no_output_file_and_publish_no_outputs() {
+    let p = Project::new(
+        r#"
+[[jobs]]
+name = "test"
+partitions = 2
+command = '''test -z "${GOODFLOWS_OUTPUT+x}" && touch checked.$GOODFLOWS_PARTITION'''
+"#,
+    );
+    let output = p
+        .command()
+        .env("GOODFLOWS_OUTPUT", "inherited")
+        .arg("--json")
+        .output()
+        .unwrap();
+    success(&output);
+    let events = events(&output);
+    let results = events.last().unwrap()["results"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert_eq!(results.len(), 2);
+    for (index, result) in results.iter().enumerate() {
+        assert_eq!(result["status"], "passed");
+        assert_eq!(result["outputs"], json!({}));
+        assert!(p.dir.join(format!("checked.{}", index + 1)).exists());
+    }
+}
+
+#[test]
+fn step_outputs_flow_between_steps_of_the_same_instance() {
+    let p = Project::new(
+        r#"
+[settings]
+parallelism = 3
+[[jobs]]
+name = "test"
+partitions = 3
+[[jobs.steps]]
+id = "a"
+command = '''sleep 0.0$GOODFLOWS_PARTITION; printf '{"key":"%s"}' "$GOODFLOWS_PARTITION" > "$GOODFLOWS_OUTPUT"'''
+[[jobs.steps]]
+id = "b"
+condition = { expression = 'steps.a.outputs.key == env.GOODFLOWS_PARTITION' }
+command = '''test -n "$GOODFLOWS_OUTPUT" && touch b.$GOODFLOWS_PARTITION'''
+"#,
+    );
+    let output = p.run(&["--json"]);
+    success(&output);
+    let events = events(&output);
+    let results = events.last().unwrap()["results"]
+        .as_array()
+        .unwrap()
+        .clone();
+    for (index, result) in results.iter().enumerate() {
+        let partition = (index + 1).to_string();
+        assert_eq!(result["steps"][0]["outputs"], json!({"key": partition}));
+        assert_eq!(result["steps"][1]["status"], "passed");
+        assert_eq!(result["outputs"], json!({}));
+        assert!(p.dir.join(format!("b.{partition}")).exists());
+    }
+}
+
+#[test]
+fn partitioned_job_before_output_producer_does_not_shift_needs_outputs() {
+    // `test` expands into three results ahead of `detect`, so `needs` must be
+    // looked up by the producer's unit, not its configured-job position.
+    let p = Project::new(
+        r#"
+[[jobs]]
+name = "test"
+partitions = 3
+command = "true"
+[[jobs]]
+name = "detect"
+command = '''printf '{"k":"v"}' > "$GOODFLOWS_OUTPUT"'''
+[[jobs]]
+name = "consume"
+depends_on = ["test", "detect"]
+condition = { expression = 'needs.detect.outputs.k == "v"' }
+command = "touch consumed"
+"#,
+    );
+    let output = p.run(&["--json"]);
+    success(&output);
+    assert!(p.dir.join("consumed").exists(), "{}", stdout(&output));
+    let events = events(&output);
+    let results = events.last().unwrap()["results"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert_eq!(results[3]["name"], "detect");
+    assert_eq!(results[3]["outputs"], json!({"k": "v"}));
+    assert_eq!(results[4]["name"], "consume");
+    assert_eq!(results[4]["status"], "passed");
+}

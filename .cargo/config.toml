@@ -1,0 +1,6 @@
+# Keep `cargo update` / `cargo add` within the package's rust-version (1.88).
+# Edition 2021 does not make the resolver MSRV-aware on its own; this makes it
+# prefer dependency versions whose rust-version is compatible, falling back to
+# the newest only when no compatible version exists.
+[resolver]
+incompatible-rust-versions = "fallback"

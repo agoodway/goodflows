@@ -1,6 +1,6 @@
 use crate::tail::{SharedTails, Tails};
 use crate::{
-    config::{Condition, Job},
+    config::{self, Condition, Job, Partition},
     expression::{Expression, Reference},
     output::Output,
 };
@@ -10,6 +10,7 @@ use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
@@ -27,9 +28,18 @@ pub enum Status {
     Cancelled,
 }
 
+/// One scheduled unit: a configured job, or one instance of a partitioned job.
+#[derive(Clone, Copy, Debug)]
+struct Unit {
+    job: usize,
+    partition: Option<Partition>,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct JobResult {
     pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub partition: Option<Partition>,
     pub command: Option<String>,
     pub status: Status,
     pub duration_ms: u128,
@@ -46,12 +56,16 @@ pub struct JobResult {
     pub stdout_truncated: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stderr_truncated: Option<bool>,
+    /// Whether the job started (as opposed to being skipped or cancelled before launch).
+    #[serde(skip)]
+    pub executed: bool,
 }
 
 impl JobResult {
-    fn new(job: &Job, status: Status, error: Option<String>) -> Self {
+    fn new(job: &Job, partition: Option<Partition>, status: Status, error: Option<String>) -> Self {
         Self {
             name: job.name.clone(),
+            partition,
             command: job.command.clone(),
             status,
             duration_ms: 0,
@@ -79,6 +93,7 @@ impl JobResult {
             stderr_tail: None,
             stdout_truncated: None,
             stderr_truncated: None,
+            executed: false,
         }
     }
 
@@ -130,6 +145,68 @@ pub struct Options {
     pub workdir: PathBuf,
     pub log_dir: Option<PathBuf>,
     pub output: Output,
+    pub reporting: Arc<ReportingEnv>,
+}
+
+/// Environment adjustments for reporting. Applied after job/step overrides.
+#[derive(Debug, Default)]
+pub struct ReportingEnv {
+    /// A `[reporting]` block exists. The reserved names are then removed from
+    /// every command and expression (even when inherited from the CLI's own
+    /// environment) and set only for report-producing jobs with a spool.
+    pub active: bool,
+    /// The publisher's credential variable, removed from every child and expression.
+    pub scrub: Option<String>,
+    /// Reserved variables injected into report-producing jobs, keyed by job
+    /// name and partition (`None` for an unpartitioned job).
+    pub jobs: HashMap<ReportingKey, Vec<(String, String)>>,
+}
+
+/// A report-producing unit: job name and, for an instance, its partition.
+pub type ReportingKey = (String, Option<Partition>);
+
+impl ReportingEnv {
+    fn reserved(&self, job: &str, partition: Option<Partition>) -> &[(String, String)] {
+        self.jobs
+            .get(&(job.to_owned(), partition))
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+    }
+
+    /// Remove the token and the reserved names. Conditions see only this view:
+    /// they decide whether the job runs, so they are not report producers.
+    fn scrub(&self, env: &mut HashMap<String, String>) {
+        if let Some(token) = &self.scrub {
+            env.remove(token);
+        }
+        if self.active {
+            for key in config::RESERVED_ENV {
+                env.remove(key);
+            }
+        }
+    }
+
+    /// The scrubbed view plus the reserved values, for the job's own commands.
+    fn inject(
+        &self,
+        job: &str,
+        partition: Option<Partition>,
+        env: &HashMap<String, String>,
+    ) -> HashMap<String, String> {
+        let mut env = env.clone();
+        for (key, value) in self.reserved(job, partition) {
+            env.insert(key.clone(), value.clone());
+        }
+        env
+    }
+}
+
+/// Per-invocation state shared by every job task.
+struct Shared {
+    workdir: PathBuf,
+    log_dir: Option<PathBuf>,
+    output: Output,
+    reporting: Arc<ReportingEnv>,
 }
 
 async fn record(
@@ -160,14 +237,34 @@ pub async fn execute(
         .enumerate()
         .map(|(i, j)| (j.name.as_str(), i))
         .collect();
+    // Dependencies are per configured job; scheduling state is per unit.
     let deps: Vec<Vec<usize>> = jobs
         .iter()
         .map(|j| j.depends_on.iter().map(|d| names[d.as_str()]).collect())
         .collect();
-    let mut results: Vec<Option<JobResult>> = vec![None; jobs.len()];
-    let mut started = vec![false; jobs.len()];
+    let units: Vec<Unit> = jobs
+        .iter()
+        .enumerate()
+        .flat_map(|(job, config)| {
+            config
+                .partition_ids()
+                .map(move |partition| Unit { job, partition })
+        })
+        .collect();
+    let mut job_units = vec![Vec::new(); jobs.len()];
+    for (index, unit) in units.iter().enumerate() {
+        job_units[unit.job].push(index);
+    }
+    let mut results: Vec<Option<JobResult>> = vec![None; units.len()];
+    let mut started = vec![false; units.len()];
     let mut running = JoinSet::new();
     let mut failed = false;
+    let shared = Arc::new(Shared {
+        workdir: options.workdir.clone(),
+        log_dir: options.log_dir.clone(),
+        output: options.output.clone(),
+        reporting: options.reporting.clone(),
+    });
 
     loop {
         // Consume completed jobs before deciding whether to launch queued work.
@@ -180,19 +277,26 @@ pub async fn execute(
         // Repeat so transitive skips propagate even when configs are not topologically ordered.
         loop {
             let mut changed = false;
-            for (index, job) in jobs.iter().enumerate() {
+            for (index, unit) in units.iter().enumerate() {
                 if started[index] || results[index].is_some() {
                     continue;
                 }
-                let blocked = deps[index].iter().any(|&d| {
-                    results[d]
-                        .as_ref()
-                        .is_some_and(|r| r.status != Status::Passed)
-                });
+                let job = &jobs[unit.job];
+                let dependency = |d: usize| dependency_state(&results, &job_units[d]);
+                let blocked = deps[unit.job]
+                    .iter()
+                    .any(|&d| dependency(d) == Dependency::Blocked);
+                // A dependency job with a non-passing unit but unfinished siblings
+                // blocks only once they finish, so the dependency reason is stable.
+                let settling = deps[unit.job]
+                    .iter()
+                    .any(|&d| dependency(d) == Dependency::Settling);
                 let reason = if cancelled {
                     Some((Status::Cancelled, "cancelled by signal"))
                 } else if blocked {
                     Some((Status::Skipped, "dependency did not pass"))
+                } else if settling {
+                    None
                 } else if options.fail_fast && failed {
                     Some((Status::Skipped, "fail_fast: previous job failed"))
                 } else {
@@ -202,7 +306,7 @@ pub async fn execute(
                     record(
                         &mut results,
                         index,
-                        JobResult::new(job, status, Some(error.into())),
+                        JobResult::new(job, unit.partition, status, Some(error.into())),
                         &options.output,
                     )
                     .await?;
@@ -213,44 +317,37 @@ pub async fn execute(
                 break;
             }
         }
-        for (index, job) in jobs.iter().enumerate() {
+        for (index, unit) in units.iter().copied().enumerate() {
             if running.len() >= options.parallelism || cancel.borrow().is_some() {
                 break;
             }
             if started[index] || results[index].is_some() {
                 continue;
             }
-            if !deps[index].iter().all(|&d| {
-                results[d]
-                    .as_ref()
-                    .is_some_and(|r| r.status == Status::Passed)
-            }) {
+            if !deps[unit.job]
+                .iter()
+                .all(|&d| dependency_state(&results, &job_units[d]) == Dependency::Passed)
+            {
                 continue;
             }
             started[index] = true;
-            let job = job.clone();
-            let workdir = options.workdir.clone();
-            let log_dir = options.log_dir.clone();
-            let output = options.output.clone();
+            let job = jobs[unit.job].clone();
+            let shared = shared.clone();
             let cancel = cancel.clone();
-            let needs = deps[index]
+            // Validation forbids output references to partitioned jobs, so only
+            // single-unit dependencies publish outputs.
+            let needs = deps[unit.job]
                 .iter()
+                .filter(|&&d| jobs[d].partitions.is_none())
                 .map(|&d| {
-                    let result = results[d].as_ref().expect("ready dependency has a result");
+                    let result = results[job_units[d][0]]
+                        .as_ref()
+                        .expect("ready dependency has a result");
                     (result.name.clone(), result.outputs.clone())
                 })
                 .collect();
             running.spawn(async move {
-                let result = run_job(
-                    index,
-                    &job,
-                    &workdir,
-                    log_dir.as_deref(),
-                    output,
-                    cancel,
-                    needs,
-                )
-                .await;
+                let result = run_job(unit.job, unit.partition, &job, &shared, cancel, needs).await;
                 (index, result)
             });
         }
@@ -277,18 +374,55 @@ pub async fn execute(
     Ok(results.into_iter().flatten().collect())
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Dependency {
+    /// Every unit of the dependency job passed.
+    Passed,
+    /// Some unit has not finished and none has failed yet.
+    Pending,
+    /// Some unit did not pass, but siblings are still unfinished.
+    Settling,
+    /// Every unit finished and at least one did not pass.
+    Blocked,
+}
+
+fn dependency_state(results: &[Option<JobResult>], units: &[usize]) -> Dependency {
+    // An empty unit list would vacuously report `Passed`.
+    debug_assert!(
+        !units.is_empty(),
+        "every job expands into at least one unit"
+    );
+    let mut finished = true;
+    let mut passed = true;
+    for &unit in units {
+        match &results[unit] {
+            Some(result) => passed &= result.status == Status::Passed,
+            None => finished = false,
+        }
+    }
+    match (finished, passed) {
+        (true, true) => Dependency::Passed,
+        (false, true) => Dependency::Pending,
+        (false, false) => Dependency::Settling,
+        (true, false) => Dependency::Blocked,
+    }
+}
+
 async fn run_job(
     index: usize,
+    partition: Option<Partition>,
     job: &Job,
-    workdir: &Path,
-    log_dir: Option<&Path>,
-    output: Output,
+    shared: &Shared,
     cancel: watch::Receiver<Option<i32>>,
     needs: DependencyOutputs,
 ) -> JobResult {
+    let (workdir, log_dir, output) = (&shared.workdir, shared.log_dir.as_deref(), &shared.output);
+    let reporting = &*shared.reporting;
     let start = Instant::now();
     let tails = Arc::new(Mutex::new(Tails::default()));
-    let mut result = JobResult::new(job, Status::Passed, None);
+    let mut result = JobResult::new(job, partition, Status::Passed, None);
+    // Set only when the main command or a step command spawns, never by a condition.
+    let spawned = AtomicBool::new(false);
     let execution: Result<()> = async {
         let safe_name: String = job
             .name
@@ -302,7 +436,11 @@ async fn run_job(
                 }
             })
             .collect();
-        let stem = format!("{:03}-{safe_name}", index + 1);
+        // `index` is the job's position in the selected job list, so instance logs sort together.
+        let stem = match partition {
+            Some(partition) => format!("{:03}-{safe_name}.p{:02}", index + 1, partition.index),
+            None => format!("{:03}-{safe_name}", index + 1),
+        };
         let logs = [
             open_log(log_dir, &format!("{stem}.stdout.log")).await?,
             open_log(log_dir, &format!("{stem}.stderr.log")).await?,
@@ -310,22 +448,43 @@ async fn run_job(
         let mut execution = JobExecution {
             job,
             workdir,
-            output: &output,
+            output,
             cancel,
             tails: tails.clone(),
             logs,
             needs,
+            reporting,
+            partition,
+            spawned: &spawned,
             deadline: job.timeout_secs.and_then(|secs| {
                 tokio::time::Instant::now().checked_add(Duration::from_secs(secs))
             }),
         };
         output
-            .emit(json!({"type":"job_started", "name":job.name}))
+            .emit(Partition::tag(
+                partition,
+                json!({"type":"job_started", "name":job.name}),
+            ))
             .await?;
-        let env: HashMap<String, String> = std::env::vars_os()
+        let mut env: HashMap<String, String> = std::env::vars_os()
             .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
             .chain(job.env.clone())
             .collect();
+        // Expressions read this map, so the token must be gone before any evaluation.
+        reporting.scrub(&mut env);
+        // Partition identity is visible to conditions, expressions and every
+        // command; unpartitioned jobs never see values inherited by the CLI.
+        let [index_key, count_key] = config::PARTITION_ENV;
+        match partition {
+            Some(partition) => {
+                env.insert(index_key.into(), partition.index.to_string());
+                env.insert(count_key.into(), partition.count.to_string());
+            }
+            None => {
+                env.remove(index_key);
+                env.remove(count_key);
+            }
+        }
         let condition = execution
             .condition(job.condition.as_ref(), &env, &[], None)
             .await?;
@@ -333,28 +492,43 @@ async fn run_job(
             result.finish(condition);
             return Ok(());
         }
+        let job_env = reporting.inject(&job.name, partition, &env);
         if let Some(command) = &job.command {
             let outcome = execution
-                .command(command, job.shell, &env, None, false)
+                .command(
+                    command,
+                    job.shell,
+                    &job_env,
+                    None,
+                    // Partitioned jobs publish no job outputs.
+                    Invocation::Command {
+                        outputs: partition.is_none(),
+                    },
+                )
                 .await?;
             result.finish(outcome);
             return Ok(());
         }
         for (index, step) in job.steps.iter().enumerate() {
             let step_start = Instant::now();
-            let env = env
+            let mut condition_env = env
                 .iter()
                 .chain(step.env.iter())
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect();
+            reporting.scrub(&mut condition_env);
+            let step_env = reporting.inject(&job.name, partition, &condition_env);
             output
-                .emit(json!({"type":"step_started", "name":job.name, "step":step.id}))
+                .emit(Partition::tag(
+                    partition,
+                    json!({"type":"step_started", "name":job.name, "step":step.id}),
+                ))
                 .await?;
             let outcome = async {
                 let condition = execution
                     .condition(
                         step.condition.as_ref(),
-                        &env,
+                        &condition_env,
                         &result.steps[..index],
                         Some(&step.id),
                     )
@@ -366,9 +540,9 @@ async fn run_job(
                     .command(
                         &step.command,
                         step.shell.unwrap_or(job.shell),
-                        &env,
+                        &step_env,
                         Some(&step.id),
-                        false,
+                        Invocation::Command { outputs: true },
                     )
                     .await
             }
@@ -377,9 +551,10 @@ async fn run_job(
             result.steps[index].duration_ms = step_start.elapsed().as_millis();
             result.steps[index].outcome = outcome.clone();
             output
-                .emit(
+                .emit(Partition::tag(
+                    partition,
                     json!({"type":"step_finished", "name":job.name, "result":result.steps[index]}),
-                )
+                ))
                 .await?;
             if !matches!(outcome.status, Status::Passed | Status::Skipped) {
                 result.command = Some(step.command.clone());
@@ -398,7 +573,10 @@ async fn run_job(
                         Some("previous step did not pass".into()),
                     );
                     output
-                        .emit(json!({"type":"step_finished", "name":job.name, "result":pending}))
+                        .emit(Partition::tag(
+                            partition,
+                            json!({"type":"step_finished", "name":job.name, "result":pending}),
+                        ))
                         .await?;
                 }
                 return Ok(());
@@ -406,7 +584,7 @@ async fn run_job(
         }
         for (key, source) in &job.outputs {
             let value = execution
-                .evaluate(source, &env, &result.steps)
+                .evaluate(source, &job_env, &result.steps)
                 .with_context(|| format!("job output '{key}'"))?;
             if !matches!(value, Value::Bool(_) | Value::Number(_) | Value::String(_)) {
                 bail!("job output '{key}' must be a boolean, number, or string");
@@ -419,6 +597,7 @@ async fn run_job(
     if let Err(error) = execution {
         result.finish(CommandResult::failed(error));
     }
+    result.executed = spawned.load(Ordering::Relaxed);
     result.duration_ms = start.elapsed().as_millis();
     if matches!(result.status, Status::Failed | Status::TimedOut) {
         let [(stdout, stdout_truncated), (stderr, stderr_truncated)] =
@@ -439,6 +618,9 @@ struct JobExecution<'a> {
     tails: SharedTails,
     logs: [Option<tokio::fs::File>; 2],
     needs: DependencyOutputs,
+    reporting: &'a ReportingEnv,
+    partition: Option<Partition>,
+    spawned: &'a AtomicBool,
     deadline: Option<tokio::time::Instant>,
 }
 
@@ -524,7 +706,8 @@ impl JobExecution<'_> {
                 }
             }
             Some(Condition::LegacyShell(shell) | Condition::Shell { shell }) => {
-                self.command(shell, true, env, step, true).await
+                self.command(shell, true, env, step, Invocation::Condition)
+                    .await
             }
             None => Ok(CommandResult::new(Status::Passed, None)),
         }
@@ -556,6 +739,15 @@ impl Drop for ProcessGroup {
     }
 }
 
+/// What a spawned command is for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Invocation {
+    /// A shell condition: a nonzero exit skips, and it never counts as spawned work.
+    Condition,
+    /// The job's command or a step; `outputs` provides `GOODFLOWS_OUTPUT`.
+    Command { outputs: bool },
+}
+
 impl JobExecution<'_> {
     async fn command(
         &mut self,
@@ -563,18 +755,19 @@ impl JobExecution<'_> {
         shell: bool,
         env: &HashMap<String, String>,
         step: Option<&str>,
-        is_condition: bool,
+        invocation: Invocation,
     ) -> Result<CommandResult> {
         if let Some(result) = self.stopped() {
             return Ok(result);
         }
+        let is_condition = invocation == Invocation::Condition;
         let job = self.job;
         let output = self.output;
         let tails = &self.tails;
-        let output_file = if is_condition {
-            None
-        } else {
+        let output_file = if invocation == (Invocation::Command { outputs: true }) {
             Some(tempfile::NamedTempFile::new().context("create job output file")?)
+        } else {
+            None
         };
         let deadline = async {
             if let Some(deadline) = self.deadline {
@@ -603,6 +796,33 @@ impl JobExecution<'_> {
             .kill_on_drop(true);
         #[cfg(unix)]
         command.process_group(0);
+        // .envs() only adds to the inherited CLI environment, so the token and any
+        // inherited reserved values (from an enclosing goodflows run) must be removed.
+        if let Some(token) = &self.reporting.scrub {
+            command.env_remove(token);
+        }
+        if self.reporting.active {
+            for key in config::RESERVED_ENV {
+                command.env_remove(key);
+            }
+        }
+        if !is_condition {
+            for (key, value) in self.reporting.reserved(&job.name, self.partition) {
+                command.env(key, value);
+            }
+        }
+        // After the reporting removals, so partition identity always wins.
+        let [index_key, count_key] = config::PARTITION_ENV;
+        match self.partition {
+            Some(partition) => {
+                command.env(index_key, partition.index.to_string());
+                command.env(count_key, partition.count.to_string());
+            }
+            None => {
+                command.env_remove(index_key);
+                command.env_remove(count_key);
+            }
+        }
         if let Some(file) = &output_file {
             command.env("GOODFLOWS_OUTPUT", file.path());
         } else {
@@ -615,16 +835,25 @@ impl JobExecution<'_> {
         let mut child = command
             .spawn()
             .with_context(|| format!("failed to spawn '{}'", job.name))?;
+        if !is_condition {
+            self.spawned.store(true, Ordering::Relaxed);
+        }
         let mut group = ProcessGroup {
             id: Some(child.id().context("child has no PID")?),
         };
         let mut readers = JoinSet::new();
-        let name = job.name.clone();
+        // The fields every `job_output` event of this command shares.
+        let mut source = Partition::tag(
+            self.partition,
+            json!({"type":"job_output", "name":job.name}),
+        );
+        if let Some(step) = step {
+            source["step"] = json!(step);
+        }
         let pipe = child.stdout.take().context("missing stdout pipe")?;
         readers.spawn(drain(
             pipe,
-            name,
-            step.map(str::to_owned),
+            source.clone(),
             "stdout",
             match &self.logs[0] {
                 Some(file) => Some(file.try_clone().await?),
@@ -633,12 +862,10 @@ impl JobExecution<'_> {
             output.clone(),
             tails.clone(),
         ));
-        let name = job.name.clone();
         let pipe = child.stderr.take().context("missing stderr pipe")?;
         readers.spawn(drain(
             pipe,
-            name,
-            step.map(str::to_owned),
+            source.clone(),
             "stderr",
             match &self.logs[1] {
                 Some(file) => Some(file.try_clone().await?),
@@ -751,13 +978,18 @@ async fn open_log(dir: Option<&Path>, filename: &str) -> Result<Option<tokio::fs
 
 async fn drain<R: AsyncRead + Unpin>(
     mut reader: R,
-    name: String,
-    step: Option<String>,
+    source: Value,
     stream: &'static str,
     mut log: Option<tokio::fs::File>,
     output: Output,
     tails: SharedTails,
 ) -> Result<()> {
+    let event = |data: &[u8]| {
+        let mut event = source.clone();
+        event["stream"] = json!(stream);
+        event["data"] = json!(String::from_utf8_lossy(data));
+        event
+    };
     let mut chunk = [0u8; 4096];
     let mut pending = Vec::new();
     loop {
@@ -794,20 +1026,12 @@ async fn drain<R: AsyncRead + Unpin>(
             if length == 0 {
                 break;
             }
-            let mut event = json!({"type":"job_output", "name":name, "stream":stream, "data":String::from_utf8_lossy(&pending[..length])});
-            if let Some(step) = &step {
-                event["step"] = json!(step);
-            }
-            output.emit(event).await?;
+            output.emit(event(&pending[..length])).await?;
             pending.drain(..length);
         }
     }
     if !pending.is_empty() {
-        let mut event = json!({"type":"job_output", "name":name, "stream":stream, "data":String::from_utf8_lossy(&pending)});
-        if let Some(step) = &step {
-            event["step"] = json!(step);
-        }
-        output.emit(event).await?;
+        output.emit(event(&pending)).await?;
     }
     if let Some(file) = log.as_mut() {
         file.flush().await?;
