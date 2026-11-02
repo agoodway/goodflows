@@ -2,6 +2,7 @@ use crate::expression::{Expression, Reference};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -21,6 +22,10 @@ pub struct Config {
 
 pub const REPORT_FORMAT: &str = crate::reporting::contract::REPORT_FORMAT;
 pub const RESERVED_ENV: [&str; 2] = ["GOODFLOWS_RUN_ID", "GOODFLOWS_REPORT_DIR"];
+/// Partition identity injected into every partitioned instance. Deliberately
+/// separate from `RESERVED_ENV`, which reporting scrubs from every command.
+pub const PARTITION_ENV: [&str; 2] = ["GOODFLOWS_PARTITION", "GOODFLOWS_PARTITION_COUNT"];
+pub const MAX_PARTITIONS: u32 = 64;
 const DEFAULT_SPOOL_DIR: &str = ".goodflows/reports";
 
 /// Opt-in publishing of job reports. Only environment variable *names* are
@@ -85,7 +90,10 @@ pub fn validate_credential_env_names(url_env: &str, token_env: &str) -> Result<(
         if !valid_env_name(name) {
             bail!("reporting {field} must be an environment variable name matching [A-Za-z_][A-Za-z0-9_]*");
         }
-        if RESERVED_ENV.contains(&name) || name == "GOODFLOWS_OUTPUT" {
+        if RESERVED_ENV.contains(&name)
+            || PARTITION_ENV.contains(&name)
+            || name == "GOODFLOWS_OUTPUT"
+        {
             bail!("reporting {field} must not name a reserved goodflows variable");
         }
     }
@@ -187,6 +195,148 @@ pub struct Job {
     pub shell: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reports: Vec<String>,
+    /// `partitions` as written. `Config::validate` range-checks it and stores the
+    /// result in `partitions`, so every out-of-range count gets one message naming the job.
+    #[serde(rename(deserialize = "partitions"), default, skip_serializing)]
+    pub(crate) partitions_input: Option<PartitionsInput>,
+    /// Validated partitioning, set by `Config::validate`; `None` until then and for
+    /// unpartitioned jobs. Serialized under the `partitions` key.
+    #[serde(skip_deserializing, skip_serializing_if = "Option::is_none")]
+    pub partitions: Option<Partitions>,
+}
+
+impl Job {
+    /// Identity of each scheduled instance in index order, or a single `None`
+    /// for an unpartitioned job.
+    pub fn partition_ids(&self) -> impl Iterator<Item = Option<Partition>> {
+        let count = self.partitions.map(|p| p.count.get());
+        (1..=count.unwrap_or(1)).map(move |index| count.map(|count| Partition { index, count }))
+    }
+
+    /// Number of scheduled instances this job expands into.
+    pub fn instances(&self) -> usize {
+        self.partition_ids().count()
+    }
+}
+
+/// Identity of one instance of a partitioned job. Serialized only into events
+/// and results; saved manifests use `reporting::ManifestPartition`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize)]
+pub struct Partition {
+    pub index: u32,
+    pub count: u32,
+}
+
+impl Partition {
+    /// Add this instance's identity to an event; unpartitioned events keep their shape.
+    pub(crate) fn tag(partition: Option<Self>, mut event: serde_json::Value) -> serde_json::Value {
+        if let Some(partition) = partition {
+            event["partition"] = serde_json::json!(partition);
+        }
+        event
+    }
+}
+
+/// How a partitioned job's work is divided. Only `index` exists today:
+/// goodflows supplies partition identity and the tool splits the work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Strategy {
+    Index,
+}
+
+/// Validated `partitions` setting, always serialized in the normalized table form.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct Partitions {
+    pub count: NonZeroU32,
+    pub strategy: Strategy,
+}
+
+/// `partitions` as parsed. Accepts `partitions = N` or
+/// `partitions = { count = N, strategy = "index" }`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PartitionsInput {
+    /// The configured count as written; `validate_partitions` enforces the range
+    /// so every out-of-range value gets one message naming the job.
+    pub count: i64,
+    pub strategy: Strategy,
+}
+
+impl<'de> Deserialize<'de> for PartitionsInput {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // A hand-written visitor keeps specific messages; `#[serde(untagged)]`
+        // would replace them with "did not match any variant".
+        struct Visitor;
+
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = PartitionsInput;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a partition count integer or a { count, strategy } table")
+            }
+
+            fn visit_i64<E: serde::de::Error>(self, value: i64) -> Result<PartitionsInput, E> {
+                Ok(PartitionsInput {
+                    count: value,
+                    strategy: Strategy::Index,
+                })
+            }
+
+            fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<PartitionsInput, E> {
+                // TOML integers are i64; anything larger is out of range anyway.
+                self.visit_i64(i64::try_from(value).unwrap_or(i64::MAX))
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<PartitionsInput, A::Error> {
+                use serde::de::Error;
+                let mut value = None;
+                let mut strategy = None;
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "count" if value.is_some() => {
+                            return Err(A::Error::duplicate_field("count"))
+                        }
+                        "count" => {
+                            let raw: i64 = map.next_value().map_err(|_| {
+                                A::Error::custom("partitions count must be an integer")
+                            })?;
+                            value = Some(raw);
+                        }
+                        "strategy" if strategy.is_some() => {
+                            return Err(A::Error::duplicate_field("strategy"))
+                        }
+                        "strategy" => {
+                            let raw: String = map.next_value().map_err(|_| {
+                                A::Error::custom("partitions strategy must be a string")
+                            })?;
+                            if raw != "index" {
+                                return Err(A::Error::custom(format!(
+                                    "partitions strategy '{}' is not supported (supported: index)",
+                                    raw.escape_debug()
+                                )));
+                            }
+                            strategy = Some(Strategy::Index);
+                        }
+                        other => {
+                            return Err(A::Error::custom(format!(
+                                "partitions key '{}' is not supported (expected count, strategy)",
+                                other.escape_debug()
+                            )))
+                        }
+                    }
+                }
+                Ok(PartitionsInput {
+                    count: value.ok_or_else(|| A::Error::missing_field("count"))?,
+                    strategy: strategy.unwrap_or(Strategy::Index),
+                })
+            }
+        }
+
+        deserializer.deserialize_any(Visitor)
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -345,7 +495,8 @@ impl Config {
         Ok((config, path))
     }
 
-    pub fn validate(&self) -> Result<()> {
+    /// Validate every job and store the validated partition settings.
+    pub fn validate(&mut self) -> Result<()> {
         if self.jobs.is_empty() && self.workflows.is_empty() {
             bail!("no jobs defined");
         }
@@ -357,12 +508,14 @@ impl Config {
             if self.workflows.contains_key("default") {
                 bail!("root jobs conflict with named workflow 'default'");
             }
-            validate_jobs(&self.jobs, reporting)?;
+            let partitions = validate_jobs(&self.jobs, reporting)?;
+            store_partitions(&mut self.jobs, partitions);
         }
-        for (name, workflow) in &self.workflows {
+        for (name, workflow) in &mut self.workflows {
             validate_workflow_name(name)?;
-            validate_jobs(&workflow.jobs, reporting)
+            let partitions = validate_jobs(&workflow.jobs, reporting)
                 .with_context(|| format!("workflow '{name}'"))?;
+            store_partitions(&mut workflow.jobs, partitions);
         }
         for name in self.environments.keys() {
             validate_name(name, "environment")?;
@@ -477,11 +630,24 @@ impl Config {
     }
 }
 
-fn validate_jobs(jobs: &[Job], reporting: Option<&Reporting>) -> Result<()> {
+fn store_partitions(jobs: &mut [Job], partitions: Vec<Option<Partitions>>) {
+    for (job, partitions) in jobs.iter_mut().zip(partitions) {
+        job.partitions = partitions;
+    }
+}
+
+/// Returns each job's validated partition setting, in job order.
+fn validate_jobs(jobs: &[Job], reporting: Option<&Reporting>) -> Result<Vec<Option<Partitions>>> {
     if jobs.is_empty() {
         bail!("no jobs defined");
     }
+    let partitioned: HashSet<&str> = jobs
+        .iter()
+        .filter(|job| job.partitions_input.is_some())
+        .map(|job| job.name.as_str())
+        .collect();
     let mut names = HashMap::new();
+    let mut partitions = Vec::with_capacity(jobs.len());
     for (index, job) in jobs.iter().enumerate() {
         if job.name.trim().is_empty() {
             bail!("empty job name");
@@ -489,7 +655,10 @@ fn validate_jobs(jobs: &[Job], reporting: Option<&Reporting>) -> Result<()> {
         if names.insert(job.name.as_str(), index).is_some() {
             bail!("duplicate job name '{}'", job.name);
         }
-        validate_job(job, reporting).with_context(|| format!("job '{}'", job.name))?;
+        partitions.push(
+            validate_job(job, reporting, &partitioned)
+                .with_context(|| format!("job '{}'", job.name))?,
+        );
         if job.timeout_secs == Some(0) {
             bail!("job '{}' timeout_secs must be greater than zero", job.name);
         }
@@ -536,7 +705,7 @@ fn validate_jobs(jobs: &[Job], reporting: Option<&Reporting>) -> Result<()> {
     if visited != jobs.len() {
         bail!("dependency cycle detected: {}", cycle_path(jobs, &names));
     }
-    Ok(())
+    Ok(partitions)
 }
 
 fn validate_command(command: &str, shell: bool) -> Result<()> {
@@ -560,8 +729,8 @@ fn validate_env(env: &HashMap<String, String>, reporting: Option<&Reporting>) ->
         if key.is_empty() || key.contains(['=', '\0']) || value.contains('\0') {
             bail!("invalid environment variable");
         }
-        if RESERVED_ENV.contains(&key.as_str()) {
-            bail!("env must not set reserved variable {key}; goodflows sets it for reporting jobs");
+        if RESERVED_ENV.contains(&key.as_str()) || PARTITION_ENV.contains(&key.as_str()) {
+            bail!("env must not set reserved variable {key}; goodflows sets it itself");
         }
         if reporting.is_some_and(|r| r.token_env == *key) {
             // The token is removed from every command, so an explicit value would be silently dropped.
@@ -571,12 +740,23 @@ fn validate_env(env: &HashMap<String, String>, reporting: Option<&Reporting>) ->
     Ok(())
 }
 
-fn validate_expression(source: &str, needs: &[String], steps: &[String]) -> Result<()> {
+/// Names of the partitioned jobs in one workflow; they publish no job outputs.
+type Partitioned<'a> = HashSet<&'a str>;
+
+fn validate_expression(
+    source: &str,
+    needs: &[String],
+    steps: &[String],
+    partitioned: &Partitioned,
+) -> Result<()> {
     let expression = Expression::parse(source)?;
     for reference in expression.references() {
         match reference {
             Reference::Needs { job, .. } if !needs.contains(job) => {
                 bail!("output reference requires declared dependency '{job}'");
+            }
+            Reference::Needs { job, .. } if partitioned.contains(job.as_str()) => {
+                bail!("partitioned job '{job}' publishes no outputs");
             }
             Reference::Step { step, .. } if !steps.contains(step) => {
                 bail!("output reference requires an earlier step '{step}'");
@@ -591,10 +771,11 @@ fn validate_condition(
     condition: Option<&Condition>,
     needs: &[String],
     steps: &[String],
+    partitioned: &Partitioned,
 ) -> Result<()> {
     match condition {
         Some(Condition::Expression { expression }) => {
-            validate_expression(expression, needs, steps)
+            validate_expression(expression, needs, steps, partitioned)
                 .context("invalid condition expression")?;
         }
         Some(Condition::LegacyShell(shell) | Condition::Shell { shell })
@@ -634,7 +815,36 @@ fn validate_reports(job: &Job, reporting: bool) -> Result<()> {
     Ok(())
 }
 
-fn validate_job(job: &Job, reporting: Option<&Reporting>) -> Result<()> {
+fn validate_partitions(job: &Job) -> Result<Option<Partitions>> {
+    let Some(input) = job.partitions_input else {
+        return Ok(None);
+    };
+    let count = u32::try_from(input.count)
+        .ok()
+        .filter(|count| *count <= MAX_PARTITIONS)
+        .and_then(NonZeroU32::new)
+        .with_context(|| {
+            format!(
+                "partitions count must be from 1 to {MAX_PARTITIONS}, got {}",
+                input.count
+            )
+        })?;
+    if !job.outputs.is_empty() {
+        bail!("partitioned jobs publish no job outputs; remove the outputs mapping (step outputs remain available within each instance)");
+    }
+    Ok(Some(Partitions {
+        count,
+        strategy: input.strategy,
+    }))
+}
+
+/// Returns the job's validated partition setting.
+fn validate_job(
+    job: &Job,
+    reporting: Option<&Reporting>,
+    partitioned: &Partitioned,
+) -> Result<Option<Partitions>> {
+    let partitions = validate_partitions(job)?;
     validate_reports(job, reporting.is_some())?;
     match (&job.command, job.steps.is_empty()) {
         (Some(command), true) => {
@@ -647,7 +857,7 @@ fn validate_job(job: &Job, reporting: Option<&Reporting>) -> Result<()> {
         _ => bail!("define either a command or nonempty steps, never both"),
     }
     validate_env(&job.env, reporting)?;
-    validate_condition(job.condition.as_ref(), &job.depends_on, &[])?;
+    validate_condition(job.condition.as_ref(), &job.depends_on, &[], partitioned)?;
     let mut steps = Vec::new();
     for step in &job.steps {
         (|| {
@@ -657,17 +867,22 @@ fn validate_job(job: &Job, reporting: Option<&Reporting>) -> Result<()> {
             }
             validate_command(&step.command, step.shell.unwrap_or(job.shell))?;
             validate_env(&step.env, reporting)?;
-            validate_condition(step.condition.as_ref(), &job.depends_on, &steps)
+            validate_condition(
+                step.condition.as_ref(),
+                &job.depends_on,
+                &steps,
+                partitioned,
+            )
         })()
         .with_context(|| format!("step '{}'", step.id))?;
         steps.push(step.id.clone());
     }
     for (key, source) in &job.outputs {
         validate_name(key, "output")?;
-        validate_expression(source, &job.depends_on, &steps)
+        validate_expression(source, &job.depends_on, &steps, partitioned)
             .with_context(|| format!("output '{key}'"))?;
     }
-    Ok(())
+    Ok(partitions)
 }
 
 fn cycle_path(jobs: &[Job], names: &HashMap<&str, usize>) -> String {
@@ -707,4 +922,150 @@ fn cycle_path(jobs: &[Job], names: &HashMap<&str, usize>) -> String {
         }
     }
     unreachable!("topological validation proved that a cycle exists")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn job(partitions: &str) -> std::result::Result<Job, String> {
+        toml::from_str::<Job>(&format!(
+            "name = 'test'\ncommand = 'true'\npartitions = {partitions}\n"
+        ))
+        .map_err(|error| error.to_string())
+    }
+
+    /// A parsed job with its partition setting validated, as `Config::validate` leaves it.
+    fn validated(partitions: &str) -> Job {
+        let mut job = job(partitions).unwrap();
+        job.partitions = validate_partitions(&job).unwrap();
+        job
+    }
+
+    fn index(count: u32) -> Option<Partitions> {
+        Some(Partitions {
+            count: NonZeroU32::new(count).unwrap(),
+            strategy: Strategy::Index,
+        })
+    }
+
+    #[test]
+    fn partitions_accept_integer_and_table_forms() {
+        let input = |count| {
+            Some(PartitionsInput {
+                count,
+                strategy: Strategy::Index,
+            })
+        };
+        assert_eq!(job("3").unwrap().partitions_input, input(3));
+        // Parsing alone never yields a scheduled partition setting.
+        assert_eq!(job("3").unwrap().partitions, None);
+        assert_eq!(validated("3").partitions, index(3));
+        assert_eq!(
+            validated("{ count = 2, strategy = 'index' }").partitions,
+            index(2)
+        );
+        assert_eq!(validated("{ count = 4 }").partitions, index(4));
+        let unpartitioned: Job = toml::from_str("name = 'a'\ncommand = 'true'").unwrap();
+        assert_eq!(unpartitioned.partitions_input, None);
+        assert_eq!(validate_partitions(&unpartitioned).unwrap(), None);
+        assert_eq!(unpartitioned.instances(), 1);
+        assert_eq!(validated("5").instances(), 5);
+    }
+
+    #[test]
+    fn config_validation_stores_validated_partitions_for_every_workflow() {
+        let mut config: Config = toml::from_str(
+            "[[workflows.ci.jobs]]\nname = 'test'\ncommand = 'true'\npartitions = 3\n",
+        )
+        .unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.workflows["ci"].jobs[0].partitions, index(3));
+    }
+
+    #[test]
+    fn partitions_serialize_in_normalized_table_form() {
+        let value = serde_json::to_value(validated("3")).unwrap();
+        assert_eq!(
+            value["partitions"],
+            serde_json::json!({"count": 3, "strategy": "index"})
+        );
+        let unpartitioned: Job = toml::from_str("name = 'a'\ncommand = 'true'").unwrap();
+        let value = serde_json::to_value(unpartitioned).unwrap();
+        assert!(value.get("partitions").is_none());
+    }
+
+    #[test]
+    fn partitions_reject_unsupported_values_with_specific_messages() {
+        for (value, message) in [
+            (
+                "{ count = 3, strategy = 'timings' }",
+                "partitions strategy 'timings' is not supported (supported: index)",
+            ),
+            (
+                "{ count = 3, files = ['a'] }",
+                "partitions key 'files' is not supported",
+            ),
+            ("{ strategy = 'index' }", "missing field `count`"),
+            ("{ count = 'three' }", "partitions count must be an integer"),
+            ("{ count = 2.5 }", "partitions count must be an integer"),
+            (
+                "{ count = 2, strategy = 1 }",
+                "partitions strategy must be a string",
+            ),
+            (
+                "'three'",
+                "expected a partition count integer or a { count, strategy } table",
+            ),
+            (
+                "2.5",
+                "expected a partition count integer or a { count, strategy } table",
+            ),
+            (
+                "true",
+                "expected a partition count integer or a { count, strategy } table",
+            ),
+        ] {
+            let error = job(value).unwrap_err();
+            assert!(error.contains(message), "{value}: {error}");
+            assert!(
+                !error.contains("did not match any variant"),
+                "{value}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn partition_counts_are_validated_from_1_to_64() {
+        for (count, valid) in [
+            (i64::MIN, false),
+            (-1, false),
+            (0, false),
+            (1, true),
+            (64, true),
+            (65, false),
+            (4_294_967_296, false),
+            (i64::MAX, false),
+        ] {
+            for form in [count.to_string(), format!("{{ count = {count} }}")] {
+                let result = validate_partitions(&job(&form).unwrap());
+                assert_eq!(result.is_ok(), valid, "{form}");
+                if !valid {
+                    assert_eq!(
+                        result.unwrap_err().to_string(),
+                        format!("partitions count must be from 1 to 64, got {count}")
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn partition_ids_expand_in_index_order() {
+        let ids: Vec<_> = validated("3").partition_ids().collect();
+        let id = |index| Some(Partition { index, count: 3 });
+        assert_eq!(ids, [id(1), id(2), id(3)]);
+        let unpartitioned: Job = toml::from_str("name = 'a'\ncommand = 'true'").unwrap();
+        assert_eq!(unpartitioned.partition_ids().collect::<Vec<_>>(), [None]);
+    }
 }

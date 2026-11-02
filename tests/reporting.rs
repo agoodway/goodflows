@@ -633,10 +633,11 @@ fn source_context_is_null_outside_git_and_captured_inside() {
 #[test]
 fn unwritable_spool_runs_checks_without_reporting_env() {
     for (command, code) in [("true", 0), ("exit 3", 1)] {
+        // `plain` must run even after `test` fails, whatever the parallelism.
         let p = project_with(
             "[reporting]\nproject = \"goodcases\"\nspool_dir = \"blocker/spool\"\n",
             &format!(
-                "[[jobs]]\nname = \"test\"\ncommand = 'printf %s \"${{GOODFLOWS_REPORT_DIR-unset}}:${{GOODFLOWS_RUN_ID-unset}}\" > seen; {command}'\nreports = [\"exunit-timings\"]\n[[jobs]]\nname = \"plain\"\ncommand = 'printf %s \"${{GOODFLOWS_REPORT_DIR-unset}}:${{GOODFLOWS_RUN_ID-unset}}\" > plain-seen'\n"
+                "[settings]\nfail_fast = false\n[[jobs]]\nname = \"test\"\ncommand = 'printf %s \"${{GOODFLOWS_REPORT_DIR-unset}}:${{GOODFLOWS_RUN_ID-unset}}\" > seen; {command}'\nreports = [\"exunit-timings\"]\n[[jobs]]\nname = \"plain\"\ncommand = 'printf %s \"${{GOODFLOWS_REPORT_DIR-unset}}:${{GOODFLOWS_RUN_ID-unset}}\" > plain-seen'\n"
             ),
         );
         std::fs::write(p.dir.join("blocker"), "file, not a directory").unwrap();
@@ -995,6 +996,48 @@ fn invalid_and_duplicate_reports_are_rejected_without_touching_files() {
     assert_eq!(
         std::fs::read_to_string(dir.join("c.jsonl")).unwrap(),
         "{bad\n"
+    );
+}
+
+#[test]
+fn invalid_filters_are_rejected_without_touching_files() {
+    let mock = Mock::store();
+    let p = project(
+        "[[jobs]]\nname = \"test\"\ncommand = 'cp fixtures/spaced.jsonl fixtures/long.jsonl \"$GOODFLOWS_REPORT_DIR/\"'\nreports = [\"exunit-timings\"]\n",
+    );
+    let with_include = |id: &str, include: Value| {
+        let mut lines: Vec<String> = timing_report(id, Some("1"))
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        let mut started: Value = serde_json::from_str(&lines[0]).unwrap();
+        started["filters"]["include"] = include;
+        lines[0] = started.to_string();
+        lines.iter().map(|l| format!("{l}\n")).collect::<String>()
+    };
+    let spaced = with_include("spaced", json!([{"tag": "slow test", "value": true}]));
+    let long = with_include(
+        "long",
+        Value::Array(vec![json!({"tag": "slow", "value": true}); 257]),
+    );
+    std::fs::write(p.dir.join("fixtures/spaced.jsonl"), &spaced).unwrap();
+    std::fs::write(p.dir.join("fixtures/long.jsonl"), &long).unwrap();
+    let output = run_with(&p, &["--json"], Some(&mock.url));
+    success(&output);
+    let collected = by_type(&events(&output), "reports_collected")[0].clone();
+    assert_eq!(collected["reports"], 0);
+    assert_eq!(collected["rejected"], json!({"unsupported_filter": 2}));
+    let dir = run_dirs(&p)[0].join("test");
+    let pending = dir.join("pending");
+    assert!(!pending.exists() || dir_entries(&pending) == 0);
+    assert_eq!(mock.connections(), 0);
+    assert_eq!(
+        std::fs::read(dir.join("reports/spaced.jsonl")).unwrap(),
+        spaced.as_bytes()
+    );
+    assert_eq!(
+        std::fs::read(dir.join("reports/long.jsonl")).unwrap(),
+        long.as_bytes()
     );
 }
 
@@ -1935,8 +1978,12 @@ fn replay_refuses_tampered_manifests_without_contacting_the_server() {
     type Edit = Box<dyn Fn(&mut Value)>;
     let cases: Vec<(Edit, &str)> = vec![
         (
+            Box::new(|m| m["version"] = json!(3)),
+            "unsupported manifest version 3",
+        ),
+        (
             Box::new(|m| m["version"] = json!(2)),
-            "unsupported manifest version 2",
+            "manifest version 2 requires at least one job with partition entries",
         ),
         (
             Box::new(|m| m["token_env"] = json!("GOODFLOWS_OUTPUT")),
@@ -2174,4 +2221,757 @@ fn replay_budget_flag_is_bounded() {
         let output = replay(&p.dir, &dir, None, &["--budget", bad]);
         assert_eq!(output.status.code(), Some(2), "{bad}");
     }
+}
+
+#[test]
+fn unpartitioned_jobs_never_see_inherited_partition_variables_with_reporting_enabled() {
+    // Reporting adds env removals and injections; inherited partition values must
+    // still be removed from report-producing and ordinary jobs alike.
+    let unset = r#"test -z "${GOODFLOWS_PARTITION+x}${GOODFLOWS_PARTITION_COUNT+x}""#;
+    let p = project(&format!(
+        r#"
+[[jobs]]
+name = "reporter"
+condition = {{ expression = 'env.GOODFLOWS_PARTITION == null && env.GOODFLOWS_PARTITION_COUNT == null' }}
+command = '''{unset} && test -n "$GOODFLOWS_REPORT_DIR" && {copy} && touch reporter'''
+reports = ["exunit-timings"]
+[[jobs]]
+name = "plain"
+condition = {{ shell = '''{unset}''' }}
+command = '''{unset} && touch plain'''
+[[jobs]]
+name = "direct"
+shell = false
+command = "sh -c '{direct} && touch direct'"
+[[jobs]]
+name = "stepped"
+reports = ["exunit-timings"]
+[[jobs.steps]]
+id = "a"
+condition = {{ shell = '''{unset}''' }}
+command = '''{unset} && touch stepped'''
+"#,
+        copy = copy(&["r1"]),
+        direct = unset.replace('"', "\\\""),
+    ));
+    let output = p
+        .command()
+        .env("GOODFLOWS_PARTITION", "2")
+        .env("GOODFLOWS_PARTITION_COUNT", "3")
+        .arg("--json")
+        .output()
+        .unwrap();
+    success(&output);
+    for file in ["reporter", "plain", "direct", "stepped"] {
+        assert!(p.dir.join(file).exists(), "{file}: {}", stdout(&output));
+    }
+    let events = events(&output);
+    let collected = by_type(&events, "reports_collected");
+    let reporter = collected.iter().find(|e| e["job"] == "reporter").unwrap();
+    assert_eq!(reporter["report_ids"], json!(["r1"]), "{collected:?}");
+}
+
+// ---- partitioned report collection ----
+
+/// A 3-partition reporting job whose instance `i` writes the fixture claiming
+/// partition `4 - i` (so Goodflows' identity must win), then runs `tail`.
+///
+/// `fail_fast` defaults to true: when `tail` makes an instance fail, any
+/// sibling not yet started (always the case at `parallelism` 1 or 2) is
+/// cancelled and produces nothing. Tests with an intentionally failing instance
+/// use [`partitioned_without_fail_fast`].
+fn partitioned(tail: &str) -> Project {
+    partitioned_with("", tail)
+}
+
+/// [`partitioned`] with `fail_fast = false`, so every instance runs whatever
+/// the machine's parallelism.
+fn partitioned_without_fail_fast(tail: &str) -> Project {
+    partitioned_with("[settings]\nfail_fast = false\n", tail)
+}
+
+fn partitioned_with(settings: &str, tail: &str) -> Project {
+    project(&format!(
+        "{settings}[[jobs]]\nname = \"test\"\npartitions = 3\ncommand = 'printf \"%s %s\" \"$GOODFLOWS_RUN_ID\" \"$GOODFLOWS_REPORT_DIR\" > seen-$GOODFLOWS_PARTITION && cp fixtures/r$((4 - GOODFLOWS_PARTITION)).jsonl \"$GOODFLOWS_REPORT_DIR/\"{tail}'\nreports = [\"exunit-timings\"]\n"
+    ))
+}
+
+#[test]
+fn partitioned_instances_get_their_own_directories_and_share_one_run_id() {
+    let p = partitioned("");
+    let output = p.run(&["--json"]);
+    success(&output);
+    let dir = run_dirs(&p).pop().unwrap();
+    let run_id = dir.file_name().unwrap().to_str().unwrap().to_owned();
+    let canonical = dir.canonicalize().unwrap();
+    let mut seen_dirs = Vec::new();
+    for i in 1..=3 {
+        let seen = p.read(&format!("seen-{i}"));
+        let (id, report_dir) = seen.split_once(' ').unwrap();
+        assert_eq!(id, run_id);
+        assert_eq!(
+            Path::new(report_dir).canonicalize().unwrap(),
+            canonical.join(format!("test/p{i}/reports"))
+        );
+        seen_dirs.push(report_dir.to_owned());
+    }
+    seen_dirs.dedup();
+    assert_eq!(seen_dirs.len(), 3);
+    // Every instance numbers its snapshots from 0 in its own pending/ directory.
+    for (i, report_id) in [(1, "r3"), (2, "r2"), (3, "r1")] {
+        let base = dir.join(format!("test/p{i}"));
+        assert_eq!(dir_entries(&base.join("pending")), 1);
+        let snapshot: Value =
+            serde_json::from_slice(&std::fs::read(base.join("pending/000.json")).unwrap()).unwrap();
+        assert_eq!(snapshot["report"]["report_id"], report_id);
+        // Goodflows' identity replaces the producer's claim in both places.
+        let partition = i.to_string();
+        assert_eq!(snapshot["report"]["partition"], partition.as_str());
+        assert_eq!(snapshot["report"]["partition_count"], 3);
+        assert_eq!(
+            snapshot["report"]["records"][0]["partition"],
+            partition.as_str()
+        );
+        assert_eq!(snapshot["report"]["records"][0]["partition_count"], 3);
+    }
+    assert!(!dir.join("test/reports").exists());
+    assert!(!dir.join("test/pending").exists());
+    use std::os::unix::fs::PermissionsExt;
+    for sub in ["", "reports", "pending", "acks"] {
+        let path = dir.join("test/p2").join(sub);
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700, "{}", path.display());
+    }
+}
+
+#[test]
+fn partitioned_instances_never_see_inherited_reporting_values() {
+    let p = partitioned("");
+    // As in a nested invocation: an enclosing goodflows exported its own values.
+    let output = p
+        .command()
+        .arg("--json")
+        .env("GOODFLOWS_REPORT_DIR", p.dir.join("inherited"))
+        .env("GOODFLOWS_RUN_ID", "inherited-run-id")
+        .output()
+        .unwrap();
+    success(&output);
+    let dir = run_dirs(&p).pop().unwrap();
+    let run_id = dir.file_name().unwrap().to_str().unwrap().to_owned();
+    let canonical = dir.canonicalize().unwrap();
+    for i in 1..=3 {
+        let seen = p.read(&format!("seen-{i}"));
+        assert!(!seen.contains("inherited"), "{i}: {seen}");
+        let (id, report_dir) = seen.split_once(' ').unwrap();
+        assert_eq!(id, run_id, "{i}");
+        assert_eq!(
+            Path::new(report_dir).canonicalize().unwrap(),
+            canonical.join(format!("test/p{i}/reports"))
+        );
+    }
+    assert!(!p.dir.join("inherited").exists());
+}
+
+#[test]
+fn instance_state_directories_replaced_by_symlinks_are_refused() {
+    let mock = Mock::store();
+    // Instance 2 points pending/ outside; instance 3 replaces acks/ with a link.
+    let p = project(
+        "[[jobs]]\nname = \"test\"\npartitions = 3\ncommand = 'cp fixtures/r$GOODFLOWS_PARTITION.jsonl \"$GOODFLOWS_REPORT_DIR/\"; d=$(dirname \"$GOODFLOWS_REPORT_DIR\"); mkdir -p \"$PWD/outside-$GOODFLOWS_PARTITION\"; case $GOODFLOWS_PARTITION in 2) rmdir \"$d/pending\"; ln -s \"$PWD/outside-2\" \"$d/pending\";; 3) rmdir \"$d/acks\"; ln -s \"$PWD/outside-3\" \"$d/acks\";; esac'\nreports = [\"exunit-timings\"]\n",
+    );
+    let output = run_with(&p, &["--json"], Some(&mock.url));
+    success(&output);
+    let events = events(&output);
+    let instance = |kind: &str, index: u64| {
+        by_type(&events, kind)
+            .into_iter()
+            .find(|e| e["partition"]["index"] == index)
+    };
+    let blocked = instance("reports_collected", 2).unwrap();
+    assert_eq!(blocked["reports"], 0);
+    assert_eq!(blocked["rejected"], json!({"snapshot_write_failed": 1}));
+    assert_eq!(dir_entries(&p.dir.join("outside-2")), 0);
+    // Instance 3's snapshot is sent, but its acknowledgement is not written through the link.
+    let pending = instance("report_upload_pending", 3).unwrap();
+    assert_eq!(pending["reason"], "state_write_failed");
+    assert_eq!(pending["report_id"], "r3");
+    assert_eq!(dir_entries(&p.dir.join("outside-3")), 0);
+    let dir = run_dirs(&p).pop().unwrap();
+    assert!(dir.join("test/p3/pending/000.json").exists());
+    // Instance 1 is unaffected.
+    assert_eq!(instance("report_uploaded", 1).unwrap()["report_id"], "r1");
+    assert!(dir.join("test/p1/acks/000.json").exists());
+    assert_eq!(by_type(&events, "report_uploaded").len(), 1);
+    assert_eq!(manifest(&dir)["state"], "finalized");
+}
+
+#[test]
+fn unpartitioned_reporting_layout_and_manifest_are_unchanged() {
+    let p = project(&format!(
+        "[[jobs]]\nname = \"test\"\ncommand = 'printf \"%s\" \"$GOODFLOWS_REPORT_DIR\" > seen && {}'\nreports = [\"exunit-timings\"]\n",
+        copy(&["r1"])
+    ));
+    let output = p.run(&["--json"]);
+    success(&output);
+    let dir = run_dirs(&p).pop().unwrap();
+    assert_eq!(
+        Path::new(&p.read("seen")).canonicalize().unwrap(),
+        dir.canonicalize().unwrap().join("test/reports")
+    );
+    let job = &manifest(&dir)["jobs"][0];
+    let mut keys: Vec<_> = job.as_object().unwrap().keys().cloned().collect();
+    keys.sort();
+    assert_eq!(keys, ["collection", "dir", "executed", "name", "status"]);
+    for kind in ["reports_collected", "report_upload_pending"] {
+        for event in by_type(&events(&output), kind) {
+            assert!(event.get("partition").is_none(), "{event}");
+        }
+    }
+}
+
+#[test]
+fn partitioned_manifest_has_one_entry_per_instance_with_its_own_status() {
+    let mock = Mock::store();
+    // Instance 2 fails; without fail_fast its siblings still run at any parallelism.
+    let p = partitioned_without_fail_fast(" && [ $GOODFLOWS_PARTITION != 2 ]");
+    let output = run_with(&p, &["--json"], Some(&mock.url));
+    assert_eq!(output.status.code(), Some(1));
+    let dir = run_dirs(&p).pop().unwrap();
+    let jobs = manifest(&dir)["jobs"].as_array().unwrap().clone();
+    assert_eq!(jobs.len(), 3);
+    for (i, job) in jobs.iter().enumerate() {
+        assert_eq!(job["name"], "test");
+        assert_eq!(job["dir"], "test");
+        assert_eq!(job["partition"], json!({"index": i + 1, "count": 3}));
+        assert_eq!(job["executed"], true);
+        assert_eq!(job["status"], if i == 1 { "failed" } else { "passed" });
+        assert_eq!(job["collection"]["reports"].as_array().unwrap().len(), 1);
+    }
+    let mut requests: Vec<_> = mock.requests().iter().map(|r| r.json()).collect();
+    requests.sort_by_key(|b| b["report"]["partition"].as_str().unwrap().to_owned());
+    let seen: Vec<_> = requests
+        .iter()
+        .map(|b| {
+            (
+                b["report"]["partition"].clone(),
+                b["report"]["partition_count"].clone(),
+                b["job_status"].clone(),
+                b["report"]["records"][0]["partition"].clone(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        seen,
+        [
+            (json!("1"), json!(3), json!("passed"), json!("1")),
+            (json!("2"), json!(3), json!("failed"), json!("2")),
+            (json!("3"), json!(3), json!("passed"), json!("3")),
+        ]
+    );
+    assert!(requests.iter().all(|b| b["job"] == "test"));
+    // Acknowledgements land in each instance's own acks/ directory.
+    for i in 1..=3 {
+        assert!(dir.join(format!("test/p{i}/acks/000.json")).exists());
+    }
+}
+
+#[test]
+fn skipped_instances_are_recorded_as_not_executed() {
+    let p = project(
+        "[settings]\nparallelism = 1\n[[jobs]]\nname = \"test\"\npartitions = 3\ncondition = { expression = \"env.GOODFLOWS_PARTITION != '2'\" }\ncommand = 'cp fixtures/r$GOODFLOWS_PARTITION.jsonl \"$GOODFLOWS_REPORT_DIR/\"'\nreports = [\"exunit-timings\"]\n",
+    );
+    let output = p.run(&["--json"]);
+    success(&output);
+    let dir = run_dirs(&p).pop().unwrap();
+    let jobs = manifest(&dir)["jobs"].as_array().unwrap().clone();
+    let executed: Vec<_> = jobs.iter().map(|j| j["executed"].clone()).collect();
+    assert_eq!(executed, [json!(true), json!(false), json!(true)]);
+    assert_eq!(jobs[1]["status"], "skipped");
+    assert_eq!(jobs[1]["collection"]["outcome"], "not_executed");
+}
+
+#[test]
+fn partitioned_reporting_events_identify_each_instance() {
+    let mock = Mock::store();
+    let p = partitioned("");
+    let output = run_with(&p, &["--json"], Some(&mock.url));
+    success(&output);
+    let events = events(&output);
+    for kind in ["reports_collected", "report_uploaded"] {
+        let mut partitions: Vec<_> = by_type(&events, kind)
+            .iter()
+            .map(|e| {
+                assert_eq!(e["job"], "test");
+                e["partition"].clone()
+            })
+            .collect();
+        partitions.sort_by_key(|p| p["index"].as_u64());
+        assert_eq!(
+            partitions,
+            (1..=3)
+                .map(|i| json!({"index": i, "count": 3}))
+                .collect::<Vec<_>>(),
+            "{kind}"
+        );
+    }
+    let collected = by_type(&events, "reports_collected")
+        .into_iter()
+        .find(|e| e["partition"]["index"] == 2)
+        .unwrap();
+    assert_eq!(collected["report_ids"], json!(["r2"]));
+
+    // Pending events carry the partition too, and text names the instance.
+    let p = partitioned("");
+    let conflict = Mock::start(|_, _| Reply::Status(409, vec![], String::new()));
+    let output = run_with(&p, &["--json"], Some(&conflict.url));
+    let pending = by_type(&events_of(&output), "report_upload_pending");
+    assert_eq!(pending.len(), 3);
+    assert!(pending.iter().all(|e| e["partition"]["count"] == 3));
+    let p = partitioned("");
+    let output = run_with(&p, &[], Some(&mock.url));
+    success(&output);
+    let text = stdout(&output);
+    for (i, id) in [(1, "r3"), (2, "r2"), (3, "r1")] {
+        assert!(
+            text.contains(&format!("reports test ({i}/3): 1 collected (collected)")),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!("report test ({i}/3)/{id} uploaded")),
+            "{text}"
+        );
+    }
+    let text = stdout(&run_with(&partitioned(""), &[], Some(&conflict.url)));
+    assert!(
+        text.contains("report test (2/3)/r2 pending: conflict (HTTP 409)"),
+        "{text}"
+    );
+}
+
+#[test]
+fn duplicate_report_ids_across_instances_reject_every_copy() {
+    let mock = Mock::store();
+    // Instances 1 and 3 both produce r1; instance 2 produces r2.
+    let p = project(
+        "[[jobs]]\nname = \"test\"\npartitions = 3\ncommand = 'if [ $GOODFLOWS_PARTITION = 2 ]; then id=r2; else id=r1; fi; cp fixtures/$id.jsonl \"$GOODFLOWS_REPORT_DIR/\"'\nreports = [\"exunit-timings\"]\n",
+    );
+    let output = run_with(&p, &["--json"], Some(&mock.url));
+    success(&output);
+    let events = events(&output);
+    let collected = by_type(&events, "reports_collected");
+    for event in &collected {
+        if event["partition"]["index"] == 2 {
+            assert_eq!(event["report_ids"], json!(["r2"]));
+            assert_eq!(event["rejected"], json!({}));
+        } else {
+            assert_eq!(event["report_ids"], json!([]));
+            assert_eq!(event["rejected"], json!({"duplicate_report_id": 1}));
+        }
+    }
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].json()["report"]["report_id"], "r2");
+    let dir = run_dirs(&p).pop().unwrap();
+    for i in [1, 3] {
+        let base = dir.join(format!("test/p{i}"));
+        assert_eq!(dir_entries(&base.join("pending")), 0);
+        assert_eq!(
+            std::fs::read_to_string(base.join("reports/r1.jsonl")).unwrap(),
+            timing_report("r1", Some("1"))
+        );
+    }
+    let jobs = manifest(&dir)["jobs"].clone();
+    assert_eq!(jobs[0]["collection"]["reports"], json!([]));
+    assert_eq!(jobs[2]["collection"]["reports"], json!([]));
+}
+
+#[test]
+fn instance_directory_replaced_by_a_symlink_is_refused() {
+    let p = project(
+        "[[jobs]]\nname = \"test\"\npartitions = 2\ncommand = 'cp fixtures/r$GOODFLOWS_PARTITION.jsonl \"$GOODFLOWS_REPORT_DIR/\"; if [ $GOODFLOWS_PARTITION = 2 ]; then d=$(dirname \"$GOODFLOWS_REPORT_DIR\"); mv \"$d\" \"$PWD/moved\"; ln -s \"$PWD/moved\" \"$d\"; fi'\nreports = [\"exunit-timings\"]\n",
+    );
+    let output = p.run(&["--json"]);
+    success(&output);
+    let collected = by_type(&events(&output), "reports_collected");
+    let second = collected
+        .iter()
+        .find(|e| e["partition"]["index"] == 2)
+        .unwrap();
+    assert_eq!(second["outcome"], "missing_directory");
+    assert_eq!(second["rejected"], json!({"not_directory": 1}));
+    let first = collected
+        .iter()
+        .find(|e| e["partition"]["index"] == 1)
+        .unwrap();
+    assert_eq!(first["report_ids"], json!(["r1"]));
+    assert_eq!(dir_entries(&p.dir.join("moved/pending")), 0);
+    assert!(p.dir.join("moved/reports/r2.jsonl").exists());
+}
+
+#[test]
+fn partitioned_instances_share_the_job_report_cap() {
+    let p = project(
+        "[[jobs]]\nname = \"test\"\npartitions = 2\ncommand = 'cp fixtures/p$GOODFLOWS_PARTITION/*.jsonl \"$GOODFLOWS_REPORT_DIR/\"'\nreports = [\"exunit-timings\"]\n",
+    );
+    for i in 1..=2 {
+        let dir = p.dir.join(format!("fixtures/p{i}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        for n in 0..130 {
+            let id = format!("p{i}-r{n:03}");
+            std::fs::write(dir.join(format!("{id}.jsonl")), timing_report(&id, None)).unwrap();
+        }
+    }
+    let output = p.run(&["--json"]);
+    success(&output);
+    let collected = by_type(&events(&output), "reports_collected");
+    let instance = |index: u64| {
+        collected
+            .iter()
+            .find(|e| e["partition"]["index"] == index)
+            .unwrap()
+    };
+    // The 256-report cap is consumed in partition order, so instance 2 loses reports.
+    assert_eq!(instance(1)["reports"], 130);
+    assert_eq!(instance(1)["rejected"], json!({}));
+    assert_eq!(instance(2)["reports"], 126);
+    assert_eq!(instance(2)["rejected"], json!({"report_limit": 4}));
+    let dir = run_dirs(&p).pop().unwrap();
+    let listed: usize = manifest(&dir)["jobs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|job| job["collection"]["reports"].as_array().unwrap().len())
+        .sum();
+    assert_eq!(listed, 256);
+    assert_eq!(dir_entries(&dir.join("test/p2/pending")), 126);
+}
+
+#[test]
+fn partitioned_steps_receive_their_instance_report_dir() {
+    // Each step records its report directory; each step condition records
+    // whether it could see one (it must not: conditions are not producers).
+    let p = project(
+        r#"
+[[jobs]]
+name = "test"
+partitions = 2
+reports = ["exunit-timings"]
+[[jobs.steps]]
+id = "a"
+condition = { shell = 'printf "%s" "${GOODFLOWS_REPORT_DIR-unset}" > cond-a-$GOODFLOWS_PARTITION' }
+command = 'printf "%s" "$GOODFLOWS_REPORT_DIR" > step-a-$GOODFLOWS_PARTITION'
+[[jobs.steps]]
+id = "b"
+condition = { shell = 'printf "%s" "${GOODFLOWS_REPORT_DIR-unset}" > cond-b-$GOODFLOWS_PARTITION' }
+command = 'printf "%s" "$GOODFLOWS_REPORT_DIR" > step-b-$GOODFLOWS_PARTITION && cp fixtures/r$GOODFLOWS_PARTITION.jsonl "$GOODFLOWS_REPORT_DIR/"'
+"#,
+    );
+    let output = p.run(&["--json"]);
+    success(&output);
+    let dir = run_dirs(&p).pop().unwrap().canonicalize().unwrap();
+    for i in 1..=2 {
+        for step in ["a", "b"] {
+            let seen = p.read(&format!("step-{step}-{i}"));
+            assert_eq!(
+                Path::new(&seen).canonicalize().unwrap(),
+                dir.join(format!("test/p{i}/reports")),
+                "step {step} of instance {i}"
+            );
+            assert_eq!(p.read(&format!("cond-{step}-{i}")), "unset", "{step} {i}");
+        }
+    }
+    let collected = by_type(&events(&output), "reports_collected");
+    for i in 1..=2u64 {
+        let event = collected
+            .iter()
+            .find(|e| e["partition"]["index"] == i)
+            .unwrap();
+        assert_eq!(event["report_ids"], json!([format!("r{i}")]));
+    }
+}
+
+/// A finalized 3-partition run saved without credentials.
+fn saved_partitioned_run() -> (Project, PathBuf) {
+    let p = project_with(
+        "[reporting]\nproject = \"goodcases\"\nurl_env = \"SAVED_URL\"\ntoken_env = \"SAVED_KEY\"\n",
+        "[[jobs]]\nname = \"test\"\npartitions = 3\ncommand = 'cp fixtures/r$GOODFLOWS_PARTITION.jsonl \"$GOODFLOWS_REPORT_DIR/\"'\nreports = [\"exunit-timings\"]\n",
+    );
+    success(&p.run(&["--json"]));
+    let dir = run_dirs(&p).pop().unwrap();
+    (p, dir)
+}
+
+#[test]
+fn replay_sends_each_instance_with_its_partition() {
+    let (p, dir) = saved_partitioned_run();
+    let mock = Mock::store();
+    let output = replay(&p.dir, &dir, Some(&mock.url), &["--json"]);
+    success(&output);
+    let mut partitions: Vec<_> = mock
+        .requests()
+        .iter()
+        .map(|r| {
+            let body = r.json();
+            assert_eq!(body["report"]["partition_count"], 3);
+            assert_eq!(
+                body["report"]["records"][0]["partition"],
+                body["report"]["partition"]
+            );
+            body["report"]["partition"].as_str().unwrap().to_owned()
+        })
+        .collect();
+    partitions.sort();
+    assert_eq!(partitions, ["1", "2", "3"]);
+    let events = events(&output);
+    let uploaded = by_type(&events, "report_uploaded");
+    assert_eq!(uploaded.len(), 3);
+    assert!(uploaded.iter().all(|e| e["partition"]["count"] == 3));
+    assert_eq!(events.last().unwrap()["acknowledged"], 3);
+    for i in 1..=3 {
+        assert!(dir.join(format!("test/p{i}/acks/000.json")).exists());
+    }
+    // A second replay finds every instance acknowledged.
+    success(&replay(&p.dir, &dir, Some(&mock.url), &["--json"]));
+    assert_eq!(mock.requests().len(), 3);
+}
+
+#[test]
+fn replay_refuses_an_instance_snapshot_edited_to_another_partition() {
+    let (p, dir) = saved_partitioned_run();
+    // Consistently rewritten, so only the manifest identity can catch it.
+    let path = dir.join("test/p2/pending/000.json");
+    let mut value: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    value["report"]["partition"] = json!("3");
+    value["report"]["records"][0]["partition"] = json!("3");
+    std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+    let mock = Mock::store();
+    let output = replay(&p.dir, &dir, Some(&mock.url), &["--json"]);
+    assert_eq!(output.status.code(), Some(1));
+    let events = events(&output);
+    let pending = by_type(&events, "report_upload_pending");
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0]["reason"], "invalid_snapshot");
+    assert_eq!(pending[0]["partition"], json!({"index": 2, "count": 3}));
+    assert_eq!(events.last().unwrap()["invalid"], 1);
+    assert_eq!(mock.requests().len(), 2);
+}
+
+#[test]
+fn replay_refuses_inconsistent_partition_entries() {
+    type Edit = Box<dyn Fn(&mut Value)>;
+    let cases: Vec<(Edit, &str)> = vec![
+        (
+            Box::new(|m| m["jobs"][1]["partition"]["index"] = json!(1)),
+            "duplicate partition index",
+        ),
+        (
+            Box::new(|m| m["jobs"][2]["partition"]["index"] = json!(4)),
+            "partition index must be from 1 to its count",
+        ),
+        (
+            Box::new(|m| m["jobs"][0]["partition"]["index"] = json!(0)),
+            "partition index must be from 1 to its count",
+        ),
+        (
+            Box::new(|m| {
+                for job in m["jobs"].as_array_mut().unwrap() {
+                    job["partition"]["count"] = json!(65);
+                }
+            }),
+            "partition count must be from 1 to 64",
+        ),
+        (
+            Box::new(|m| m["jobs"][1]["partition"]["count"] = json!(4)),
+            "disagree on the partition count",
+        ),
+        (
+            Box::new(|m| {
+                m["jobs"][1].as_object_mut().unwrap().remove("partition");
+            }),
+            "both partitioned and unpartitioned entries",
+        ),
+        (
+            Box::new(|m| {
+                m["jobs"][0].as_object_mut().unwrap().remove("partition");
+            }),
+            "both partitioned and unpartitioned entries",
+        ),
+        (
+            Box::new(|m| m["jobs"][0]["partition"]["count"] = json!(0)),
+            "partition count must be from 1 to 64",
+        ),
+        (
+            Box::new(|m| m["jobs"][0]["partition"]["extra"] = json!(1)),
+            "invalid manifest",
+        ),
+        (
+            Box::new(|m| m["version"] = json!(1)),
+            "manifest version 1 requires no partition entries",
+        ),
+        (
+            Box::new(|m| m["version"] = json!(3)),
+            "unsupported manifest version 3",
+        ),
+    ];
+    let mock = Mock::store();
+    for (edit, message) in cases {
+        let (p, dir) = saved_partitioned_run();
+        edit_manifest(&dir, edit);
+        let output = replay(&p.dir, &dir, Some(&mock.url), &["--json"]);
+        assert_eq!(output.status.code(), Some(1), "{message}");
+        let event = events(&output).pop().unwrap();
+        assert_eq!(event["type"], "error");
+        let text = event["message"].as_str().unwrap();
+        assert!(text.contains(message), "{message}: {text}");
+    }
+    assert_eq!(mock.connections(), 0);
+}
+
+#[test]
+fn replay_accepts_reordered_and_incomplete_instance_entries() {
+    // Entries listed 3, 1, 2: order is not part of the manifest's consistency.
+    let (p, dir) = saved_partitioned_run();
+    assert_eq!(manifest(&dir)["version"], 2);
+    edit_manifest(&dir, |m| {
+        let jobs = m["jobs"].as_array_mut().unwrap();
+        jobs.rotate_right(1);
+    });
+    let mock = Mock::store();
+    let output = replay(&p.dir, &dir, Some(&mock.url), &["--json"]);
+    success(&output);
+    let mut sent: Vec<_> = mock
+        .requests()
+        .iter()
+        .map(|r| {
+            let report = &r.json()["report"];
+            (
+                report["partition"].as_str().unwrap().to_owned(),
+                report["report_id"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect();
+    sent.sort();
+    assert_eq!(
+        sent,
+        [("1", "r1"), ("2", "r2"), ("3", "r3")].map(|(a, b)| (a.to_owned(), b.to_owned()))
+    );
+    assert_eq!(events(&output).last().unwrap()["acknowledged"], 3);
+
+    // A manifest missing an instance replays the instances it lists.
+    let (p, dir) = saved_partitioned_run();
+    edit_manifest(&dir, |m| {
+        m["jobs"].as_array_mut().unwrap().remove(1);
+    });
+    let mock = Mock::store();
+    let output = replay(&p.dir, &dir, Some(&mock.url), &["--json"]);
+    success(&output);
+    let mut sent: Vec<_> = mock
+        .requests()
+        .iter()
+        .map(|r| r.json()["report"]["report_id"].as_str().unwrap().to_owned())
+        .collect();
+    sent.sort();
+    assert_eq!(sent, ["r1", "r3"]);
+}
+
+#[test]
+fn replay_counts_a_leftover_duplicate_snapshot_once_and_never_sends_it() {
+    let (p, dir) = saved_partitioned_run();
+    // As if instance 2's duplicate could not be discarded: its snapshot stays
+    // in pending/ but is not listed.
+    assert!(dir.join("test/p2/pending/000.json").exists());
+    edit_manifest(&dir, |m| {
+        let collection = &mut m["jobs"][1]["collection"];
+        collection["reports"] = json!([]);
+        collection["rejected"] = json!({"duplicate_report_id": 1, "snapshot_discard_failed": 1});
+    });
+    let mock = Mock::store();
+    let output = replay(&p.dir, &dir, Some(&mock.url), &["--json"]);
+    assert_eq!(output.status.code(), Some(1));
+    let events = events(&output);
+    let summary = events.last().unwrap();
+    assert_eq!(summary["type"], "reports_upload_summary");
+    assert_eq!(summary["invalid"], 1);
+    assert_eq!(summary["acknowledged"], 2);
+    let mut sent: Vec<_> = mock
+        .requests()
+        .iter()
+        .map(|r| r.json()["report"]["report_id"].as_str().unwrap().to_owned())
+        .collect();
+    sent.sort();
+    assert_eq!(sent, ["r1", "r3"]);
+    assert!(by_type(&events, "report_upload_pending").is_empty());
+    assert!(!dir.join("test/p2/acks/000.json").exists());
+    assert!(dir.join("test/p2/pending/000.json").exists());
+}
+
+#[test]
+fn replay_checks_report_ids_across_a_jobs_instances() {
+    let (p, dir) = saved_partitioned_run();
+    // Instance 3's manifest entry claims instance 1's report id.
+    edit_manifest(&dir, |m| {
+        m["jobs"][2]["collection"]["reports"][0]["report_id"] = json!("r1")
+    });
+    let mock = Mock::store();
+    let output = replay(&p.dir, &dir, Some(&mock.url), &["--json"]);
+    assert_eq!(output.status.code(), Some(1));
+    let events = events(&output);
+    // Like collection, replay refuses every copy, not only the later one.
+    let pending = by_type(&events, "report_upload_pending");
+    assert_eq!(pending.len(), 2);
+    for (event, index) in pending.iter().zip([1, 3]) {
+        assert_eq!(event["reason"], "invalid_snapshot");
+        assert_eq!(event["report_id"], "r1");
+        assert_eq!(event["partition"]["index"], index);
+    }
+    assert_eq!(events.last().unwrap()["invalid"], 2);
+    assert_eq!(events.last().unwrap()["acknowledged"], 1);
+    let sent: Vec<_> = mock
+        .requests()
+        .iter()
+        .map(|r| r.json()["report"]["report_id"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(sent, ["r2"]);
+    for i in [1, 3] {
+        assert!(!dir.join(format!("test/p{i}/acks/000.json")).exists());
+    }
+
+    // The same id listed twice within one unpartitioned entry refuses both too.
+    let (p, dir) = saved_run(None);
+    edit_manifest(&dir, |m| {
+        let reports = &mut m["jobs"][0]["collection"]["reports"];
+        reports[1]["report_id"] = reports[0]["report_id"].clone();
+    });
+    let output = replay(&p.dir, &dir, Some(&mock.url), &["--json"]);
+    assert_eq!(output.status.code(), Some(1));
+    let replayed = events_of(&output);
+    assert_eq!(by_type(&replayed, "report_upload_pending").len(), 2);
+    assert_eq!(replayed.last().unwrap()["invalid"], 2);
+    assert_eq!(mock.requests().len(), 1);
+}
+
+#[test]
+fn replay_of_a_manifest_written_before_partitions_is_unchanged() {
+    let (p, dir) = saved_run(None);
+    // The older format: job entries without any partition key.
+    let saved = manifest(&dir);
+    assert_eq!(saved["version"], 1);
+    for job in saved["jobs"].as_array().unwrap() {
+        assert!(job.get("partition").is_none());
+    }
+    let before: Vec<_> = (0..2)
+        .map(|i| std::fs::read(dir.join(format!("test/pending/{i:03}.json"))).unwrap())
+        .collect();
+    let mock = Mock::store();
+    let output = replay(&p.dir, &dir, Some(&mock.url), &["--json"]);
+    success(&output);
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 2);
+    for (request, bytes) in requests.iter().zip(&before) {
+        assert_eq!(&request.body, bytes);
+    }
+    for event in by_type(&events(&output), "report_uploaded") {
+        assert!(event.get("partition").is_none(), "{event}");
+    }
+    assert_eq!(manifest(&dir), saved);
 }

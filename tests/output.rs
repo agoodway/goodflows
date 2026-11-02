@@ -247,3 +247,247 @@ command = """head -c 6000 /dev/zero | LC_ALL=C tr '\\000' '\\377'; i=0; while [ 
     assert_eq!(result["stdout_truncated"], true);
     assert_eq!(result["stderr_truncated"], true);
 }
+
+const PARTITIONED: &str = r#"
+[settings]
+parallelism = 4
+[[jobs]]
+name = "compile"
+command = "echo compiled"
+[[jobs]]
+name = "test"
+depends_on = ["compile"]
+partitions = 3
+command = "echo $GOODFLOWS_PARTITION/$GOODFLOWS_PARTITION_COUNT"
+[[jobs]]
+name = "stepped"
+partitions = 2
+[[jobs.steps]]
+id = "unit"
+command = "echo step $GOODFLOWS_PARTITION"
+[[jobs]]
+name = "plainsteps"
+[[jobs.steps]]
+id = "only"
+command = "echo plain step"
+"#;
+
+#[test]
+fn json_events_identify_each_instance_and_leave_unpartitioned_events_unchanged() {
+    let p = Project::new(PARTITIONED);
+    let output = p.run(&["--json"]);
+    success(&output);
+    // `events` asserts every line is a valid versioned event.
+    let events = events(&output);
+    assert_eq!(events[0]["type"], "run_started");
+    assert_eq!(events[0]["jobs"], 7);
+    for event in &events {
+        let (name, partition) = match event["type"].as_str().unwrap() {
+            "job_started" | "step_started" | "job_output" | "step_finished" => {
+                (&event["name"], &event["partition"])
+            }
+            "job_finished" => (&event["result"]["name"], &event["result"]["partition"]),
+            _ => continue,
+        };
+        match name.as_str().unwrap() {
+            "compile" | "plainsteps" => {
+                assert!(event.get("partition").is_none(), "{event}");
+                assert!(event["result"].get("partition").is_none(), "{event}");
+                if name == "plainsteps" && event["type"] == "job_output" {
+                    assert_eq!(event["step"], "only");
+                    assert_eq!(event["data"], "plain step\n");
+                }
+            }
+            "test" => {
+                let index = partition["index"].as_u64().unwrap();
+                assert!((1..=3).contains(&index), "{event}");
+                assert_eq!(partition["count"], 3, "{event}");
+                assert_eq!(partition.as_object().unwrap().len(), 2, "{event}");
+                if event["type"] == "job_output" {
+                    assert_eq!(event["data"], format!("{index}/3\n"));
+                }
+            }
+            "stepped" => {
+                let index = partition["index"].as_u64().unwrap();
+                assert_eq!(partition["count"], 2, "{event}");
+                if event["type"] == "job_output" {
+                    assert_eq!(event["step"], "unit");
+                    assert_eq!(event["data"], format!("step {index}\n"));
+                }
+            }
+            other => panic!("unexpected job {other}"),
+        }
+    }
+    for kind in ["job_started", "job_finished"] {
+        assert_eq!(events.iter().filter(|e| e["type"] == kind).count(), 7);
+    }
+    for kind in ["step_started", "step_finished", "job_output"] {
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| e["type"] == kind && e["name"] == "plainsteps")
+                .count(),
+            1,
+            "{kind}"
+        );
+    }
+    for kind in ["step_started", "step_finished"] {
+        assert_eq!(events.iter().filter(|e| e["type"] == kind).count(), 3);
+    }
+    let finished = events
+        .iter()
+        .find(|e| {
+            e["type"] == "job_finished"
+                && e["result"]["partition"]["index"] == 2
+                && e["result"]["name"] == "test"
+        })
+        .unwrap();
+    assert_eq!(
+        finished["result"]["partition"],
+        serde_json::json!({"index": 2, "count": 3})
+    );
+    // Jobs start concurrently, so find each event by name rather than position.
+    let find = |kind: &str, name: &str| {
+        events
+            .iter()
+            .find(|e| e["type"] == kind && e["name"] == name)
+            .unwrap_or_else(|| panic!("no {kind} for {name}"))
+    };
+    let keys = |event: &serde_json::Value| {
+        event
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        keys(find("job_started", "compile")),
+        ["name", "schema_version", "type", "workflow"]
+    );
+    assert_eq!(
+        keys(find("step_started", "plainsteps")),
+        ["name", "schema_version", "step", "type", "workflow"]
+    );
+    assert_eq!(
+        keys(find("step_finished", "plainsteps")),
+        ["name", "result", "schema_version", "type", "workflow"]
+    );
+    assert_eq!(
+        keys(find("job_output", "plainsteps")),
+        [
+            "data",
+            "name",
+            "schema_version",
+            "step",
+            "stream",
+            "type",
+            "workflow"
+        ]
+    );
+}
+
+#[test]
+fn steps_skipped_after_a_failed_step_keep_the_instance_identity() {
+    let p = Project::new(
+        r#"
+[settings]
+fail_fast = false
+[[jobs]]
+name = "test"
+partitions = 2
+[[jobs.steps]]
+id = "a"
+command = "test $GOODFLOWS_PARTITION != 2"
+[[jobs.steps]]
+id = "b"
+command = "true"
+[[jobs.steps]]
+id = "c"
+command = "true"
+"#,
+    );
+    let output = p.run(&["--json"]);
+    assert_eq!(output.status.code(), Some(1));
+    let events = events(&output);
+    let finished: Vec<_> = events
+        .iter()
+        .filter(|e| e["type"] == "step_finished" && e["partition"]["index"] == 2)
+        .collect();
+    assert_eq!(finished.len(), 3, "{finished:?}");
+    assert_eq!(finished[0]["result"]["status"], "failed");
+    for (event, step) in finished[1..].iter().zip(["b", "c"]) {
+        assert_eq!(event["result"]["id"], step);
+        assert_eq!(event["result"]["status"], "skipped");
+        assert_eq!(event["result"]["error"], "previous step did not pass");
+        assert_eq!(
+            event["partition"],
+            serde_json::json!({"index": 2, "count": 2})
+        );
+    }
+    // Skipped steps emit no step_started.
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| e["type"] == "step_started" && e["partition"]["index"] == 2)
+            .count(),
+        1
+    );
+    let summary = events.last().unwrap();
+    assert_eq!(summary["results"][0]["status"], "passed");
+    assert_eq!(summary["results"][1]["status"], "failed");
+    assert_eq!(summary["results"][1]["error"], "step 'a': exited with 1");
+}
+
+#[test]
+fn text_output_names_instances_and_the_summary_counts_them() {
+    let p = Project::new(
+        "[[jobs]]\nname='compile'\ncommand='true'\n[[jobs]]\nname='test'\npartitions=3\ndepends_on=['compile']\ncommand='echo $GOODFLOWS_PARTITION'\n",
+    );
+    let output = p.run(&[]);
+    success(&output);
+    let text = stdout(&output);
+    assert!(text.contains("jobs=4"), "{text}");
+    for index in 1..=3 {
+        for line in [
+            format!("→ test ({index}/3)\n"),
+            format!("[test ({index}/3) stdout] {index}\n"),
+            format!("test ({index}/3) PASSED"),
+        ] {
+            assert!(text.contains(&line), "missing {line:?}: {text}");
+        }
+    }
+    assert!(text.contains("→ compile\n") && text.contains("compile PASSED"));
+    assert!(text.contains("Summary: 4 passed, 0 failed"), "{text}");
+
+    let p = Project::new(
+        "[settings]\nfail_fast=false\n[[jobs]]\nname='test'\npartitions=3\ncommand='if [ $GOODFLOWS_PARTITION = 2 ]; then echo boom-$GOODFLOWS_PARTITION >&2; exit 3; fi'\n",
+    );
+    let output = p.run(&[]);
+    assert_eq!(output.status.code(), Some(1));
+    let text = stdout(&output);
+    for line in [
+        "test (2/3) FAILED",
+        "  stderr tail:\n",
+        "boom-2",
+        "test (1/3) PASSED",
+        "test (3/3) PASSED",
+    ] {
+        assert!(text.contains(line), "missing {line:?}: {text}");
+    }
+    // The tail belongs to the failed instance's block.
+    let failed = text.find("test (2/3) FAILED").unwrap();
+    assert!(text[failed..].contains("  stderr tail:"), "{text}");
+
+    let p = Project::new(PARTITIONED);
+    let text = stdout(&p.run(&["--jobs", "stepped"]));
+    for index in 1..=2 {
+        for line in [
+            format!("  → stepped ({index}/2)/unit\n"),
+            format!("[stepped ({index}/2)/unit stdout] step {index}\n"),
+            format!("  stepped ({index}/2)/unit PASSED"),
+        ] {
+            assert!(text.contains(&line), "missing {line:?}: {text}");
+        }
+    }
+}
