@@ -288,11 +288,60 @@ The whole config is validated before any command runs—even when selecting a su
 Unknown fields, duplicate/empty names, empty commands, missing or duplicate
 dependencies, self-dependencies, cycles, invalid environment entries, malformed
 direct-command quoting, zero timeouts, nonexistent workdirs, and job or step `env`
-entries for the reserved `GOODFLOWS_RUN_ID`/`GOODFLOWS_REPORT_DIR` are errors.
+entries for the reserved `GOODFLOWS_RUN_ID`, `GOODFLOWS_REPORT_DIR`,
+`GOODFLOWS_PARTITION` and `GOODFLOWS_PARTITION_COUNT` are errors.
 Cycle errors include an actual cycle path, such as `a -> b -> a`.
 
+### Partitioned jobs
+
+A job can declare `partitions` to run as several scheduled instances instead of
+fanning work out inside one command:
+
+```toml
+[settings]
+parallelism = 6   # 4 for other checks, plus count - 1 = 2 for the extra instances
+
+[[jobs]]
+name = "compile"
+command = "mix compile --warnings-as-errors"
+
+[[jobs]]
+name = "test"
+command = "MIX_TEST_PARTITION=$GOODFLOWS_PARTITION mix test --partitions $GOODFLOWS_PARTITION_COUNT"
+depends_on = ["compile"]
+partitions = 3
+# Equivalent table form:
+# partitions = { count = 3, strategy = "index" }
+```
+
+- `partitions = N` is shorthand for `partitions = { count = N, strategy = "index" }`.
+  The count must be an integer from 1 to 64. `partitions = 1` is allowed and runs a
+  single instance with the partition variables set.
+- `index` is the only strategy: goodflows supplies each instance's identity and the
+  command splits the work. Other strategies (such as timing-balanced file
+  assignment) are reserved for later releases; today any other `strategy` value or
+  any other table key is a validation error.
+- Every command, step and shell condition of instance *i* receives
+  `GOODFLOWS_PARTITION=i` (1-based) and `GOODFLOWS_PARTITION_COUNT=N`, and
+  expressions see the same values through `env.GOODFLOWS_PARTITION`. They override
+  inherited values. Unpartitioned jobs never see these variables, even when
+  goodflows itself was launched with them exported (expressions resolve them to
+  `null`). Setting either name in any job or step `env` is a validation error.
+- The command must consume the partition variables; a tool that ignores them runs
+  its full workload in every instance.
+- Partitioned jobs publish no job outputs. An `outputs` mapping on a partitioned job
+  and any `needs.<partitioned job>.outputs.*` reference are validation errors.
+  Command-only instances do not receive `GOODFLOWS_OUTPUT`; steps inside an instance
+  still do, and later steps of the same instance can read `steps.<id>.outputs.*`.
+- `partitions` cannot yet be combined with `reports`.
+
+See [Scheduling and failures](#scheduling-and-failures) for how instances are
+scheduled and [Logs and machine output](#logs-and-machine-output) for how they are
+reported.
+
 `list` displays every job field: name, command or steps, conditions, output mappings,
-dependencies, timeout, configured environment, and shell mode. It also shows effective `fail_fast`, `parallelism`,
+dependencies, timeout, configured environment, shell mode, and partitions (count and
+strategy, shown only for partitioned jobs). It also shows effective `fail_fast`, `parallelism`,
 and the resolved `workdir`, applying the same CLI overrides and CPU-count default
 as a run. In JSON, these values are under `jobs` and `settings`; job fields retain
 explicit defaults and nullable timeouts even though generated TOML omits them.
@@ -301,7 +350,8 @@ explicit defaults and nullable timeouts even though generated TOML omits them.
 `config_valid` JSON event retains `jobs` as the selected count, and includes
 `requested_jobs` (explicit CLI names; empty means all), `selected_jobs` (the
 dependency closure in config order), and `total_defined_jobs`. Human output also
-distinguishes selected and defined counts and lists the names.
+distinguishes selected and defined counts and lists the names. These counts are
+configured jobs; a partitioned job counts once.
 
 ## Named workflows
 
@@ -574,6 +624,23 @@ jobs finish. `--no-fail-fast` continues unrelated jobs, but a failed prerequisit
 always skips its dependents, transitively. `--fail-fast` and `--no-fail-fast`
 override the config and cannot be used together.
 
+A [partitioned job](#partitioned-jobs) expands into one instance per partition.
+Each instance occupies its own `parallelism` slot and has its own condition
+evaluation, steps, `timeout_secs` budget, status and failure tails. Instances are
+launched in index order at the job's position in the config. With `parallelism = 4`,
+a ready 3-partition job leaves one slot for other work; with `parallelism = 2`, two
+instances start and the third waits for a free slot. Raise `parallelism` by
+`count - 1` to keep other checks from queuing behind the instances. There is no
+per-job concurrency cap: a ready partitioned job (up to 64 instances) can take every
+slot, so jobs later in the config wait until its instances finish. `--jobs test`
+selects every instance of `test`, and a job with `depends_on = ["test"]` starts only
+after every instance passes. If any instance fails, times out, is cancelled or is
+skipped (including by its own condition), dependents are skipped with the usual
+dependency reason once the remaining instances finish, even under fail-fast. Jobs
+further down the chain that have not started may instead be skipped for fail-fast. Fail-fast, conditions, steps and cancellation apply to each
+instance as to any job: a failed instance stops unstarted siblings from starting,
+while running siblings finish.
+
 Results distinguish `passed`, `failed`, `skipped`, `timed_out`, and `cancelled`.
 Skipped jobs do not inflate the failure count. Failed commands retain their exit
 codes. Timeout, Ctrl+C, and SIGTERM terminate each job's Unix process group and
@@ -630,8 +697,13 @@ reports = ["exunit-timings"]
   UTF-8 bytes or containing control characters are validation errors.
 - `GOODFLOWS_RUN_ID` and `GOODFLOWS_REPORT_DIR` are reserved: setting either in any
   job or step `env` is a validation error. `url_env` and `token_env` must differ and
-  must not name a reserved variable or `GOODFLOWS_OUTPUT`, and no job or step `env`
-  may set the `token_env` variable (it is removed from every command).
+  must not name a reserved variable (`GOODFLOWS_RUN_ID`, `GOODFLOWS_REPORT_DIR`,
+  `GOODFLOWS_PARTITION`, `GOODFLOWS_PARTITION_COUNT`) or `GOODFLOWS_OUTPUT`, and no
+  job or step `env` may set the `token_env` variable (it is removed from every
+  command).
+- A job cannot declare both `partitions` and `reports` yet. A `[reporting]` block
+  may coexist with partitioned jobs that do not report; their instances still
+  receive `GOODFLOWS_PARTITION` and `GOODFLOWS_PARTITION_COUNT`.
 
 `validate` and `list` never read credentials, create spool directories or contact
 the server. `list --json` includes the nonsecret `reporting` block (project, env
@@ -793,6 +865,15 @@ Human output prefixes each stdout/stderr line with its job name and stream:
 [lint stderr] warning: ...
 ```
 
+Instances of a partitioned job are shown as `name (index/count)` on job, step and
+output lines:
+
+```text
+→ test (2/3)
+[test (2/3) stdout] 2/3
+test (2/3) PASSED  2ms exit=0
+```
+
 Optionally save raw stdout and stderr separately:
 
 ```bash
@@ -801,7 +882,11 @@ goodflows --log-dir .goodflows-logs
 
 Files use indexed, sanitized job names such as `001-fmt.stdout.log` and
 `001-fmt.stderr.log`. Named workflows get their own subdirectory, for example
-`.goodflows-logs/ci/001-fmt.stdout.log`. Workflow names are encoded as safe path
+`.goodflows-logs/ci/001-fmt.stdout.log`. Each instance of a partitioned job writes
+its own pair of files, with the partition index zero-padded to two digits after the
+job name so instance logs sort in index order: a 3-partition `test` at position 2 in
+the selected job list writes `002-test.p01.stdout.log` through
+`002-test.p03.stdout.log` and the matching `.stderr.log` files. Workflow names are encoded as safe path
 components: lowercase ASCII letters, digits, `_`, and `-` remain unchanged;
 other UTF-8 bytes are percent-encoded (including uppercase letters, avoiding
 collisions on case-insensitive filesystems). Legacy top-level jobs keep their
@@ -833,8 +918,20 @@ human-readable even with `--json`. Argument errors produce an `error` event.
 {"schema_version":1,"type":"job_output","name":"test","stream":"stdout","data":"ok\n"}
 ```
 
+Events and results for an instance of a partitioned job repeat the job `name` and
+add `partition` with `index` (1-based) and `count`. `job_started`, `step_started`,
+`step_finished`, `job_output` and `job_finished` results all carry it, including
+results for instances skipped or cancelled before they started. Use
+`(name, partition.index)` as the instance key. Events for unpartitioned jobs have
+no `partition` field. `run_started.jobs` and the `summary` counts count instances,
+so `compile` plus a 3-partition `test` reports 4 jobs.
+
+```json
+{"data":"2/3\n","name":"test","partition":{"count":3,"index":2},"schema_version":1,"stream":"stdout","type":"job_output","workflow":"default"}
+```
+
 The final `summary` contains `success`, counts for every status, and `results` in
-config order. Each result contains `name`, `command`, `status`, `duration_ms`,
+config order, with a partitioned job's instances in index order at its position. Each result contains `name`, `command`, `status`, `duration_ms`,
 nullable `exit_code`, nullable `error`, and `outputs`. Stepped jobs additionally
 include `steps` in config order, each with `id`, `command`, `status`, `duration_ms`,
 nullable `exit_code`, nullable `error`, and `outputs`. Their job-level `command` is

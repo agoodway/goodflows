@@ -7,7 +7,7 @@ Publish test timing reports from Goodflows invocations to account-scoped storage
 ## Requirements
 
 ### Requirement: Reporting is explicitly configured
-The CLI SHALL support a top-level reporting block and per-job `reports = ["exunit-timings"]`. Configuration without reporting SHALL retain existing behavior. Unsupported or duplicate formats, `reports` declared without a reporting block, inline tokens, a project not matching `[a-z0-9][a-z0-9_-]*` (1-64 bytes), a reporting job name longer than 64 UTF-8 bytes or containing control characters, `url_env`/`token_env` values that are not environment variable names, name a reserved goodflows variable (`GOODFLOWS_RUN_ID`, `GOODFLOWS_REPORT_DIR`, `GOODFLOWS_OUTPUT`) or name the same variable, a job or step `env` entry for the configured `token_env`, and malformed reporting configuration MUST fail validation before jobs execute. Inspection commands MUST NOT create report directories or contact the server.
+The CLI SHALL support a top-level reporting block and per-job `reports = ["exunit-timings"]`. Configuration without reporting SHALL retain existing behavior. Unsupported or duplicate formats, `reports` declared without a reporting block, inline tokens, a project not matching `[a-z0-9][a-z0-9_-]*` (1-64 bytes), a reporting job name longer than 64 UTF-8 bytes or containing control characters, `url_env`/`token_env` values that are not environment variable names, name a reserved goodflows variable (`GOODFLOWS_RUN_ID`, `GOODFLOWS_REPORT_DIR`, `GOODFLOWS_OUTPUT`, `GOODFLOWS_PARTITION`, `GOODFLOWS_PARTITION_COUNT`) or name the same variable, a job or step `env` entry for the configured `token_env`, and malformed reporting configuration MUST fail validation before jobs execute. Inspection commands MUST NOT create report directories or contact the server.
 
 #### Scenario: Existing workflow
 - **WHEN** a workflow has no reporting configuration
@@ -36,6 +36,10 @@ The CLI SHALL support a top-level reporting block and per-job `reports = ["exuni
 #### Scenario: Token variable set in job env
 - **WHEN** a reporting block exists and a job or step `env` sets the configured `token_env`
 - **THEN** validation fails naming the job, rather than the value being silently removed
+
+#### Scenario: Credential variable names a partition variable
+- **WHEN** the reporting block sets `url_env` or `token_env` to `GOODFLOWS_PARTITION` or `GOODFLOWS_PARTITION_COUNT`
+- **THEN** validation fails and no jobs execute
 
 ### Requirement: Collection belongs to one invocation and job
 Each reporting invocation SHALL have a unique workflow run identity and persistent job-specific report directories. The CLI MUST expose `GOODFLOWS_RUN_ID` and `GOODFLOWS_REPORT_DIR` to report-producing commands, prevent configured overrides of these values, and collect only regular JSONL files in that job directory after child processes finish. Whenever a reporting block exists, values of these names inherited from the CLI's own environment MUST NOT reach any command or expression. The job's `reports/`, `pending/` and `acks/` directories SHALL be created private (mode 0700) before any job starts, and snapshot or acknowledgement writes MUST refuse a state directory replaced by a symlink.

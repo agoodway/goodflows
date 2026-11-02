@@ -147,16 +147,14 @@ fn render(json: bool, mut event: Value, out: &mut impl Write, err: &mut impl Wri
                 text(&event, "workflow"),
                 text(&event, "workdir")
             )?,
-            "job_started" => writeln!(out, "→ {}", text(&event, "name").cyan())?,
-            "step_started" => {
-                writeln!(out, "  → {}/{}", text(&event, "name"), text(&event, "step"))?
-            }
+            "job_started" => writeln!(out, "→ {}", instance(&event).cyan())?,
+            "step_started" => writeln!(out, "  → {}/{}", instance(&event), text(&event, "step"))?,
             "step_finished" => {
                 let result = &event["result"];
                 writeln!(
                     out,
                     "  {}/{} {}  {}ms",
-                    text(&event, "name"),
+                    instance(&event),
                     text(result, "id"),
                     text(result, "status").to_uppercase(),
                     result["duration_ms"]
@@ -168,8 +166,8 @@ fn render(json: bool, mut event: Value, out: &mut impl Write, err: &mut impl Wri
             "job_output" => {
                 let data = text(&event, "data");
                 let name = match event["step"].as_str() {
-                    Some(step) => format!("{}/{step}", text(&event, "name")),
-                    None => text(&event, "name").to_owned(),
+                    Some(step) => format!("{}/{step}", instance(&event)),
+                    None => instance(&event),
                 };
                 write!(out, "[{} {}] {}", name, text(&event, "stream"), data)?;
                 if !data.ends_with('\n') {
@@ -188,7 +186,7 @@ fn render(json: bool, mut event: Value, out: &mut impl Write, err: &mut impl Wri
                 write!(
                     out,
                     "{} {}  {}ms",
-                    text(result, "name"),
+                    instance(result),
                     label,
                     result["duration_ms"]
                 )?;
@@ -331,6 +329,14 @@ fn render(json: bool, mut event: Value, out: &mut impl Write, err: &mut impl Wri
                     if let Some(outputs) = job.get("outputs") {
                         writeln!(out, "    outputs: {outputs}")?;
                     }
+                    if let Some(partitions) = job.get("partitions") {
+                        writeln!(
+                            out,
+                            "    partitions: {} (strategy={})",
+                            partitions["count"],
+                            text(partitions, "strategy")
+                        )?;
+                    }
                     if job.get("reports").is_some() {
                         writeln!(out, "    reports: {}", names(&job["reports"]))?;
                     }
@@ -456,6 +462,18 @@ fn names(value: &Value) -> String {
         .filter_map(Value::as_str)
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// A job's display name: `name`, or `name (i/N)` for a partition instance.
+fn instance(value: &Value) -> String {
+    let name = text(value, "name");
+    match (
+        value["partition"]["index"].as_u64(),
+        value["partition"]["count"].as_u64(),
+    ) {
+        (Some(index), Some(count)) => format!("{name} ({index}/{count})"),
+        _ => name.to_owned(),
+    }
 }
 
 fn text<'a>(event: &'a Value, key: &str) -> &'a str {

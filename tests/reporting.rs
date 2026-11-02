@@ -2175,3 +2175,51 @@ fn replay_budget_flag_is_bounded() {
         assert_eq!(output.status.code(), Some(2), "{bad}");
     }
 }
+
+#[test]
+fn unpartitioned_jobs_never_see_inherited_partition_variables_with_reporting_enabled() {
+    // Reporting adds env removals and injections; inherited partition values must
+    // still be removed from report-producing and ordinary jobs alike.
+    let unset = r#"test -z "${GOODFLOWS_PARTITION+x}${GOODFLOWS_PARTITION_COUNT+x}""#;
+    let p = project(&format!(
+        r#"
+[[jobs]]
+name = "reporter"
+condition = {{ expression = 'env.GOODFLOWS_PARTITION == null && env.GOODFLOWS_PARTITION_COUNT == null' }}
+command = '''{unset} && test -n "$GOODFLOWS_REPORT_DIR" && {copy} && touch reporter'''
+reports = ["exunit-timings"]
+[[jobs]]
+name = "plain"
+condition = {{ shell = '''{unset}''' }}
+command = '''{unset} && touch plain'''
+[[jobs]]
+name = "direct"
+shell = false
+command = "sh -c '{direct} && touch direct'"
+[[jobs]]
+name = "stepped"
+reports = ["exunit-timings"]
+[[jobs.steps]]
+id = "a"
+condition = {{ shell = '''{unset}''' }}
+command = '''{unset} && touch stepped'''
+"#,
+        copy = copy(&["r1"]),
+        direct = unset.replace('"', "\\\""),
+    ));
+    let output = p
+        .command()
+        .env("GOODFLOWS_PARTITION", "2")
+        .env("GOODFLOWS_PARTITION_COUNT", "3")
+        .arg("--json")
+        .output()
+        .unwrap();
+    success(&output);
+    for file in ["reporter", "plain", "direct", "stepped"] {
+        assert!(p.dir.join(file).exists(), "{file}: {}", stdout(&output));
+    }
+    let events = events(&output);
+    let collected = by_type(&events, "reports_collected");
+    let reporter = collected.iter().find(|e| e["job"] == "reporter").unwrap();
+    assert_eq!(reporter["report_ids"], json!(["r1"]), "{collected:?}");
+}

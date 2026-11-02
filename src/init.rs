@@ -153,6 +153,8 @@ fn job(name: &str, command: &str, deps: &[&str]) -> Job {
         env: HashMap::new(),
         shell: true,
         reports: Vec::new(),
+        partitions_input: None,
+        partitions: None,
     }
 }
 
