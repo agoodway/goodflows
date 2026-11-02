@@ -333,7 +333,9 @@ partitions = 3
   and any `needs.<partitioned job>.outputs.*` reference are validation errors.
   Command-only instances do not receive `GOODFLOWS_OUTPUT`; steps inside an instance
   still do, and later steps of the same instance can read `steps.<id>.outputs.*`.
-- `partitions` cannot yet be combined with `reports`.
+- Partitioned jobs may declare `reports`: each instance gets its own report
+  directory and its reports carry the instance's partition (see
+  [Test timing reports](#test-timing-reports)).
 
 See [Scheduling and failures](#scheduling-and-failures) for how instances are
 scheduled and [Logs and machine output](#logs-and-machine-output) for how they are
@@ -701,9 +703,17 @@ reports = ["exunit-timings"]
   `GOODFLOWS_PARTITION`, `GOODFLOWS_PARTITION_COUNT`) or `GOODFLOWS_OUTPUT`, and no
   job or step `env` may set the `token_env` variable (it is removed from every
   command).
-- A job cannot declare both `partitions` and `reports` yet. A `[reporting]` block
-  may coexist with partitioned jobs that do not report; their instances still
-  receive `GOODFLOWS_PARTITION` and `GOODFLOWS_PARTITION_COUNT`.
+- A [partitioned job](#partitioned-jobs) may declare `reports`. Every instance
+  receives its own `GOODFLOWS_REPORT_DIR` (all instances share one
+  `GOODFLOWS_RUN_ID`) and is collected separately, once, with its own
+  `job_status`. For reports collected from an instance, goodflows sets `partition`
+  to the instance index (as a decimal string, for example `"2"`) and
+  `partition_count` to the instance count, in both the request envelope and the
+  report's initial `suite_started` record, replacing whatever the producer wrote
+  (the server requires the two to agree). No other record field changes. Malformed
+  producer values (for example `"a b"`) still reject the report. Unpartitioned
+  reporting jobs keep the producer's partition values. A producer that ignores
+  `GOODFLOWS_REPORT_DIR` and writes to a shared path is never collected.
 
 `validate` and `list` never read credentials, create spool directories or contact
 the server. `list --json` includes the nonsecret `reporting` block (project, env
@@ -724,9 +734,9 @@ When at least one selected job declares `reports`, goodflows:
    a condition decides whether the job runs and is never a report producer. Values
    of these names inherited from the environment that launched goodflows (for
    example an enclosing goodflows run) are removed from every command whenever a
-   `[reporting]` block exists. The run directory and each job's `reports/`,
-   `pending/` and `acks/` directories are created private (mode 0700) before any job
-   starts.
+   `[reporting]` block exists. The run directory and each job's (or, for a
+   partitioned job, each instance's) `reports/`, `pending/` and `acks/` directories
+   are created private (mode 0700) before any job starts.
 3. Removes the `token_env` variable from **every** job, step and condition command,
    and from `${{ env.* }}` expression lookups, even when it is exported in the shell
    that launched goodflows. Only the publisher holds the key. On Linux goodflows also
@@ -778,7 +788,10 @@ certificate store. Other 4xx responses and redirects are not retried. A signal s
 requests immediately and preserves the signal exit code. Job `duration_ms` never
 includes reporting time.
 
-Collection is bounded: at most 256 reports and 256 MiB of source data per job,
+Collection is bounded: at most 256 reports and 256 MiB of source data per job
+(shared by all instances of a partitioned job and consumed in partition order,
+so when the instances together exceed a cap the highest-numbered instances lose
+reports first: two instances with 130 reports each collect 130 and 126),
 100,000 records and 32 MiB encoded per report. Source files over 33 MiB are
 rejected (`request_too_large`) without being parsed, and each valid report is
 frozen as soon as it is built, so only one report body is held in memory. An invalid final unterminated line
@@ -788,8 +801,14 @@ suite/report identities, an invalid partition, U+0000, an oversized field, a
 duplicate object key, nesting deeper than the server's 16-level body limit, a
 number with a fraction or exponent (or an integer above 2^53-1), a filter tag
 outside the server allowlist or a non-boolean filter value, or a `report_id`
-reused by two reports in the same job rejects that report locally. Only regular
-files that were read count toward the 256-report limit.
+reused by two reports in the same job (including across its instances, which
+rejects every copy as `duplicate_report_id`) rejects that report locally. A
+snapshot that cannot be written is counted as `snapshot_write_failed` (and,
+if it was also a duplicate, only as that). Each rejected file is counted under
+exactly one code, except that a rejected duplicate whose already-frozen snapshot
+cannot be removed is also counted as `snapshot_discard_failed`, which marks the
+leftover snapshot rather than another file (it is never listed in the manifest
+or sent). Only regular files that were read count toward the 256-report limit.
 Rejections appear only as codes and counts in `reports_collected.rejected`; source
 files are never modified and record contents are never printed.
 
@@ -809,14 +828,24 @@ collected stops collection between files (`collection_interrupted`).
   <job>/pending/000.json     # frozen request snapshots, written before any HTTP
   <job>/acks/000.json        # server acknowledgement, written atomically on success
   <job>/acks/000.rejected.json  # terminal server rejection (400/409/413/415/422)
+  <job>/p<index>/reports/*.jsonl   # partitioned jobs: one directory per instance,
+  <job>/p<index>/pending/000.json  # each with its own reports/, pending/ and acks/
+  <job>/p<index>/acks/000.json
 ```
 
 Job directory names use the same reversible encoding as workflow log directories
-(`Test` becomes `%54est`). The manifest stores only structural metadata: project,
-workflow, environment, the credential variable *names*, source context, job
-statuses, collection outcomes and each report's id and snapshot index (file
-locations are derived from the job directory and index, never stored as paths). It
-never stores the endpoint, the key or other environment values.
+(`Test` becomes `%54est`). A partitioned job (including `partitions = 1`) has no
+`reports/`, `pending/` or `acks/` of its own; each instance `p1`, `p2`, ... has them
+instead, and numbers its snapshots from `000`. Unpartitioned jobs keep the layout
+above. The manifest stores only structural metadata: project, workflow,
+environment, the credential variable *names*, source context, job statuses,
+collection outcomes and each report's id and snapshot index (file locations are
+derived from the job directory, partition and index, never stored as paths). A
+partitioned job has one manifest entry per instance, with `partition`
+(`{"index": i, "count": N}`) and that instance's own status; unpartitioned entries
+have no `partition` key. A manifest is `"version": 1` unless some entry has a
+partition, in which case it is `"version": 2`. It never stores the endpoint, the key or other environment
+values.
 
 The manifest is `running` while jobs execute and becomes `finalized` once every
 snapshot is written; a scheduler error marks it `aborted`. If goodflows is killed
@@ -833,9 +862,20 @@ GOODFLOWS_URL=https://flows.example.com GOODFLOWS_API_KEY=... \
 ```
 
 `reports upload` reads only the finalized manifest and its frozen snapshots. It
-validates the manifest first (version, a lowercase canonical run id, the project
-slug and credential variable name rules, and job names) and refuses a tampered one
-without contacting the server. Because the manifest chooses which of your
+validates the manifest first (version 1, or 2 exactly when an entry has a
+partition; a lowercase canonical run id, the project slug and credential variable
+name rules, job names, and partition entries: an index from 1 to its count, a
+count from 1 to 64, no repeated index, one count per job, and no job with both
+partitioned and unpartitioned entries) and refuses a tampered one without
+contacting the server. Partitioned runs replay per instance: each instance's
+snapshots are read from its own `p<index>/` directory, re-validated against that
+instance's partition, and acknowledged in its own `acks/`. Entries may appear in
+any order, and a manifest listing only some of a job's instances replays the
+instances it lists. A `report_id` listed more than once within one job, even by
+different instances, is not sent at all: every copy is reported as
+`invalid_snapshot`. Manifests written before partitions existed replay unchanged.
+Replay a run with the goodflows version that wrote it or a newer one: an older
+goodflows refuses a version 2 manifest with an unsupported-version error. Because the manifest chooses which of your
 environment variables become the endpoint and key, only replay run directories
 produced by your own invocations. It does
 not need the project checkout or config, runs no jobs and does not read current Git
@@ -849,7 +889,10 @@ permanently are skipped (`rejected_by_server`); delete the matching
 the 30-second publishing budget for large reports on slow links.
 
 It uses the same budget, retry and validation rules as a run, ends with a
-`reports_upload_summary` event (`acknowledged`, `pending`, `rejected`, `invalid`),
+`reports_upload_summary` event (`acknowledged`, `pending`, `rejected`, `invalid`;
+`invalid` counts every file collection rejected, once each: it excludes
+`snapshot_discard_failed`, which marks a leftover snapshot of a file already
+counted as `duplicate_report_id`),
 and exits 0 only when every frozen report is acknowledged, none was rejected by the
 server and collection rejected no files; otherwise it exits 1 (including missing
 credentials or an invalid origin, and for every replay of a run whose collection
@@ -909,6 +952,10 @@ and `type`. Types are `run_started`, `job_started`, `step_started`, `step_finish
 Runs with reporting jobs also emit `reports_collected`, `report_uploaded`,
 `report_upload_pending` and `reporting_skipped` before the final `summary`, and
 `reports upload` ends with `reports_upload_summary` (see Test timing reports).
+For an instance of a partitioned job, `reports_collected`, `report_uploaded` and
+`report_upload_pending` (from a run or from `reports upload`) keep `job` and add
+`partition` (`{"index": i, "count": N}`); text output shows the job as
+`job (i/N)`, for example `report test (2/3)/r2 uploaded`.
 Events for a selected workflow include `workflow`, including the default workflow.
 Discovery/aggregate-validation events and errors before selection may omit it.
 An interactive init confirmation goes to stderr in JSON mode. Help/version remain

@@ -219,8 +219,9 @@ impl Job {
     }
 }
 
-/// Identity of one instance of a partitioned job.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+/// Identity of one instance of a partitioned job. Serialized only into events
+/// and results; saved manifests use `reporting::ManifestPartition`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize)]
 pub struct Partition {
     pub index: u32,
     pub count: u32,
@@ -828,9 +829,6 @@ fn validate_partitions(job: &Job) -> Result<Option<Partitions>> {
                 input.count
             )
         })?;
-    if !job.reports.is_empty() {
-        bail!("partitions cannot be combined with reports; per-instance report collection is not supported yet");
-    }
     if !job.outputs.is_empty() {
         bail!("partitioned jobs publish no job outputs; remove the outputs mapping (step outputs remain available within each instance)");
     }

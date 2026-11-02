@@ -157,13 +157,20 @@ pub struct ReportingEnv {
     pub active: bool,
     /// The publisher's credential variable, removed from every child and expression.
     pub scrub: Option<String>,
-    /// Reserved variables injected into report-producing jobs.
-    pub jobs: HashMap<String, Vec<(String, String)>>,
+    /// Reserved variables injected into report-producing jobs, keyed by job
+    /// name and partition (`None` for an unpartitioned job).
+    pub jobs: HashMap<ReportingKey, Vec<(String, String)>>,
 }
 
+/// A report-producing unit: job name and, for an instance, its partition.
+pub type ReportingKey = (String, Option<Partition>);
+
 impl ReportingEnv {
-    fn reserved(&self, job: &str) -> &[(String, String)] {
-        self.jobs.get(job).map(Vec::as_slice).unwrap_or_default()
+    fn reserved(&self, job: &str, partition: Option<Partition>) -> &[(String, String)] {
+        self.jobs
+            .get(&(job.to_owned(), partition))
+            .map(Vec::as_slice)
+            .unwrap_or_default()
     }
 
     /// Remove the token and the reserved names. Conditions see only this view:
@@ -180,9 +187,14 @@ impl ReportingEnv {
     }
 
     /// The scrubbed view plus the reserved values, for the job's own commands.
-    fn inject(&self, job: &str, env: &HashMap<String, String>) -> HashMap<String, String> {
+    fn inject(
+        &self,
+        job: &str,
+        partition: Option<Partition>,
+        env: &HashMap<String, String>,
+    ) -> HashMap<String, String> {
         let mut env = env.clone();
-        for (key, value) in self.reserved(job) {
+        for (key, value) in self.reserved(job, partition) {
             env.insert(key.clone(), value.clone());
         }
         env
@@ -480,7 +492,7 @@ async fn run_job(
             result.finish(condition);
             return Ok(());
         }
-        let job_env = reporting.inject(&job.name, &env);
+        let job_env = reporting.inject(&job.name, partition, &env);
         if let Some(command) = &job.command {
             let outcome = execution
                 .command(
@@ -505,7 +517,7 @@ async fn run_job(
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect();
             reporting.scrub(&mut condition_env);
-            let step_env = reporting.inject(&job.name, &condition_env);
+            let step_env = reporting.inject(&job.name, partition, &condition_env);
             output
                 .emit(Partition::tag(
                     partition,
@@ -795,7 +807,7 @@ impl JobExecution<'_> {
             }
         }
         if !is_condition {
-            for (key, value) in self.reporting.reserved(&job.name) {
+            for (key, value) in self.reporting.reserved(&job.name, self.partition) {
                 command.env(key, value);
             }
         }

@@ -7,6 +7,7 @@
 
 use super::contract::{self, *};
 use super::Source;
+use crate::config::Partition;
 use serde::de::{DeserializeSeed, Deserializer, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde_json::{json, Map, Value};
 use std::cell::Cell;
@@ -34,6 +35,26 @@ pub const MAX_SOURCE_BYTES_PER_REPORT: u64 = MAX_REQUEST_BYTES as u64 + SOURCE_A
 /// so its own nesting, counting the record object as level 1, may be at most 13.
 const MAX_RECORD_DEPTH: usize = MAX_BODY_DEPTH - 3;
 
+/// A rejected duplicate whose already-frozen snapshot could not be removed.
+/// The file is already counted as `duplicate_report_id`; this code only makes
+/// the leftover snapshot visible.
+pub const SNAPSHOT_DISCARD_FAILED: &str = "snapshot_discard_failed";
+
+/// Rejection codes that annotate a file already counted under another code.
+/// Every other code counts exactly one rejected file, so these are excluded
+/// when rejections are totalled (see [`rejected_files`]).
+pub const SECONDARY_REJECTIONS: &[&str] = &[SNAPSHOT_DISCARD_FAILED];
+
+/// The number of files a collection rejected: one per file, never counting a
+/// [`SECONDARY_REJECTIONS`] code.
+pub fn rejected_files(rejected: &BTreeMap<String, usize>) -> usize {
+    rejected
+        .iter()
+        .filter(|(code, _)| !SECONDARY_REJECTIONS.contains(&code.as_str()))
+        .map(|(_, n)| n)
+        .sum()
+}
+
 pub struct JobContext<'a> {
     pub workflow_run_id: &'a str,
     pub workflow: &'a str,
@@ -41,6 +62,27 @@ pub struct JobContext<'a> {
     pub job: &'a str,
     pub job_status: &'a str,
     pub source: &'a Source,
+    /// The instance Goodflows scheduled, authoritative over producer values.
+    pub partition: Option<Partition>,
+}
+
+/// What remains of one job's collection allowance. All instances of a
+/// partitioned job draw from one budget, in index order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Budget {
+    pub reports: usize,
+    pub bytes: u64,
+    pub entries: usize,
+}
+
+impl Default for Budget {
+    fn default() -> Self {
+        Self {
+            reports: MAX_REPORTS_PER_JOB,
+            bytes: MAX_JOB_SOURCE_BYTES,
+            entries: MAX_ENTRIES_PER_JOB,
+        }
+    }
 }
 
 /// Receives each valid request body as soon as it is built, so at most one
@@ -49,7 +91,8 @@ pub trait Sink {
     /// Persist a frozen request body, returning its snapshot index.
     fn freeze(&mut self, body: &[u8]) -> Result<u32, ()>;
     /// Remove a body frozen earlier in this collection (a duplicate identity).
-    fn discard(&mut self, index: u32);
+    /// An error means the snapshot may remain on disk.
+    fn discard(&mut self, index: u32) -> Result<(), ()>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,7 +104,10 @@ pub struct Frozen {
 pub struct Collection {
     pub outcome: &'static str,
     pub rejected: BTreeMap<String, usize>,
+    /// Frozen reports that survived the job-wide duplicate pass.
     pub reports: Vec<Frozen>,
+    /// Every parsed identity (frozen or not), awaiting [`resolve_duplicates`].
+    parsed: Vec<(String, Option<u32>)>,
 }
 
 impl Collection {
@@ -74,6 +120,7 @@ impl Collection {
             outcome,
             rejected: BTreeMap::new(),
             reports: Vec::new(),
+            parsed: Vec::new(),
         }
     }
 
@@ -88,14 +135,18 @@ impl Collection {
     }
 }
 
-/// Collect every valid report from one executed job's directory, freezing each
-/// into `sink` as it is built. `stop` is checked before each file; once it
-/// returns true the remaining files are left unread (`collection_interrupted`).
+/// Collect every valid report from one executed job's (or instance's)
+/// directory, freezing each into `sink` as it is built and drawing from the
+/// job's remaining `budget`. `stop` is checked before each file; once it returns
+/// true the remaining files are left unread (`collection_interrupted`).
+/// Duplicate identities are resolved afterwards, across every directory of the
+/// job, by [`resolve_duplicates`].
 pub fn collect_dir(
     dir: &Path,
     ctx: &JobContext,
     sink: &mut dyn Sink,
     stop: &dyn Fn() -> bool,
+    budget: &mut Budget,
 ) -> Collection {
     // The directory itself must be a real directory, never a symlink to elsewhere.
     match std::fs::symlink_metadata(dir) {
@@ -113,7 +164,7 @@ pub fn collect_dir(
         collection.reject("unreadable_directory");
         return collection;
     };
-    // Keep only the lowest MAX_ENTRIES_PER_JOB names while enumerating, so a
+    // Keep only the lowest remaining-allowance names while enumerating, so a
     // directory flooded with entries bounds memory and sorting work, and the
     // examined set does not depend on directory order.
     let mut kept: BinaryHeap<String> = BinaryHeap::new();
@@ -126,7 +177,7 @@ pub fn collect_dir(
         let name = entry.file_name();
         match name.to_str() {
             Some(name) if name.ends_with(".jsonl") => {
-                if kept.len() < MAX_ENTRIES_PER_JOB {
+                if kept.len() < budget.entries {
                     kept.push(name.to_owned());
                 } else if kept.peek().is_some_and(|max| name < max.as_str()) {
                     kept.pop();
@@ -145,10 +196,7 @@ pub fn collect_dir(
         }
     }
     let names = kept.into_sorted_vec();
-    let mut used: u64 = 0;
-    let mut read = 0;
-    // Every parsed identity, frozen or not, so a duplicate is never chosen.
-    let mut parsed: Vec<(String, Option<u32>)> = Vec::new();
+    budget.entries -= names.len();
     for (index, name) in names.iter().enumerate() {
         if stop() {
             collection.outcome = "interrupted";
@@ -158,7 +206,7 @@ pub fn collect_dir(
         let path = dir.join(name);
         // Only regular files that were read count toward the report cap, so
         // symlinks and other junk cannot crowd out valid reports.
-        if read >= MAX_REPORTS_PER_JOB {
+        if budget.reports == 0 {
             collection.reject(match std::fs::symlink_metadata(&path) {
                 Ok(meta) if meta.file_type().is_symlink() => "symlink",
                 Ok(meta) if !meta.is_file() => "not_regular_file",
@@ -167,16 +215,17 @@ pub fn collect_dir(
             });
             continue;
         }
-        let bytes = match read_regular(&path, MAX_JOB_SOURCE_BYTES - used) {
+        let bytes = match read_regular(&path, budget.bytes) {
             Ok(bytes) => bytes,
             Err(code) => {
                 collection.reject(code);
                 continue;
             }
         };
-        used += bytes.len() as u64;
-        read += 1;
-        let built = parse_report(&bytes).and_then(|report| {
+        budget.bytes -= bytes.len() as u64;
+        budget.reports -= 1;
+        let built = parse_report(&bytes).and_then(|mut report| {
+            assign_partition(ctx.partition, &mut report);
             let body = envelope(ctx, &report)?;
             Ok((report.report_id, body))
         });
@@ -187,33 +236,68 @@ pub fn collect_dir(
                 if frozen.is_none() {
                     collection.reject("snapshot_write_failed");
                 }
-                parsed.push((report_id, frozen));
+                collection.parsed.push((report_id, frozen));
             }
             Err(code) => collection.reject(code),
         }
     }
-    // The server identity excludes suite_id, so a reused report_id cannot be disambiguated.
-    let mut counts: HashMap<&str, usize> = HashMap::new();
-    for (report_id, _) in &parsed {
-        *counts.entry(report_id.as_str()).or_default() += 1;
-    }
-    for (report_id, frozen) in &parsed {
-        if counts[report_id.as_str()] > 1 {
-            if let Some(index) = frozen {
-                sink.discard(*index);
-            }
-            collection.reject("duplicate_report_id");
-        } else if let Some(index) = frozen {
-            collection.reports.push(Frozen {
-                report_id: report_id.clone(),
-                index: *index,
-            });
+    collection
+}
+
+/// Resolve `report_id` uniqueness across every directory of one job. The
+/// server identity is `(project, workflow_run_id, job, report_id)` and excludes
+/// suite_id and partition, so a reused report_id cannot be disambiguated: every
+/// copy is rejected and any already-frozen snapshot is discarded through its own
+/// sink. A snapshot that cannot be removed is never listed or sent, and is
+/// counted as [`SNAPSHOT_DISCARD_FAILED`] in addition to `duplicate_report_id`.
+/// Each file counts under exactly one primary code: a duplicate that was never
+/// frozen is already counted as `snapshot_write_failed`, so it still makes the
+/// other copies duplicates but is not counted again. Surviving frozen reports
+/// become the collection's `reports`.
+pub fn resolve_duplicates<S: Sink>(instances: &mut [(Collection, S)]) {
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for (collection, _) in instances.iter() {
+        for (report_id, _) in &collection.parsed {
+            *counts.entry(report_id.clone()).or_default() += 1;
         }
     }
-    if collection.reports.is_empty() && collection.rejected.is_empty() {
-        collection.outcome = "no_reports";
+    for (collection, sink) in instances.iter_mut() {
+        for (report_id, frozen) in std::mem::take(&mut collection.parsed) {
+            if counts[&report_id] > 1 {
+                // Without a snapshot the file is already `snapshot_write_failed`.
+                if let Some(index) = frozen {
+                    if sink.discard(index).is_err() {
+                        collection.reject(SNAPSHOT_DISCARD_FAILED);
+                    }
+                    collection.reject("duplicate_report_id");
+                }
+            } else if let Some(index) = frozen {
+                collection.reports.push(Frozen { report_id, index });
+            }
+        }
+        if collection.outcome == "collected"
+            && collection.reports.is_empty()
+            && collection.rejected.is_empty()
+        {
+            collection.outcome = "no_reports";
+        }
     }
-    collection
+}
+
+/// For an instance Goodflows scheduled, its identity replaces the producer's
+/// partition fields in both the envelope and the initial `suite_started`
+/// record (the server requires the two to agree). Producer values were already
+/// grammar-checked by [`parse_report`]; no other record field changes.
+fn assign_partition(partition: Option<Partition>, report: &mut Report) {
+    let Some(partition) = partition else {
+        return;
+    };
+    report.partition = Value::String(partition.index.to_string());
+    report.partition_count = Value::from(partition.count);
+    if let Some(Value::Object(first)) = report.records.first_mut() {
+        first.insert("partition".into(), report.partition.clone());
+        first.insert("partition_count".into(), report.partition_count.clone());
+    }
 }
 
 /// Open a path without following a final symlink.
@@ -502,6 +586,8 @@ pub struct Head {
     pub job_status: String,
     pub source: Source,
     pub report_id: String,
+    pub partition: Option<String>,
+    pub partition_count: Option<u64>,
 }
 
 fn exact_keys(map: &Map<String, Value>, keys: &[&str]) -> bool {
@@ -594,6 +680,8 @@ pub fn validate_envelope(bytes: &[u8]) -> Result<Head, &'static str> {
         job_status,
         source,
         report_id: string(&report["report_id"])?,
+        partition: report["partition"].as_str().map(str::to_owned),
+        partition_count: report["partition_count"].as_u64(),
     })
 }
 
@@ -842,6 +930,8 @@ mod tests {
         pub bodies: BTreeMap<u32, Vec<u8>>,
         next: u32,
         pub fail: bool,
+        /// Discards fail and keep the body, like an unremovable snapshot.
+        pub fail_discard: bool,
     }
 
     impl Sink for MemorySink {
@@ -855,15 +945,32 @@ mod tests {
             Ok(index)
         }
 
-        fn discard(&mut self, index: u32) {
+        fn discard(&mut self, index: u32) -> Result<(), ()> {
+            if self.fail_discard {
+                return Err(());
+            }
             self.bodies.remove(&index);
+            Ok(())
         }
     }
 
-    fn collect(dir: &Path, ctx: &JobContext) -> (Collection, MemorySink) {
-        let mut sink = MemorySink::default();
-        let collection = collect_dir(dir, ctx, &mut sink, &|| false);
+    /// Collect one directory as a whole job: its own budget and duplicate pass.
+    fn collect_with(
+        dir: &Path,
+        ctx: &JobContext,
+        sink: MemorySink,
+        stop: &dyn Fn() -> bool,
+    ) -> (Collection, MemorySink) {
+        let mut sink = sink;
+        let collection = collect_dir(dir, ctx, &mut sink, stop, &mut Budget::default());
+        let mut instances = [(collection, sink)];
+        resolve_duplicates(&mut instances);
+        let [(collection, sink)] = instances;
         (collection, sink)
+    }
+
+    fn collect(dir: &Path, ctx: &JobContext) -> (Collection, MemorySink) {
+        collect_with(dir, ctx, MemorySink::default(), &|| false)
     }
 
     fn ctx<'a>(source: &'a Source, status: &'a str) -> JobContext<'a> {
@@ -874,6 +981,7 @@ mod tests {
             job: "test",
             job_status: status,
             source,
+            partition: None,
         }
     }
 
@@ -1380,8 +1488,12 @@ mod tests {
         for i in 0..STOP_CHECK_INTERVAL + 1 {
             std::fs::write(dir.path().join(format!("{i:05}.jsonl")), complete("x")).unwrap();
         }
-        let mut sink = MemorySink::default();
-        let collection = collect_dir(dir.path(), &ctx(&source, "passed"), &mut sink, &|| true);
+        let (collection, sink) = collect_with(
+            dir.path(),
+            &ctx(&source, "passed"),
+            MemorySink::default(),
+            &|| true,
+        );
         assert_eq!(collection.outcome, "interrupted");
         assert!(collection.reports.is_empty());
         assert_eq!(
@@ -1430,6 +1542,8 @@ mod tests {
                 job_status: "passed".into(),
                 source: source.clone(),
                 report_id: "r".into(),
+                partition: Some("1".into()),
+                partition_count: Some(3),
             }
         );
         let value: Value = serde_json::from_slice(&body).unwrap();
@@ -1528,8 +1642,12 @@ mod tests {
             calls.set(calls.get() + 1);
             calls.get() > 1
         };
-        let mut sink = MemorySink::default();
-        let collection = collect_dir(dir.path(), &ctx(&source, "passed"), &mut sink, &stop);
+        let (collection, _) = collect_with(
+            dir.path(),
+            &ctx(&source, "passed"),
+            MemorySink::default(),
+            &stop,
+        );
         assert_eq!(collection.outcome, "interrupted");
         assert_eq!(collection.reports.len(), 1);
         assert_eq!(collection.rejected["collection_interrupted"], 2);
@@ -1542,14 +1660,61 @@ mod tests {
         std::fs::write(dir.path().join("a.jsonl"), complete("a")).unwrap();
         std::fs::write(dir.path().join("b.jsonl"), complete("a")).unwrap();
         std::fs::write(dir.path().join("c.jsonl"), complete("c")).unwrap();
-        let mut sink = MemorySink {
+        let sink = MemorySink {
             fail: true,
             ..Default::default()
         };
-        let collection = collect_dir(dir.path(), &ctx(&source, "passed"), &mut sink, &|| false);
+        let (collection, _) = collect_with(dir.path(), &ctx(&source, "passed"), sink, &|| false);
         assert!(collection.reports.is_empty());
-        assert_eq!(collection.rejected["snapshot_write_failed"], 3);
-        assert_eq!(collection.rejected["duplicate_report_id"], 2);
+        // One code per file: the unfrozen duplicates are not counted twice.
+        assert_eq!(
+            collection.rejected,
+            BTreeMap::from([("snapshot_write_failed".into(), 3)])
+        );
+        assert_eq!(rejected_files(&collection.rejected), 3);
+    }
+
+    #[test]
+    fn a_duplicate_that_failed_to_freeze_still_rejects_its_frozen_copy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = Source::default();
+        let mut instances = Vec::new();
+        let mut budget = Budget::default();
+        for (index, fail) in [(1, true), (2, false)] {
+            let dir = tmp.path().join(format!("p{index}"));
+            std::fs::create_dir(&dir).unwrap();
+            std::fs::write(dir.join("dup.jsonl"), complete("dup")).unwrap();
+            let mut sink = MemorySink {
+                fail,
+                ..Default::default()
+            };
+            let ctx = instance_ctx(&source, index, 2);
+            let collection = collect_dir(&dir, &ctx, &mut sink, &|| false, &mut budget);
+            instances.push((collection, sink));
+        }
+        resolve_duplicates(&mut instances);
+        assert_eq!(
+            instances[0].0.rejected,
+            BTreeMap::from([("snapshot_write_failed".into(), 1)])
+        );
+        assert_eq!(
+            instances[1].0.rejected,
+            BTreeMap::from([("duplicate_report_id".into(), 1)])
+        );
+        assert!(instances
+            .iter()
+            .all(|(c, s)| c.reports.is_empty() && s.bodies.is_empty()));
+    }
+
+    #[test]
+    fn rejected_files_skip_secondary_codes() {
+        let rejected = BTreeMap::from([
+            ("duplicate_report_id".into(), 2),
+            (SNAPSHOT_DISCARD_FAILED.into(), 1),
+            ("snapshot_write_failed".into(), 1),
+        ]);
+        assert_eq!(rejected_files(&rejected), 3);
+        assert_eq!(rejected_files(&BTreeMap::new()), 0);
     }
 
     #[test]
@@ -1583,5 +1748,255 @@ mod tests {
             read_regular(&path, MAX_JOB_SOURCE_BYTES).unwrap_err(),
             "request_too_large"
         );
+    }
+
+    fn instance_ctx<'a>(source: &'a Source, index: u32, count: u32) -> JobContext<'a> {
+        JobContext {
+            partition: Some(Partition { index, count }),
+            ..ctx(source, "passed")
+        }
+    }
+
+    /// Collect one report file as instance `index` of `count` and return its frozen body.
+    fn collect_instance(report: &[u8], index: u32, count: u32) -> (Collection, MemorySink) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("r.jsonl"), report).unwrap();
+        let source = Source::default();
+        collect(dir.path(), &instance_ctx(&source, index, count))
+    }
+
+    fn frozen_partition(sink: &MemorySink) -> (Value, Value, Value, Value) {
+        let body: Value = serde_json::from_slice(sink.bodies.values().next().unwrap()).unwrap();
+        let report = &body["report"];
+        (
+            report["partition"].clone(),
+            report["partition_count"].clone(),
+            report["records"][0]["partition"].clone(),
+            report["records"][0]["partition_count"].clone(),
+        )
+    }
+
+    #[test]
+    fn instance_identity_replaces_null_producer_partition() {
+        let mut started = suite_started("r", Value::Null);
+        started["partition_count"] = Value::Null;
+        let report = jsonl(&[started, test_finished("r", "passed"), suite_finished("r")]);
+        let (collection, sink) = collect_instance(&report, 2, 3);
+        assert_eq!(collection.reports.len(), 1);
+        assert_eq!(
+            frozen_partition(&sink),
+            (json!("2"), json!(3), json!("2"), json!(3))
+        );
+        let head = validate_envelope(sink.bodies.values().next().unwrap()).unwrap();
+        assert_eq!(head.partition.as_deref(), Some("2"));
+        assert_eq!(head.partition_count, Some(3));
+    }
+
+    #[test]
+    fn instance_identity_overrides_a_disagreeing_producer() {
+        let mut started = suite_started("r", json!("1"));
+        started["partition_count"] = json!(4);
+        let report = jsonl(&[started, test_finished("r", "passed"), suite_finished("r")]);
+        let (collection, sink) = collect_instance(&report, 2, 3);
+        assert_eq!(collection.reports.len(), 1);
+        assert_eq!(
+            frozen_partition(&sink),
+            (json!("2"), json!(3), json!("2"), json!(3))
+        );
+        // The frozen body agrees with itself, as the server requires.
+        let body = sink.bodies.values().next().unwrap();
+        assert!(validate_envelope(body).is_ok());
+        // No other record field changes.
+        let value: Value = serde_json::from_slice(body).unwrap();
+        let mut first = value["report"]["records"][0].clone();
+        let mut original = suite_started("r", json!("1"));
+        for record in [&mut first, &mut original] {
+            record.as_object_mut().unwrap().remove("partition");
+            record.as_object_mut().unwrap().remove("partition_count");
+        }
+        assert_eq!(first, original);
+        assert_eq!(value["report"]["records"][1], test_finished("r", "passed"));
+    }
+
+    #[test]
+    fn malformed_producer_partition_still_rejects_an_instance_report() {
+        let report = jsonl(&[suite_started("r", json!("a b")), suite_finished("r")]);
+        let (collection, sink) = collect_instance(&report, 1, 2);
+        assert!(collection.reports.is_empty());
+        assert_eq!(collection.rejected["invalid_partition"], 1);
+        assert!(sink.bodies.is_empty());
+    }
+
+    #[test]
+    fn unpartitioned_jobs_keep_producer_partition_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut started = suite_started("r", json!("7"));
+        started["partition_count"] = json!(9);
+        std::fs::write(
+            dir.path().join("r.jsonl"),
+            jsonl(&[started, suite_finished("r")]),
+        )
+        .unwrap();
+        let source = Source::default();
+        let (_, sink) = collect(dir.path(), &ctx(&source, "passed"));
+        assert_eq!(
+            frozen_partition(&sink),
+            (json!("7"), json!(9), json!("7"), json!(9))
+        );
+    }
+
+    #[test]
+    fn duplicates_across_instances_reject_every_copy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = Source::default();
+        let mut instances = Vec::new();
+        let mut budget = Budget::default();
+        for (index, ids) in [(1, ["dup", "a"]), (2, ["b", "c"]), (3, ["dup", "d"])] {
+            let dir = tmp.path().join(format!("p{index}"));
+            std::fs::create_dir(&dir).unwrap();
+            for id in ids {
+                std::fs::write(dir.join(format!("{id}.jsonl")), complete(id)).unwrap();
+            }
+            let mut sink = MemorySink::default();
+            let ctx = instance_ctx(&source, index, 3);
+            let collection = collect_dir(&dir, &ctx, &mut sink, &|| false, &mut budget);
+            instances.push((collection, sink));
+        }
+        resolve_duplicates(&mut instances);
+        let ids = |i: usize| -> Vec<&str> {
+            instances[i]
+                .0
+                .reports
+                .iter()
+                .map(|r| r.report_id.as_str())
+                .collect()
+        };
+        assert_eq!(ids(0), ["a"]);
+        assert_eq!(ids(1), ["b", "c"]);
+        assert_eq!(ids(2), ["d"]);
+        for i in [0, 2] {
+            assert_eq!(instances[i].0.rejected["duplicate_report_id"], 1);
+            // The frozen duplicate was discarded through its own instance's sink.
+            assert_eq!(instances[i].1.bodies.len(), 1);
+        }
+        assert!(instances[1].0.rejected.is_empty());
+        assert_eq!(
+            std::fs::read(tmp.path().join("p1/dup.jsonl")).unwrap(),
+            complete("dup")
+        );
+    }
+
+    #[test]
+    fn a_failed_duplicate_discard_is_counted_and_never_listed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = Source::default();
+        let mut instances = Vec::new();
+        let mut budget = Budget::default();
+        for (index, fail_discard) in [(1, true), (2, false)] {
+            let dir = tmp.path().join(format!("p{index}"));
+            std::fs::create_dir(&dir).unwrap();
+            std::fs::write(dir.join("dup.jsonl"), complete("dup")).unwrap();
+            let mut sink = MemorySink {
+                fail_discard,
+                ..Default::default()
+            };
+            let ctx = instance_ctx(&source, index, 2);
+            let collection = collect_dir(&dir, &ctx, &mut sink, &|| false, &mut budget);
+            instances.push((collection, sink));
+        }
+        resolve_duplicates(&mut instances);
+        let (failed, kept) = (&instances[0], &instances[1]);
+        assert!(failed.0.reports.is_empty());
+        assert_eq!(
+            failed.0.rejected,
+            BTreeMap::from([
+                ("duplicate_report_id".into(), 1),
+                (SNAPSHOT_DISCARD_FAILED.into(), 1)
+            ])
+        );
+        assert_eq!(rejected_files(&failed.0.rejected), 1);
+        // The snapshot stays behind, but it is not a collected report.
+        assert_eq!(failed.1.bodies.len(), 1);
+        assert!(kept.0.reports.is_empty());
+        assert_eq!(
+            kept.0.rejected,
+            BTreeMap::from([("duplicate_report_id".into(), 1)])
+        );
+        assert!(kept.1.bodies.is_empty());
+    }
+
+    #[test]
+    fn instances_of_one_job_share_the_report_and_entry_caps() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = Source::default();
+        let mut budget = Budget::default();
+        let mut instances = Vec::new();
+        for index in 1..=2u32 {
+            let dir = tmp.path().join(format!("p{index}"));
+            std::fs::create_dir(&dir).unwrap();
+            for i in 0..200 {
+                std::fs::write(
+                    dir.join(format!("{i:04}.jsonl")),
+                    complete(&format!("p{index}-r{i}")),
+                )
+                .unwrap();
+            }
+            let mut sink = MemorySink::default();
+            let ctx = instance_ctx(&source, index, 2);
+            let collection = collect_dir(&dir, &ctx, &mut sink, &|| false, &mut budget);
+            instances.push((collection, sink));
+        }
+        resolve_duplicates(&mut instances);
+        assert_eq!(instances[0].0.reports.len(), 200);
+        assert_eq!(instances[0].1.bodies.len(), 200);
+        assert_eq!(instances[1].1.bodies.len(), MAX_REPORTS_PER_JOB - 200);
+        assert!(instances[0].0.rejected.is_empty());
+        assert_eq!(instances[1].0.reports.len(), MAX_REPORTS_PER_JOB - 200);
+        assert_eq!(
+            instances[1].0.rejected["report_limit"],
+            400 - MAX_REPORTS_PER_JOB
+        );
+        assert_eq!(budget.reports, 0);
+        assert_eq!(budget.entries, MAX_ENTRIES_PER_JOB - 400);
+        // A later instance with no allowance left examines nothing.
+        let dir = tmp.path().join("p3");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("x.jsonl"), complete("x")).unwrap();
+        let mut empty = Budget {
+            entries: 0,
+            ..budget
+        };
+        let mut sink = MemorySink::default();
+        let collection = collect_dir(
+            &dir,
+            &instance_ctx(&source, 3, 3),
+            &mut sink,
+            &|| false,
+            &mut empty,
+        );
+        assert_eq!(collection.rejected["entry_limit"], 1);
+        assert!(sink.bodies.is_empty());
+    }
+
+    #[test]
+    fn instances_of_one_job_share_the_source_byte_cap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = Source::default();
+        let report = complete("r1");
+        let mut budget = Budget {
+            bytes: report.len() as u64,
+            ..Budget::default()
+        };
+        let mut rejected = Vec::new();
+        for index in 1..=2u32 {
+            let dir = tmp.path().join(format!("p{index}"));
+            std::fs::create_dir(&dir).unwrap();
+            std::fs::write(dir.join("r.jsonl"), complete(&format!("r{index}"))).unwrap();
+            let mut sink = MemorySink::default();
+            let ctx = instance_ctx(&source, index, 2);
+            rejected.push(collect_dir(&dir, &ctx, &mut sink, &|| false, &mut budget).rejected);
+        }
+        assert!(rejected[0].is_empty());
+        assert_eq!(rejected[1]["job_byte_limit"], 1);
     }
 }

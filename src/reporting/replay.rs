@@ -8,14 +8,15 @@
 
 use super::publish::{self, Ack, Limits};
 use super::{
-    canonical_uuid, deliver, emit, protect_process, Head, Item, JobDirs, Manifest, ManifestState,
-    Rejection, MANIFEST, MANIFEST_VERSION,
+    canonical_uuid, deliver, emit, manifest_version, protect_process, Head, Item, JobDirs,
+    Manifest, ManifestPartition, ManifestState, Rejection, MANIFEST, MANIFEST_VERSION,
+    PARTITIONED_MANIFEST_VERSION,
 };
-use crate::config;
+use crate::config::{self, Partition};
 use crate::output::Output;
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::Duration;
 use tokio::sync::watch;
@@ -44,9 +45,10 @@ pub fn load_manifest(run_dir: &Path) -> Result<Manifest> {
         .with_context(|| format!("invalid manifest {}", path.display()))?;
     // Check the version before the schema, which another version may not share.
     let version = value.get("version").and_then(Value::as_u64);
-    if version != Some(u64::from(MANIFEST_VERSION)) {
+    let supported = [MANIFEST_VERSION, PARTITIONED_MANIFEST_VERSION].map(u64::from);
+    if !version.is_some_and(|v| supported.contains(&v)) {
         bail!(
-            "unsupported manifest version {} in {} (this goodflows reads version {MANIFEST_VERSION})",
+            "unsupported manifest version {} in {} (this goodflows reads versions {MANIFEST_VERSION} and {PARTITIONED_MANIFEST_VERSION})",
             version.map_or("missing".into(), |v| v.to_string()),
             path.display()
         );
@@ -84,14 +86,64 @@ fn validate(manifest: &Manifest) -> Result<()> {
     {
         bail!("environment name is invalid");
     }
-    let mut names = HashSet::new();
+    // Partition entries exist exactly when the manifest is version 2, so an
+    // older goodflows never meets one under a version it claims to read.
+    if manifest.version != manifest_version(&manifest.jobs) {
+        bail!(
+            "manifest version {} requires {} partition entries",
+            manifest.version,
+            if manifest.version == MANIFEST_VERSION {
+                "no"
+            } else {
+                "at least one job with"
+            }
+        );
+    }
+    // Per job name: `None` for an unpartitioned entry, or the instance count
+    // and the indexes seen so far.
+    let mut names: HashMap<&str, Option<(u32, HashSet<u32>)>> = HashMap::new();
     for job in &manifest.jobs {
         if !config::valid_report_name(&job.name) {
             bail!("job names must be 1-64 UTF-8 bytes without control characters");
         }
-        if !names.insert(job.name.as_str()) {
-            bail!("duplicate job name");
+        match (names.get_mut(job.name.as_str()), job.partition) {
+            (None, None) => {
+                names.insert(&job.name, None);
+            }
+            (None, Some(partition)) => {
+                valid_partition(partition)?;
+                names.insert(
+                    &job.name,
+                    Some((partition.count, HashSet::from([partition.index]))),
+                );
+            }
+            (Some(None), None) => bail!("duplicate job name"),
+            (Some(None), Some(_)) | (Some(Some(_)), None) => {
+                bail!("job has both partitioned and unpartitioned entries")
+            }
+            (Some(Some((count, indexes))), Some(partition)) => {
+                valid_partition(partition)?;
+                if partition.count != *count {
+                    bail!("partition entries of one job disagree on the partition count");
+                }
+                if !indexes.insert(partition.index) {
+                    bail!("duplicate partition index");
+                }
+            }
         }
+    }
+    Ok(())
+}
+
+fn valid_partition(partition: ManifestPartition) -> Result<()> {
+    if !(1..=config::MAX_PARTITIONS).contains(&partition.count) {
+        bail!(
+            "partition count must be from 1 to {}",
+            config::MAX_PARTITIONS
+        );
+    }
+    if !(1..=partition.count).contains(&partition.index) {
+        bail!("partition index must be from 1 to its count");
     }
     Ok(())
 }
@@ -113,21 +165,39 @@ pub async fn upload_with(
     // Collection rejections count as invalid: those reports were never frozen.
     let mut invalid: usize = 0;
     let mut items = Vec::new();
+    // report_id is unique across every entry (instance) of one job, as on the
+    // server. As in collection, an id listed more than once refuses every copy.
+    let mut job_ids: HashMap<(&str, &str), usize> = HashMap::new();
+    for job in &manifest.jobs {
+        for report in job.collection.iter().flat_map(|c| &c.reports) {
+            *job_ids
+                .entry((job.name.as_str(), report.report_id.as_str()))
+                .or_default() += 1;
+        }
+    }
     for job in &manifest.jobs {
         let Some(collection) = &job.collection else {
             continue;
         };
-        invalid += collection.rejected.values().sum::<usize>();
-        // Locations derive from the job name, never from a manifest-supplied path.
+        // One per rejected file; a leftover duplicate snapshot is not another.
+        invalid += super::collect::rejected_files(&collection.rejected);
+        // Locations derive from the job name and partition, never from a
+        // manifest-supplied path.
+        let partition = job.instance();
         let dir_matches = job.dir == config::path_component(&job.name);
-        let dirs = JobDirs::new(run_dir, &job.dir);
-        let (mut indexes, mut ids) = (HashSet::new(), HashSet::new());
+        let dirs = JobDirs::new(run_dir, &job.dir, partition);
+        let mut indexes = HashSet::new();
         for report in &collection.reports {
-            let pending = |reason: &str, http_status: Option<u16>| json!({"type":"report_upload_pending", "run_id":run_id, "job":job.name, "report_id":report.report_id, "reason":reason, "http_status":http_status});
+            let pending = |reason: &str, http_status: Option<u16>| {
+                Partition::tag(
+                    partition,
+                    json!({"type":"report_upload_pending", "run_id":run_id, "job":job.name, "report_id":report.report_id, "reason":reason, "http_status":http_status}),
+                )
+            };
             if !dir_matches
                 || !super::collect::valid_identifier(&report.report_id)
                 || !indexes.insert(report.index)
-                || !ids.insert(report.report_id.as_str())
+                || job_ids[&(job.name.as_str(), report.report_id.as_str())] > 1
             {
                 invalid += 1;
                 emit(output, pending("invalid_snapshot", None)).await;
@@ -155,6 +225,7 @@ pub async fn upload_with(
             }
             items.push(Item {
                 job: job.name.clone(),
+                partition,
                 report_id: report.report_id.clone(),
                 index: report.index,
                 dirs: dirs.clone(),
@@ -166,6 +237,8 @@ pub async fn upload_with(
                     job_status: job.status.clone().unwrap_or_default(),
                     source: manifest.source.clone(),
                     report_id: report.report_id.clone(),
+                    partition: partition.map(|p| p.index.to_string()),
+                    partition_count: partition.map(|p| u64::from(p.count)),
                 },
             });
         }

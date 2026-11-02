@@ -238,15 +238,16 @@ fn invalid_partition_configs_fail_validation_before_execution() {
             assert_rejected(&named, message);
         }
     }
-    // Partitions and reports cannot be combined.
-    assert_rejected(
-        &format!("{REPORTING}[[jobs]]\n{SAFE}[[jobs]]\nname='test'\ncommand='true'\npartitions=3\nreports=['exunit-timings']\n"),
-        "partitions cannot be combined with reports",
-    );
-    assert_rejected(
-        &format!("{REPORTING}[[workflows.ci.jobs]]\n{SAFE}[[workflows.ci.jobs]]\nname='test'\ncommand='true'\npartitions=3\nreports=['exunit-timings']\n"),
-        "partitions cannot be combined with reports",
-    );
+    // Partitioned jobs may declare reports; each instance collects its own directory.
+    for jobs in ["jobs", "workflows.ci.jobs"] {
+        let p = Project::new(&format!(
+            "{REPORTING}[[{jobs}]]\n{SAFE}[[{jobs}]]\nname='test'\ncommand='true'\npartitions=3\nreports=['exunit-timings']\n"
+        ));
+        let output = p.run(&["validate", "--json"]);
+        success(&output);
+        assert!(!p.dir.join("ran").exists());
+        assert!(!p.dir.join(".goodflows").exists());
+    }
     // Reporting credential variables must not name a partition variable.
     for (field, name) in [
         ("token_env", "GOODFLOWS_PARTITION"),

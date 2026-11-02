@@ -12,11 +12,11 @@ pub mod publish;
 pub mod replay;
 mod source;
 
-use crate::config::{self, Job, Reporting};
+use crate::config::{self, Job, Partition, Reporting};
 use crate::output::Output;
-use crate::runner::{JobResult, ReportingEnv, Status};
+use crate::runner::{JobResult, ReportingEnv, ReportingKey, Status};
 use anyhow::{Context, Result};
-use collect::{Collection, Head, JobContext, Sink};
+use collect::{Budget, Collection, Head, JobContext, Sink};
 use publish::{Credentials, Limits};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -28,7 +28,13 @@ use std::sync::Arc;
 use tokio::sync::watch;
 
 pub const MANIFEST: &str = "manifest.json";
+/// Version of manifests without partition entries, readable by every goodflows
+/// that supports replay.
 pub const MANIFEST_VERSION: u32 = 1;
+/// Version of manifests with at least one partition entry. Goodflows releases
+/// that predate partitions refuse it with a clear version error rather than a
+/// schema error.
+pub const PARTITIONED_MANIFEST_VERSION: u32 = 2;
 /// Acknowledgement and rejection markers are tiny; anything larger is not ours.
 const MAX_MARKER_BYTES: u64 = 64 * 1024;
 
@@ -65,9 +71,58 @@ pub struct ManifestJob {
     /// Reversibly encoded directory name under the run directory; always
     /// `config::path_component(name)`.
     pub dir: String,
+    /// The instance of a partitioned job. Its state lives in `<dir>/p<index>/`,
+    /// derived from this value and never read as a path. Absent for
+    /// unpartitioned jobs, so their manifests keep the original layout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partition: Option<ManifestPartition>,
     pub status: Option<String>,
     pub executed: bool,
     pub collection: Option<ManifestCollection>,
+}
+
+impl ManifestJob {
+    /// The instance this entry describes, for paths, events and expectations.
+    pub fn instance(&self) -> Option<Partition> {
+        self.partition.map(Partition::from)
+    }
+}
+
+/// The on-disk form of an instance's identity. Kept apart from
+/// [`config::Partition`] so the saved schema (strict, versioned) does not
+/// change when the in-memory type does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManifestPartition {
+    pub index: u32,
+    pub count: u32,
+}
+
+impl From<Partition> for ManifestPartition {
+    fn from(partition: Partition) -> Self {
+        Self {
+            index: partition.index,
+            count: partition.count,
+        }
+    }
+}
+
+impl From<ManifestPartition> for Partition {
+    fn from(partition: ManifestPartition) -> Self {
+        Self {
+            index: partition.index,
+            count: partition.count,
+        }
+    }
+}
+
+/// The version a manifest with these entries is written as (and must carry).
+pub fn manifest_version(jobs: &[ManifestJob]) -> u32 {
+    if jobs.iter().any(|job| job.partition.is_some()) {
+        PARTITIONED_MANIFEST_VERSION
+    } else {
+        MANIFEST_VERSION
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -78,9 +133,10 @@ pub struct ManifestCollection {
     pub reports: Vec<ManifestReport>,
 }
 
-/// Snapshot `<job>/pending/NNN.json`, acknowledgement `<job>/acks/NNN.json`
-/// and rejection marker `<job>/acks/NNN.rejected.json` are derived from the
-/// job directory and this index only; the manifest never names a path.
+/// Snapshot `<base>/pending/NNN.json`, acknowledgement `<base>/acks/NNN.json`
+/// and rejection marker `<base>/acks/NNN.rejected.json` are derived from the
+/// job directory (`<base>` is `<job>` or, for an instance, `<job>/p<index>`)
+/// and this index only; the manifest never names a path.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ManifestReport {
@@ -170,25 +226,43 @@ fn private_dir(path: &Path) -> std::io::Result<()> {
     }
 }
 
-/// One job's state directories inside a run directory.
+/// One job's (or one instance's) state directories inside a run directory.
 #[derive(Debug, Clone)]
 pub struct JobDirs {
     job: PathBuf,
+    /// `job` itself, or `job/p<index>` for an instance of a partitioned job.
+    base: PathBuf,
 }
 
 impl JobDirs {
-    pub fn new(run_dir: &Path, encoded: &str) -> Self {
-        Self {
-            job: run_dir.join(encoded),
-        }
+    pub fn new(run_dir: &Path, encoded: &str, partition: Option<Partition>) -> Self {
+        let job = run_dir.join(encoded);
+        let base = match partition {
+            Some(partition) => job.join(instance_dir(partition)),
+            None => job.clone(),
+        };
+        Self { job, base }
+    }
+
+    fn reports(&self) -> PathBuf {
+        self.base.join("reports")
     }
 
     fn pending(&self) -> PathBuf {
-        self.job.join("pending")
+        self.base.join("pending")
     }
 
     fn acks(&self) -> PathBuf {
-        self.job.join("acks")
+        self.base.join("acks")
+    }
+
+    /// Neither the job directory nor an instance directory may be a symlink.
+    fn check_base(&self) -> std::io::Result<()> {
+        real_dir(&self.job)?;
+        if self.base != self.job {
+            real_dir(&self.base)?;
+        }
+        Ok(())
     }
 
     pub fn snapshot(&self, index: u32) -> PathBuf {
@@ -203,21 +277,21 @@ impl JobDirs {
         self.acks().join(format!("{index:03}.rejected.json"))
     }
 
-    /// Neither the job directory nor `pending/` may have been replaced by a symlink.
+    /// Neither the job/instance directories nor `pending/` may have been replaced by a symlink.
     fn check_pending(&self) -> std::io::Result<()> {
-        real_dir(&self.job)?;
+        self.check_base()?;
         real_dir(&self.pending())
     }
 
-    /// The job directory must be real; `acks/` is (re)created privately if missing.
+    /// The job/instance directories must be real; `acks/` is (re)created privately if missing.
     fn ensure_acks(&self) -> std::io::Result<()> {
-        real_dir(&self.job)?;
+        self.check_base()?;
         private_dir(&self.acks())
     }
 
     /// Read a small marker file (never through a symlink).
     fn read_marker<T: serde::de::DeserializeOwned>(&self, path: &Path) -> Option<T> {
-        real_dir(&self.job).ok()?;
+        self.check_base().ok()?;
         real_dir(&self.acks()).ok()?;
         let bytes = collect::read_bounded(path, MAX_MARKER_BYTES).ok()?;
         serde_json::from_slice(&bytes).ok()
@@ -250,17 +324,24 @@ impl Sink for SpoolSink {
         Ok(index)
     }
 
-    fn discard(&mut self, index: u32) {
-        if self.dirs.check_pending().is_ok() {
-            let _ = std::fs::remove_file(self.dirs.snapshot(index));
+    fn discard(&mut self, index: u32) -> Result<(), ()> {
+        self.dirs.check_pending().map_err(drop)?;
+        match std::fs::remove_file(self.dirs.snapshot(index)) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(()),
+            _ => Ok(()),
         }
     }
+}
+
+/// The instance directory name under a partitioned job's directory.
+fn instance_dir(partition: Partition) -> String {
+    format!("p{}", partition.index)
 }
 
 struct Run {
     dir: PathBuf,
     manifest: Manifest,
-    env: HashMap<String, Vec<(String, String)>>,
+    env: HashMap<ReportingKey, Vec<(String, String)>>,
 }
 
 /// Reporting state for one `run` invocation.
@@ -361,9 +442,13 @@ impl Session {
         let Some(mut run) = self.run.take() else {
             return;
         };
-        let find = |name: &str| results.iter().find(|r| r.name == name);
+        let find = |name: &str, partition: Option<Partition>| {
+            results
+                .iter()
+                .find(|r| r.name == name && r.partition == partition)
+        };
         for job in &mut run.manifest.jobs {
-            let result = find(&job.name);
+            let result = find(&job.name, job.instance());
             job.status = Some(job_status(result.map(|r| r.status)).into());
             job.executed = result.is_some_and(|r| r.executed);
         }
@@ -394,16 +479,19 @@ impl Session {
             };
             emit(
                 output,
-                json!({
-                    "type":"reports_collected",
-                    "run_id":run_id,
-                    "run_dir":run.dir,
-                    "job":job.name,
-                    "outcome":collection.outcome,
-                    "reports":collection.reports.len(),
-                    "report_ids":collection.reports.iter().map(|r| &r.report_id).collect::<Vec<_>>(),
-                    "rejected":collection.rejected,
-                }),
+                Partition::tag(
+                    job.instance(),
+                    json!({
+                        "type":"reports_collected",
+                        "run_id":run_id,
+                        "run_dir":run.dir,
+                        "job":job.name,
+                        "outcome":collection.outcome,
+                        "reports":collection.reports.len(),
+                        "report_ids":collection.reports.iter().map(|r| &r.report_id).collect::<Vec<_>>(),
+                        "rejected":collection.rejected,
+                    }),
+                ),
             )
             .await;
         }
@@ -421,7 +509,9 @@ impl Session {
     }
 }
 
-/// Collect every executed job of a run into its pending area. Blocking.
+/// Collect every executed job (or instance) of a run into its pending area.
+/// Instances of one job share the job's collection budget, in index order, and
+/// `report_id` uniqueness is enforced across all of them. Blocking.
 fn collect_run(run: &mut Run, stop: &dyn Fn() -> bool) -> Vec<Item> {
     let Manifest {
         workflow_run_id,
@@ -432,62 +522,98 @@ fn collect_run(run: &mut Run, stop: &dyn Fn() -> bool) -> Vec<Item> {
         ..
     } = &mut run.manifest;
     let mut items = Vec::new();
-    for job in jobs.iter_mut() {
-        let dirs = JobDirs::new(&run.dir, &job.dir);
-        let job_status = job.status.clone().unwrap_or_else(|| "unknown".into());
-        let collection = if !job.executed {
-            Collection::not_executed()
-        } else if real_dir(&dirs.job).is_err() {
-            let mut collection = Collection::empty("missing_directory");
-            collection.reject("not_directory");
-            collection
-        } else {
-            let ctx = JobContext {
-                workflow_run_id,
-                workflow,
-                environment: environment.as_deref(),
-                job: &job.name,
-                job_status: &job_status,
-                source,
-            };
+    // `create_run` lists a job's instances consecutively, in index order, so
+    // each job is one run of entries sharing one budget.
+    debug_assert!(
+        grouped_in_index_order(jobs),
+        "manifest entries are not grouped"
+    );
+    for group in jobs.chunk_by_mut(|a, b| a.name == b.name) {
+        let mut budget = Budget::default();
+        let mut instances = Vec::with_capacity(group.len());
+        for job in group.iter() {
+            let partition = job.instance();
+            let dirs = JobDirs::new(&run.dir, &job.dir, partition);
+            let job_status = job.status.clone().unwrap_or_else(|| "unknown".into());
             let mut sink = SpoolSink {
                 dirs: dirs.clone(),
                 next: 0,
             };
-            collect::collect_dir(&dirs.job.join("reports"), &ctx, &mut sink, stop)
-        };
-        let reports: Vec<_> = collection
-            .reports
-            .into_iter()
-            .map(|frozen| ManifestReport {
-                report_id: frozen.report_id,
-                index: frozen.index,
-            })
-            .collect();
-        for report in &reports {
-            items.push(Item {
-                job: job.name.clone(),
-                report_id: report.report_id.clone(),
-                index: report.index,
-                dirs: dirs.clone(),
-                expected: Head {
-                    workflow_run_id: workflow_run_id.clone(),
-                    workflow: workflow.clone(),
-                    environment: environment.clone(),
+            let collection = if !job.executed {
+                Collection::not_executed()
+            } else if dirs.check_base().is_err() {
+                let mut collection = Collection::empty("missing_directory");
+                collection.reject("not_directory");
+                collection
+            } else {
+                let ctx = JobContext {
+                    workflow_run_id,
+                    workflow,
+                    environment: environment.as_deref(),
+                    job: &job.name,
+                    job_status: &job_status,
+                    source,
+                    partition,
+                };
+                collect::collect_dir(&dirs.reports(), &ctx, &mut sink, stop, &mut budget)
+            };
+            instances.push((collection, sink));
+        }
+        collect::resolve_duplicates(&mut instances);
+        for (job, (collection, sink)) in group.iter_mut().zip(instances) {
+            let partition = job.instance();
+            let job_status = job.status.clone().unwrap_or_else(|| "unknown".into());
+            let reports: Vec<_> = collection
+                .reports
+                .into_iter()
+                .map(|frozen| ManifestReport {
+                    report_id: frozen.report_id,
+                    index: frozen.index,
+                })
+                .collect();
+            for report in &reports {
+                items.push(Item {
                     job: job.name.clone(),
-                    job_status: job_status.clone(),
-                    source: source.clone(),
+                    partition,
                     report_id: report.report_id.clone(),
-                },
+                    index: report.index,
+                    dirs: sink.dirs.clone(),
+                    expected: Head {
+                        workflow_run_id: workflow_run_id.clone(),
+                        workflow: workflow.clone(),
+                        environment: environment.clone(),
+                        job: job.name.clone(),
+                        job_status: job_status.clone(),
+                        source: source.clone(),
+                        report_id: report.report_id.clone(),
+                        partition: partition.map(|p| p.index.to_string()),
+                        partition_count: partition.map(|p| u64::from(p.count)),
+                    },
+                });
+            }
+            job.collection = Some(ManifestCollection {
+                outcome: collection.outcome.into(),
+                rejected: collection.rejected,
+                reports,
             });
         }
-        job.collection = Some(ManifestCollection {
-            outcome: collection.outcome.into(),
-            rejected: collection.rejected,
-            reports,
-        });
     }
     items
+}
+
+/// Every job name forms one contiguous run of entries whose partition indexes
+/// ascend, as `create_run` writes them.
+fn grouped_in_index_order(jobs: &[ManifestJob]) -> bool {
+    let mut seen = std::collections::HashSet::new();
+    jobs.chunk_by(|a, b| a.name == b.name).all(|group| {
+        seen.insert(group[0].name.as_str())
+            && group.windows(2).all(|pair| {
+                matches!(
+                    (pair[0].partition, pair[1].partition),
+                    (Some(a), Some(b)) if a.index < b.index
+                )
+            })
+    })
 }
 
 fn create_run(
@@ -508,31 +634,43 @@ fn create_run(
     for job in jobs {
         let encoded = config::path_component(&job.name);
         let job_dir = dir.join(&encoded);
-        // Every state directory exists (privately) before any job can run, so a
-        // job cannot pre-create one of them as a symlink.
-        for sub in ["", "reports", "pending", "acks"] {
-            dir_builder(false).create(job_dir.join(sub))?;
+        // Every state directory exists (privately) before any job or instance
+        // can run, so none of them can be pre-created as a symlink.
+        dir_builder(false).create(&job_dir)?;
+        for partition in job.partition_ids() {
+            let base = match partition {
+                Some(partition) => {
+                    let base = job_dir.join(instance_dir(partition));
+                    dir_builder(false).create(&base)?;
+                    base
+                }
+                None => job_dir.clone(),
+            };
+            for sub in ["reports", "pending", "acks"] {
+                dir_builder(false).create(base.join(sub))?;
+            }
+            env.insert(
+                (job.name.clone(), partition),
+                vec![
+                    ("GOODFLOWS_RUN_ID".to_owned(), id.clone()),
+                    (
+                        "GOODFLOWS_REPORT_DIR".to_owned(),
+                        base.join("reports").to_string_lossy().into_owned(),
+                    ),
+                ],
+            );
+            manifest_jobs.push(ManifestJob {
+                name: job.name.clone(),
+                dir: encoded.clone(),
+                partition: partition.map(ManifestPartition::from),
+                status: None,
+                executed: false,
+                collection: None,
+            });
         }
-        env.insert(
-            job.name.clone(),
-            vec![
-                ("GOODFLOWS_RUN_ID".to_owned(), id.clone()),
-                (
-                    "GOODFLOWS_REPORT_DIR".to_owned(),
-                    job_dir.join("reports").to_string_lossy().into_owned(),
-                ),
-            ],
-        );
-        manifest_jobs.push(ManifestJob {
-            name: job.name.clone(),
-            dir: encoded,
-            status: None,
-            executed: false,
-            collection: None,
-        });
     }
     let manifest = Manifest {
-        version: MANIFEST_VERSION,
+        version: manifest_version(&manifest_jobs),
         state: ManifestState::Running,
         workflow_run_id: id,
         project: reporting.project.clone(),
@@ -552,6 +690,7 @@ fn create_run(
 /// most one body is in memory.
 pub struct Item {
     pub job: String,
+    pub partition: Option<Partition>,
     pub report_id: String,
     pub index: u32,
     pub dirs: JobDirs,
@@ -563,8 +702,20 @@ impl Item {
     fn load(&self) -> Result<Vec<u8>, &'static str> {
         let body = self.dirs.read_snapshot(self.index)?;
         match collect::validate_envelope(&body) {
-            Ok(head) if head == self.expected => Ok(body),
-            _ => Err("invalid_snapshot"),
+            Ok(mut head) => {
+                // Unpartitioned jobs keep whatever partition the producer reported;
+                // an instance's snapshot must carry exactly its own identity.
+                if self.partition.is_none() {
+                    head.partition.clone_from(&self.expected.partition);
+                    head.partition_count = self.expected.partition_count;
+                }
+                if head == self.expected {
+                    Ok(body)
+                } else {
+                    Err("invalid_snapshot")
+                }
+            }
+            Err(_) => Err("invalid_snapshot"),
         }
     }
 }
@@ -609,7 +760,12 @@ pub async fn deliver(
         _ => None,
     };
     for item in items {
-        let pending = |reason: &str, http_status: Option<u16>| json!({"type":"report_upload_pending", "run_id":run_id, "job":item.job, "report_id":item.report_id, "reason":reason, "http_status":http_status});
+        let pending = |reason: &str, http_status: Option<u16>| {
+            Partition::tag(
+                item.partition,
+                json!({"type":"report_upload_pending", "run_id":run_id, "job":item.job, "report_id":item.report_id, "reason":reason, "http_status":http_status}),
+            )
+        };
         let outcome = match &mut publisher {
             _ if cancel.borrow().is_some() => publish::Outcome::pending("cancelled", None),
             Some(publisher) if publisher.exhausted() => {
@@ -630,7 +786,10 @@ pub async fn deliver(
                 match item.dirs.record(&item.dirs.ack(item.index), &ack) {
                     Ok(()) => {
                         delivery.uploaded += 1;
-                        json!({"type":"report_uploaded", "run_id":run_id, "job":item.job, "report_id":item.report_id, "server_id":ack.id, "status":ack.status, "duplicate":ack.duplicate})
+                        Partition::tag(
+                            item.partition,
+                            json!({"type":"report_uploaded", "run_id":run_id, "job":item.job, "report_id":item.report_id, "server_id":ack.id, "status":ack.status, "duplicate":ack.duplicate}),
+                        )
                     }
                     Err(_) => {
                         delivery.pending += 1;
@@ -703,7 +862,7 @@ mod tests {
 
     #[test]
     fn job_paths_derive_from_directory_and_index_only() {
-        let dirs = JobDirs::new(Path::new("/spool/run"), "test");
+        let dirs = JobDirs::new(Path::new("/spool/run"), "test", None);
         assert_eq!(
             dirs.snapshot(7),
             Path::new("/spool/run/test/pending/007.json")
@@ -724,7 +883,7 @@ mod tests {
         std::fs::create_dir_all(run.join("test/pending")).unwrap();
         std::fs::create_dir(&elsewhere).unwrap();
         std::os::unix::fs::symlink(&elsewhere, run.join("test/acks")).unwrap();
-        let dirs = JobDirs::new(&run, "test");
+        let dirs = JobDirs::new(&run, "test", None);
         assert!(dirs.check_pending().is_ok());
         assert!(dirs.record(&dirs.ack(0), &json!({})).is_err());
         assert_eq!(std::fs::read_dir(&elsewhere).unwrap().count(), 0);
@@ -742,5 +901,189 @@ mod tests {
         std::os::unix::fs::symlink(tmp.path().join("moved"), run.join("test")).unwrap();
         assert!(dirs.check_pending().is_err());
         assert!(dirs.record(&dirs.ack(1), &json!({})).is_err());
+    }
+
+    #[test]
+    fn instance_paths_nest_under_the_job_directory() {
+        let partition = Some(Partition { index: 2, count: 3 });
+        let dirs = JobDirs::new(Path::new("/spool/run"), "test", partition);
+        assert_eq!(dirs.reports(), Path::new("/spool/run/test/p2/reports"));
+        assert_eq!(
+            dirs.snapshot(0),
+            Path::new("/spool/run/test/p2/pending/000.json")
+        );
+        assert_eq!(dirs.ack(3), Path::new("/spool/run/test/p2/acks/003.json"));
+        assert_eq!(
+            JobDirs::new(Path::new("/spool/run"), "test", None).reports(),
+            Path::new("/spool/run/test/reports")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn instance_directories_refuse_symlinks_at_both_levels() {
+        let tmp = tempfile::tempdir().unwrap();
+        let run = tmp.path().join("run");
+        let partition = Some(Partition { index: 1, count: 2 });
+        for sub in ["pending", "acks"] {
+            std::fs::create_dir_all(run.join("test/p1").join(sub)).unwrap();
+        }
+        let dirs = JobDirs::new(&run, "test", partition);
+        assert!(dirs.check_pending().is_ok());
+        // The instance directory swapped for a symlink.
+        let moved = tmp.path().join("moved-instance");
+        std::fs::rename(run.join("test/p1"), &moved).unwrap();
+        std::os::unix::fs::symlink(&moved, run.join("test/p1")).unwrap();
+        assert!(dirs.check_pending().is_err());
+        assert!(dirs.record(&dirs.ack(0), &json!({})).is_err());
+        let mut sink = SpoolSink {
+            dirs: dirs.clone(),
+            next: 0,
+        };
+        assert!(sink.freeze(b"{}").is_err());
+        assert_eq!(std::fs::read_dir(moved.join("pending")).unwrap().count(), 0);
+        assert_eq!(std::fs::read_dir(moved.join("acks")).unwrap().count(), 0);
+        // The job directory swapped for a symlink, with a real instance inside.
+        std::fs::remove_file(run.join("test/p1")).unwrap();
+        std::fs::rename(&moved, run.join("test/p1")).unwrap();
+        assert!(dirs.check_pending().is_ok());
+        std::fs::rename(run.join("test"), tmp.path().join("moved-job")).unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("moved-job"), run.join("test")).unwrap();
+        assert!(dirs.check_pending().is_err());
+        assert!(dirs.record(&dirs.ack(0), &json!({})).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn instance_state_directories_refuse_symlinks_on_their_own() {
+        let tmp = tempfile::tempdir().unwrap();
+        let run = tmp.path().join("run");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        let base = run.join("test/p1");
+        std::fs::create_dir_all(&base).unwrap();
+        let dirs = JobDirs::new(&run, "test", Some(Partition { index: 1, count: 2 }));
+        // Only acks/ is swapped: snapshots still freeze, acknowledgements do not.
+        std::fs::create_dir(base.join("pending")).unwrap();
+        std::os::unix::fs::symlink(&outside, base.join("acks")).unwrap();
+        let mut sink = SpoolSink {
+            dirs: dirs.clone(),
+            next: 0,
+        };
+        assert_eq!(sink.freeze(b"{}"), Ok(0));
+        assert!(dirs.record(&dirs.ack(0), &json!({})).is_err());
+        assert!(dirs.record(&dirs.rejection(0), &json!({})).is_err());
+        assert_eq!(dir_entries(&outside), 0);
+        // Only pending/ is swapped: nothing is frozen or discarded through it.
+        std::fs::remove_file(base.join("acks")).unwrap();
+        std::fs::create_dir(base.join("acks")).unwrap();
+        std::fs::rename(base.join("pending"), tmp.path().join("moved-pending")).unwrap();
+        std::os::unix::fs::symlink(&outside, base.join("pending")).unwrap();
+        assert!(sink.freeze(b"{}").is_err());
+        assert!(dirs.read_snapshot(0).is_err());
+        assert!(sink.discard(0).is_err());
+        assert_eq!(dir_entries(&outside), 0);
+        // Acknowledgements for the real instance still work.
+        dirs.record(&dirs.ack(0), &json!({})).unwrap();
+        assert_eq!(dir_entries(&base.join("acks")), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discarding_reports_a_snapshot_left_behind() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = JobDirs::new(tmp.path(), "test", Some(Partition { index: 1, count: 1 }));
+        std::fs::create_dir_all(tmp.path().join("test/p1/pending")).unwrap();
+        let mut sink = SpoolSink { dirs, next: 0 };
+        let index = sink.freeze(b"{}").unwrap();
+        assert_eq!(sink.discard(index), Ok(()));
+        // Already gone counts as discarded.
+        assert_eq!(sink.discard(index), Ok(()));
+        // A snapshot path that cannot be unlinked (here a non-empty directory) remains.
+        let stuck = sink.dirs.snapshot(7);
+        std::fs::create_dir_all(stuck.join("x")).unwrap();
+        assert_eq!(sink.discard(7), Err(()));
+        assert!(stuck.exists());
+    }
+
+    fn dir_entries(dir: &Path) -> usize {
+        std::fs::read_dir(dir).unwrap().count()
+    }
+
+    /// A manifest exactly as written before partitions existed.
+    const OLDER_MANIFEST: &str = r#"{
+  "version": 1,
+  "state": "finalized",
+  "workflow_run_id": "67f7946d-136b-4608-ab01-e1f251a09754",
+  "project": "goodcases",
+  "workflow": "default",
+  "environment": null,
+  "url_env": "GOODFLOWS_URL",
+  "token_env": "GOODFLOWS_API_KEY",
+  "source": {"commit": null, "branch": null, "dirty": null},
+  "jobs": [
+    {
+      "name": "test",
+      "dir": "test",
+      "status": "passed",
+      "executed": true,
+      "collection": {
+        "outcome": "collected",
+        "rejected": {},
+        "reports": [{"report_id": "r1", "index": 0}]
+      }
+    }
+  ]
+}"#;
+
+    #[test]
+    fn older_manifests_deserialize_and_unpartitioned_entries_serialize_unchanged() {
+        let manifest: Manifest = serde_json::from_str(OLDER_MANIFEST).unwrap();
+        assert_eq!(manifest.jobs[0].partition, None);
+        let original: Value = serde_json::from_str(OLDER_MANIFEST).unwrap();
+        assert_eq!(serde_json::to_value(&manifest).unwrap(), original);
+        // An instance entry records its partition.
+        assert_eq!(manifest_version(&manifest.jobs), MANIFEST_VERSION);
+        let mut instance = manifest.jobs[0].clone();
+        instance.partition = Some(Partition { index: 2, count: 3 }.into());
+        let value = serde_json::to_value(&instance).unwrap();
+        assert_eq!(value["partition"], json!({"index": 2, "count": 3}));
+        let back: ManifestJob = serde_json::from_value(value).unwrap();
+        assert_eq!(back.partition, instance.partition);
+        assert_eq!(back.instance(), Some(Partition { index: 2, count: 3 }));
+        // Any partition entry makes the whole manifest version 2.
+        let jobs = [manifest.jobs[0].clone(), instance];
+        assert_eq!(manifest_version(&jobs), PARTITIONED_MANIFEST_VERSION);
+    }
+
+    #[test]
+    fn grouping_requires_contiguous_jobs_with_ascending_indexes() {
+        let manifest: Manifest = serde_json::from_str(OLDER_MANIFEST).unwrap();
+        let entry = |name: &str, index: Option<u32>| {
+            let mut job = manifest.jobs[0].clone();
+            job.name = name.into();
+            job.partition = index.map(|index| ManifestPartition { index, count: 3 });
+            job
+        };
+        assert!(grouped_in_index_order(&[
+            entry("a", None),
+            entry("b", Some(1)),
+            entry("b", Some(2)),
+            entry("c", None),
+        ]));
+        assert!(grouped_in_index_order(&[]));
+        assert!(!grouped_in_index_order(&[
+            entry("b", Some(2)),
+            entry("b", Some(1)),
+        ]));
+        assert!(!grouped_in_index_order(&[
+            entry("b", Some(1)),
+            entry("a", None),
+            entry("b", Some(2)),
+        ]));
+        assert!(!grouped_in_index_order(&[
+            entry("a", None),
+            entry("a", None)
+        ]));
     }
 }

@@ -143,13 +143,6 @@ Text output SHALL show instances as `<name> (<index>/<count>)`. JSON job and ste
 - **WHEN** a workflow has `compile` and a 3-partition `test`, and everything passes
 - **THEN** `run_started` reports 4 jobs and the summary reports 4 passed
 
-### Requirement: Partitions are not combined with reporting
-A job that declares both `partitions` and `reports` MUST fail validation until per-instance report collection is specified.
-
-#### Scenario: Partitioned reporting job
-- **WHEN** a job declares `partitions = 3` and `reports = ["exunit-timings"]`
-- **THEN** validation fails, naming both fields, and no jobs execute
-
 ### Requirement: Inspection shows partition configuration
 `goodflows list` SHALL show each partitioned job's partition count and strategy, in text and in the JSON `jobs` event, without running commands. `goodflows validate` and `goodflows list` defined-job and selected-job counts SHALL keep counting configured jobs, not instances.
 

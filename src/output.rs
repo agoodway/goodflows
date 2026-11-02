@@ -385,7 +385,7 @@ fn render(json: bool, mut event: Value, out: &mut impl Write, err: &mut impl Wri
                 write!(
                     out,
                     "reports {}: {} collected ({})",
-                    text(&event, "job"),
+                    instance_of(&event, "job"),
                     event["reports"],
                     text(&event, "outcome").replace('_', " ")
                 )?;
@@ -404,7 +404,7 @@ fn render(json: bool, mut event: Value, out: &mut impl Write, err: &mut impl Wri
             "report_uploaded" => writeln!(
                 out,
                 "report {}/{} uploaded{}",
-                text(&event, "job"),
+                instance_of(&event, "job"),
                 text(&event, "report_id"),
                 if event["duplicate"] == true {
                     " (already stored)"
@@ -416,7 +416,7 @@ fn render(json: bool, mut event: Value, out: &mut impl Write, err: &mut impl Wri
                 write!(
                     out,
                     "report {}/{} pending: {}",
-                    text(&event, "job"),
+                    instance_of(&event, "job"),
                     text(&event, "report_id"),
                     text(&event, "reason").replace('_', " ")
                 )?;
@@ -466,7 +466,12 @@ fn names(value: &Value) -> String {
 
 /// A job's display name: `name`, or `name (i/N)` for a partition instance.
 fn instance(value: &Value) -> String {
-    let name = text(value, "name");
+    instance_of(value, "name")
+}
+
+/// [`instance`] for events that name the job under `key`.
+fn instance_of(value: &Value, key: &str) -> String {
+    let name = text(value, key);
     match (
         value["partition"]["index"].as_u64(),
         value["partition"]["count"].as_u64(),
@@ -478,4 +483,46 @@ fn instance(value: &Value) -> String {
 
 fn text<'a>(event: &'a Value, key: &str) -> &'a str {
     event[key].as_str().unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rendered(event: Value) -> String {
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        render(false, event, &mut out, &mut err).unwrap();
+        assert!(err.is_empty());
+        String::from_utf8(out).unwrap()
+    }
+
+    /// Text for reporting events with and without a partition instance.
+    #[test]
+    fn reporting_events_name_the_instance_in_text() {
+        let partition = json!({"index": 2, "count": 3});
+        for (tag, job) in [(None, "test"), (Some(partition), "test (2/3)")] {
+            let with = |mut event: Value| {
+                if let Some(partition) = &tag {
+                    event["partition"] = partition.clone();
+                }
+                rendered(event)
+            };
+            assert_eq!(
+                with(json!({"type":"reports_collected", "job":"test", "outcome":"collected", "reports":1, "run_dir":"/spool/run", "rejected":{"duplicate_report_id":1}})),
+                format!("reports {job}: 1 collected (collected)  rejected: duplicate_report_id=1\n  saved in /spool/run\n")
+            );
+            assert_eq!(
+                with(
+                    json!({"type":"report_uploaded", "job":"test", "report_id":"r1", "duplicate":true})
+                ),
+                format!("report {job}/r1 uploaded (already stored)\n")
+            );
+            assert_eq!(
+                with(
+                    json!({"type":"report_upload_pending", "job":"test", "report_id":"r1", "reason":"state_write_failed", "http_status":null})
+                ),
+                format!("report {job}/r1 pending: state write failed\n")
+            );
+        }
+    }
 }
