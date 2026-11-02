@@ -1000,6 +1000,48 @@ fn invalid_and_duplicate_reports_are_rejected_without_touching_files() {
 }
 
 #[test]
+fn invalid_filters_are_rejected_without_touching_files() {
+    let mock = Mock::store();
+    let p = project(
+        "[[jobs]]\nname = \"test\"\ncommand = 'cp fixtures/spaced.jsonl fixtures/long.jsonl \"$GOODFLOWS_REPORT_DIR/\"'\nreports = [\"exunit-timings\"]\n",
+    );
+    let with_include = |id: &str, include: Value| {
+        let mut lines: Vec<String> = timing_report(id, Some("1"))
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        let mut started: Value = serde_json::from_str(&lines[0]).unwrap();
+        started["filters"]["include"] = include;
+        lines[0] = started.to_string();
+        lines.iter().map(|l| format!("{l}\n")).collect::<String>()
+    };
+    let spaced = with_include("spaced", json!([{"tag": "slow test", "value": true}]));
+    let long = with_include(
+        "long",
+        Value::Array(vec![json!({"tag": "slow", "value": true}); 257]),
+    );
+    std::fs::write(p.dir.join("fixtures/spaced.jsonl"), &spaced).unwrap();
+    std::fs::write(p.dir.join("fixtures/long.jsonl"), &long).unwrap();
+    let output = run_with(&p, &["--json"], Some(&mock.url));
+    success(&output);
+    let collected = by_type(&events(&output), "reports_collected")[0].clone();
+    assert_eq!(collected["reports"], 0);
+    assert_eq!(collected["rejected"], json!({"unsupported_filter": 2}));
+    let dir = run_dirs(&p)[0].join("test");
+    let pending = dir.join("pending");
+    assert!(!pending.exists() || dir_entries(&pending) == 0);
+    assert_eq!(mock.connections(), 0);
+    assert_eq!(
+        std::fs::read(dir.join("reports/spaced.jsonl")).unwrap(),
+        spaced.as_bytes()
+    );
+    assert_eq!(
+        std::fs::read(dir.join("reports/long.jsonl")).unwrap(),
+        long.as_bytes()
+    );
+}
+
+#[test]
 fn scheduler_errors_mark_the_manifest_aborted() {
     let p = project(&format!(
         "[[jobs]]\nname = \"test\"\ncommand = '{}'\nreports = [\"exunit-timings\"]\n",

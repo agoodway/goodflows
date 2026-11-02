@@ -1,19 +1,24 @@
 //! The local copy of the server's test-report wire contract.
 //!
-//! Every server-defined vocabulary and limit the publisher enforces locally
-//! lives here, tied to one contract version. The authoritative definition is
-//! the GoodFlows server change `2026-11-01-store-test-timings` (design D1).
+//! Every server-defined vocabulary, limit and identifier grammar (suite,
+//! report and filter-tag ids) the publisher enforces locally lives here, tied
+//! to one contract version. The authoritative definition is
+//! the GoodFlows server change `2026-11-01-store-test-timings` (design D1), as
+//! amended by `generalize-test-report-filters` (filter tags are boolean
+//! identifiers and each filter list holds at most [`MAX_FILTER_ENTRIES`]).
 //!
 //! Coupling: collection rejects anything outside these lists *before* a
 //! request snapshot is frozen, so a report the server would accept but this
-//! table does not (for example a filter tag the server added later) is
+//! table does not (for example an event or field the server added later) is
 //! rejected locally and never becomes replayable; only its raw JSONL stays on
 //! disk. When the server contract changes, update this module, bump
 //! [`CONTRACT_VERSION`] and release the CLI before producers emit the new
 //! vocabulary.
 
 /// Identifies the server contract revision these tables were copied from.
-pub const CONTRACT_VERSION: &str = "2026-11-01-store-test-timings";
+/// The server change is not archived yet; if it is archived under a dated id,
+/// rename this to match. Release only after that change is deployed.
+pub const CONTRACT_VERSION: &str = "generalize-test-report-filters";
 
 pub const REPORT_FORMAT: &str = "exunit-timings";
 
@@ -116,14 +121,30 @@ pub const FILE_EXTRA: &[&str] = &["file", "async", "sync", "unknown"];
 pub const LONG_FIELDS: &[&str] = &["module", "name", "description", "describe", "file"];
 /// Fields limited to 128 bytes.
 pub const VERSION_FIELDS: &[&str] = &["elixir_version", "otp_release"];
-/// The only `filters` tags the server accepts; values are booleans.
-pub const FILTER_TAGS: &[&str] = &[
-    "chrome",
-    "goodaudit_integration",
-    "athena_preview",
-    "chromic_teardown",
-    "qpdf",
-];
+/// Maximum entries in each of `filters.include` and `filters.exclude`.
+pub const MAX_FILTER_ENTRIES: usize = 256;
+/// Suite, report and filter-tag identifiers: at most this many bytes.
+pub const MAX_IDENTIFIER_BYTES: usize = 128;
+
+/// The server's identifier grammar for suite and report ids: 1 to
+/// [`MAX_IDENTIFIER_BYTES`] bytes of ASCII letters, digits, `.`, `_` or `-`,
+/// starting with a letter or digit. Every byte is checked, so unlike a regex
+/// anchored with `$` a trailing newline never matches.
+pub fn valid_identifier(id: &str) -> bool {
+    let bytes = id.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= MAX_IDENTIFIER_BYTES
+        && bytes[0].is_ascii_alphanumeric()
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+/// A `filters.include`/`filters.exclude` tag follows the identifier grammar
+/// (server change `generalize-test-report-filters`); its value is a boolean.
+pub fn valid_filter_tag(tag: &str) -> bool {
+    valid_identifier(tag)
+}
 
 /// Allowed keys for an event, or `None` for an unknown event.
 pub fn allowed(event: &str, key: &str) -> Option<bool> {
@@ -146,9 +167,10 @@ mod tests {
 
     #[test]
     fn contract_is_versioned_and_matches_the_server_vocabulary() {
-        assert_eq!(CONTRACT_VERSION, "2026-11-01-store-test-timings");
+        assert_eq!(CONTRACT_VERSION, "generalize-test-report-filters");
         assert_eq!(MAX_REQUEST_BYTES, 33_554_432);
-        assert_eq!(FILTER_TAGS.len(), 5);
+        assert_eq!(MAX_FILTER_ENTRIES, 256);
+        assert_eq!(MAX_IDENTIFIER_BYTES, 128);
         assert_eq!(ENVELOPE.len(), 8);
         assert_eq!(allowed("suite_started", "filters"), Some(true));
         assert_eq!(allowed("test_started", "duration_us"), Some(false));

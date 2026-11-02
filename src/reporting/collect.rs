@@ -685,16 +685,6 @@ pub fn validate_envelope(bytes: &[u8]) -> Result<Head, &'static str> {
     })
 }
 
-pub fn valid_identifier(id: &str) -> bool {
-    let bytes = id.as_bytes();
-    !bytes.is_empty()
-        && bytes.len() <= 128
-        && bytes[0].is_ascii_alphanumeric()
-        && bytes
-            .iter()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
-}
-
 fn valid_partition(value: &Value) -> bool {
     match value {
         Value::Null => true,
@@ -746,28 +736,38 @@ fn too_long(map: &Map<String, Value>) -> bool {
 }
 
 fn validate_nested(map: &Map<String, Value>) -> Result<(), &'static str> {
-    let unsupported = Err("unsupported_field");
+    let unsupported_field = Err("unsupported_field");
+    let unsupported_filter = Err("unsupported_filter");
     if map.get("counts").is_some_and(|c| !keys_within(c, OUTCOMES)) {
-        return unsupported;
+        return unsupported_field;
     }
     if map.get("times_us").is_some_and(|t| !keys_within(t, TIMES)) {
-        return unsupported;
+        return unsupported_field;
     }
     if let Some(filters) = map.get("filters") {
         if !keys_within(filters, &["include", "exclude"]) {
-            return unsupported;
+            return unsupported_field;
         }
         for list in ["include", "exclude"] {
-            for entry in filters[list].as_array().into_iter().flatten() {
+            // The server requires `filters` to be an object holding both lists
+            // as arrays, and caps each list; anything else would freeze and
+            // then 422.
+            let Some(entries) = filters.get(list).and_then(Value::as_array) else {
+                return unsupported_filter;
+            };
+            if entries.len() > MAX_FILTER_ENTRIES {
+                return unsupported_filter;
+            }
+            for entry in entries {
                 if !keys_within(entry, &["tag", "value"]) {
-                    return unsupported;
+                    return unsupported_field;
                 }
-                // Only allowlisted boolean tags; filters never carry arbitrary tags.
+                // Tags follow the server's identifier grammar and values are booleans.
                 let tag = entry.get("tag").and_then(Value::as_str);
-                if !tag.is_some_and(|tag| FILTER_TAGS.contains(&tag))
+                if !tag.is_some_and(valid_filter_tag)
                     || !entry.get("value").is_some_and(Value::is_boolean)
                 {
-                    return Err("unsupported_filter");
+                    return unsupported_filter;
                 }
             }
         }
@@ -780,7 +780,7 @@ fn validate_nested(map: &Map<String, Value>) -> Result<(), &'static str> {
     {
         let file_keys: Vec<&str> = BUCKET.iter().chain(FILE_EXTRA).copied().collect();
         if !keys_within(file, &file_keys) {
-            return unsupported;
+            return unsupported_field;
         }
         if let Value::Object(file) = file {
             if file
@@ -793,13 +793,13 @@ fn validate_nested(map: &Map<String, Value>) -> Result<(), &'static str> {
             for bucket in ["async", "sync", "unknown"] {
                 if let Some(bucket) = file.get(bucket) {
                     if !keys_within(bucket, BUCKET) {
-                        return unsupported;
+                        return unsupported_field;
                     }
                     if bucket
                         .get("counts")
                         .is_some_and(|c| !keys_within(c, OUTCOMES))
                     {
-                        return unsupported;
+                        return unsupported_field;
                     }
                 }
             }
@@ -807,7 +807,7 @@ fn validate_nested(map: &Map<String, Value>) -> Result<(), &'static str> {
                 .get("counts")
                 .is_some_and(|c| !keys_within(c, OUTCOMES))
             {
-                return unsupported;
+                return unsupported_field;
             }
         }
     }
@@ -1397,14 +1397,65 @@ mod tests {
     }
 
     #[test]
-    fn filters_use_the_server_tag_allowlist() {
-        for tag in FILTER_TAGS {
+    fn filters_use_the_server_tag_grammar() {
+        let with_filters = |list: &str, entries: Value| {
             let mut started = suite_started("r", Value::Null);
-            started["filters"]["include"] = json!([{"tag": tag, "value": false}]);
-            assert!(parse_report(&jsonl(&[started])).is_ok(), "{tag}");
+            started["filters"][list] = entries;
+            jsonl(&[started])
+        };
+        for tag in [
+            "chrome",
+            "goodaudit_integration",
+            "athena_preview",
+            "chromic_teardown",
+            "qpdf",
+        ] {
+            let raw = with_filters("include", json!([{"tag": tag, "value": false}]));
+            assert!(parse_report(&raw).is_ok(), "{tag}");
+        }
+        // Any boolean identifier tag is accepted, in either list.
+        let mut started = suite_started("r", Value::Null);
+        started["filters"]["include"] = json!([{"tag": "slow", "value": true}]);
+        started["filters"]["exclude"] = json!([{"tag": "chrome", "value": true}]);
+        let report = parse_report(&jsonl(&[started])).unwrap();
+        assert_eq!(
+            report.records[0]["filters"]["include"],
+            json!([{"tag": "slow", "value": true}])
+        );
+        assert_eq!(
+            report.records[0]["filters"]["exclude"],
+            json!([{"tag": "chrome", "value": true}])
+        );
+        // Tags are case-sensitive and frozen without normalization.
+        let cased = json!([{"tag": "Chrome", "value": true}, {"tag": "chrome", "value": true}]);
+        let report = parse_report(&with_filters("include", cased.clone())).unwrap();
+        assert_eq!(report.records[0]["filters"]["include"], cased);
+        // A repeated tag keeps its supplied order in the frozen envelope.
+        let repeated = json!([{"tag": "slow", "value": true}, {"tag": "slow", "value": false}]);
+        let report = parse_report(&with_filters("exclude", repeated.clone())).unwrap();
+        let source = Source::default();
+        let body: Value =
+            serde_json::from_slice(&envelope(&ctx(&source, "passed"), &report).unwrap()).unwrap();
+        assert_eq!(body["report"]["records"][0]["filters"]["exclude"], repeated);
+        // Each list holds at most MAX_FILTER_ENTRIES entries.
+        let entries = |n: usize| Value::Array(vec![json!({"tag": "slow", "value": true}); n]);
+        for list in ["include", "exclude"] {
+            assert!(
+                parse_report(&with_filters(list, entries(256))).is_ok(),
+                "{list}"
+            );
+            assert_eq!(
+                parse_report(&with_filters(list, entries(257))).unwrap_err(),
+                "unsupported_filter",
+                "{list}"
+            );
         }
         for entry in [
-            json!({"tag":"slow","value":true}),
+            json!({"tag":"slow test","value":true}),
+            json!({"tag":"ok?","value":true}),
+            json!({"tag":"slow\n","value":true}),
+            json!({"tag":"","value":true}),
+            json!({"tag":"a".repeat(129),"value":true}),
             json!({"tag":"chrome","value":"yes"}),
             json!({"tag":"chrome","value":null}),
             json!({"tag":1,"value":true}),
@@ -1412,14 +1463,86 @@ mod tests {
             json!({"tag":"chrome"}),
         ] {
             for list in ["include", "exclude"] {
-                let mut started = suite_started("r", Value::Null);
-                started["filters"][list] = json!([entry]);
                 assert_eq!(
-                    parse_report(&jsonl(&[started])).unwrap_err(),
+                    parse_report(&with_filters(list, json!([entry]))).unwrap_err(),
                     "unsupported_filter",
                     "{entry}"
                 );
             }
+        }
+        // Grammar boundaries on the filter path: 128 bytes, a leading digit, `.`,
+        // `_` and `-` pass; a leading punctuation byte or any non-ASCII byte fails.
+        for tag in ["a".repeat(128), "1x.a-b".into(), "a_b".into()] {
+            let raw = with_filters("include", json!([{"tag": tag, "value": true}]));
+            assert!(parse_report(&raw).is_ok(), "{tag}");
+        }
+        for tag in [".slow", "_slow", "-slow", "caf\u{e9}", "\u{ff53}low"] {
+            for list in ["include", "exclude"] {
+                assert_eq!(
+                    parse_report(&with_filters(list, json!([{"tag": tag, "value": true}])))
+                        .unwrap_err(),
+                    "unsupported_filter",
+                    "{tag:?} in {list}"
+                );
+            }
+        }
+        // A non-object entry has no tag to read.
+        for entry in [json!("slow"), Value::Null, json!(["slow", true])] {
+            for list in ["include", "exclude"] {
+                assert_eq!(
+                    parse_report(&with_filters(list, json!([entry]))).unwrap_err(),
+                    "unsupported_filter",
+                    "{entry} in {list}"
+                );
+            }
+        }
+        // Collection stops at the first failure and reports one code; the server
+        // collects every error, so only accept/reject is shared. Pin the order:
+        // an unknown key in an entry or in `filters` is `unsupported_field`.
+        for list in ["include", "exclude"] {
+            let raw = with_filters(list, json!([{"tag": "slow", "value": true, "note": "x"}]));
+            assert_eq!(
+                parse_report(&raw).unwrap_err(),
+                "unsupported_field",
+                "{list}"
+            );
+        }
+        let mut started = suite_started("r", Value::Null);
+        started["filters"] = json!({"include": [], "exclude": [], "x": 1});
+        assert_eq!(
+            parse_report(&jsonl(&[started])).unwrap_err(),
+            "unsupported_field"
+        );
+        // `filters` must be an object whose `include` and `exclude` are both arrays.
+        for list in ["include", "exclude"] {
+            for value in [
+                None,
+                Some(Value::Null),
+                Some(json!({})),
+                Some(json!("slow")),
+            ] {
+                let mut started = suite_started("r", Value::Null);
+                match value {
+                    None => started["filters"].as_object_mut().unwrap().remove(list),
+                    Some(value) => started["filters"]
+                        .as_object_mut()
+                        .unwrap()
+                        .insert(list.into(), value),
+                };
+                assert_eq!(
+                    parse_report(&jsonl(&[started])).unwrap_err(),
+                    "unsupported_filter",
+                    "{list}"
+                );
+            }
+        }
+        for filters in [Value::Null, json!([]), json!("x")] {
+            let mut started = suite_started("r", Value::Null);
+            started["filters"] = filters;
+            assert_eq!(
+                parse_report(&jsonl(&[started])).unwrap_err(),
+                "unsupported_filter"
+            );
         }
     }
 
@@ -1604,12 +1727,30 @@ mod tests {
                 "empty_report",
             ),
             (
+                // A snapshot frozen before both filter lists were required is
+                // refused on replay (`invalid_snapshot`), never sent.
+                &|v: &mut Value| {
+                    v["report"]["records"][0]["filters"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("exclude");
+                },
+                "unsupported_filter",
+            ),
+            (
                 &|v: &mut Value| v["workflow"] = json!("a\u{0}b"),
                 "nul_character",
             ),
         ] {
             assert_eq!(tampered(edit).unwrap_err(), code);
         }
+        // Snapshots are re-validated against the current grammar, so a tag the
+        // old allowlist refused now replays (and an older CLI would refuse it).
+        assert!(tampered(&|v: &mut Value| {
+            v["report"]["records"][0]["filters"]["include"] =
+                json!([{"tag": "slow", "value": true}])
+        })
+        .is_ok());
         let duplicate = String::from_utf8(body.clone())
             .unwrap()
             .replacen("{", r#"{"job":"x","#, 1);

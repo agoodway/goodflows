@@ -800,24 +800,32 @@ frozen as soon as it is built, so only one report body is held in memory. An inv
 suite/report identities, an invalid partition, U+0000, an oversized field, a
 duplicate object key, nesting deeper than the server's 16-level body limit, a
 number with a fraction or exponent (or an integer above 2^53-1), a filter tag
-outside the server allowlist or a non-boolean filter value, or a `report_id`
-reused by two reports in the same job (including across its instances, which
-rejects every copy as `duplicate_report_id`) rejects that report locally. A
-snapshot that cannot be written is counted as `snapshot_write_failed` (and,
-if it was also a duplicate, only as that). Each rejected file is counted under
-exactly one code, except that a rejected duplicate whose already-frozen snapshot
-cannot be removed is also counted as `snapshot_discard_failed`, which marks the
-leftover snapshot rather than another file (it is never listed in the manifest
-or sent). Only regular files that were read count toward the 256-report limit.
-Rejections appear only as codes and counts in `reports_collected.rejected`; source
-files are never modified and record contents are never printed.
+that is not an identifier (1 to 128 bytes of ASCII letters, digits, `.`, `_` or
+`-`, starting with a letter or digit), a non-boolean filter value, a `filters`
+that is not an object holding both `include` and `exclude` as arrays, either
+list longer than 256 entries, or a `report_id` reused by two reports in the same job (including
+across its instances, which rejects every copy as `duplicate_report_id`) rejects
+that report locally. A snapshot that cannot be written is counted as
+`snapshot_write_failed` (and, if it was also a duplicate, only as that). Each
+rejected file is counted under exactly one code, except that a rejected
+duplicate whose already-frozen snapshot cannot be removed is also counted as
+`snapshot_discard_failed`, which marks the leftover snapshot rather than another
+file (it is never listed in the manifest or sent). Only regular files that were
+read count toward the 256-report limit. Rejections appear only as codes and
+counts in `reports_collected.rejected`; source files are never modified and
+record contents are never printed.
 
-The field, event and filter-tag allowlists mirror the GoodFlows server contract and
-live in one versioned module (`src/reporting/contract.rs`). A report using
-vocabulary a newer server accepts but this goodflows does not know (for example a
-new filter tag) is rejected locally and is not replayable; upgrade goodflows before
-producers emit new vocabulary. A signal that arrives while reports are being
-collected stops collection between files (`collection_interrupted`).
+The field and event allowlists, the limits and the identifier grammar shared by
+suite ids, report ids and filter tags mirror the GoodFlows server contract and
+live in one versioned module (`src/reporting/contract.rs`), currently the
+GoodFlows change `generalize-test-report-filters`. Release this
+goodflows only after that server change is deployed: an older server accepts
+only five filter tags, so it permanently rejects (422) a report with any other
+tag. A report using vocabulary a newer server accepts but this goodflows does
+not know (for example a new event or field) is rejected locally and is not
+replayable; upgrade goodflows before producers emit new vocabulary. A signal
+that arrives while reports are being collected stops collection between files
+(`collection_interrupted`).
 
 ### Spool layout and retention
 
@@ -875,7 +883,14 @@ instances it lists. A `report_id` listed more than once within one job, even by
 different instances, is not sent at all: every copy is reported as
 `invalid_snapshot`. Manifests written before partitions existed replay unchanged.
 Replay a run with the goodflows version that wrote it or a newer one: an older
-goodflows refuses a version 2 manifest with an unsupported-version error. Because the manifest chooses which of your
+goodflows refuses a version 2 manifest with an unsupported-version error. The
+same rule covers snapshot contents, because every snapshot is re-validated
+against the replaying goodflows's contract before it is sent: an older goodflows
+refuses (`invalid_snapshot`) a snapshot with a filter tag outside its five-name
+list, and a newer one refuses a snapshot its rules no longer accept (for example
+one frozen without both `filters.include` and `filters.exclude`, or with a filter
+list over 256 entries). A refused
+snapshot is never sent; its raw JSONL stays in `reports/`. Because the manifest chooses which of your
 environment variables become the endpoint and key, only replay run directories
 produced by your own invocations. It does
 not need the project checkout or config, runs no jobs and does not read current Git

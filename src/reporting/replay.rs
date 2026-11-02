@@ -195,7 +195,7 @@ pub async fn upload_with(
                 )
             };
             if !dir_matches
-                || !super::collect::valid_identifier(&report.report_id)
+                || !super::contract::valid_identifier(&report.report_id)
                 || !indexes.insert(report.index)
                 || job_ids[&(job.name.as_str(), report.report_id.as_str())] > 1
             {
