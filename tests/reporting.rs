@@ -3096,3 +3096,87 @@ fn settings_env_never_supplies_a_custom_url_env_endpoint() {
     assert_eq!(decoy.connections(), 0);
     assert_no_secret(&p, &output);
 }
+
+// ---- profile partition counts ----
+
+/// Declared count 3; the selected `local` profile raises it to 6. Saved without credentials.
+fn saved_profile_count_run() -> (Project, PathBuf, std::process::Output) {
+    let p = project_with(
+        "[reporting]\nproject = \"goodcases\"\nurl_env = \"SAVED_URL\"\ntoken_env = \"SAVED_KEY\"\n",
+        "[[jobs]]\nname = \"test\"\npartitions = 3\ncommand = 'cp fixtures/q$GOODFLOWS_PARTITION.jsonl \"$GOODFLOWS_REPORT_DIR/\"'\nreports = [\"exunit-timings\"]\n[environments.local.partitions]\ntest = 6\n",
+    );
+    for i in 1..=6 {
+        std::fs::write(
+            p.dir.join(format!("fixtures/q{i}.jsonl")),
+            timing_report(&format!("q{i}"), Some(&i.to_string())),
+        )
+        .unwrap();
+    }
+    let output = p.run(&["--json", "--env", "local"]);
+    success(&output);
+    let dir = run_dirs(&p).pop().unwrap();
+    (p, dir, output)
+}
+
+#[test]
+fn profile_partition_count_drives_report_collection_and_replay() {
+    let (p, dir, output) = saved_profile_count_run();
+    let events = events(&output);
+    assert_eq!(events[0]["jobs"], 6);
+    let collected = by_type(&events, "reports_collected");
+    assert_eq!(collected.len(), 6);
+    let mut indexes: Vec<_> = collected
+        .iter()
+        .map(|e| {
+            assert_eq!(e["partition"]["count"], 6, "{e}");
+            assert_eq!(e["reports"], 1, "{e}");
+            e["partition"]["index"].as_u64().unwrap()
+        })
+        .collect();
+    indexes.sort();
+    assert_eq!(indexes, [1, 2, 3, 4, 5, 6]);
+    let summary = events.last().unwrap();
+    assert_eq!(summary["passed"], 6);
+    assert_eq!(summary["results"].as_array().unwrap().len(), 6);
+
+    let jobs = manifest(&dir)["jobs"].as_array().unwrap().clone();
+    assert_eq!(jobs.len(), 6);
+    for (i, job) in jobs.iter().enumerate() {
+        assert_eq!(job["partition"], json!({"index": i + 1, "count": 6}));
+        assert_eq!(job["status"], "passed");
+        // The saved report envelope carries the effective count.
+        let snapshot: Value = serde_json::from_slice(
+            &std::fs::read(dir.join(format!("test/p{}/pending/000.json", i + 1))).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(snapshot["report"]["partition"], (i + 1).to_string());
+        assert_eq!(snapshot["report"]["partition_count"], 6);
+    }
+
+    // Replay reads the saved run only: change the config so a fresh resolution
+    // would give a different count, then check the original count is sent.
+    std::fs::write(
+        p.dir.join("goodflows.toml"),
+        "[reporting]\nproject = \"goodcases\"\nurl_env = \"SAVED_URL\"\ntoken_env = \"SAVED_KEY\"\n[[jobs]]\nname = \"test\"\npartitions = 2\ncommand = 'true'\n[environments.local.partitions]\ntest = 1\n",
+    )
+    .unwrap();
+    let mock = Mock::store();
+    let output = replay(&p.dir, &dir, Some(&mock.url), &["--json"]);
+    success(&output);
+    let mut partitions: Vec<_> = mock
+        .requests()
+        .iter()
+        .map(|r| {
+            let body = r.json();
+            assert_eq!(body["environment"], "local");
+            assert_eq!(body["report"]["partition_count"], 6);
+            assert_eq!(body["report"]["records"][0]["partition_count"], 6);
+            body["report"]["partition"].as_str().unwrap().to_owned()
+        })
+        .collect();
+    partitions.sort();
+    assert_eq!(partitions, ["1", "2", "3", "4", "5", "6"]);
+    let uploaded = by_type(&events_of(&output), "report_uploaded");
+    assert_eq!(uploaded.len(), 6);
+    assert!(uploaded.iter().all(|e| e["partition"]["count"] == 6));
+}

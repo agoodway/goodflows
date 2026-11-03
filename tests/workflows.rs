@@ -775,3 +775,138 @@ fn readme_settings_env_examples_validate() {
         );
     }
 }
+
+const PARTITIONED_CI: &str = r#"
+[[workflows.ci.jobs]]
+name = "test"
+partitions = 3
+command = "printf '%s/%s' $GOODFLOWS_PARTITION $GOODFLOWS_PARTITION_COUNT > ci.$GOODFLOWS_PARTITION"
+[environments.local.partitions]
+test = 6
+"#;
+
+fn ci_outputs(p: &Project) -> Vec<String> {
+    (1..=6)
+        .filter(|i| p.dir.join(format!("ci.{i}")).exists())
+        .map(|i| p.read(&format!("ci.{i}")))
+        .collect()
+}
+
+#[test]
+fn profile_partition_entry_is_ignored_where_the_job_is_absent() {
+    let p = Project::new(&format!(
+        "{PARTITIONED_CI}[[workflows.nightly.jobs]]\nname = 'lint'\ncommand = 'touch nightly'\n"
+    ));
+    success(&p.run(&["run", "ci", "--env", "local"]));
+    assert_eq!(
+        ci_outputs(&p),
+        (1..=6).map(|i| format!("{i}/6")).collect::<Vec<_>>()
+    );
+    success(&p.run(&["run", "nightly", "--env", "local"]));
+    assert!(p.dir.join("nightly").exists());
+    success(&p.run(&["validate", "--env", "local"]));
+    // Without --env, aggregate validation checks every profile and passes here.
+    success(&p.run(&["validate"]));
+    let output = p.run(&["list", "--workflows", "--env", "local", "--json"]);
+    success(&output);
+}
+
+#[test]
+fn profile_partition_entry_fails_where_the_job_is_not_partitioned() {
+    let p = Project::new(&format!(
+        "{PARTITIONED_CI}[[workflows.nightly.jobs]]\nname = 'test'\ncommand = 'touch nightly'\n"
+    ));
+    success(&p.run(&["run", "ci", "--env", "local"]));
+    assert_eq!(ci_outputs(&p).len(), 6);
+    let message = "environment 'local': workflow 'nightly': job 'test' is not partitioned";
+    for args in [
+        &["run", "nightly", "--env", "local"][..],
+        &["validate", "nightly", "--env", "local"][..],
+        &["list", "nightly", "--env", "local"][..],
+        &["validate", "--env", "local"][..],
+        &["list", "--workflows", "--env", "local"][..],
+        // Without --env, aggregate validation resolves every profile.
+        &["validate"][..],
+    ] {
+        let output = p.run(args);
+        assert_eq!(output.status.code(), Some(1), "{args:?}");
+        assert!(
+            stderr(&output).contains(message),
+            "{args:?}: {}",
+            stderr(&output)
+        );
+        assert!(!p.dir.join("nightly").exists(), "{args:?}");
+    }
+    // The JSON error event names the workflow too.
+    let output = p.run(&["run", "nightly", "--env", "local", "--json"]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stdout(&output).contains(message), "{}", stdout(&output));
+    // Without the profile, nightly still runs and the other commands pass.
+    success(&p.run(&["validate", "nightly"]));
+    success(&p.run(&["list", "--workflows"]));
+    success(&p.run(&["run", "nightly"]));
+    assert!(p.dir.join("nightly").exists());
+}
+
+#[test]
+fn profile_partition_checks_apply_with_jobs_selection() {
+    let p = Project::new(&format!(
+        "{PARTITIONED_CI}[[workflows.nightly.jobs]]\nname = 'test'\ncommand = 'touch nightly'\n\
+         [[workflows.nightly.jobs]]\nname = 'lint'\ncommand = 'touch lint'\n"
+    ));
+    // The check covers the whole workflow, not only the --jobs selection.
+    let output = p.run(&["run", "nightly", "--jobs", "lint", "--env", "local"]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        stderr(&output)
+            .contains("environment 'local': workflow 'nightly': job 'test' is not partitioned"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(!p.dir.join("lint").exists());
+    assert!(!p.dir.join("nightly").exists());
+    success(&p.run(&["run", "ci", "--jobs", "test", "--env", "local"]));
+    assert_eq!(
+        ci_outputs(&p),
+        (1..=6).map(|i| format!("{i}/6")).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn readme_profile_partition_examples_validate() {
+    let readme =
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/README.md")).unwrap();
+    let blocks: Vec<&str> = readme
+        .split("```toml\n")
+        .skip(1)
+        .map(|rest| rest.split("```").next().unwrap())
+        .filter(|block| block.contains(".partitions]"))
+        .collect();
+    assert!(!blocks.is_empty(), "expected a profile partitions example");
+    for block in blocks {
+        let p = Project::new(block);
+        for args in [
+            &["validate"][..],
+            &["validate", "--env", "local"][..],
+            &["validate", "--env", "orb"][..],
+        ] {
+            let output = p.run(args);
+            assert!(
+                output.status.success(),
+                "README example failed {args:?}:\n{block}\n{}",
+                stderr(&output)
+            );
+        }
+        let output = p.run(&["list", "--env", "local"]);
+        success(&output);
+        assert!(stdout(&output).contains("partitions: 6 (strategy=index)"));
+    }
+    let profiles = readme
+        .split("## Environment profiles")
+        .nth(1)
+        .unwrap()
+        .split("\n## ")
+        .next()
+        .unwrap();
+    assert!(!profiles.contains("cannot change a partition count"));
+}

@@ -391,14 +391,18 @@ partitions = 3
 - Partitioned jobs may declare `reports`: each instance gets its own report
   directory and its reports carry the instance's partition (see
   [Test timing reports](#test-timing-reports)).
+- An [environment profile](#environment-profiles) can replace the count for one
+  machine with `[environments.<profile>.partitions]`. The job's `partitions` value
+  is the declared count used by a bare run and by any profile that omits the job.
 
 See [Scheduling and failures](#scheduling-and-failures) for how instances are
 scheduled and [Logs and machine output](#logs-and-machine-output) for how they are
 reported.
 
 `list` displays every job field: name, command or steps, conditions, output mappings,
-dependencies, timeout, configured environment, shell mode, and partitions (count and
-strategy, shown only for partitioned jobs). It also shows effective `fail_fast`, `parallelism`,
+dependencies, timeout, configured environment, shell mode, and partitions (effective
+count and strategy, shown only for partitioned jobs; with `--env`, the count is the
+selected profile's override when it sets one). It also shows effective `fail_fast`, `parallelism`,
 and the resolved `workdir`, applying the same CLI overrides and CPU-count default
 as a run. In JSON, these values are under `jobs` and `settings`; job fields retain
 explicit defaults and nullable timeouts even though generated TOML omits them.
@@ -611,8 +615,8 @@ when produced by a step. Raw log paths remain per-job.
 
 ## Environment profiles
 
-Share jobs across machines while overriding runner settings for local development,
-orbs, or CI:
+Share jobs across machines while overriding runner settings and partition counts
+for local development, orbs, or CI:
 
 ```toml
 [settings]
@@ -648,12 +652,15 @@ workflow. Without `--env`, no profile is applied; goodflows does not detect the
 machine or read an environment variable to select one. The Amp plugin likewise
 uses no environment profile.
 
-Each profile can override `parallelism`, `fail_fast`, `workdir`, and `env`. Omitted fields
+Each profile can override `parallelism`, `fail_fast`, `workdir`, and `env` under
+`settings`, and the counts of partitioned jobs under `partitions` (see
+[Profile partition counts](#profile-partition-counts)). Omitted fields
 inherit independently, with precedence **CLI overrides > environment settings >
 workflow settings > shared settings > built-in defaults**. Explicit `false` and
 `0` values are preserved (`parallelism = 0` uses the logical CPU count). Relative
 profile workdirs resolve from the config file's directory, not the inherited
-workdir. Profiles do not change jobs or dependencies. A profile's `settings.env` overrides
+workdir. Profiles do not change jobs or dependencies, except for the partition
+counts described below. A profile's `settings.env` overrides
 shared and workflow `settings.env` per key, while job and step `env` still win (see
 [Settings environment defaults](#settings-environment-defaults)).
 Every command and expression sees the selected profile as `GOODFLOWS_ENVIRONMENT`.
@@ -680,6 +687,64 @@ caller's environment or job/step overrides; `jobs[*].env` in `list` output still
 each job's explicitly configured `env`. Human `list` output shows the same merged
 map on the settings line (`Settings: fail_fast=... parallelism=... env={...}`) and in
 each `list --workflows` entry.
+
+### Profile partition counts
+
+A profile can replace the count of a job that already declares
+[`partitions`](#partitioned-jobs), so one config can run six test partitions on a
+laptop and three in an orb:
+
+```toml
+[settings]
+parallelism = 4
+
+[environments.local.settings]
+parallelism = 8   # size parallelism for the effective count yourself
+
+[environments.local.partitions]
+test = 6
+
+[environments.orb.partitions]
+test = 3
+
+[[jobs]]
+name = "test"
+command = "MIX_TEST_PARTITION=$GOODFLOWS_PARTITION mix test --partitions $GOODFLOWS_PARTITION_COUNT"
+partitions = 3
+```
+
+- Each entry maps a job name to an integer count from 1 to 64. The job keeps its
+  strategy and every other field; only the count changes. The effective count is
+  what scheduling, `GOODFLOWS_PARTITION_COUNT`, events, logs, summaries, report
+  envelopes, and `list` use.
+- Without `--env`, or with a profile that omits the job, the job's declared count
+  applies.
+- A profile cannot add or remove partitioning. Every entry, in every profile
+  (selected or not), must name a job that declares `partitions` in at least one
+  workflow. A name that matches no job fails with `environment '<profile>':
+  unknown job '<job>' (partitioned jobs: ...)`; a name whose jobs are all
+  unpartitioned fails with `environment '<profile>': job '<job>' is not
+  partitioned`. Counts outside 1 to 64 fail with the profile and job named, and
+  non-integer values fail while parsing the TOML.
+- Entries apply per selected workflow. A name the selected workflow does not
+  contain is ignored. When the selected workflow has a job by that name that does
+  not declare `partitions`, the run, `list`, and `validate` fail before any job
+  runs with `environment '<profile>': workflow '<workflow>': job '<job>' is not
+  partitioned`; aggregate `validate --env` and `list --workflows --env` fail if any
+  workflow would. Aggregate `validate` without `--env` checks every profile against
+  every workflow the same way, so it fails if any `run <workflow> --env <profile>`
+  would.
+- Known limitation: this check covers the whole workflow, not just the jobs
+  `--jobs` selects. If a profile sets `test` and a workflow has a plain `test` job,
+  every command for that workflow fails with that profile, including
+  `goodflows run nightly --jobs lint --env local`. Rename one of the jobs or use a
+  separate profile for that workflow.
+- The count does not change `parallelism`. Extra instances wait for free slots, so
+  set the profile's `settings.parallelism` (or `--parallelism`) for the effective
+  count; the usual parallelism precedence still applies.
+- Older goodflows versions reject the `partitions` table on a profile. Remove it
+  before rolling back to an older binary. Saved runs keep the count they ran with,
+  so `reports upload` replays them unchanged.
 
 ## Scheduling and failures
 

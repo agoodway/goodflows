@@ -708,3 +708,215 @@ command = "touch ran"
     success(&run(&p, &[]));
     assert!(p.dir.join("ran").exists());
 }
+
+/// Declared count 3; the `local` profile raises it to 6 and `one` lowers it to 1.
+fn profile_count_project(extra: &str) -> Project {
+    Project::new(&format!(
+        r#"
+[settings]
+parallelism = 5
+{extra}
+[[jobs]]
+name = "test"
+partitions = {{ count = 3, strategy = "index" }}
+command = '''{PARTITION_PROBE} > out.$GOODFLOWS_PARTITION; printf 'out %s' $GOODFLOWS_PARTITION; printf 'err %s' $GOODFLOWS_PARTITION >&2'''
+[environments.local.partitions]
+test = 6
+[environments.one.partitions]
+test = 1
+[environments.other.settings]
+fail_fast = false
+"#
+    ))
+}
+
+fn partition_outputs(p: &Project) -> Vec<String> {
+    let mut names: Vec<_> = std::fs::read_dir(&p.dir)
+        .unwrap()
+        .map(|f| f.unwrap().file_name().into_string().unwrap())
+        .filter(|name| name.starts_with("out."))
+        .collect();
+    names.sort();
+    names.iter().map(|name| p.read(name)).collect()
+}
+
+#[test]
+fn selected_profile_count_drives_instances_identity_and_logs() {
+    let p = profile_count_project("");
+    let output = p.run(&["--json", "--env", "local", "--log-dir", "logs"]);
+    success(&output);
+    assert_eq!(
+        partition_outputs(&p),
+        (1..=6).map(|i| format!("{i}/6")).collect::<Vec<_>>()
+    );
+    let events = events(&output);
+    assert_eq!(events[0]["type"], "run_started");
+    assert_eq!(events[0]["jobs"], 6);
+    // Started events tag the instance; finished events carry it in the result.
+    for (kind, path) in [
+        ("job_started", "/partition"),
+        ("job_finished", "/result/partition"),
+    ] {
+        let tagged: Vec<_> = events
+            .iter()
+            .filter(|e| e["type"] == kind)
+            .map(|e| e.pointer(path).cloned().unwrap_or_default())
+            .collect();
+        assert_eq!(tagged.len(), 6, "{kind}");
+        for partition in tagged {
+            assert_eq!(partition["count"], 6, "{kind}");
+        }
+    }
+    let summary = events.last().unwrap();
+    assert_eq!(summary["type"], "summary");
+    assert_eq!(summary["passed"], 6);
+    let results = summary["results"].as_array().unwrap();
+    assert_eq!(results.len(), 6);
+    for (index, result) in results.iter().enumerate() {
+        assert_eq!(
+            result["partition"],
+            serde_json::json!({"index": index + 1, "count": 6})
+        );
+    }
+    let mut names: Vec<_> = std::fs::read_dir(p.dir.join("logs"))
+        .unwrap()
+        .map(|f| f.unwrap().file_name().into_string().unwrap())
+        .collect();
+    names.sort();
+    let expected: Vec<_> = (1..=6)
+        .flat_map(|i| {
+            [
+                format!("001-test.p{i:02}.stderr.log"),
+                format!("001-test.p{i:02}.stdout.log"),
+            ]
+        })
+        .collect();
+    assert_eq!(names, expected);
+    for index in 1..=6 {
+        assert_eq!(
+            p.read(&format!("logs/001-test.p{index:02}.stdout.log")),
+            format!("out {index}")
+        );
+        assert_eq!(
+            p.read(&format!("logs/001-test.p{index:02}.stderr.log")),
+            format!("err {index}")
+        );
+    }
+}
+
+#[test]
+fn selected_profile_count_drives_step_identities() {
+    let p = Project::new(&format!(
+        r#"
+[[jobs]]
+name = "stepped"
+partitions = {{ count = 3, strategy = "index" }}
+[[jobs.steps]]
+id = "a"
+command = '''{PARTITION_PROBE} > a.$GOODFLOWS_PARTITION'''
+[[jobs.steps]]
+id = "b"
+command = "true"
+[environments.local.partitions]
+stepped = 6
+"#
+    ));
+    let output = p.run(&["--json", "--env", "local"]);
+    success(&output);
+    for index in 1..=6 {
+        assert_eq!(p.read(&format!("a.{index}")), format!("{index}/6"));
+    }
+    let events = events(&output);
+    for kind in ["step_started", "step_finished"] {
+        let mut indexes: Vec<_> = events
+            .iter()
+            .filter(|e| e["type"] == kind)
+            .map(|e| {
+                assert_eq!(e["partition"]["count"], 6, "{kind}: {e}");
+                e["partition"]["index"].as_u64().unwrap()
+            })
+            .collect();
+        indexes.sort();
+        let expected: Vec<u64> = (1..=6).flat_map(|i| [i, i]).collect();
+        assert_eq!(indexes, expected, "{kind}");
+    }
+}
+
+#[test]
+fn profile_count_of_one_and_declared_count_without_override() {
+    let p = profile_count_project("");
+    success(&p.run(&["--env", "one"]));
+    assert_eq!(partition_outputs(&p), ["1/1"]);
+    for args in [&["--env", "other"][..], &[][..]] {
+        let p = profile_count_project("");
+        success(&p.run(args));
+        assert_eq!(partition_outputs(&p), ["1/3", "2/3", "3/3"], "{args:?}");
+    }
+}
+
+#[test]
+fn profile_count_does_not_change_parallelism() {
+    // Each instance records how many instances are running alongside it.
+    let p = Project::new(
+        r#"
+[[jobs]]
+name = "test"
+partitions = 3
+command = "touch running.$GOODFLOWS_PARTITION; sleep 0.3; ls running.* | wc -l > seen.$GOODFLOWS_PARTITION; rm running.$GOODFLOWS_PARTITION"
+[environments.local.partitions]
+test = 6
+"#,
+    );
+    let output = p.run(&["--json", "--env", "local", "--parallelism", "2"]);
+    success(&output);
+    let events = events(&output);
+    assert_eq!(events[0]["parallelism"], 2);
+    let mut running = 0;
+    let mut peak = 0;
+    for event in &events {
+        match event["type"].as_str() {
+            Some("job_started") => running += 1,
+            Some("job_finished") => running -= 1,
+            _ => continue,
+        }
+        peak = peak.max(running);
+    }
+    assert_eq!(peak, 2);
+    for index in 1..=6 {
+        let seen: u32 = p.read(&format!("seen.{index}")).trim().parse().unwrap();
+        assert!(seen <= 2, "instance {index} saw {seen} running");
+    }
+}
+
+#[test]
+fn profile_partition_map_keeps_parallelism_precedence() {
+    let p = profile_count_project("[environments.local.settings]\nparallelism = 2\n");
+    for (args, parallelism) in [
+        (vec!["--json", "--env", "local"], 2),
+        (vec!["--json", "--env", "local", "--parallelism", "3"], 3),
+        (vec!["--json", "--env", "one"], 5),
+        (vec!["--json"], 5),
+    ] {
+        let output = p.run(&args);
+        success(&output);
+        let events = events(&output);
+        assert_eq!(events[0]["parallelism"], parallelism, "{args:?}");
+    }
+    let output = p.run(&["list", "--json", "--env", "local"]);
+    success(&output);
+    let event: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(event["settings"]["parallelism"], 2);
+    assert_eq!(event["jobs"][0]["partitions"]["count"], 6);
+}
+
+#[test]
+fn plain_text_labels_instances_with_the_profile_count() {
+    let p = profile_count_project("");
+    let output = p.run(&["--env", "local"]);
+    success(&output);
+    let out = stdout(&output);
+    for index in 1..=6 {
+        assert!(out.contains(&format!("test ({index}/6) PASSED")), "{out}");
+    }
+    assert!(!out.contains("/3)"), "{out}");
+}
