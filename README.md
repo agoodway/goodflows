@@ -962,10 +962,9 @@ record contents are never printed.
 The field and event allowlists, the limits and the identifier grammar shared by
 suite ids, report ids and filter tags mirror the GoodFlows server contract and
 live in one versioned module (`src/reporting/contract.rs`), currently the
-GoodFlows change `generalize-test-report-filters`. Release this
-goodflows only after that server change is deployed: an older server accepts
-only five filter tags, so it permanently rejects (422) a report with any other
-tag. A report using vocabulary a newer server accepts but this goodflows does
+GoodFlows change `2026-11-01-generalize-test-report-filters`. An older server
+accepts only five filter tags, so it permanently rejects (422) a report with
+any other tag. A report using vocabulary a newer server accepts but this goodflows does
 not know (for example a new event or field) is rejected locally and is not
 replayable; upgrade goodflows before producers emit new vocabulary. A signal
 that arrives while reports are being collected stops collection between files
@@ -1274,5 +1273,5 @@ To exercise packaging locally, Linux targets need Docker and produce a Debian 12
 binary. macOS targets build natively:
 
 ```bash
-bash scripts/package-release.sh x86_64-unknown-linux-gnu v0.4.0
+bash scripts/package-release.sh x86_64-unknown-linux-gnu v0.5.0
 ```

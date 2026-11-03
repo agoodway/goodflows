@@ -4,8 +4,8 @@
 //! report and filter-tag ids) the publisher enforces locally lives here, tied
 //! to one contract version. The authoritative definition is
 //! the GoodFlows server change `2026-11-01-store-test-timings` (design D1), as
-//! amended by `generalize-test-report-filters` (filter tags are boolean
-//! identifiers and each filter list holds at most [`MAX_FILTER_ENTRIES`]).
+//! amended by `2026-11-01-generalize-test-report-filters` (filter tags are
+//! boolean identifiers and each filter list holds at most [`MAX_FILTER_ENTRIES`]).
 //!
 //! Coupling: collection rejects anything outside these lists *before* a
 //! request snapshot is frozen, so a report the server would accept but this
@@ -16,9 +16,7 @@
 //! vocabulary.
 
 /// Identifies the server contract revision these tables were copied from.
-/// The server change is not archived yet; if it is archived under a dated id,
-/// rename this to match. Release only after that change is deployed.
-pub const CONTRACT_VERSION: &str = "generalize-test-report-filters";
+pub const CONTRACT_VERSION: &str = "2026-11-01-generalize-test-report-filters";
 
 pub const REPORT_FORMAT: &str = "exunit-timings";
 
@@ -141,7 +139,7 @@ pub fn valid_identifier(id: &str) -> bool {
 }
 
 /// A `filters.include`/`filters.exclude` tag follows the identifier grammar
-/// (server change `generalize-test-report-filters`); its value is a boolean.
+/// (server change `2026-11-01-generalize-test-report-filters`); its value is a boolean.
 pub fn valid_filter_tag(tag: &str) -> bool {
     valid_identifier(tag)
 }
@@ -167,7 +165,10 @@ mod tests {
 
     #[test]
     fn contract_is_versioned_and_matches_the_server_vocabulary() {
-        assert_eq!(CONTRACT_VERSION, "generalize-test-report-filters");
+        assert_eq!(
+            CONTRACT_VERSION,
+            "2026-11-01-generalize-test-report-filters"
+        );
         assert_eq!(MAX_REQUEST_BYTES, 33_554_432);
         assert_eq!(MAX_FILTER_ENTRIES, 256);
         assert_eq!(MAX_IDENTIFIER_BYTES, 128);
