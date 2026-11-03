@@ -456,7 +456,7 @@ fn local_only_collection_without_credentials() {
         "{text}"
     );
     assert!(text.contains("reporting skipped: credentials unavailable (3 reports kept locally)"));
-    assert!(text.trim_end().ends_with("All jobs passed"));
+    assert!(text.trim_end().ends_with("\n1 passed"), "{text}");
 }
 
 #[test]
@@ -1309,6 +1309,13 @@ fn offline_and_transient_failures_retry_then_stay_pending() {
     let summary = first.last().unwrap();
     assert_eq!(summary["type"], "summary");
     assert!(summary["results"][0]["duration_ms"].as_u64().unwrap() < 2000);
+    // The run's wall time includes reporting, so it covers the retries too.
+    let wall = summary["duration_ms"].as_u64().unwrap();
+    assert!(wall >= 3000, "{summary}");
+    assert!(
+        wall >= summary["results"][0]["duration_ms"].as_u64().unwrap(),
+        "{summary}"
+    );
 
     // 503 with Retry-After is retried, then succeeds.
     let rows = std::sync::Mutex::new(Default::default());
@@ -1366,8 +1373,11 @@ fn text_output_shows_delivery_and_summary_stays_last() {
         "{text}"
     );
     assert!(text.contains("report test/r1 uploaded"));
-    let summary = text.find("Summary:").unwrap();
-    assert!(text.find("report test/r1 uploaded").unwrap() < summary);
+    // The run report follows every reporting line and nothing follows it.
+    let report = text.find("\ndefault  PASSED  in ").unwrap();
+    assert!(text.find("report test/r1 uploaded").unwrap() < report);
+    assert!(text.trim_end().ends_with("\n1 passed"), "{text}");
+    assert!(!text[report..].contains("report"), "{text}");
     let p2 = project(&format!(
         "[[jobs]]\nname = \"test\"\ncommand = '{}'\nreports = [\"exunit-timings\"]\n",
         copy(&["r1"])
@@ -1408,7 +1418,7 @@ fn text_output_shows_delivery_and_summary_stays_last() {
         text.contains("report test/r1 uploaded (already stored)"),
         "{text}"
     );
-    assert!(text.trim_end().ends_with("All jobs passed"), "{text}");
+    assert!(text.trim_end().ends_with("\n1 passed"), "{text}");
 
     // Delivery skips.
     let text = stdout(&run_with(&p3, &[], Some("http://flows.example.com")));
@@ -1428,7 +1438,7 @@ fn text_output_shows_delivery_and_summary_stays_last() {
         text.contains("reporting skipped: spool unavailable\n"),
         "{text}"
     );
-    assert!(text.trim_end().ends_with("All jobs passed"), "{text}");
+    assert!(text.trim_end().ends_with("\n1 passed"), "{text}");
 }
 
 // ---- 4.x replay ----
@@ -2974,4 +2984,209 @@ fn replay_of_a_manifest_written_before_partitions_is_unchanged() {
         assert!(event.get("partition").is_none(), "{event}");
     }
     assert_eq!(manifest(&dir), saved);
+}
+
+// ---- settings env ----
+
+#[test]
+fn settings_env_never_reveals_inherited_token_and_keeps_reporting_identity() {
+    let p = project(&format!(
+        r#"
+[settings.env]
+SHARED = "settings"
+[environments.local.settings.env]
+PROFILE = "profile"
+[[jobs]]
+name = "shell"
+condition = {{ expression = 'env.GOODFLOWS_API_KEY == null && env.SHARED == "settings"' }}
+command = 'env > shell-env.txt; {copy}'
+reports = ["exunit-timings"]
+[[jobs]]
+name = "stepped"
+outputs = {{ token = "env.GOODFLOWS_API_KEY ?? \"absent\"" }}
+[[jobs.steps]]
+id = "probe"
+condition = {{ shell = "env > step-condition-env.txt" }}
+command = 'env > step-env.txt'
+"#,
+        copy = copy(&["r1"])
+    ));
+    let output = p
+        .command()
+        .args(["--env", "local", "--json"])
+        .env("GOODFLOWS_URL", "http://flows.example.com")
+        .env("GOODFLOWS_API_KEY", SECRET)
+        .env("GOODFLOWS_RUN_ID", "inherited-run-id")
+        .output()
+        .unwrap();
+    success(&output);
+    for file in ["shell-env.txt", "step-condition-env.txt", "step-env.txt"] {
+        let env = p.read(file);
+        assert!(env.contains("SHARED=settings"), "{file}: {env}");
+        assert!(env.contains("PROFILE=profile"), "{file}: {env}");
+        assert!(!env.contains("GOODFLOWS_API_KEY="), "{file}: {env}");
+        assert!(!env.contains("inherited"), "{file}: {env}");
+    }
+    let run_id = manifest(&run_dirs(&p)[0])["workflow_run_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(p
+        .read("shell-env.txt")
+        .contains(&format!("GOODFLOWS_RUN_ID={run_id}")));
+    let summary = events(&output).last().unwrap().clone();
+    let stepped = summary["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["name"] == "stepped")
+        .unwrap()
+        .clone();
+    assert_eq!(stepped["outputs"]["token"], "absent");
+    assert_no_secret(&p, &output);
+}
+
+#[test]
+fn settings_env_never_supplies_the_publisher_endpoint() {
+    let mock = Mock::store();
+    let decoy = Mock::store();
+    let jobs = |url: &str| {
+        format!(
+            "[settings.env]\nGOODFLOWS_URL = \"{url}\"\n[[jobs]]\nname = \"test\"\ncommand = 'printf %s \"$GOODFLOWS_URL\" > seen-url; {}'\nreports = [\"exunit-timings\"]\n",
+            copy(&["r1"])
+        )
+    };
+    // The command sees the settings value while the publisher uses the caller's endpoint.
+    let p = project(&jobs(&decoy.url));
+    let output = run_with(&p, &["--json"], Some(&mock.url));
+    success(&output);
+    assert_eq!(p.read("seen-url"), decoy.url);
+    assert_eq!(mock.requests().len(), 1);
+    assert_eq!(decoy.connections(), 0);
+    assert_no_secret(&p, &output);
+    // Without a caller endpoint, settings do not make one available to the publisher.
+    let p = project(&jobs(&decoy.url));
+    let output = p
+        .command()
+        .arg("--json")
+        .env("GOODFLOWS_API_KEY", SECRET)
+        .output()
+        .unwrap();
+    success(&output);
+    assert_eq!(p.read("seen-url"), decoy.url);
+    let skipped = by_type(&events(&output), "reporting_skipped");
+    assert_eq!(skipped[0]["reason"], "credentials_unavailable");
+    assert_eq!(decoy.connections(), 0);
+    assert_eq!(mock.requests().len(), 1);
+}
+
+#[test]
+fn settings_env_never_supplies_a_custom_url_env_endpoint() {
+    let mock = Mock::store();
+    let decoy = Mock::store();
+    let p = project_with(
+        "[reporting]\nproject = \"goodcases\"\nurl_env = \"CUSTOM_URL\"\n",
+        &format!(
+            "[settings.env]\nCUSTOM_URL = \"{}\"\n[[jobs]]\nname = \"test\"\ncommand = 'printf %s \"$CUSTOM_URL\" > seen-url; {}'\nreports = [\"exunit-timings\"]\n",
+            decoy.url,
+            copy(&["r1"])
+        ),
+    );
+    let output = p
+        .command()
+        .arg("--json")
+        .env("CUSTOM_URL", &mock.url)
+        .env("GOODFLOWS_API_KEY", SECRET)
+        .output()
+        .unwrap();
+    success(&output);
+    // Commands see the settings value; the publisher uses the caller's endpoint.
+    assert_eq!(p.read("seen-url"), decoy.url);
+    assert_eq!(mock.requests().len(), 1);
+    assert_eq!(decoy.connections(), 0);
+    assert_no_secret(&p, &output);
+}
+
+// ---- profile partition counts ----
+
+/// Declared count 3; the selected `local` profile raises it to 6. Saved without credentials.
+fn saved_profile_count_run() -> (Project, PathBuf, std::process::Output) {
+    let p = project_with(
+        "[reporting]\nproject = \"goodcases\"\nurl_env = \"SAVED_URL\"\ntoken_env = \"SAVED_KEY\"\n",
+        "[[jobs]]\nname = \"test\"\npartitions = 3\ncommand = 'cp fixtures/q$GOODFLOWS_PARTITION.jsonl \"$GOODFLOWS_REPORT_DIR/\"'\nreports = [\"exunit-timings\"]\n[environments.local.partitions]\ntest = 6\n",
+    );
+    for i in 1..=6 {
+        std::fs::write(
+            p.dir.join(format!("fixtures/q{i}.jsonl")),
+            timing_report(&format!("q{i}"), Some(&i.to_string())),
+        )
+        .unwrap();
+    }
+    let output = p.run(&["--json", "--env", "local"]);
+    success(&output);
+    let dir = run_dirs(&p).pop().unwrap();
+    (p, dir, output)
+}
+
+#[test]
+fn profile_partition_count_drives_report_collection_and_replay() {
+    let (p, dir, output) = saved_profile_count_run();
+    let events = events(&output);
+    assert_eq!(events[0]["jobs"], 6);
+    let collected = by_type(&events, "reports_collected");
+    assert_eq!(collected.len(), 6);
+    let mut indexes: Vec<_> = collected
+        .iter()
+        .map(|e| {
+            assert_eq!(e["partition"]["count"], 6, "{e}");
+            assert_eq!(e["reports"], 1, "{e}");
+            e["partition"]["index"].as_u64().unwrap()
+        })
+        .collect();
+    indexes.sort();
+    assert_eq!(indexes, [1, 2, 3, 4, 5, 6]);
+    let summary = events.last().unwrap();
+    assert_eq!(summary["passed"], 6);
+    assert_eq!(summary["results"].as_array().unwrap().len(), 6);
+
+    let jobs = manifest(&dir)["jobs"].as_array().unwrap().clone();
+    assert_eq!(jobs.len(), 6);
+    for (i, job) in jobs.iter().enumerate() {
+        assert_eq!(job["partition"], json!({"index": i + 1, "count": 6}));
+        assert_eq!(job["status"], "passed");
+        // The saved report envelope carries the effective count.
+        let snapshot: Value = serde_json::from_slice(
+            &std::fs::read(dir.join(format!("test/p{}/pending/000.json", i + 1))).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(snapshot["report"]["partition"], (i + 1).to_string());
+        assert_eq!(snapshot["report"]["partition_count"], 6);
+    }
+
+    // Replay reads the saved run only: change the config so a fresh resolution
+    // would give a different count, then check the original count is sent.
+    std::fs::write(
+        p.dir.join("goodflows.toml"),
+        "[reporting]\nproject = \"goodcases\"\nurl_env = \"SAVED_URL\"\ntoken_env = \"SAVED_KEY\"\n[[jobs]]\nname = \"test\"\npartitions = 2\ncommand = 'true'\n[environments.local.partitions]\ntest = 1\n",
+    )
+    .unwrap();
+    let mock = Mock::store();
+    let output = replay(&p.dir, &dir, Some(&mock.url), &["--json"]);
+    success(&output);
+    let mut partitions: Vec<_> = mock
+        .requests()
+        .iter()
+        .map(|r| {
+            let body = r.json();
+            assert_eq!(body["environment"], "local");
+            assert_eq!(body["report"]["partition_count"], 6);
+            assert_eq!(body["report"]["records"][0]["partition_count"], 6);
+            body["report"]["partition"].as_str().unwrap().to_owned()
+        })
+        .collect();
+    partitions.sort();
+    assert_eq!(partitions, ["1", "2", "3", "4", "5", "6"]);
+    let uploaded = by_type(&events_of(&output), "report_uploaded");
+    assert_eq!(uploaded.len(), 6);
+    assert!(uploaded.iter().all(|e| e["partition"]["count"] == 6));
 }

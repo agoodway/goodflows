@@ -41,19 +41,23 @@ When a profile is selected, each partition entry SHALL replace the count of the 
 - **THEN** two instances start, and the others start as slots free
 
 ### Requirement: Profile partition names must match a partitioned job
-A profile partition entry MUST name a job that declares `partitions` in at least one workflow. An entry that names no such job MUST fail validation before jobs execute, whether or not the profile is selected. When the selected workflow contains that job and the job does not declare `partitions`, validation MUST fail before jobs execute. An entry whose job is absent from the selected workflow SHALL be ignored.
+A profile partition entry MUST name a job that declares `partitions` in at least one workflow. An entry that names no such job MUST fail validation before jobs execute, whether or not the profile is selected. When the entry names no job in any workflow, the error MUST name the profile and the job, say the job is unknown, and list the jobs that declare `partitions`. When the selected workflow contains that job and the job does not declare `partitions`, validation MUST fail before jobs execute, and the error MUST name the profile, the workflow, and the job. An entry whose job is absent from the selected workflow SHALL be ignored. Aggregate `goodflows validate` without `--env` SHALL resolve every workflow under every declared profile and fail with that same error when any combination would fail.
 
-#### Scenario: Unknown or never-partitioned job
-- **WHEN** a profile sets `test = 6` and no workflow has a partitioned job named `test`
-- **THEN** validation names the profile and the job, and no jobs execute, even when that profile is not selected
+#### Scenario: Unknown job
+- **WHEN** a profile sets `missing = 2`, no workflow has a job named `missing`, and `test` declares `partitions`
+- **THEN** validation fails with `environment '<profile>': unknown job 'missing' (partitioned jobs: test)`, and no jobs execute, even when that profile is not selected
+
+#### Scenario: Never-partitioned job
+- **WHEN** a profile sets `test = 6` and jobs named `test` exist but none declares `partitions`
+- **THEN** validation fails with `environment '<profile>': job 'test' is not partitioned`, and no jobs execute, even when that profile is not selected
 
 #### Scenario: Selected workflow's job is not partitioned
-- **WHEN** the selected workflow has an unpartitioned job named `test` and the profile sets `test = 6`
-- **THEN** validation names the profile and the job, and no jobs execute
+- **WHEN** the selected workflow `nightly` has an unpartitioned job named `test` and the local profile sets `test = 6`
+- **THEN** validation fails with `environment 'local': workflow 'nightly': job 'test' is not partitioned`, and no jobs execute
 
 #### Scenario: Same name differs by workflow
 - **WHEN** workflow `ci` has partitioned `test`, workflow `nightly` has unpartitioned `test`, and the local profile sets `test = 6`
-- **THEN** `goodflows run ci --env local` uses six instances, and `goodflows run nightly --env local` fails before jobs execute
+- **THEN** `goodflows run ci --env local` uses six instances, and `goodflows run nightly --env local` fails before jobs execute, even when `--jobs` selects only other `nightly` jobs
 
 #### Scenario: Entry unused by the selected workflow
 - **WHEN** only workflow `ci` has partitioned `test`, the local profile sets `test = 6`, and the user runs workflow `nightly` with `--env local`
@@ -61,7 +65,11 @@ A profile partition entry MUST name a job that declares `partitions` in at least
 
 #### Scenario: Aggregate inspection rejects an incompatible workflow
 - **WHEN** workflow `ci` has partitioned `test`, workflow `nightly` has unpartitioned `test`, the local profile sets `test = 6`, and the user runs `goodflows validate --env local` or `goodflows list --workflows --env local`
-- **THEN** the command fails naming the profile and job before any jobs execute
+- **THEN** the command fails naming the profile, the workflow, and the job before any jobs execute
+
+#### Scenario: Aggregate validation without a profile checks every profile
+- **WHEN** workflow `ci` has partitioned `test`, workflow `nightly` has unpartitioned `test`, the local profile sets `test = 6`, and the user runs `goodflows validate` without `--env`
+- **THEN** validation fails with `environment 'local': workflow 'nightly': job 'test' is not partitioned`, while `goodflows validate nightly` and `goodflows run nightly` without `--env` still succeed
 
 ## MODIFIED Requirements
 

@@ -18,7 +18,7 @@ In text mode, `goodflows run` SHALL render the `summary` event as a run report a
 - **THEN** every stdout line is a versioned JSON event and no report text is printed
 
 ### Requirement: Report header states the outcome and wall time
-The report SHALL start with a header naming the workflow, the run outcome and the run's wall-clock time. The outcome SHALL be `FAILED` if any instance failed or timed out, otherwise `CANCELLED` if any instance was cancelled, otherwise `PASSED`.
+The report SHALL start with a header naming the workflow, the run outcome and the run's wall-clock time, which includes reporting after the last job. The outcome SHALL be `FAILED` if any instance failed or timed out, otherwise `CANCELLED` if any instance was cancelled or a signal arrived before the summary was emitted, otherwise `PASSED`. The signal state shown SHALL be the same one that determines the exit code.
 
 #### Scenario: Passing run
 - **WHEN** every job in workflow `ci` passes or is skipped
@@ -26,7 +26,11 @@ The report SHALL start with a header naming the workflow, the run outcome and th
 
 #### Scenario: Interrupted run
 - **WHEN** a signal cancels running jobs and no instance failed or timed out
-- **THEN** the header shows `CANCELLED`
+- **THEN** the header shows `CANCELLED`, the cancelled job's row shows `CANCEL`, and there is no Failures section or rerun command
+
+#### Scenario: Signal after every job finished
+- **WHEN** every job passed but a signal arrived before the summary was emitted, so the run exits with `128+n`
+- **THEN** the header shows `CANCELLED`, not `PASSED`
 
 ### Requirement: Report lists one row per configured job
 The report SHALL list one row per selected configured job, including transitive prerequisites, in configuration order. Each row SHALL show the job's status, its duration if any instance started, and, for a skipped job, the distinct nonempty skip reasons in instance order without duplicates. Start state SHALL come from the summary result's `started` flag, meaning execution entered `run_job`, rather than from status or a positive duration. A row for a job that never started MUST NOT show a duration; a started job with a recorded duration of zero SHALL show `0ms`.
@@ -88,8 +92,12 @@ When any instance failed or timed out, the report SHALL include a Failures secti
 - **WHEN** an instance times out and has no exit code
 - **THEN** its entry shows timed out and the available command, error and tails without a fabricated exit code
 
+#### Scenario: Timed-out step
+- **WHEN** step `a` of job `test` passes and step `slow` times out
+- **THEN** the entry for `test` shows timed out, names step `slow` and shows no exit code
+
 ### Requirement: Report points at logs and a rerun command
-When the run used a log directory, the report SHALL show that directory. When any job's row status is failed or timed out, the report SHALL end with a rerun command `goodflows run <workflow> [--env=<env>] --jobs=<names>` that lists each such configured job once, in configuration order, and keeps the workflow and any `--env` selection of the original run. Values SHALL be POSIX shell-quoted with embedded apostrophes escaped. Option values SHALL use equals form; a workflow beginning with `-` SHALL appear last after `--`. If any failed or timed-out job name contains a comma, the report SHALL instead explain that selective rerun is unavailable and end with a full-workflow rerun command preserving workflow and environment but omitting `--jobs`.
+When the run used a log directory, the report SHALL show that directory. When any job's row status is failed or timed out, the report SHALL end with a rerun command `goodflows run <workflow> [--config=<path>] [--env=<env>] --jobs=<names>` that lists, once each and in configuration order, every job whose row is failed or timed out and every skipped job with the skip reason `dependency did not pass`, and keeps the workflow and any `--env` selection of the original run. `--config` SHALL be included, with the path as given, only when the original run passed `--config` explicitly; this path MUST NOT be added to the JSON `summary` event. Values SHALL be POSIX shell-quoted with embedded apostrophes escaped. Option values SHALL use equals form; a workflow beginning with `-` SHALL appear last after `--`. If any job selected for the rerun has a name containing a comma, the report SHALL instead explain that selective rerun is unavailable and end with a full-workflow rerun command preserving workflow, config and environment but omitting `--jobs`.
 
 #### Scenario: Rerun hint for a partitioned failure
 - **WHEN** `lint` precedes `test` in configuration order, and two instances of `test` and the job `lint` fail
@@ -103,9 +111,36 @@ When the run used a log directory, the report SHALL show that directory. When an
 - **WHEN** a failed configured job is named `test,unit`
 - **THEN** the report explains the selector limitation and ends with a full-workflow rerun command without `--jobs`
 
+#### Scenario: Comma fallback keeps environment and workflow position
+- **WHEN** a failed job named `test,unit` runs in workflow `-wf` with `--env prod`
+- **THEN** the report ends with `Rerun workflow: goodflows run --env=prod -- -wf`
+
+#### Scenario: Skipped dependents are rerun
+- **WHEN** `build` fails, `deploy` (which depends on `build`) is skipped with reason `dependency did not pass`, and `late` is skipped by fail-fast
+- **THEN** the rerun command selects `build` and `deploy` but not `late`
+
+#### Scenario: Timed-out job only
+- **WHEN** the only non-passing job `slow` timed out
+- **THEN** the report ends with a rerun command selecting `slow`
+
+#### Scenario: Explicit config path
+- **WHEN** the run used `--config 'my ci.toml'` and a job failed
+- **THEN** the rerun command includes `--config='my ci.toml'`, and running it through `sh` uses that config; a run without `--config` gets a hint without it
+
 #### Scenario: No hint on success
 - **WHEN** every job passes
 - **THEN** the report shows no Failures section and no rerun command
+
+### Requirement: Job-provided text cannot rewrite the terminal
+In text mode, the report and the live failure and step error lines SHALL print control characters other than tab in commands, errors, skip reasons and output tails as visible escapes (for example `\u{1b}` or `\r`), keeping tail line breaks as separate lines. Job names containing control characters MUST fail validation; other job-name rules are unchanged.
+
+#### Scenario: Escape sequence in a tail
+- **WHEN** a failed job's stderr tail contains `ESC [2J` and a bare carriage return
+- **THEN** the report shows them as `\u{1b}[2J` and `\r` and writes no raw control characters other than newlines
+
+#### Scenario: Control character in a job name
+- **WHEN** a job name contains an escape character or a tab
+- **THEN** validation fails with an error naming the job and its invalid control characters, while names with spaces or commas stay valid
 
 ### Requirement: Live failure lines stay short in text mode
 In text mode, a failed or timed-out `job_finished` line SHALL show the instance, status, duration, and exit code and error when available, only. The command and output tails MUST NOT be printed there, because the run report shows them. JSON `job_finished` events MUST keep their command and tail fields.
@@ -114,12 +149,24 @@ In text mode, a failed or timed-out `job_finished` line SHALL show the instance,
 - **WHEN** `test (1/2)` fails while other jobs are still running, in text mode
 - **THEN** its finished line and error line are printed, without the command or `stdout tail` / `stderr tail` blocks
 
+#### Scenario: Timeout while the run continues
+- **WHEN** a job with `timeout_secs = 1` prints `out` and then sleeps past its timeout, in text mode
+- **THEN** its live finished line shows `TIMED OUT` without a command or tail block, and the report's entry shows `stdout tail:` with `out`
+
 ### Requirement: JSON summary carries run duration and log directory
-The JSON `summary` event SHALL include integer `duration_ms`, measured immediately before `runner::execute` until summary construction after reporting finishes, and, when a log directory is in use, `log_dir` with the effective `options.log_dir` path (including the workflow subdirectory where applicable). Without a log directory, `log_dir` MUST be absent. Each `summary.results` entry SHALL additionally include boolean `started`, true if it entered `run_job` and false if skipped or cancelled before launch; this field MUST NOT be added to live `job_finished` events. Every existing `summary` field MUST keep its name and meaning, including per-instance counts.
+The JSON `summary` event SHALL include integer `duration_ms`, measured immediately before `runner::execute` until summary construction after reporting finishes, and, when a log directory is in use, `log_dir` with the effective `options.log_dir` path (including the workflow subdirectory where applicable), converted lossily when the path is not valid UTF-8. Without a log directory, `log_dir` MUST be absent. Each `summary.results` entry SHALL additionally include boolean `started`, true if it entered `run_job` and false if skipped or cancelled before launch; this field MUST NOT be added to live `job_finished` events. Every existing `summary` field MUST keep its name and meaning, including per-instance counts.
 
 #### Scenario: Summary fields
 - **WHEN** a workflow runs with `--json --log-dir logs`
 - **THEN** the `summary` event has an integer `duration_ms`, a `log_dir` naming the workflow's log directory, and its `passed`, `failed`, `timed_out`, `skipped`, `cancelled` and `results` fields are unchanged in meaning
+
+#### Scenario: Wall time covers jobs and reporting
+- **WHEN** a job runs `sleep 0.2`
+- **THEN** `duration_ms` is at least 200 and at least every result's `duration_ms`, and it also covers reporting retries after the last job
+
+#### Scenario: Non-UTF-8 log directory
+- **WHEN** `--log-dir` names a path that is not valid UTF-8
+- **THEN** the jobs' logs are written there and the run still ends with a `summary` whose `log_dir` is the lossy conversion of that path
 
 #### Scenario: No log directory
 - **WHEN** a workflow runs with `--json` without `--log-dir`

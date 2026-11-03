@@ -12,9 +12,11 @@ After `goodflows run` finishes in text mode, the only closing output is one line
   - status counts by configured job, not by instance;
   - a Failures section with one entry per failed or timed-out instance, showing the failing step, command, error and output tails;
   - the log directory when `--log-dir` is set;
-  - a shell-safe rerun hint (`goodflows run <workflow> --jobs=...`) naming the failed or timed-out jobs and preserving environment selection; when a failed name contains a comma that the existing selector cannot represent, explain the limitation and offer a full-workflow rerun.
+  - a shell-safe rerun hint (`goodflows run <workflow> --jobs=...`) naming the failed or timed-out jobs and the dependents they blocked, and preserving environment selection and an explicitly passed `--config`; when a selected name contains a comma that the existing selector cannot represent, explain the limitation and offer a full-workflow rerun.
+  - job-provided text (commands, errors, skip reasons, tails) with control characters escaped.
 - Trim the text rendering of a failed or timed-out `job_finished`. It keeps the status line and the error line; the command and output tails move to the report.
 - Add `duration_ms` (run wall-clock time) and, when a log directory is in use, `log_dir` to the JSON `summary` event. Add `started` to each summary result to distinguish a scheduled instance that entered execution from one skipped or cancelled before launch. These fields are additive; existing fields, including per-instance counts and result fields, keep their meaning. Live `job_finished` event shapes stay unchanged.
+- Reject control characters in job names (workflow, environment and step names already reject them).
 - **BREAKING** (text output only): the `Summary: N passed, ...` line and the `All jobs passed` / `All checks succeeded (some jobs skipped)` lines are replaced by the report. JSON output is not broken.
 
 Out of scope: naming which dependency caused a skip, a quiet or compact live mode, and an in-place live dashboard.
@@ -29,8 +31,9 @@ Out of scope: naming which dependency caused a skip, a quiet or compact live mod
 
 ## Impact
 
-- `src/output.rs`: new rendering for `summary`, trimmed `job_finished` failure text.
-- `src/main.rs`: measures run wall time, adds `duration_ms` and `log_dir`, and projects each result's `started` marker into the `summary` event.
+- `src/output.rs`, new `src/output/report.rs`: new rendering for `summary`, trimmed and escaped `job_finished` failure text.
+- `src/config.rs`: job names with control characters fail validation.
+- `src/main.rs`: measures run wall time, adds `duration_ms` and `log_dir`, projects each result's `started` marker into the `summary` event, and passes the explicit `--config` path and signal state to the text report.
 - `src/runner.rs`: tracks whether each result entered `run_job`, separately from the existing command-spawn `executed` flag used by reporting; the new marker is not serialized in live events.
 - `tests/output.rs`, `tests/reporting.rs`, `tests/scheduling.rs`: assertions on `Summary:`, `All jobs passed` and the mid-stream `stdout tail` / `stderr tail` text need updating.
 - `src/reporting/replay.rs` (`reports upload`) emits its own `reports_upload_summary` and is unaffected.

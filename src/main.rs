@@ -28,7 +28,7 @@ struct Cli {
     /// Config file (default: goodflows.toml or .goodflows.toml)
     #[arg(short, long, global = true)]
     config: Option<PathBuf>,
-    /// Apply a named environment's settings (no automatic selection)
+    /// Apply a named environment's settings and partition counts (no automatic selection)
     #[arg(long, global = true, value_name = "NAME")]
     env: Option<String>,
     /// Maximum concurrent jobs (0 uses logical CPU count)
@@ -221,7 +221,10 @@ async fn run(cli: &Cli, output: &mut Output, cancel: watch::Receiver<Option<i32>
         return reporting::replay::upload(run_directory, output, cancel, budget).await;
     }
     let (document, _) = Config::load(cli.config.as_deref())?;
-    let environment = document.environment(cli.env.as_deref())?;
+    let profile = cli.env.as_deref();
+    // Report an unknown --env before the --jobs check for all-workflow commands;
+    // workflow() repeats this lookup.
+    document.environment(profile)?;
     let fail_fast_override = if cli.fail_fast {
         Some(true)
     } else if cli.no_fail_fast {
@@ -242,10 +245,20 @@ async fn run(cli: &Cli, output: &mut Output, cancel: watch::Receiver<Option<i32>
         if !cli.jobs.is_empty() {
             anyhow::bail!("--jobs requires an explicit workflow for aggregate validation");
         }
+        if aggregate_validation && profile.is_none() {
+            // Without --env, check that every profile resolves for every
+            // workflow, so `validate` passes only if each `run <workflow>
+            // --env <profile>` would get past configuration.
+            for environment in document.environments.keys() {
+                for name in document.workflow_names() {
+                    document.workflow(Some(&name), Some(environment))?;
+                }
+            }
+        }
         let mut workflows = Vec::new();
         let mut total = 0;
         for name in document.workflow_names() {
-            let (_, config) = document.workflow(Some(&name), environment)?;
+            let (_, config) = document.workflow(Some(&name), profile)?;
             total += config.jobs.len();
             workflows.push(json!({"name":name, "jobs":config.jobs.len(), "selected_jobs":config.jobs.iter().map(|j| &j.name).collect::<Vec<_>>(), "requested_jobs":[], "total_defined_jobs":config.jobs.len(), "settings":config.settings.resolve(cli.parallelism, fail_fast_override)?}));
         }
@@ -257,7 +270,7 @@ async fn run(cli: &Cli, output: &mut Output, cancel: watch::Receiver<Option<i32>
         return Ok(0);
     }
     let legacy_default = !document.jobs.is_empty();
-    let (name, mut config) = document.workflow(cli.workflow(), environment)?;
+    let (name, mut config) = document.workflow(cli.workflow(), profile)?;
     *output = output.with_workflow(&name);
     let total_defined_jobs = config.jobs.len();
     config.select(&cli.jobs)?;
@@ -314,11 +327,13 @@ async fn run(cli: &Cli, output: &mut Output, cancel: watch::Receiver<Option<i32>
             .map(reporting::Session::runner_env)
             .unwrap_or_default(),
         environment: cli.env.clone(),
+        settings_env: settings.env,
     };
     output.emit(json!({"type":"run_started", "parallelism":parallelism, "fail_fast":fail_fast, "jobs":config.jobs.iter().map(config::Job::instances).sum::<usize>(), "workdir":options.workdir})).await?;
     if let Some(session) = &session {
         session.announce(output).await;
     }
+    let run_start = std::time::Instant::now();
     let results = match runner::execute(&config.jobs, &options, cancel.clone()).await {
         Ok(results) => results,
         Err(error) => {
@@ -336,8 +351,27 @@ async fn run(cli: &Cli, output: &mut Output, cancel: watch::Receiver<Option<i32>
     let success = results
         .iter()
         .all(|r| matches!(r.status, Status::Passed | Status::Skipped));
-    output.emit(json!({"type":"summary", "success":success, "passed":count(Status::Passed), "failed":count(Status::Failed), "timed_out":count(Status::TimedOut), "skipped":count(Status::Skipped), "cancelled":count(Status::Cancelled), "results":results})).await?;
+    // `started` is projected only here; live job_finished events never carry it.
+    let summary_results: Vec<_> = results
+        .iter()
+        .map(|result| {
+            let mut value = json!(result);
+            value["started"] = json!(result.started);
+            value
+        })
+        .collect();
+    let mut summary = json!({"type":"summary", "success":success, "passed":count(Status::Passed), "failed":count(Status::Failed), "timed_out":count(Status::TimedOut), "skipped":count(Status::Skipped), "cancelled":count(Status::Cancelled), "results":summary_results});
+    if let Some(dir) = &options.log_dir {
+        // A non-UTF-8 path cannot be a JSON string; show it lossily.
+        summary["log_dir"] = json!(dir.to_string_lossy());
+    }
+    summary["duration_ms"] = json!(run_start.elapsed().as_millis() as u64);
+    // One snapshot decides both the report's outcome and the exit code.
     let signal = *cancel.borrow();
+    let config_path = cli.config.as_ref().map(|path| path.to_string_lossy());
+    output
+        .emit_summary(summary, config_path.as_deref(), signal.is_some())
+        .await?;
     Ok(signal
         .map(|s| (128 + s) as u8)
         .unwrap_or(if success { 0 } else { 1 }))

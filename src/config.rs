@@ -1,7 +1,7 @@
 use crate::expression::{Expression, Reference};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 
@@ -28,6 +28,9 @@ pub const PARTITION_ENV: [&str; 2] = ["GOODFLOWS_PARTITION", "GOODFLOWS_PARTITIO
 
 /// Selected `--env` profile name. Set by the runner; absent when no profile is selected.
 pub const ENVIRONMENT_ENV: &str = "GOODFLOWS_ENVIRONMENT";
+/// Per-command output file path. Set by the runner for each command that may
+/// publish outputs; never inherited from the caller.
+pub const OUTPUT_ENV: &str = "GOODFLOWS_OUTPUT";
 pub const MAX_PARTITIONS: u32 = 64;
 const DEFAULT_SPOOL_DIR: &str = ".goodflows/reports";
 
@@ -96,7 +99,7 @@ pub fn validate_credential_env_names(url_env: &str, token_env: &str) -> Result<(
         if RESERVED_ENV.contains(&name)
             || PARTITION_ENV.contains(&name)
             || name == ENVIRONMENT_ENV
-            || name == "GOODFLOWS_OUTPUT"
+            || name == OUTPUT_ENV
         {
             bail!("reporting {field} must not name a reserved goodflows variable");
         }
@@ -139,6 +142,9 @@ pub struct Settings {
     #[serde(default = "default_true")]
     pub fail_fast: bool,
     pub workdir: Option<PathBuf>,
+    /// Command environment defaults, layered between the caller's environment and job env.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
 }
 
 impl Default for Settings {
@@ -147,6 +153,7 @@ impl Default for Settings {
             parallelism: None,
             fail_fast: true,
             workdir: None,
+            env: BTreeMap::new(),
         }
     }
 }
@@ -156,6 +163,9 @@ pub struct EffectiveSettings {
     pub parallelism: usize,
     pub fail_fast: bool,
     pub workdir: PathBuf,
+    /// Merged configured env defaults (shared < workflow < selected profile).
+    /// Never includes the caller's environment or job/step overrides.
+    pub env: BTreeMap<String, String>,
 }
 
 impl Settings {
@@ -176,6 +186,7 @@ impl Settings {
                 .workdir
                 .clone()
                 .context("config workdir has not been resolved")?,
+            env: self.env.clone(),
         })
     }
 }
@@ -201,6 +212,7 @@ pub struct Job {
     pub reports: Vec<String>,
     /// `partitions` as written. `Config::validate` range-checks it and stores the
     /// result in `partitions`, so every out-of-range count gets one message naming the job.
+    /// `Config::workflow` sets its count to a selected profile's count on the resolved copy.
     #[serde(rename(deserialize = "partitions"), default, skip_serializing)]
     pub(crate) partitions_input: Option<PartitionsInput>,
     /// Validated partitioning, set by `Config::validate`; `None` until then and for
@@ -376,6 +388,11 @@ pub struct Workflow {
 pub struct Environment {
     #[serde(default, skip_serializing_if = "SettingsOverrides::is_empty")]
     pub settings: SettingsOverrides,
+    /// Partition count per job name, replacing the declared count of a
+    /// partitioned job when this profile is selected. Kept as `i64` until
+    /// `Config::validate` so every out-of-range count gets one message.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub partitions: BTreeMap<String, i64>,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize, Clone)]
@@ -384,18 +401,28 @@ pub struct SettingsOverrides {
     pub parallelism: Option<usize>,
     pub fail_fast: Option<bool>,
     pub workdir: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
 }
 
 impl SettingsOverrides {
     fn is_empty(&self) -> bool {
-        self.parallelism.is_none() && self.fail_fast.is_none() && self.workdir.is_none()
+        self.parallelism.is_none()
+            && self.fail_fast.is_none()
+            && self.workdir.is_none()
+            && self.env.is_empty()
     }
 
     fn apply(&self, shared: &Settings) -> Settings {
+        // Per-key merge: inherited keys survive unless overridden; an empty
+        // string is a real override.
+        let mut env = shared.env.clone();
+        env.extend(self.env.clone());
         Settings {
             parallelism: self.parallelism.or(shared.parallelism),
             fail_fast: self.fail_fast.unwrap_or(shared.fail_fast),
             workdir: self.workdir.clone().or_else(|| shared.workdir.clone()),
+            env,
         }
     }
 }
@@ -508,6 +535,17 @@ impl Config {
             reporting.validate().context("reporting")?;
         }
         let reporting = self.reporting.as_ref();
+        // Validate every authored settings map, including unselected workflows and
+        // profiles and entries a later scope overrides.
+        validate_settings_env(&self.settings.env, reporting).context("settings env")?;
+        for (name, workflow) in &self.workflows {
+            validate_settings_env(&workflow.settings.env, reporting)
+                .with_context(|| format!("workflow '{name}' settings env"))?;
+        }
+        for (name, environment) in &self.environments {
+            validate_settings_env(&environment.settings.env, reporting)
+                .with_context(|| format!("environment '{name}' settings env"))?;
+        }
         if !self.jobs.is_empty() {
             if self.workflows.contains_key("default") {
                 bail!("root jobs conflict with named workflow 'default'");
@@ -524,24 +562,52 @@ impl Config {
         for name in self.environments.keys() {
             validate_name(name, "environment")?;
         }
+        // Profile partition entries are checked for every profile, selected or
+        // not, against jobs that declare `partitions` in any workflow.
+        let all_jobs = || {
+            self.jobs
+                .iter()
+                .chain(self.workflows.values().flat_map(|workflow| &workflow.jobs))
+        };
+        let defined: HashSet<&str> = all_jobs().map(|job| job.name.as_str()).collect();
+        let partitioned: BTreeSet<&str> = all_jobs()
+            .filter(|job| job.partitions.is_some())
+            .map(|job| job.name.as_str())
+            .collect();
+        for (profile, environment) in &self.environments {
+            for (job, &count) in &environment.partitions {
+                partition_count(count)
+                    .with_context(|| format!("environment '{profile}': job '{job}'"))?;
+                if !defined.contains(job.as_str()) {
+                    let available = if partitioned.is_empty() {
+                        "none".to_owned()
+                    } else {
+                        partitioned.iter().copied().collect::<Vec<_>>().join(", ")
+                    };
+                    bail!(
+                        "environment '{profile}': unknown job '{job}' (partitioned jobs: {available})"
+                    );
+                }
+                if !partitioned.contains(job.as_str()) {
+                    bail!("environment '{profile}': job '{job}' is not partitioned");
+                }
+            }
+        }
         Ok(())
     }
 
-    pub fn environment(&self, requested: Option<&str>) -> Result<Option<&SettingsOverrides>> {
+    pub fn environment(&self, requested: Option<&str>) -> Result<Option<&Environment>> {
         requested
             .map(|name| {
-                self.environments
-                    .get(name)
-                    .map(|environment| &environment.settings)
-                    .with_context(|| {
-                        let available = self
-                            .environments
-                            .keys()
-                            .cloned()
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        format!("unknown environment '{name}' (available: {available})")
-                    })
+                self.environments.get(name).with_context(|| {
+                    let available = self
+                        .environments
+                        .keys()
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!("unknown environment '{name}' (available: {available})")
+                })
             })
             .transpose()
     }
@@ -563,15 +629,18 @@ impl Config {
         }
     }
 
+    /// Resolve a workflow, applying the selected environment profile's settings
+    /// and partition counts to the returned copy. The document is not modified.
     pub fn workflow(
         &self,
         requested: Option<&str>,
-        environment: Option<&SettingsOverrides>,
+        profile: Option<&str>,
     ) -> Result<(String, Config)> {
+        let environment = self.environment(profile)?;
         let available = self.workflow_names().join(", ");
         let name = requested.or_else(|| self.default_workflow())
             .with_context(|| format!("no default workflow; choose a workflow with 'goodflows run <workflow>' (available: {available})"))?;
-        let (settings, jobs) = if name == "default" && !self.jobs.is_empty() {
+        let (settings, mut jobs) = if name == "default" && !self.jobs.is_empty() {
             (self.settings.clone(), self.jobs.clone())
         } else {
             let workflow = self
@@ -583,11 +652,39 @@ impl Config {
                 workflow.jobs.clone(),
             )
         };
+        // The environment exists exactly when a profile name was supplied.
+        let selected = profile.zip(environment);
+        if let Some((profile, environment)) = selected {
+            for (job_name, &count) in &environment.partitions {
+                // A name absent from this workflow is unused here.
+                let Some(job) = jobs.iter_mut().find(|job| &job.name == job_name) else {
+                    continue;
+                };
+                let Some(partitions) = &mut job.partitions else {
+                    let workflow = if name == "default" && !self.jobs.is_empty() {
+                        "workflow 'default' (root jobs)".to_owned()
+                    } else {
+                        format!("workflow '{name}'")
+                    };
+                    bail!(
+                        "environment '{profile}': {workflow}: job '{job_name}' is not partitioned"
+                    );
+                };
+                // Defensive: `Config::validate` already rejected out-of-range
+                // counts, so this conversion cannot fail for a validated config.
+                partitions.count = partition_count(count)
+                    .with_context(|| format!("environment '{profile}': job '{job_name}'"))?;
+                // Keep the parsed input consistent with the resolved count.
+                if let Some(input) = &mut job.partitions_input {
+                    input.count = count;
+                }
+            }
+        }
         Ok((
             name.to_owned(),
             Config {
-                settings: match environment {
-                    Some(overrides) => overrides.apply(&settings),
+                settings: match selected {
+                    Some((_, environment)) => environment.settings.apply(&settings),
                     None => settings,
                 },
                 jobs,
@@ -634,6 +731,17 @@ impl Config {
     }
 }
 
+/// Range-check a raw partition count; callers add the job or profile context.
+fn partition_count(count: i64) -> Result<NonZeroU32> {
+    u32::try_from(count)
+        .ok()
+        .filter(|count| *count <= MAX_PARTITIONS)
+        .and_then(NonZeroU32::new)
+        .with_context(|| {
+            format!("partitions count must be from 1 to {MAX_PARTITIONS}, got {count}")
+        })
+}
+
 fn store_partitions(jobs: &mut [Job], partitions: Vec<Option<Partitions>>) {
     for (job, partitions) in jobs.iter_mut().zip(partitions) {
         job.partitions = partitions;
@@ -666,7 +774,9 @@ fn validate_jobs(jobs: &[Job], reporting: Option<&Reporting>) -> Result<Vec<Opti
         if job.timeout_secs == Some(0) {
             bail!("job '{}' timeout_secs must be greater than zero", job.name);
         }
-        if job.name.contains(['\n', '\r', '\0']) {
+        // Names appear in text output and rerun hints, so no control characters
+        // (including escape sequences). Other name rules are unchanged.
+        if job.name.chars().any(char::is_control) {
             bail!(
                 "job '{}' contains invalid control characters",
                 job.name.escape_debug()
@@ -728,7 +838,10 @@ fn validate_command(command: &str, shell: bool) -> Result<()> {
     Ok(())
 }
 
-fn validate_env(env: &HashMap<String, String>, reporting: Option<&Reporting>) -> Result<()> {
+fn validate_env<'a>(
+    env: impl IntoIterator<Item = (&'a String, &'a String)>,
+    reporting: Option<&Reporting>,
+) -> Result<()> {
     for (key, value) in env {
         if key.is_empty() || key.contains(['=', '\0']) || value.contains('\0') {
             bail!("invalid environment variable");
@@ -745,6 +858,19 @@ fn validate_env(env: &HashMap<String, String>, reporting: Option<&Reporting>) ->
         }
     }
     Ok(())
+}
+
+/// Settings env additionally rejects `GOODFLOWS_OUTPUT`: the runner owns it for
+/// every command, so a settings default could only leak into expressions. Job and
+/// step env keep accepting it for compatibility with existing configs.
+fn validate_settings_env(
+    env: &BTreeMap<String, String>,
+    reporting: Option<&Reporting>,
+) -> Result<()> {
+    if env.contains_key(OUTPUT_ENV) {
+        bail!("env must not set reserved variable {OUTPUT_ENV}; goodflows sets it itself");
+    }
+    validate_env(env, reporting)
 }
 
 /// Names of the partitioned jobs in one workflow; they publish no job outputs.
@@ -826,16 +952,7 @@ fn validate_partitions(job: &Job) -> Result<Option<Partitions>> {
     let Some(input) = job.partitions_input else {
         return Ok(None);
     };
-    let count = u32::try_from(input.count)
-        .ok()
-        .filter(|count| *count <= MAX_PARTITIONS)
-        .and_then(NonZeroU32::new)
-        .with_context(|| {
-            format!(
-                "partitions count must be from 1 to {MAX_PARTITIONS}, got {}",
-                input.count
-            )
-        })?;
+    let count = partition_count(input.count)?;
     if !job.outputs.is_empty() {
         bail!("partitioned jobs publish no job outputs; remove the outputs mapping (step outputs remain available within each instance)");
     }
@@ -1074,5 +1191,349 @@ mod tests {
         assert_eq!(ids, [id(1), id(2), id(3)]);
         let unpartitioned: Job = toml::from_str("name = 'a'\ncommand = 'true'").unwrap();
         assert_eq!(unpartitioned.partition_ids().collect::<Vec<_>>(), [None]);
+    }
+
+    fn parse(source: &str) -> std::result::Result<Config, String> {
+        toml::from_str::<Config>(source).map_err(|error| error.to_string())
+    }
+
+    fn validate(source: &str) -> std::result::Result<Config, String> {
+        let mut config = parse(source)?;
+        config.validate().map_err(|error| format!("{error:#}"))?;
+        Ok(config)
+    }
+
+    #[test]
+    fn job_names_reject_control_characters_only() {
+        for escape in ["\\n", "\\r", "\\u0000", "\\t", "\\u001b", "\\u009b"] {
+            let error = validate(&format!(
+                "[[jobs]]\nname = \"a{escape}b\"\ncommand = 'true'\n"
+            ))
+            .unwrap_err();
+            assert!(
+                error.contains("contains invalid control characters"),
+                "{error}"
+            );
+        }
+        // Spaces, commas and long names stay valid.
+        let long = "x".repeat(100);
+        validate(&format!(
+            "[[jobs]]\nname = 'a b,c'\ncommand = 'true'\n[[jobs]]\nname = '{long}'\ncommand = 'true'\n"
+        ))
+        .unwrap();
+    }
+
+    fn resolved_env(
+        config: &Config,
+        workflow: &str,
+        profile: Option<&str>,
+    ) -> BTreeMap<String, String> {
+        let (_, mut selected) = config.workflow(Some(workflow), profile).unwrap();
+        selected.settings.workdir = Some(PathBuf::from("/"));
+        selected.settings.resolve(None, None).unwrap().env
+    }
+
+    fn map(entries: &[(&str, &str)]) -> BTreeMap<String, String> {
+        entries
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect()
+    }
+
+    const JOB: &str = "[[workflows.ci.jobs]]\nname = 'a'\ncommand = 'true'\n[[workflows.other.jobs]]\nname = 'a'\ncommand = 'true'\n";
+
+    #[test]
+    fn settings_env_merges_per_key_and_keeps_empty_strings() {
+        let config = validate(&format!(
+            "{JOB}[settings.env]\nMIX_ENV = 'test'\nKEEP = 'shared'\nVALUE = 'shared'\n\
+             [workflows.ci.settings.env]\nMIX_ENV = 'dev'\n\
+             [workflows.other.settings.env]\n\
+             [environments.ci.settings.env]\nMIX_ENV = 'prod'\nCI = 'true'\nVALUE = ''\nLITERAL = '$HOME ${{X}}'\n"
+        ))
+        .unwrap();
+        assert_eq!(
+            resolved_env(&config, "ci", Some("ci")),
+            map(&[
+                ("CI", "true"),
+                ("KEEP", "shared"),
+                ("LITERAL", "$HOME ${X}"),
+                ("MIX_ENV", "prod"),
+                ("VALUE", ""),
+            ])
+        );
+        assert_eq!(
+            resolved_env(&config, "ci", None),
+            map(&[("KEEP", "shared"), ("MIX_ENV", "dev"), ("VALUE", "shared")])
+        );
+        // An empty workflow map inherits everything.
+        assert_eq!(
+            resolved_env(&config, "other", None),
+            map(&[("KEEP", "shared"), ("MIX_ENV", "test"), ("VALUE", "shared")])
+        );
+    }
+
+    #[test]
+    fn absent_settings_env_resolves_to_empty_map() {
+        let config = validate(JOB).unwrap();
+        assert!(resolved_env(&config, "ci", None).is_empty());
+        assert!(config.settings.env.is_empty());
+    }
+
+    #[test]
+    fn env_only_overrides_are_not_empty() {
+        let overrides: SettingsOverrides = toml::from_str("env = { A = '1' }").unwrap();
+        assert!(!overrides.is_empty());
+        assert!(SettingsOverrides::default().is_empty());
+        let config = validate(&format!(
+            "{JOB}[environments.local.settings.env]\nA = '1'\n"
+        ))
+        .unwrap();
+        let text = toml::to_string(&config).unwrap();
+        assert!(text.contains("[environments.local.settings.env]"), "{text}");
+        let shared = toml::to_string(&Settings::default()).unwrap();
+        assert!(!shared.contains("env"), "{shared}");
+    }
+
+    #[test]
+    fn settings_env_rejects_non_string_values() {
+        for scope in [
+            "settings",
+            "workflows.ci.settings",
+            "environments.local.settings",
+        ] {
+            for value in ["1", "true", "['a']", "{ a = 'b' }"] {
+                let error = parse(&format!("{JOB}[{scope}.env]\nVALUE = {value}\n")).unwrap_err();
+                assert!(error.contains("invalid type"), "{scope} {value}: {error}");
+            }
+        }
+    }
+
+    #[test]
+    fn settings_env_validates_every_scope_without_exposing_values() {
+        let custom = "[reporting]\nproject = 'demo'\ntoken_env = 'PRIVATE_TOKEN'\n";
+        let default = "[reporting]\nproject = 'demo'\n";
+        for (scope, context) in [
+            ("settings", "settings env"),
+            ("workflows.ci.settings", "workflow 'ci' settings env"),
+            ("workflows.other.settings", "workflow 'other' settings env"),
+            (
+                "environments.unused.settings",
+                "environment 'unused' settings env",
+            ),
+        ] {
+            for (entry, message) in [
+                (
+                    "GOODFLOWS_PARTITION = 'secret-value'",
+                    "reserved variable GOODFLOWS_PARTITION",
+                ),
+                (
+                    "GOODFLOWS_PARTITION_COUNT = 'secret-value'",
+                    "reserved variable",
+                ),
+                ("GOODFLOWS_RUN_ID = 'secret-value'", "reserved variable"),
+                ("GOODFLOWS_REPORT_DIR = 'secret-value'", "reserved variable"),
+                (
+                    "GOODFLOWS_ENVIRONMENT = 'secret-value'",
+                    "reserved variable GOODFLOWS_ENVIRONMENT",
+                ),
+                (
+                    "GOODFLOWS_OUTPUT = 'secret-value'",
+                    "reserved variable GOODFLOWS_OUTPUT",
+                ),
+                ("PRIVATE_TOKEN = 'secret-value'", "reporting token_env"),
+                ("'' = 'secret-value'", "invalid environment variable"),
+                ("'A=B' = 'secret-value'", "invalid environment variable"),
+                (
+                    "A = \"secret-value\\u0000\"",
+                    "invalid environment variable",
+                ),
+            ] {
+                let error =
+                    validate(&format!("{JOB}{custom}[{scope}.env]\n{entry}\n")).unwrap_err();
+                assert!(error.contains(context), "{scope} {entry}: {error}");
+                assert!(error.contains(message), "{scope} {entry}: {error}");
+                assert!(!error.contains("secret-value"), "{scope} {entry}: {error}");
+            }
+            // The default token_env is rejected the same way.
+            let entry = "GOODFLOWS_API_KEY = 'secret-value'";
+            let error = validate(&format!("{JOB}{default}[{scope}.env]\n{entry}\n")).unwrap_err();
+            assert!(error.contains(context), "{scope} {entry}: {error}");
+            assert!(
+                error.contains("GOODFLOWS_API_KEY: it is the reporting token_env"),
+                "{scope} {entry}: {error}"
+            );
+            assert!(!error.contains("secret-value"), "{scope} {entry}: {error}");
+        }
+    }
+
+    #[test]
+    fn job_and_step_env_may_still_set_goodflows_output() {
+        // Compatibility: only settings env rejects it; commands still get their own file.
+        validate(&format!(
+            "{JOB}[[jobs]]\nname = 'b'\nenv = {{ GOODFLOWS_OUTPUT = 'x' }}\n[[jobs.steps]]\nid = 's'\nenv = {{ GOODFLOWS_OUTPUT = 'y' }}\ncommand = 'true'\n"
+        ))
+        .unwrap();
+    }
+
+    fn counts(config: &Config, workflow: &str, profile: Option<&str>) -> Vec<Option<Partitions>> {
+        let (_, selected) = config.workflow(Some(workflow), profile).unwrap();
+        selected.jobs.iter().map(|job| job.partitions).collect()
+    }
+
+    #[test]
+    fn selected_profile_replaces_declared_partition_counts() {
+        let config = validate(
+            "[[workflows.ci.jobs]]\nname = 'test'\ncommand = 'true'\npartitions = { count = 3, strategy = 'index' }\n\
+             [[workflows.ci.jobs]]\nname = 'lint'\ncommand = 'true'\npartitions = 2\n\
+             [[workflows.ci.jobs]]\nname = 'compile'\ncommand = 'true'\n\
+             [[workflows.solo.jobs]]\nname = 'compile'\ncommand = 'true'\n\
+             [[workflows.nightly.jobs]]\nname = 'test'\ncommand = 'true'\n\
+             [environments.local.settings]\nparallelism = 2\n\
+             [environments.local.partitions]\ntest = 6\n\
+             [environments.orb.partitions]\ntest = 1\nlint = 4\n\
+             [environments.empty.partitions]\n",
+        )
+        .unwrap();
+        let six = index(6);
+        // Replaced count keeps the table form's strategy; unnamed jobs keep theirs.
+        assert_eq!(counts(&config, "ci", Some("local")), [six, index(2), None]);
+        assert_eq!(six.unwrap().strategy, Strategy::Index);
+        // Bare run and an empty map keep the declared counts.
+        assert_eq!(counts(&config, "ci", None), [index(3), index(2), None]);
+        assert_eq!(
+            counts(&config, "ci", Some("empty")),
+            [index(3), index(2), None]
+        );
+        // A sibling profile resolves independently of earlier resolutions.
+        assert_eq!(
+            counts(&config, "ci", Some("orb")),
+            [index(1), index(4), None]
+        );
+        assert_eq!(counts(&config, "ci", Some("local")), [six, index(2), None]);
+        // The loaded document is never mutated.
+        assert_eq!(config.workflows["ci"].jobs[0].partitions, index(3));
+        assert_eq!(config.environments["local"].partitions["test"], 6);
+        // A name absent from the selected workflow is ignored.
+        assert_eq!(counts(&config, "solo", Some("local")), [None]);
+        // The selected workflow's unpartitioned job with that name fails.
+        let error = config
+            .workflow(Some("nightly"), Some("local"))
+            .map(|_| ())
+            .unwrap_err();
+        assert_eq!(
+            format!("{error:#}"),
+            "environment 'local': workflow 'nightly': job 'test' is not partitioned"
+        );
+        // Settings precedence is unchanged by the partition map.
+        let (_, selected) = config.workflow(Some("ci"), Some("local")).unwrap();
+        assert_eq!(selected.settings.parallelism, Some(2));
+        // The resolved copy's parsed input follows the effective count.
+        assert_eq!(
+            selected.jobs[0].partitions_input.map(|input| input.count),
+            Some(6)
+        );
+        assert_eq!(
+            config.workflows["ci"].jobs[0]
+                .partitions_input
+                .map(|input| input.count),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn unpartitioned_root_job_error_names_the_default_workflow() {
+        let config = validate(
+            "[[jobs]]\nname = 'test'\ncommand = 'true'\n\
+             [[workflows.ci.jobs]]\nname = 'test'\ncommand = 'true'\npartitions = 3\n\
+             [environments.local.partitions]\ntest = 6\n",
+        )
+        .unwrap();
+        let error = config
+            .workflow(None, Some("local"))
+            .map(|_| ())
+            .unwrap_err();
+        assert_eq!(
+            format!("{error:#}"),
+            "environment 'local': workflow 'default' (root jobs): job 'test' is not partitioned"
+        );
+    }
+
+    #[test]
+    fn profile_partitions_are_validated_for_every_profile() {
+        let base = "[[jobs]]\nname = 'test'\ncommand = 'true'\npartitions = 3\n[[jobs]]\nname = 'plain'\ncommand = 'true'\n";
+        for (entry, message) in [
+            (
+                "test = 0",
+                "environment 'unused': job 'test': partitions count must be from 1 to 64, got 0",
+            ),
+            (
+                "test = 65",
+                "environment 'unused': job 'test': partitions count must be from 1 to 64, got 65",
+            ),
+            (
+                "test = -1",
+                "environment 'unused': job 'test': partitions count must be from 1 to 64, got -1",
+            ),
+            (
+                "test = 4294967302",
+                "environment 'unused': job 'test': partitions count must be from 1 to 64, got 4294967302",
+            ),
+            (
+                "missing = 2",
+                "environment 'unused': unknown job 'missing' (partitioned jobs: test)",
+            ),
+            (
+                "plain = 2",
+                "environment 'unused': job 'plain' is not partitioned",
+            ),
+        ] {
+            let error = validate(&format!(
+                "{base}[environments.unused.partitions]\n{entry}\n"
+            ))
+            .unwrap_err();
+            assert_eq!(error, message, "{entry}");
+        }
+        for entry in ["test = 'six'", "test = { count = 6 }", "test = 6.0"] {
+            let error = parse(&format!(
+                "{base}[environments.unused.partitions]\n{entry}\n"
+            ))
+            .unwrap_err();
+            assert!(error.contains("invalid type"), "{entry}: {error}");
+            assert!(error.contains("expected i64"), "{entry}: {error}");
+            assert!(error.contains("line 9"), "{entry}: {error}");
+            assert!(error.contains(entry), "{entry}: {error}");
+        }
+        validate(base).unwrap();
+        validate(&format!(
+            "{base}[environments.unused.partitions]\ntest = 64\n"
+        ))
+        .unwrap();
+        let error = validate(
+            "[[jobs]]\nname = 'plain'\ncommand = 'true'\n[environments.unused.partitions]\nmissing = 2\n",
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            "environment 'unused': unknown job 'missing' (partitioned jobs: none)"
+        );
+        let config = validate(&format!("{base}[environments.local.partitions]\n")).unwrap();
+        assert!(config.environments["local"].partitions.is_empty());
+        let text = toml::to_string(&config).unwrap();
+        assert!(!text.contains("[environments.local.partitions]"), "{text}");
+        let config = validate(&format!(
+            "{base}[environments.local.partitions]\ntest = 6\n"
+        ))
+        .unwrap();
+        let text = toml::to_string(&config).unwrap();
+        assert!(text.contains("[environments.local.partitions]"), "{text}");
+    }
+
+    #[test]
+    fn overridden_invalid_shared_entry_still_fails() {
+        let error = validate(&format!(
+            "{JOB}[settings.env]\nGOODFLOWS_PARTITION = 'x'\n[workflows.ci.settings.env]\nGOODFLOWS_PARTITION = 'y'\n"
+        ))
+        .unwrap_err();
+        assert!(error.starts_with("settings env"), "{error}");
     }
 }

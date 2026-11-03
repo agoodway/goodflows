@@ -343,3 +343,100 @@ fn validate_counts_configured_jobs_not_instances() {
     assert_eq!(event["workflows"][0]["jobs"], 1);
     assert_eq!(event["workflows"][1]["jobs"], 2);
 }
+
+#[test]
+fn invalid_profile_partitions_fail_before_execution_even_when_unselected() {
+    const JOBS: &str = "[[jobs]]\nname='safe'\ncommand='touch ran'\n[[jobs]]\nname='test'\ncommand='touch ran'\npartitions=3\n[[workflows.ci.jobs]]\nname='plain'\ncommand='touch ran'\n[environments.local.partitions]\n";
+    for (entry, message) in [
+        (
+            "test = -1",
+            "environment 'local': job 'test': partitions count must be from 1 to 64, got -1",
+        ),
+        (
+            "test = 0",
+            "environment 'local': job 'test': partitions count must be from 1 to 64, got 0",
+        ),
+        (
+            "test = 65",
+            "environment 'local': job 'test': partitions count must be from 1 to 64, got 65",
+        ),
+        (
+            "missing = 2",
+            "environment 'local': unknown job 'missing' (partitioned jobs: test)",
+        ),
+        (
+            "plain = 2",
+            "environment 'local': job 'plain' is not partitioned",
+        ),
+    ] {
+        assert_rejected(&format!("{JOBS}{entry}\n"), message);
+    }
+    // Type errors keep native TOML diagnostics: location, entry, expected type.
+    for entry in ["test = 'six'", "test = { count = 6 }"] {
+        let config = format!("{JOBS}{entry}\n");
+        assert_rejected(&config, "line 12");
+        assert_rejected(&config, entry);
+        assert_rejected(&config, "expected i64");
+    }
+    // An omitted map and an empty table are accepted.
+    for config in [
+        JOBS.replace("partitions]", "settings]\nfail_fast = false"),
+        JOBS.to_owned(),
+    ] {
+        let p = Project::new(&config);
+        success(&p.run(&["validate"]));
+        success(&p.run(&["validate", "--env", "local"]));
+        assert!(!p.dir.join("ran").exists());
+    }
+}
+
+#[test]
+fn list_shows_profile_partition_count() {
+    let p = Project::new(
+        r#"
+[[jobs]]
+name = "compile"
+command = "touch ran"
+[[jobs]]
+name = "test"
+command = "touch ran"
+partitions = 3
+[environments.local.partitions]
+test = 6
+"#,
+    );
+    for (args, count) in [
+        (vec!["list", "--json", "--env", "local"], 6),
+        (vec!["list", "--json"], 3),
+    ] {
+        let output = p.run(&args);
+        success(&output);
+        let event: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(event["type"], "jobs");
+        let jobs = event["jobs"].as_array().unwrap();
+        assert_eq!(jobs.len(), 2);
+        assert_eq!(
+            jobs[1]["partitions"],
+            serde_json::json!({"count": count, "strategy": "index"})
+        );
+    }
+    for (args, count) in [(vec!["list", "--env", "local"], 6), (vec!["list"], 3)] {
+        let output = p.run(&args);
+        success(&output);
+        let text = stdout(&output);
+        assert_eq!(text.matches("  test").count(), 1, "{text}");
+        assert!(
+            text.contains(&format!("partitions: {count} (strategy=index)")),
+            "{text}"
+        );
+    }
+    let output = p.run(&["validate", "--json", "--env", "local"]);
+    success(&output);
+    let event: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(event["total_defined_jobs"], 2);
+    assert_eq!(event["jobs"], 2);
+    let output = p.run(&["validate", "--env", "local"]);
+    success(&output);
+    assert!(stdout(&output).contains("2 defined"), "{}", stdout(&output));
+    assert!(!p.dir.join("ran").exists());
+}

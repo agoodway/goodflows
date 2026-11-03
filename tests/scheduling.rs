@@ -68,7 +68,10 @@ command = "touch unrelated"
     let output = p.run(&["--jobs", "disabled"]);
     success(&output);
     assert!(stdout(&output).contains("SKIPPED"));
-    assert!(!stdout(&output).contains("All jobs passed"));
+    let text = stdout(&output);
+    assert!(!text.contains("All jobs passed") && !text.contains("All checks succeeded"));
+    assert!(text.contains("\ndefault  PASSED  in "), "{text}");
+    assert!(text.trim_end().ends_with("1 skipped"), "{text}");
 }
 
 #[test]
@@ -769,5 +772,61 @@ fn a_signal_cancels_running_and_unstarted_instances() {
                 id("test", Some(3), "cancelled"),
             ]
         );
+        // Running instances entered execution; the queued one never did.
+        let started: Vec<_> = summary["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["started"].as_bool().unwrap())
+            .collect();
+        assert_eq!(started, [true, true, false]);
+        for line in stdout(&output).lines() {
+            let event: serde_json::Value = serde_json::from_str(line).unwrap();
+            if event["type"] == "job_finished" {
+                assert!(event["result"].get("started").is_none(), "{event}");
+            }
+        }
+    }
+}
+
+#[test]
+fn a_signal_ends_the_text_report_cancelled() {
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+    let p = Project::new(
+        "[settings]\nparallelism=2\n[[jobs]]\nname='test'\npartitions=3\ncommand='touch started.$GOODFLOWS_PARTITION; i=0; while [ $i -lt 500 ] && ! test -f release; do sleep 0.01; i=$((i+1)); done'\n",
+    );
+    let _release = Release(p.dir.join("release"));
+    let mut child = p
+        .command() // sets NO_COLOR=1
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let start = Instant::now();
+    while !(p.dir.join("started.1").exists() && p.dir.join("started.2").exists()) {
+        if start.elapsed() > Duration::from_secs(5) {
+            let _ = child.kill();
+            panic!("instances did not start");
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    // SAFETY: the child PID identifies the CLI spawned above.
+    assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGINT) }, 0);
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(130));
+    let text = stdout(&output);
+    let report = &text[text
+        .find("\ndefault  CANCELLED  in ")
+        .expect("report header")..];
+    let row = report
+        .lines()
+        .find(|l| l.starts_with("  CANCEL  test"))
+        .unwrap_or_else(|| panic!("no cancelled row: {text}"));
+    assert!(row.ends_with("3/3 cancelled"), "{text}");
+    // Nothing follows the counts: no Failures section and no rerun hint.
+    assert!(report.ends_with("\n1 cancelled\n"), "{text}");
+    for absent in ["Failures", "Rerun"] {
+        assert!(!report.contains(absent), "{absent}: {text}");
     }
 }

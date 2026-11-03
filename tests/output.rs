@@ -156,7 +156,15 @@ command = """printf 'EARLY'; head -c 10000 /dev/zero | tr '\\000' x; printf 'OUT
     assert_eq!(result["stdout_truncated"], true);
     assert_eq!(result["stderr_truncated"], true);
     let finished = events.iter().find(|e| e["type"] == "job_finished").unwrap();
-    assert_eq!(&finished["result"], result);
+    // The summary result adds only `started`; the live event never carries it.
+    let mut projected = result.clone();
+    assert_eq!(
+        projected.as_object_mut().unwrap().remove("started"),
+        Some(true.into())
+    );
+    assert_eq!(finished["result"], projected);
+    assert!(finished["result"].get("stdout_tail").is_some());
+    assert!(finished["result"].get("stderr_tail").is_some());
     assert!(p.read("logs/001-fail.stdout.log").starts_with("EARLY"));
     let full: String = events
         .iter()
@@ -166,14 +174,32 @@ command = """printf 'EARLY'; head -c 10000 /dev/zero | tr '\\000' x; printf 'OUT
     assert_eq!(full.len(), 10012);
     assert!(full.starts_with("EARLY"));
     let output = p.run(&[]);
+    let text = stdout(&output);
+    let header = text.find("\ndefault  FAILED  in ").expect("report header");
+    let failures = text.find("\nFailures\n").unwrap();
+    assert!(header < failures, "{text}");
+    // The live job_finished block keeps only the status and error lines.
+    let live = text.find("fail FAILED").unwrap();
+    assert!(text[live..header].starts_with("fail FAILED"), "{text}");
+    assert_eq!(
+        &text[live..header].lines().nth(1).unwrap(),
+        &"  exited with 7"
+    );
     for label in [
-        "command:",
-        "stdout tail",
-        "stderr tail",
-        "OUT-END",
-        "ERR-END",
+        "  command: ",
+        "  stdout tail (truncated):\n",
+        "  stderr tail (truncated):\n",
     ] {
-        assert!(stdout(&output).contains(label));
+        assert!(!text[..header].contains(label), "{label}: {text}");
+        assert_eq!(
+            text[failures..].matches(label).count(),
+            1,
+            "{label}: {text}"
+        );
+    }
+    // Tail lines end the tail; the command also mentions these markers.
+    for tail in ["OUT-END\n", "ERR-END\n"] {
+        assert_eq!(text[failures..].matches(tail).count(), 1, "{text}");
     }
 }
 
@@ -458,7 +484,15 @@ fn text_output_names_instances_and_the_summary_counts_them() {
         }
     }
     assert!(text.contains("→ compile\n") && text.contains("compile PASSED"));
-    assert!(text.contains("Summary: 4 passed, 0 failed"), "{text}");
+    // The report counts configured jobs: one row each for compile and test.
+    let report = &text[text.find("\ndefault  PASSED  in ").expect("report header")..];
+    let rows: Vec<_> = report.lines().filter(|l| l.starts_with("  ")).collect();
+    assert_eq!(rows.len(), 2, "{report}");
+    assert!(rows[0].starts_with("  PASS  compile "), "{report}");
+    assert!(rows[1].starts_with("  PASS  test "), "{report}");
+    assert!(!rows[1].contains("/3"), "{report}");
+    assert!(report.contains("\n2 passed\n"), "{report}");
+    assert!(!text.contains("Summary:") && !text.contains("All jobs passed"));
 
     let p = Project::new(
         "[settings]\nfail_fast=false\n[[jobs]]\nname='test'\npartitions=3\ncommand='if [ $GOODFLOWS_PARTITION = 2 ]; then echo boom-$GOODFLOWS_PARTITION >&2; exit 3; fi'\n",
@@ -468,16 +502,31 @@ fn text_output_names_instances_and_the_summary_counts_them() {
     let text = stdout(&output);
     for line in [
         "test (2/3) FAILED",
-        "  stderr tail:\n",
-        "boom-2",
         "test (1/3) PASSED",
         "test (3/3) PASSED",
     ] {
         assert!(text.contains(line), "missing {line:?}: {text}");
     }
-    // The tail belongs to the failed instance's block.
-    let failed = text.find("test (2/3) FAILED").unwrap();
-    assert!(text[failed..].contains("  stderr tail:"), "{text}");
+    let header = text.find("\ndefault  FAILED  in ").expect("report header");
+    // The live failure block has no tails; the report's Failures entry has them.
+    assert!(!text[..header].contains("stderr tail"), "{text}");
+    let report = &text[header..];
+    let rows: Vec<_> = report.lines().filter(|l| l.starts_with("  ")).collect();
+    assert!(rows[0].starts_with("  FAIL  test "), "{report}");
+    assert!(rows[0].ends_with("  1/3 failed"), "{report}");
+    assert!(report.contains("\n1 failed\n"), "{report}");
+    let entry = &report[report.find("\nFailures\n").unwrap()..];
+    assert!(
+        entry.starts_with("\nFailures\n--- test (2/3)  FAILED  exit 3\n"),
+        "{report}"
+    );
+    assert!(entry.contains("  stderr tail:\n    boom-2\n"), "{report}");
+    assert!(!entry.contains("test (1/3)") && !entry.contains("test (3/3)"));
+    // The report is the last stdout text and ends with the rerun hint.
+    assert!(
+        text.ends_with("\nRerun failed: goodflows run default --jobs=test\n"),
+        "{text}"
+    );
 
     let p = Project::new(PARTITIONED);
     let text = stdout(&p.run(&["--jobs", "stepped"]));
@@ -490,4 +539,312 @@ fn text_output_names_instances_and_the_summary_counts_them() {
             assert!(text.contains(&line), "missing {line:?}: {text}");
         }
     }
+}
+
+#[test]
+fn json_summary_carries_duration_log_dir_and_instance_counts() {
+    let config = "[[jobs]]\nname='compile'\ncommand='sleep 0.2'\n[[jobs]]\nname='test'\npartitions=3\ndepends_on=['compile']\ncommand='true'\n";
+    let legacy = Project::new(config);
+    let named = Project::new(&format!(
+        "[workflows.ci]\n{}",
+        config.replace("[[jobs]]", "[[workflows.ci.jobs]]")
+    ));
+    for (p, args, log_dir) in [
+        (&legacy, vec!["--json", "--log-dir", "logs"], Some("logs")),
+        (
+            &named,
+            vec!["run", "ci", "--json", "--log-dir", "logs"],
+            Some("logs/ci"),
+        ),
+        (&legacy, vec!["--json"], None),
+    ] {
+        let output = p.run(&args);
+        success(&output);
+        let events = events(&output);
+        assert_eq!(events[0]["jobs"], 4);
+        let summary = events.last().unwrap();
+        assert_eq!(summary["type"], "summary");
+        // Wall time covers the whole run, so at least the longest job.
+        let wall = summary["duration_ms"].as_u64().unwrap();
+        let longest = summary["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["duration_ms"].as_u64().unwrap())
+            .max()
+            .unwrap();
+        assert!(wall >= 200 && wall >= longest, "{summary}");
+        assert_eq!(summary["passed"], 4);
+        assert_eq!(summary["results"].as_array().unwrap().len(), 4);
+        match log_dir {
+            Some(dir) => {
+                assert_eq!(summary["log_dir"], dir);
+                assert!(p.dir.join(dir).join("001-compile.stdout.log").exists());
+            }
+            None => assert!(summary.get("log_dir").is_none(), "{summary}"),
+        }
+    }
+}
+
+#[test]
+fn summary_results_mark_whether_each_instance_started() {
+    let p = Project::new(
+        r#"
+[settings]
+fail_fast = true
+parallelism = 1
+[[jobs]]
+name = "ran"
+command = "true"
+[[jobs]]
+name = "cond"
+condition = "false"
+command = "touch cond"
+[[jobs]]
+name = "boom"
+command = "exit 1"
+[[jobs]]
+name = "dependent"
+depends_on = ["boom"]
+command = "true"
+[[jobs]]
+name = "late"
+command = "true"
+"#,
+    );
+    let output = p.run(&["--json"]);
+    assert_eq!(output.status.code(), Some(1));
+    let events = events(&output);
+    let results = events.last().unwrap()["results"].as_array().unwrap();
+    let started: Vec<_> = results
+        .iter()
+        .map(|r| {
+            (
+                r["name"].as_str().unwrap(),
+                r["status"].as_str().unwrap(),
+                r["started"].as_bool().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        started,
+        [
+            ("ran", "passed", true),
+            ("cond", "skipped", true),
+            ("boom", "failed", true),
+            ("dependent", "skipped", false),
+            ("late", "skipped", false),
+        ]
+    );
+    for event in events.iter().filter(|e| e["type"] == "job_finished") {
+        assert!(event["result"].get("started").is_none(), "{event}");
+    }
+    // A started condition skip shows its duration; queued skips show none.
+    let text = stdout(&p.run(&[]));
+    let report = &text[text.find("\ndefault  FAILED  in ").unwrap()..];
+    let row = |name: &str| {
+        report
+            .lines()
+            .find(|l| l.split_whitespace().nth(1) == Some(name))
+            .unwrap()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let cond = row("cond");
+    let tokens: Vec<_> = cond.split_whitespace().collect();
+    assert_eq!(tokens[..2], ["SKIP", "cond"], "{report}");
+    assert!(is_report_duration(tokens[2]), "{report}");
+    assert_eq!(row("dependent"), "SKIP dependent dependency did not pass");
+    assert_eq!(row("late"), "SKIP late fail_fast: previous job failed");
+}
+
+/// Runs a report's rerun hint through `sh`, with `goodflows` resolving to the
+/// binary under test.
+fn run_hint(p: &Project, hint: &str) -> std::process::Output {
+    let bin = std::path::Path::new(env!("CARGO_BIN_EXE_goodflows"))
+        .parent()
+        .unwrap();
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    std::process::Command::new("sh")
+        .current_dir(&p.dir)
+        .env("NO_COLOR", "1")
+        .env("PATH", path)
+        .args(["-c", hint])
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn rerun_hint_survives_the_shell_and_cli_parsing() {
+    let p = Project::new(
+        r#"
+[environments."pr'od $(touch env-pwned) ;x".settings]
+fail_fast = false
+
+[workflows."-it's a $(touch wf-pwned) flow"]
+[workflows."-it's a $(touch wf-pwned) flow".settings]
+fail_fast = false
+[[workflows."-it's a $(touch wf-pwned) flow".jobs]]
+name = "base"
+command = "true"
+[[workflows."-it's a $(touch wf-pwned) flow".jobs]]
+name = "other"
+command = "true"
+[[workflows."-it's a $(touch wf-pwned) flow".jobs]]
+name = "a b's `touch job-pwned`"
+depends_on = ["base"]
+command = "echo ran-a >&2; exit 1"
+[[workflows."-it's a $(touch wf-pwned) flow".jobs]]
+name = "-x;y"
+command = "exit 2"
+"#,
+    );
+    let workflow = "-it's a $(touch wf-pwned) flow";
+    let environment = "pr'od $(touch env-pwned) ;x";
+    let output = p.run(&["run", "--env", environment, "--", workflow]);
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    let text = stdout(&output);
+    let hint = text
+        .lines()
+        .last()
+        .unwrap()
+        .strip_prefix("Rerun failed: ")
+        .unwrap_or_else(|| panic!("no rerun hint: {text}"));
+    assert!(hint.contains(" -- "), "{hint}");
+    let rerun = run_hint(&p, hint);
+    assert_eq!(rerun.status.code(), Some(1), "{}", stderr(&rerun));
+    let text = stdout(&rerun);
+    assert!(
+        text.contains(&format!("Environment: {environment}\n")),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("\nworkflow: {workflow}\n")),
+        "{text}"
+    );
+    // Exactly the failed jobs plus their prerequisite were selected.
+    assert!(text.contains("jobs=3"), "{text}");
+    assert!(text.contains("  PASS  base"), "{text}");
+    assert!(!text.contains("other"), "{text}");
+    // The rerun failed the same way, so its own hint is identical.
+    assert!(text.ends_with(&format!("Rerun failed: {hint}\n")), "{text}");
+    for file in ["wf-pwned", "env-pwned", "job-pwned"] {
+        assert!(!p.dir.join(file).exists(), "{file}");
+    }
+}
+
+#[test]
+fn comma_job_names_fall_back_to_a_full_workflow_rerun() {
+    let p = Project::new(
+        "[workflows.ci]\n[[workflows.ci.jobs]]\nname='test,unit'\ncommand='exit 1'\n[[workflows.ci.jobs]]\nname='ok'\ncommand='true'\n",
+    );
+    let output = p.run(&["run", "ci"]);
+    assert_eq!(output.status.code(), Some(1));
+    let text = stdout(&output);
+    assert!(
+        text.ends_with("Selective rerun unavailable: job 'test,unit' contains a comma, which --jobs cannot select.\nRerun workflow: goodflows run ci\n"),
+        "{text}"
+    );
+    let rerun = run_hint(&p, "goodflows run ci");
+    assert!(stdout(&rerun).contains("  PASS  ok"));
+}
+
+/// Matches a report duration: `\d+ms`, `\d+.\ds` or `\d+m\d\ds`.
+fn is_report_duration(token: &str) -> bool {
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    if let Some(ms) = token.strip_suffix("ms") {
+        return digits(ms);
+    }
+    if let Some((minutes, seconds)) = token.strip_suffix('s').and_then(|t| t.split_once('m')) {
+        return digits(minutes) && seconds.len() == 2 && digits(seconds);
+    }
+    match token.strip_suffix('s').and_then(|t| t.split_once('.')) {
+        Some((whole, tenth)) => digits(whole) && tenth.len() == 1 && digits(tenth),
+        None => false,
+    }
+}
+
+#[test]
+fn report_duration_tokens_are_recognized() {
+    for token in ["0ms", "999ms", "1.2s", "1m05s"] {
+        assert!(is_report_duration(token), "{token}");
+    }
+    for token in ["ms", "1.23s", "1m5s", "fail_fast:", "1s"] {
+        assert!(!is_report_duration(token), "{token}");
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn non_utf8_log_dir_still_gets_a_summary() {
+    use std::os::unix::ffi::OsStrExt;
+    let p = Project::new("[[jobs]]\nname='a'\ncommand='echo hi'\n");
+    let dir = std::ffi::OsStr::from_bytes(b"l\xff");
+    let output = p
+        .command()
+        .arg("--json")
+        .arg("--log-dir")
+        .arg(dir)
+        .output()
+        .unwrap();
+    success(&output);
+    let summary = events(&output).pop().unwrap();
+    assert_eq!(summary["type"], "summary");
+    assert_eq!(summary["log_dir"], "l\u{fffd}");
+    assert!(p.dir.join(dir).join("001-a.stdout.log").exists());
+    let output = p.command().arg("--log-dir").arg(dir).output().unwrap();
+    success(&output);
+    assert!(stdout(&output).ends_with("\n1 passed\n\nLogs: l\u{fffd}\n"));
+}
+
+#[test]
+fn timeout_live_line_is_short_and_the_report_has_the_tail() {
+    let p = Project::new("[[jobs]]\nname='slow'\ntimeout_secs=1\ncommand='echo out; sleep 5'\n");
+    let output = p.run(&[]);
+    assert_eq!(output.status.code(), Some(1));
+    let text = stdout(&output);
+    let header = text.find("\ndefault  FAILED  in ").expect("report header");
+    let live = &text[text.find("slow TIMED OUT").expect("live line")..header];
+    for absent in ["command:", "stdout tail", "stderr tail"] {
+        assert!(!live.contains(absent), "{absent}: {text}");
+    }
+    let report = &text[header..];
+    let entry = &report[report.find("\n--- slow  TIMED OUT").expect("entry")..];
+    assert!(entry.contains("  stdout tail:\n    out\n"), "{text}");
+    assert!(
+        text.ends_with("\nRerun failed: goodflows run default --jobs=slow\n"),
+        "{text}"
+    );
+}
+
+#[test]
+fn rerun_hint_keeps_an_explicit_config_and_skipped_dependents() {
+    let p = Project::new("");
+    std::fs::write(
+        p.dir.join("my ci.toml"),
+        "[settings]\nfail_fast=false\n[[jobs]]\nname='build'\ncommand='exit 1'\n[[jobs]]\nname='deploy'\ndepends_on=['build']\ncommand='true'\n[[jobs]]\nname='other'\ncommand='true'\n",
+    )
+    .unwrap();
+    let output = p.run(&["--config", "my ci.toml"]);
+    assert_eq!(output.status.code(), Some(1));
+    let text = stdout(&output);
+    let hint = "goodflows run default --config='my ci.toml' --jobs='build,deploy'";
+    assert!(
+        text.ends_with(&format!("\nRerun failed: {hint}\n")),
+        "{text}"
+    );
+    let rerun = run_hint(&p, hint);
+    assert_eq!(rerun.status.code(), Some(1), "{}", stderr(&rerun));
+    let text = stdout(&rerun);
+    assert!(text.contains("jobs=2"), "{text}");
+    assert!(!text.contains("other"), "{text}");
+    assert!(text.ends_with(&format!("Rerun failed: {hint}\n")), "{text}");
+    // Without --config, the hint has none.
+    std::fs::copy(p.dir.join("my ci.toml"), p.dir.join("goodflows.toml")).unwrap();
+    let text = stdout(&p.run(&[]));
+    assert!(
+        text.ends_with("\nRerun failed: goodflows run default --jobs='build,deploy'\n"),
+        "{text}"
+    );
 }

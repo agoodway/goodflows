@@ -87,7 +87,13 @@ Node initialization uses the package manager indicated by `package-lock.json`,
 (default: npm). Conflicting package-manager lockfiles are rejected. Only declared
 `format:check`, `lint`, `typecheck`, `check`, `test`, and `build` scripts become jobs;
 no check scripts produces an error. The Node template requires `package.json`.
-Elixir jobs use `MIX_ENV=test`.
+The Elixir template declares `MIX_ENV = "test"` once under `[settings.env]`, so every
+generated job (including jobs generated into a named workflow with `--workflow`)
+inherits it without repeating it per job. Other templates write no `[settings.env]`.
+Because `[settings.env]` is shared, `MIX_ENV = "test"` also applies to workflows you
+add later; the generated file says so in a header comment, and a workflow can override
+it with `[workflows.NAME.settings.env]`. Goodflows binaries older than settings env
+support reject the generated `env` field as unknown.
 
 ## Ampcode orbs
 
@@ -256,6 +262,9 @@ parallelism = 4       # Maximum running jobs; 0 or omitted = logical CPU count
 fail_fast = true      # Default, including when [settings] is omitted
 workdir = "."        # Relative to the config file's directory; absolute paths work
 
+[settings.env]        # Command environment defaults inherited by every job
+CARGO_TERM_COLOR = "always"
+
 [[jobs]]
 name = "fmt"
 command = "cargo fmt --check"
@@ -276,8 +285,49 @@ depends_on = ["fmt"]
 Commands use `sh -c` by default, so pipes, redirects, and shell expansion work.
 With `shell = false`, commands are split using shell-style quoting and executed
 directly; quoted arguments work, but variables, pipes, and globbing are not expanded.
-Jobs inherit the runner's environment plus their own `env` entries. Job stdin is
-closed, so checks must run noninteractively.
+Jobs inherit the runner's environment, then settings `env` defaults, then their own
+`env` entries. Job stdin is closed, so checks must run noninteractively.
+
+### Settings environment defaults
+
+`[settings.env]`, `[workflows.NAME.settings.env]`, and
+`[environments.NAME.settings.env]` declare command environment defaults so values
+such as `MIX_ENV=test` need not be repeated on every job. Variables merge **by key**,
+lowest to highest precedence:
+
+1. the environment goodflows was started with (the caller),
+2. shared `[settings.env]`,
+3. the selected workflow's `settings.env`,
+4. the selected `--env` profile's `settings.env` (only when `--env` selects it),
+5. job `env`,
+6. step `env` (for that step only).
+
+Each scope keeps the keys it does not override. An omitted or empty map changes
+nothing; an empty string (`VALUE = ""`) sets the variable to an empty value. Values
+are literal strings: there is no `$VAR` interpolation and no way to unset a
+variable. Non-string values (numbers, booleans, arrays, tables) are rejected. A
+workflow's overrides never affect sibling workflows or top-level `[[jobs]]`.
+
+```toml
+[settings.env]
+MIX_ENV = "test"
+KEEP = "shared"
+
+[workflows.ci.settings.env]
+MIX_ENV = "dev"
+
+[environments.ci.settings.env]
+MIX_ENV = "prod"   # `goodflows run ci --env ci` -> MIX_ENV=prod, KEEP=shared, CI=true
+CI = "true"
+```
+
+Settings defaults reach job and step commands, shell and expression conditions, and
+job output expressions the same way job `env` does. Runner-owned variables keep their
+existing behavior: partition identity, `GOODFLOWS_ENVIRONMENT`, `GOODFLOWS_OUTPUT`,
+and reporting variables are still set or removed by goodflows, and the reporting
+`token_env` is still removed from every command. Settings never become the reporting
+publisher's endpoint or token; the publisher reads `url_env` and `token_env` only from
+the caller's environment.
 
 Without `--config`, goodflows looks in the current directory for `goodflows.toml`, then
 `.goodflows.toml`. Commands default to that file's directory. A configured relative
@@ -287,9 +337,13 @@ goodflows. `--log-dir` is resolved from the invocation directory.
 The whole config is validated before any command runs—even when selecting a subset.
 Unknown fields, duplicate/empty names, empty commands, missing or duplicate
 dependencies, self-dependencies, cycles, invalid environment entries, malformed
-direct-command quoting, zero timeouts, nonexistent workdirs, and job or step `env`
-entries for the reserved `GOODFLOWS_RUN_ID`, `GOODFLOWS_REPORT_DIR`,
-`GOODFLOWS_PARTITION` and `GOODFLOWS_PARTITION_COUNT` are errors.
+direct-command quoting, zero timeouts, nonexistent workdirs, and job, step, or
+settings `env` entries for the reserved `GOODFLOWS_RUN_ID`, `GOODFLOWS_REPORT_DIR`,
+`GOODFLOWS_PARTITION`, `GOODFLOWS_PARTITION_COUNT`, and `GOODFLOWS_ENVIRONMENT`
+(or the configured reporting `token_env`) are errors. Every shared, workflow, and
+profile `settings.env` map is validated, including unselected workflows and profiles
+and entries that a later scope overrides; errors name the settings scope (for
+example `environment 'local' settings env`) without printing configured values.
 Cycle errors include an actual cycle path, such as `a -> b -> a`.
 
 ### Partitioned jobs
@@ -326,7 +380,8 @@ partitions = 3
   expressions see the same values through `env.GOODFLOWS_PARTITION`. They override
   inherited values. Unpartitioned jobs never see these variables, even when
   goodflows itself was launched with them exported (expressions resolve them to
-  `null`). Setting either name in any job or step `env` is a validation error.
+  `null`). Setting either name in any job, step, or settings `env` (shared, workflow,
+  or profile) is a validation error.
 - The command must consume the partition variables; a tool that ignores them runs
   its full workload in every instance.
 - Partitioned jobs publish no job outputs. An `outputs` mapping on a partitioned job
@@ -336,14 +391,21 @@ partitions = 3
 - Partitioned jobs may declare `reports`: each instance gets its own report
   directory and its reports carry the instance's partition (see
   [Test timing reports](#test-timing-reports)).
+- An [environment profile](#environment-profiles) can replace the count for one
+  machine with `[environments.<profile>.partitions]`. The job's `partitions` value
+  is the declared count used by a bare run and by any profile that omits the job.
 
 See [Scheduling and failures](#scheduling-and-failures) for how instances are
 scheduled and [Logs and machine output](#logs-and-machine-output) for how they are
 reported.
+The text run report printed at the end of a run counts configured jobs and shows a
+partitioned job as one row (for example `FAIL  test  3ms  1/3 failed`), while the
+JSON `summary` counts and `run_started.jobs` count instances.
 
 `list` displays every job field: name, command or steps, conditions, output mappings,
-dependencies, timeout, configured environment, shell mode, and partitions (count and
-strategy, shown only for partitioned jobs). It also shows effective `fail_fast`, `parallelism`,
+dependencies, timeout, configured environment, shell mode, and partitions (effective
+count and strategy, shown only for partitioned jobs; with `--env`, the count is the
+selected profile's override when it sets one). It also shows effective `fail_fast`, `parallelism`,
 and the resolved `workdir`, applying the same CLI overrides and CPU-count default
 as a run. In JSON, these values are under `jobs` and `settings`; job fields retain
 explicit defaults and nullable timeouts even though generated TOML omits them.
@@ -398,7 +460,9 @@ explicit overrides. Both shared and workflow-relative `workdir` values resolve
 from the config file's directory.
 
 Job names and dependencies are scoped to their workflow. For example, both ci and
-integration can have a job named test. Dependencies must refer to local jobs;
+integration can have a job named test. Job names must be nonempty and cannot
+contain control characters (such as newlines, tabs or terminal escape sequences);
+other characters, including spaces and commas, are allowed. Dependencies must refer to local jobs;
 cross-workflow dependencies are not supported. The entire config, including every
 workflow's graph and effective workdir, is validated before anything runs.
 
@@ -450,8 +514,10 @@ Expression values are booleans, strings, numbers, and `null`. There is no implic
 truthiness or type conversion: environment values such as `"false"` remain strings.
 The supported references are:
 
-- `env.NAME`: inherited environment plus job overrides (and step overrides inside
-  a step). An unset or non-UTF-8 variable is `null`; use `??` for a fallback.
+- `env.NAME`: inherited environment, then settings `env` defaults (shared,
+  workflow, selected profile), then job overrides (and step overrides inside a
+  step). Job output mappings see the job environment without step-only
+  overrides. An unset or non-UTF-8 variable is `null`; use `??` for a fallback.
 - `needs.JOB.outputs.KEY`: published outputs from a job explicitly listed in
   `depends_on`. There are no implicit dependencies or cross-workflow references.
 - `steps.ID.outputs.KEY`: an earlier step's outputs, inside a step condition.
@@ -528,7 +594,10 @@ or files exceeding **64 KiB** fail the command. Files are cleaned up automatical
 outputs are read only after the command succeeds and its process group is cleaned
 up. Stdout remains logs and is never parsed for outputs. `GOODFLOWS_OUTPUT` is
 runner-controlled, overrides any configured value, and is not supplied to shell
-conditions.
+conditions. A value inherited from goodflows' own environment (for example when
+goodflows runs inside another goodflows command) is dropped, so expressions see
+`env.GOODFLOWS_OUTPUT` as `null` unless job or step `env` sets it. Settings `env`
+cannot set it (validation error).
 
 Successful steps expose their outputs to later steps. Step outputs stay internal
 unless explicitly promoted using the job's `outputs` mapping, whose values are
@@ -551,8 +620,8 @@ when produced by a step. Raw log paths remain per-job.
 
 ## Environment profiles
 
-Share jobs across machines while overriding runner settings for local development,
-orbs, or CI:
+Share jobs across machines while overriding runner settings and partition counts
+for local development, orbs, or CI:
 
 ```toml
 [settings]
@@ -588,14 +657,19 @@ workflow. Without `--env`, no profile is applied; goodflows does not detect the
 machine or read an environment variable to select one. The Amp plugin likewise
 uses no environment profile.
 
-Each profile can override `parallelism`, `fail_fast`, and `workdir`. Omitted fields
+Each profile can override `parallelism`, `fail_fast`, `workdir`, and `env` under
+`settings`, and the counts of partitioned jobs under `partitions` (see
+[Profile partition counts](#profile-partition-counts)). Omitted fields
 inherit independently, with precedence **CLI overrides > environment settings >
 workflow settings > shared settings > built-in defaults**. Explicit `false` and
 `0` values are preserved (`parallelism = 0` uses the logical CPU count). Relative
 profile workdirs resolve from the config file's directory, not the inherited
-workdir. Profiles do not change jobs, dependencies, or configured job environment variables.
+workdir. Profiles do not change jobs or dependencies, except for the partition
+counts described below. A profile's `settings.env` overrides
+shared and workflow `settings.env` per key, while job and step `env` still win (see
+[Settings environment defaults](#settings-environment-defaults)).
 Every command and expression sees the selected profile as `GOODFLOWS_ENVIRONMENT`.
-Goodflows sets that variable itself, so job and step `env` cannot. A run without
+Goodflows sets that variable itself, so job, step, and settings `env` cannot. A run without
 `--env` removes it, even when the parent process exported it.
 
 Unknown profile names fail with the available names before jobs run. Names follow
@@ -609,6 +683,73 @@ Human output identifies the selected environment. JSON events include
 `config_valid` events also include effective `settings`; aggregate validation and
 workflow discovery report each workflow's settings with the selected profile and
 CLI overrides applied.
+
+Effective JSON `settings` (from `list WORKFLOW --json`, selected-workflow
+`validate --json`, `list --workflows --json`, and aggregate `validate --json`)
+include an `env` object with the merged shared, workflow, and selected-profile
+`settings.env` defaults (`{}` when none are configured). It never includes the
+caller's environment or job/step overrides; `jobs[*].env` in `list` output still shows
+each job's explicitly configured `env`. Human `list` output shows the same merged
+map on the settings line (`Settings: fail_fast=... parallelism=... env={...}`) and in
+each `list --workflows` entry.
+
+### Profile partition counts
+
+A profile can replace the count of a job that already declares
+[`partitions`](#partitioned-jobs), so one config can run six test partitions on a
+laptop and three in an orb:
+
+```toml
+[settings]
+parallelism = 4
+
+[environments.local.settings]
+parallelism = 8   # size parallelism for the effective count yourself
+
+[environments.local.partitions]
+test = 6
+
+[environments.orb.partitions]
+test = 3
+
+[[jobs]]
+name = "test"
+command = "MIX_TEST_PARTITION=$GOODFLOWS_PARTITION mix test --partitions $GOODFLOWS_PARTITION_COUNT"
+partitions = 3
+```
+
+- Each entry maps a job name to an integer count from 1 to 64. The job keeps its
+  strategy and every other field; only the count changes. The effective count is
+  what scheduling, `GOODFLOWS_PARTITION_COUNT`, events, logs, summaries, report
+  envelopes, and `list` use.
+- Without `--env`, or with a profile that omits the job, the job's declared count
+  applies.
+- A profile cannot add or remove partitioning. Every entry, in every profile
+  (selected or not), must name a job that declares `partitions` in at least one
+  workflow. A name that matches no job fails with `environment '<profile>':
+  unknown job '<job>' (partitioned jobs: ...)`; a name whose jobs are all
+  unpartitioned fails with `environment '<profile>': job '<job>' is not
+  partitioned`. Counts outside 1 to 64 fail with the profile and job named, and
+  non-integer values fail while parsing the TOML.
+- Entries apply per selected workflow. A name the selected workflow does not
+  contain is ignored. When the selected workflow has a job by that name that does
+  not declare `partitions`, the run, `list`, and `validate` fail before any job
+  runs with `environment '<profile>': workflow '<workflow>': job '<job>' is not
+  partitioned`; aggregate `validate --env` and `list --workflows --env` fail if any
+  workflow would. Aggregate `validate` without `--env` checks every profile against
+  every workflow the same way, so it fails if any `run <workflow> --env <profile>`
+  would.
+- Known limitation: this check covers the whole workflow, not just the jobs
+  `--jobs` selects. If a profile sets `test` and a workflow has a plain `test` job,
+  every command for that workflow fails with that profile, including
+  `goodflows run nightly --jobs lint --env local`. Rename one of the jobs or use a
+  separate profile for that workflow.
+- The count does not change `parallelism`. Extra instances wait for free slots, so
+  set the profile's `settings.parallelism` (or `--parallelism`) for the effective
+  count; the usual parallelism precedence still applies.
+- Older goodflows versions reject the `partitions` table on a profile. Remove it
+  before rolling back to an older binary. Saved runs keep the count they ran with,
+  so `reports upload` replays them unchanged.
 
 ## Scheduling and failures
 
@@ -701,11 +842,11 @@ reports = ["exunit-timings"]
   `reports` without a `[reporting]` block, and reporting job names longer than 64
   UTF-8 bytes or containing control characters are validation errors.
 - `GOODFLOWS_RUN_ID` and `GOODFLOWS_REPORT_DIR` are reserved: setting either in any
-  job or step `env` is a validation error. `url_env` and `token_env` must differ and
-  must not name a reserved variable (`GOODFLOWS_RUN_ID`, `GOODFLOWS_REPORT_DIR`,
-  `GOODFLOWS_PARTITION`, `GOODFLOWS_PARTITION_COUNT`) or `GOODFLOWS_OUTPUT`, and no
-  job or step `env` may set the `token_env` variable (it is removed from every
-  command).
+  job, step, or settings `env` is a validation error. `url_env` and `token_env` must
+  differ and must not name a reserved variable (`GOODFLOWS_RUN_ID`,
+  `GOODFLOWS_REPORT_DIR`, `GOODFLOWS_PARTITION`, `GOODFLOWS_PARTITION_COUNT`) or
+  `GOODFLOWS_OUTPUT`, and no job, step, or settings `env` may set the `token_env`
+  variable (it is removed from every command).
 - A [partitioned job](#partitioned-jobs) may declare `reports`. Every instance
   receives its own `GOODFLOWS_REPORT_DIR` (all instances share one
   `GOODFLOWS_RUN_ID`) and is collected separately, once, with its own
@@ -988,16 +1129,24 @@ add `partition` with `index` (1-based) and `count`. `job_started`, `step_started
 `step_finished`, `job_output` and `job_finished` results all carry it, including
 results for instances skipped or cancelled before they started. Use
 `(name, partition.index)` as the instance key. Events for unpartitioned jobs have
-no `partition` field. `run_started.jobs` and the `summary` counts count instances,
-so `compile` plus a 3-partition `test` reports 4 jobs.
+no `partition` field. `run_started.jobs` and the JSON `summary` counts count
+instances, so `compile` plus a 3-partition `test` reports 4 jobs. The text run
+report counts configured jobs instead, so the same run reads `2 passed`.
 
 ```json
 {"data":"2/3\n","name":"test","partition":{"count":3,"index":2},"schema_version":1,"stream":"stdout","type":"job_output","workflow":"default"}
 ```
 
-The final `summary` contains `success`, counts for every status, and `results` in
-config order, with a partitioned job's instances in index order at its position. Each result contains `name`, `command`, `status`, `duration_ms`,
-nullable `exit_code`, nullable `error`, and `outputs`. Stepped jobs additionally
+The final `summary` contains `success`, counts for every status (`passed`,
+`failed`, `timed_out`, `skipped`, `cancelled`), integer `duration_ms` (the run's
+wall-clock time, including reporting), `log_dir` (the effective log directory,
+including a named workflow's subdirectory; present only with `--log-dir`), and
+`results` in config order, with a partitioned job's instances in index order at its
+position. Each result contains `name`, `command`, `status`, `duration_ms`,
+nullable `exit_code`, nullable `error`, and `outputs`. Summary results also carry
+boolean `started`: true when the instance entered execution (including one a
+condition then skipped), false when it was skipped or cancelled while still
+queued. `started` appears only in `summary.results`, never in `job_finished`. Stepped jobs additionally
 include `steps` in config order, each with `id`, `command`, `status`, `duration_ms`,
 nullable `exit_code`, nullable `error`, and `outputs`. Their job-level `command` is
 null unless a step failed, in which case it identifies that step's command.
@@ -1008,8 +1157,8 @@ The tails are captured incrementally and capped at **4096 UTF-8 bytes per stream
 with truncation flags indicating omitted leading content. Non-UTF-8 bytes are
 decoded lossily and character boundaries are preserved when trimming the tails.
 Empty output produces empty tails with false truncation flags; other statuses
-omit the tail fields. Human failure output shows the command and nonempty tails.
-Full output remains available in the events and optional raw log files.
+omit the tail fields. Full output remains available in the events and optional raw
+log files.
 Configuration/runtime failures produce an
 `error` event instead of a completed summary.
 
@@ -1024,6 +1173,73 @@ Output backpressure never blocks timeout or signal handling. On interruption, if
 the downstream consumer stops reading, goodflows allows 250 ms for pending output
 before discarding further events so it can exit. A final summary cannot be
 guaranteed when the output pipe is blocked or closed.
+
+### Run report
+
+In text mode a run ends with a report built from the `summary` event, printed after
+every job and reporting line. A failed `job_finished` line shows only its status,
+duration, exit code and error; the command and output tails appear once, in the
+report. For a config with top-level `[[jobs]]` `fmt`, `lint`, a 2-partition `test`
+that fails and a dependent `deploy`, run with `--log-dir logs` (a named workflow
+shows its subdirectory, such as `Logs: logs/ci`):
+
+```text
+default  FAILED  in 207ms
+  PASS  fmt     203ms
+  PASS  lint      2ms
+  FAIL  test      3ms  2/2 failed
+  SKIP  deploy         dependency did not pass
+2 passed, 1 failed, 1 skipped
+
+Failures
+--- test (1/2)  FAILED  exit 1
+  command: echo boom-$GOODFLOWS_PARTITION >&2; exit 1
+  error: exited with 1
+  stderr tail:
+    boom-1
+
+--- test (2/2)  FAILED  exit 1
+  command: echo boom-$GOODFLOWS_PARTITION >&2; exit 1
+  error: exited with 1
+  stderr tail:
+    boom-2
+
+Logs: logs
+Rerun failed: goodflows run default --jobs='test,deploy'
+```
+
+- The header shows the workflow, the outcome (`FAILED` if any instance failed or
+  timed out, otherwise `CANCELLED` if any was cancelled or a signal arrived before
+  the report, otherwise `PASSED`) and the wall-clock time. The time runs from just
+  before the first job until the report, so it includes reporting (collection and
+  uploads) after the last job finished.
+- There is one row per selected configured job, including prerequisites. A
+  partitioned job's row takes its most severe instance status (failed, timed out,
+  cancelled, passed, skipped) and lists nonzero non-passed instance counts. The
+  duration is the longest among instances that started; jobs that never started
+  show none. Skipped rows list their distinct skip reasons.
+- Counts are per configured job, with zero counts omitted.
+- Columns are aligned by character count, which assumes narrow characters; wide
+  characters (for example CJK) in job names shift the rest of that row.
+- Failures has one entry per failed or timed-out instance: the instance, its status
+  and exit code (when present), then the failing step when one failed or timed
+  out, then the command and error when present, then the job-level stderr and
+  stdout tails (which can include output of earlier steps).
+- Control characters other than tab in commands, errors, skip reasons and tails are
+  shown escaped (for example `\u{1b}`), here and in live failure lines, so job
+  output cannot rewrite the report.
+- `Logs:` appears with `--log-dir`. When a job failed or timed out, the report ends
+  with a shell-quoted rerun command keeping the workflow, `--env` and an explicitly
+  passed `--config`, and selecting the failed jobs plus jobs skipped because a
+  dependency did not pass, in row order (`--jobs` adds their dependencies). It does
+  not repeat `--parallelism` or fail-fast flags. A selected job whose name contains
+  a comma cannot be selected with `--jobs`, so the report explains that and
+  suggests rerunning the whole workflow.
+
+**Compatibility:** the text `Summary: N passed, ...` line and the `All jobs passed`
+and `All checks succeeded (some jobs skipped)` lines were replaced by the run report.
+Scripts should use `--json`, whose `summary` event only gained fields
+(`duration_ms`, `log_dir`, `results[].started`).
 
 ## Development and releases
 

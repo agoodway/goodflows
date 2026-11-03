@@ -3,7 +3,7 @@ use crate::output::Output;
 use anyhow::{bail, Context, Result};
 use clap::ValueEnum;
 use serde_json::json;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
@@ -84,6 +84,7 @@ pub async fn generate(
     let mut config = Config {
         settings: Settings {
             workdir: Some(relative_path(&parent, &root)),
+            env: settings_env(template),
             ..Settings::default()
         },
         jobs,
@@ -101,7 +102,12 @@ pub async fn generate(
         );
     }
     config.validate()?;
-    let content = format!("# goodflows.toml — {} project checks\n# Commands run relative to settings.workdir (resolved from this file).\n# Omitted parallelism uses every logical CPU.\n# Set parallelism to the machine size before a run.\n\n{}", template.name(), generated_toml(&config)?);
+    let env_note = if config.settings.env.is_empty() {
+        ""
+    } else {
+        "# [settings.env] applies to every workflow; override per workflow with [workflows.NAME.settings.env]\n"
+    };
+    let content = format!("# goodflows.toml — {} project checks\n# Commands run relative to settings.workdir (resolved from this file).\n# Omitted parallelism uses every logical CPU.\n# Set parallelism to the machine size before a run.\n{env_note}\n{}", template.name(), generated_toml(&config)?);
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create(exists)
@@ -141,6 +147,15 @@ fn detect(root: &Path) -> Result<Template> {
     }
 }
 
+/// Command environment defaults declared once in shared settings, so every
+/// job (including jobs moved into a named workflow) inherits them.
+fn settings_env(template: Template) -> BTreeMap<String, String> {
+    match template {
+        Template::Elixir => BTreeMap::from([("MIX_ENV".into(), "test".into())]),
+        _ => BTreeMap::new(),
+    }
+}
+
 fn job(name: &str, command: &str, deps: &[&str]) -> Job {
     Job {
         name: name.into(),
@@ -166,15 +181,11 @@ fn jobs(template: Template, root: &Path) -> Result<Vec<Job>> {
             job("test", "cargo test --locked --all", &["fmt"]),
             job("doc", "cargo doc --locked --no-deps", &["fmt"]),
         ],
-        Template::Elixir => {
-            let mut jobs = vec![
-                job("fmt", "mix format --check-formatted", &[]),
-                job("compile", "mix compile --warnings-as-errors", &["fmt"]),
-                job("test", "mix test", &["compile"]),
-            ];
-            for job in &mut jobs { job.env.insert("MIX_ENV".into(), "test".into()); }
-            jobs
-        }
+        Template::Elixir => vec![
+            job("fmt", "mix format --check-formatted", &[]),
+            job("compile", "mix compile --warnings-as-errors", &["fmt"]),
+            job("test", "mix test", &["compile"]),
+        ],
         Template::Go => vec![
             job("fmt", "files=$(gofmt -l .) && if [ -n \"$files\" ]; then printf '%s\\n' \"$files\"; exit 1; fi", &[]),
             job("vet", "go vet ./...", &["fmt"]),
