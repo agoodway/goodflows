@@ -534,6 +534,8 @@ fn legacy_jobs_use_shared_settings_env_beside_named_workflows() {
         let output = p
             .command()
             .env("MIX_ENV", "caller")
+            // CI runners export CI; keep it unset so only the profile supplies it.
+            .env_remove("CI")
             .args(args)
             .output()
             .unwrap();
