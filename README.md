@@ -87,7 +87,13 @@ Node initialization uses the package manager indicated by `package-lock.json`,
 (default: npm). Conflicting package-manager lockfiles are rejected. Only declared
 `format:check`, `lint`, `typecheck`, `check`, `test`, and `build` scripts become jobs;
 no check scripts produces an error. The Node template requires `package.json`.
-Elixir jobs use `MIX_ENV=test`.
+The Elixir template declares `MIX_ENV = "test"` once under `[settings.env]`, so every
+generated job (including jobs generated into a named workflow with `--workflow`)
+inherits it without repeating it per job. Other templates write no `[settings.env]`.
+Because `[settings.env]` is shared, `MIX_ENV = "test"` also applies to workflows you
+add later; the generated file says so in a header comment, and a workflow can override
+it with `[workflows.NAME.settings.env]`. Goodflows binaries older than settings env
+support reject the generated `env` field as unknown.
 
 ## Ampcode orbs
 
@@ -256,6 +262,9 @@ parallelism = 4       # Maximum running jobs; 0 or omitted = logical CPU count
 fail_fast = true      # Default, including when [settings] is omitted
 workdir = "."        # Relative to the config file's directory; absolute paths work
 
+[settings.env]        # Command environment defaults inherited by every job
+CARGO_TERM_COLOR = "always"
+
 [[jobs]]
 name = "fmt"
 command = "cargo fmt --check"
@@ -276,8 +285,49 @@ depends_on = ["fmt"]
 Commands use `sh -c` by default, so pipes, redirects, and shell expansion work.
 With `shell = false`, commands are split using shell-style quoting and executed
 directly; quoted arguments work, but variables, pipes, and globbing are not expanded.
-Jobs inherit the runner's environment plus their own `env` entries. Job stdin is
-closed, so checks must run noninteractively.
+Jobs inherit the runner's environment, then settings `env` defaults, then their own
+`env` entries. Job stdin is closed, so checks must run noninteractively.
+
+### Settings environment defaults
+
+`[settings.env]`, `[workflows.NAME.settings.env]`, and
+`[environments.NAME.settings.env]` declare command environment defaults so values
+such as `MIX_ENV=test` need not be repeated on every job. Variables merge **by key**,
+lowest to highest precedence:
+
+1. the environment goodflows was started with (the caller),
+2. shared `[settings.env]`,
+3. the selected workflow's `settings.env`,
+4. the selected `--env` profile's `settings.env` (only when `--env` selects it),
+5. job `env`,
+6. step `env` (for that step only).
+
+Each scope keeps the keys it does not override. An omitted or empty map changes
+nothing; an empty string (`VALUE = ""`) sets the variable to an empty value. Values
+are literal strings: there is no `$VAR` interpolation and no way to unset a
+variable. Non-string values (numbers, booleans, arrays, tables) are rejected. A
+workflow's overrides never affect sibling workflows or top-level `[[jobs]]`.
+
+```toml
+[settings.env]
+MIX_ENV = "test"
+KEEP = "shared"
+
+[workflows.ci.settings.env]
+MIX_ENV = "dev"
+
+[environments.ci.settings.env]
+MIX_ENV = "prod"   # `goodflows run ci --env ci` -> MIX_ENV=prod, KEEP=shared, CI=true
+CI = "true"
+```
+
+Settings defaults reach job and step commands, shell and expression conditions, and
+job output expressions the same way job `env` does. Runner-owned variables keep their
+existing behavior: partition identity, `GOODFLOWS_ENVIRONMENT`, `GOODFLOWS_OUTPUT`,
+and reporting variables are still set or removed by goodflows, and the reporting
+`token_env` is still removed from every command. Settings never become the reporting
+publisher's endpoint or token; the publisher reads `url_env` and `token_env` only from
+the caller's environment.
 
 Without `--config`, goodflows looks in the current directory for `goodflows.toml`, then
 `.goodflows.toml`. Commands default to that file's directory. A configured relative
@@ -287,9 +337,13 @@ goodflows. `--log-dir` is resolved from the invocation directory.
 The whole config is validated before any command runs—even when selecting a subset.
 Unknown fields, duplicate/empty names, empty commands, missing or duplicate
 dependencies, self-dependencies, cycles, invalid environment entries, malformed
-direct-command quoting, zero timeouts, nonexistent workdirs, and job or step `env`
-entries for the reserved `GOODFLOWS_RUN_ID`, `GOODFLOWS_REPORT_DIR`,
-`GOODFLOWS_PARTITION` and `GOODFLOWS_PARTITION_COUNT` are errors.
+direct-command quoting, zero timeouts, nonexistent workdirs, and job, step, or
+settings `env` entries for the reserved `GOODFLOWS_RUN_ID`, `GOODFLOWS_REPORT_DIR`,
+`GOODFLOWS_PARTITION`, `GOODFLOWS_PARTITION_COUNT`, and `GOODFLOWS_ENVIRONMENT`
+(or the configured reporting `token_env`) are errors. Every shared, workflow, and
+profile `settings.env` map is validated, including unselected workflows and profiles
+and entries that a later scope overrides; errors name the settings scope (for
+example `environment 'local' settings env`) without printing configured values.
 Cycle errors include an actual cycle path, such as `a -> b -> a`.
 
 ### Partitioned jobs
@@ -326,7 +380,8 @@ partitions = 3
   expressions see the same values through `env.GOODFLOWS_PARTITION`. They override
   inherited values. Unpartitioned jobs never see these variables, even when
   goodflows itself was launched with them exported (expressions resolve them to
-  `null`). Setting either name in any job or step `env` is a validation error.
+  `null`). Setting either name in any job, step, or settings `env` (shared, workflow,
+  or profile) is a validation error.
 - The command must consume the partition variables; a tool that ignores them runs
   its full workload in every instance.
 - Partitioned jobs publish no job outputs. An `outputs` mapping on a partitioned job
@@ -450,8 +505,10 @@ Expression values are booleans, strings, numbers, and `null`. There is no implic
 truthiness or type conversion: environment values such as `"false"` remain strings.
 The supported references are:
 
-- `env.NAME`: inherited environment plus job overrides (and step overrides inside
-  a step). An unset or non-UTF-8 variable is `null`; use `??` for a fallback.
+- `env.NAME`: inherited environment, then settings `env` defaults (shared,
+  workflow, selected profile), then job overrides (and step overrides inside a
+  step). Job output mappings see the job environment without step-only
+  overrides. An unset or non-UTF-8 variable is `null`; use `??` for a fallback.
 - `needs.JOB.outputs.KEY`: published outputs from a job explicitly listed in
   `depends_on`. There are no implicit dependencies or cross-workflow references.
 - `steps.ID.outputs.KEY`: an earlier step's outputs, inside a step condition.
@@ -528,7 +585,10 @@ or files exceeding **64 KiB** fail the command. Files are cleaned up automatical
 outputs are read only after the command succeeds and its process group is cleaned
 up. Stdout remains logs and is never parsed for outputs. `GOODFLOWS_OUTPUT` is
 runner-controlled, overrides any configured value, and is not supplied to shell
-conditions.
+conditions. A value inherited from goodflows' own environment (for example when
+goodflows runs inside another goodflows command) is dropped, so expressions see
+`env.GOODFLOWS_OUTPUT` as `null` unless job or step `env` sets it. Settings `env`
+cannot set it (validation error).
 
 Successful steps expose their outputs to later steps. Step outputs stay internal
 unless explicitly promoted using the job's `outputs` mapping, whose values are
@@ -588,14 +648,16 @@ workflow. Without `--env`, no profile is applied; goodflows does not detect the
 machine or read an environment variable to select one. The Amp plugin likewise
 uses no environment profile.
 
-Each profile can override `parallelism`, `fail_fast`, and `workdir`. Omitted fields
+Each profile can override `parallelism`, `fail_fast`, `workdir`, and `env`. Omitted fields
 inherit independently, with precedence **CLI overrides > environment settings >
 workflow settings > shared settings > built-in defaults**. Explicit `false` and
 `0` values are preserved (`parallelism = 0` uses the logical CPU count). Relative
 profile workdirs resolve from the config file's directory, not the inherited
-workdir. Profiles do not change jobs, dependencies, or configured job environment variables.
+workdir. Profiles do not change jobs or dependencies. A profile's `settings.env` overrides
+shared and workflow `settings.env` per key, while job and step `env` still win (see
+[Settings environment defaults](#settings-environment-defaults)).
 Every command and expression sees the selected profile as `GOODFLOWS_ENVIRONMENT`.
-Goodflows sets that variable itself, so job and step `env` cannot. A run without
+Goodflows sets that variable itself, so job, step, and settings `env` cannot. A run without
 `--env` removes it, even when the parent process exported it.
 
 Unknown profile names fail with the available names before jobs run. Names follow
@@ -609,6 +671,15 @@ Human output identifies the selected environment. JSON events include
 `config_valid` events also include effective `settings`; aggregate validation and
 workflow discovery report each workflow's settings with the selected profile and
 CLI overrides applied.
+
+Effective JSON `settings` (from `list WORKFLOW --json`, selected-workflow
+`validate --json`, `list --workflows --json`, and aggregate `validate --json`)
+include an `env` object with the merged shared, workflow, and selected-profile
+`settings.env` defaults (`{}` when none are configured). It never includes the
+caller's environment or job/step overrides; `jobs[*].env` in `list` output still shows
+each job's explicitly configured `env`. Human `list` output shows the same merged
+map on the settings line (`Settings: fail_fast=... parallelism=... env={...}`) and in
+each `list --workflows` entry.
 
 ## Scheduling and failures
 
@@ -701,11 +772,11 @@ reports = ["exunit-timings"]
   `reports` without a `[reporting]` block, and reporting job names longer than 64
   UTF-8 bytes or containing control characters are validation errors.
 - `GOODFLOWS_RUN_ID` and `GOODFLOWS_REPORT_DIR` are reserved: setting either in any
-  job or step `env` is a validation error. `url_env` and `token_env` must differ and
-  must not name a reserved variable (`GOODFLOWS_RUN_ID`, `GOODFLOWS_REPORT_DIR`,
-  `GOODFLOWS_PARTITION`, `GOODFLOWS_PARTITION_COUNT`) or `GOODFLOWS_OUTPUT`, and no
-  job or step `env` may set the `token_env` variable (it is removed from every
-  command).
+  job, step, or settings `env` is a validation error. `url_env` and `token_env` must
+  differ and must not name a reserved variable (`GOODFLOWS_RUN_ID`,
+  `GOODFLOWS_REPORT_DIR`, `GOODFLOWS_PARTITION`, `GOODFLOWS_PARTITION_COUNT`) or
+  `GOODFLOWS_OUTPUT`, and no job, step, or settings `env` may set the `token_env`
+  variable (it is removed from every command).
 - A [partitioned job](#partitioned-jobs) may declare `reports`. Every instance
   receives its own `GOODFLOWS_REPORT_DIR` (all instances share one
   `GOODFLOWS_RUN_ID`) and is collected separately, once, with its own

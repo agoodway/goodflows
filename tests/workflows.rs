@@ -452,3 +452,326 @@ fn invalid_and_unknown_environments_fail_before_running_jobs() {
     assert!(!output.status.success());
     assert_eq!(p.read("goodflows.toml"), "keep");
 }
+
+// Settings env fixtures, concatenated per test.
+const SHARED: &str = r#"
+[settings.env]
+MIX_ENV = "test"
+KEEP = "shared"
+VALUE = "shared"
+"#;
+const LEGACY_JOB: &str = r#"
+[[jobs]]
+name = "show"
+command = "printf '%s|%s|%s|%s|%s' \"$MIX_ENV\" \"$KEEP\" \"${CI-unset}\" \"${VALUE-unset}\" \"${VALUE+set}\" > default.out"
+"#;
+const EXTRA: &str = r#"
+[[workflows.extra.jobs]]
+name = "show"
+command = "printf '%s|%s|%s|%s|%s' \"$MIX_ENV\" \"$KEEP\" \"${CI-unset}\" \"${VALUE-unset}\" \"${VALUE+set}\" > default.out"
+"#;
+const CI: &str = r#"
+[workflows.ci.settings.env]
+MIX_ENV = "dev"
+[[workflows.ci.jobs]]
+name = "show"
+command = "printf '%s|%s|%s|%s|%s' \"$MIX_ENV\" \"$KEEP\" \"${CI-unset}\" \"${VALUE-unset}\" \"${VALUE+set}\" > ci.out"
+env = { JOB_ONLY = "job" }
+"#;
+const RELEASE: &str = r#"
+[workflows.release.settings.env]
+[[workflows.release.jobs]]
+name = "show"
+command = "printf '%s|%s|%s|%s|%s' \"$MIX_ENV\" \"$KEEP\" \"${CI-unset}\" \"${VALUE-unset}\" \"${VALUE+set}\" > release.out"
+"#;
+const PROFILES: &str = r#"
+[environments.ci.settings.env]
+MIX_ENV = "prod"
+CI = "true"
+VALUE = ""
+[environments.parallel.settings]
+parallelism = 2
+"#;
+
+/// Shared settings, the `ci`/`release`/`extra` workflows and the profiles.
+fn named_settings_env() -> String {
+    [SHARED, EXTRA, CI, RELEASE, PROFILES].concat()
+}
+
+#[test]
+fn settings_env_inherits_shared_workflow_and_selected_profile_per_key() {
+    let p = Project::new(&[SHARED, CI, RELEASE, PROFILES].concat());
+    let run = |args: &[&str]| {
+        let output = p
+            .command()
+            .env("MIX_ENV", "caller")
+            .env("CI", "caller")
+            .args(args)
+            .output()
+            .unwrap();
+        success(&output);
+    };
+    // Profile overrides workflow, which overrides shared; unrelated keys survive.
+    run(&["run", "ci", "--env", "ci"]);
+    assert_eq!(p.read("ci.out"), "prod|shared|true||set");
+    // Absent profile selection: profile env has no effect; caller fills the gaps.
+    run(&["run", "ci"]);
+    assert_eq!(p.read("ci.out"), "dev|shared|caller|shared|set");
+    // A profile with no env changes nothing.
+    run(&["run", "ci", "--env", "parallel"]);
+    assert_eq!(p.read("ci.out"), "dev|shared|caller|shared|set");
+    // Sibling isolation: an empty workflow map inherits shared values only.
+    run(&["run", "release"]);
+    assert_eq!(p.read("release.out"), "test|shared|caller|shared|set");
+}
+
+#[test]
+fn legacy_jobs_use_shared_settings_env_beside_named_workflows() {
+    // Only a workflow named "default" conflicts with root jobs, so legacy jobs
+    // coexist with named workflows and must not see their overrides.
+    let p = Project::new(&[SHARED, LEGACY_JOB, CI, RELEASE, PROFILES].concat());
+    let run = |args: &[&str]| {
+        let output = p
+            .command()
+            .env("MIX_ENV", "caller")
+            .args(args)
+            .output()
+            .unwrap();
+        success(&output);
+    };
+    run(&["run"]);
+    assert_eq!(p.read("default.out"), "test|shared|unset|shared|set");
+    run(&["run", "ci"]);
+    assert_eq!(p.read("ci.out"), "dev|shared|unset|shared|set");
+    run(&["run", "release"]);
+    assert_eq!(p.read("release.out"), "test|shared|unset|shared|set");
+    // The selected profile applies to legacy jobs too.
+    run(&["run", "--env", "ci"]);
+    assert_eq!(p.read("default.out"), "prod|shared|true||set");
+}
+
+#[test]
+fn every_settings_scope_accepts_env_and_env_only_profiles_are_kept() {
+    let p = Project::new(&named_settings_env());
+    success(&p.run(&["validate"]));
+    // An env-only profile is a real profile: it can be selected and contributes env.
+    let listed = event(&p.run(&["list", "ci", "--env", "ci", "--json"]));
+    assert_eq!(listed["environment"], "ci");
+    assert_eq!(listed["settings"]["env"]["CI"], "true");
+    for value in ["1", "true", "['a']", "{ a = 'b' }"] {
+        let p = Project::new(&format!(
+            "[[jobs]]\nname='a'\ncommand='touch ran'\n[environments.local.settings.env]\nVALUE = {value}\n"
+        ));
+        let output = p.run(&["validate"]);
+        assert!(!output.status.success(), "accepted {value}");
+        assert!(
+            stderr(&output).contains("invalid type"),
+            "{}",
+            stderr(&output)
+        );
+        assert!(!p.run(&[]).status.success());
+        assert!(!p.dir.join("ran").exists());
+    }
+}
+
+#[test]
+fn invalid_settings_env_in_any_scope_fails_before_jobs_run() {
+    for (section, context) in [
+        ("[settings.env]", "settings env"),
+        (
+            "[workflows.other.settings.env]",
+            "workflow 'other' settings env",
+        ),
+        (
+            "[environments.unused.settings.env]",
+            "environment 'unused' settings env",
+        ),
+    ] {
+        for (entry, message) in [
+            (
+                "GOODFLOWS_PARTITION = 'hidden-value'",
+                "reserved variable GOODFLOWS_PARTITION",
+            ),
+            (
+                "GOODFLOWS_ENVIRONMENT = 'hidden-value'",
+                "reserved variable GOODFLOWS_ENVIRONMENT",
+            ),
+            (
+                "'BAD=NAME' = 'hidden-value'",
+                "invalid environment variable",
+            ),
+            ("PRIVATE_TOKEN = 'hidden-value'", "reporting token_env"),
+        ] {
+            let p = Project::new(&format!(
+                "[reporting]\nproject='demo'\ntoken_env='PRIVATE_TOKEN'\n[[workflows.ci.jobs]]\nname='a'\ncommand='touch ran'\n[[workflows.other.jobs]]\nname='a'\ncommand='true'\n{section}\n{entry}\n"
+            ));
+            for args in [
+                &["run", "ci"][..],
+                &["validate"][..],
+                &["list", "ci", "--json"][..],
+            ] {
+                let output = p.run(args);
+                assert!(!output.status.success(), "accepted {section} {entry}");
+                let text = format!("{}{}", stdout(&output), stderr(&output));
+                assert!(text.contains(context), "{text}");
+                assert!(text.contains(message), "{text}");
+                assert!(!text.contains("hidden-value"), "{text}");
+            }
+            assert!(!p.dir.join("ran").exists());
+        }
+    }
+    // A shared entry that a workflow overrides is still validated.
+    let p = Project::new("[settings.env]\nGOODFLOWS_PARTITION='x'\n[workflows.ci.settings.env]\nGOODFLOWS_PARTITION='y'\n[[workflows.ci.jobs]]\nname='a'\ncommand='touch ran'\n");
+    let output = p.run(&["run", "ci"]);
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains("settings env"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(!p.dir.join("ran").exists());
+}
+
+#[test]
+fn inspection_reports_merged_settings_env_without_caller_or_job_env() {
+    let p = Project::new(&named_settings_env());
+    let inspect = |args: &[&str]| {
+        let output = p
+            .command()
+            .env("AMBIENT_ONLY", "1")
+            .args(args)
+            .output()
+            .unwrap();
+        event(&output)
+    };
+    let expected = serde_json::json!({"MIX_ENV":"prod", "KEEP":"shared", "VALUE":"", "CI":"true"});
+    let listed = inspect(&["list", "ci", "--env", "ci", "--json"]);
+    assert_eq!(listed["settings"]["env"], expected);
+    assert_eq!(
+        listed["jobs"][0]["env"],
+        serde_json::json!({"JOB_ONLY":"job"})
+    );
+    let validated = inspect(&["validate", "ci", "--env", "ci", "--json"]);
+    assert_eq!(validated["settings"]["env"], expected);
+    let no_profile = inspect(&["list", "ci", "--json"]);
+    assert_eq!(
+        no_profile["settings"]["env"],
+        serde_json::json!({"MIX_ENV":"dev", "KEEP":"shared", "VALUE":"shared"})
+    );
+    for args in [
+        &["list", "--workflows", "--env", "ci", "--json"][..],
+        &["validate", "--env", "ci", "--json"][..],
+    ] {
+        let aggregate = inspect(args);
+        let workflows = aggregate["workflows"].as_array().unwrap();
+        let env = |name: &str| {
+            workflows.iter().find(|w| w["name"] == name).unwrap()["settings"]["env"].clone()
+        };
+        assert_eq!(env("ci"), expected);
+        assert_eq!(
+            env("release"),
+            serde_json::json!({"MIX_ENV":"prod", "KEEP":"shared", "VALUE":"", "CI":"true"})
+        );
+        assert_eq!(env("extra"), env("release"));
+    }
+    let aggregate = inspect(&["list", "--workflows", "--json"]);
+    let release = &aggregate["workflows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|w| w["name"] == "release")
+        .unwrap()["settings"]["env"];
+    assert_eq!(
+        *release,
+        serde_json::json!({"MIX_ENV":"test", "KEEP":"shared", "VALUE":"shared"})
+    );
+    // Human output shows the merged settings env on the settings line.
+    let human = |args: &[&str]| {
+        let output = p
+            .command()
+            .env("AMBIENT_ONLY", "1")
+            .args(args)
+            .output()
+            .unwrap();
+        success(&output);
+        stdout(&output)
+    };
+    let text = human(&["list", "ci", "--env", "ci"]);
+    assert!(
+        text.contains(r#"env={"CI":"true","KEEP":"shared","MIX_ENV":"prod","VALUE":""}"#),
+        "{text}"
+    );
+    assert!(!text.contains("AMBIENT_ONLY"), "{text}");
+    let text = human(&["list", "--workflows"]);
+    assert!(
+        text.contains(r#"release: 1 jobs  parallelism="#)
+            && text.contains(r#"env={"KEEP":"shared","MIX_ENV":"test","VALUE":"shared"}"#),
+        "{text}"
+    );
+    // No settings env anywhere: an empty object, never the caller's variables.
+    let p = Project::new(MULTI);
+    let output = p
+        .command()
+        .env("AMBIENT_ONLY", "1")
+        .args(["list", "ci", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(event(&output)["settings"]["env"], serde_json::json!({}));
+    let output = p
+        .command()
+        .env("AMBIENT_ONLY", "1")
+        .args(["validate", "--json"])
+        .output()
+        .unwrap();
+    for workflow in event(&output)["workflows"].as_array().unwrap() {
+        assert_eq!(workflow["settings"]["env"], serde_json::json!({}));
+    }
+    let text = stdout(&p.run(&["list", "ci"]));
+    assert!(text.contains(" env={}\n"), "{text}");
+}
+
+/// Every README `toml` block that mentions `settings.env` must validate. Blocks
+/// that declare jobs are validated as written. Fragments without jobs get one
+/// trivial job per `[workflows.NAME...]` table they mention (or a root job when
+/// they mention none), so only the settings they show are under test.
+#[test]
+fn readme_settings_env_examples_validate() {
+    let readme =
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/README.md")).unwrap();
+    let blocks: Vec<&str> = readme
+        .split("```toml\n")
+        .skip(1)
+        .map(|rest| rest.split("```").next().unwrap())
+        .filter(|block| block.contains("settings.env"))
+        .collect();
+    assert!(
+        blocks.len() >= 2,
+        "expected settings.env examples in README"
+    );
+    for block in blocks {
+        let mut config = block.to_owned();
+        if !config.contains("jobs]]") {
+            let mut workflows: Vec<&str> = block
+                .lines()
+                .filter_map(|line| line.trim().strip_prefix("[workflows."))
+                .filter_map(|rest| rest.split('.').next())
+                .collect();
+            workflows.dedup();
+            if workflows.is_empty() {
+                config.push_str("\n[[jobs]]\nname = 'readme'\ncommand = 'true'\n");
+            }
+            for name in workflows {
+                config.push_str(&format!(
+                    "\n[[workflows.{name}.jobs]]\nname = 'readme'\ncommand = 'true'\n"
+                ));
+            }
+        }
+        let p = Project::new(&config);
+        let output = p.run(&["validate"]);
+        assert!(
+            output.status.success(),
+            "README example failed:\n{block}\n{}",
+            stderr(&output)
+        );
+    }
+}

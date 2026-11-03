@@ -391,10 +391,107 @@ fn generated_toml_omits_defaults_and_explains_parallelism() {
             .as_array()
             .is_some_and(|v| !v.is_empty()));
         if template == "elixir" {
-            assert_eq!(config["jobs"][0]["env"]["MIX_ENV"].as_str(), Some("test"));
+            assert_eq!(
+                config["settings"]["env"],
+                toml::Value::Table(toml::toml! { MIX_ENV = "test" })
+            );
+        } else {
+            assert!(config["settings"].get("env").is_none(), "{text}");
+            assert!(!text.contains("[settings.env]"), "{text}");
         }
         assert!(text.contains("every logical CPU"));
         assert!(text.contains("machine size"));
         success(&p.run(&["validate"]));
+    }
+}
+
+/// A stub `mix` that records the MIX_ENV each invocation sees.
+fn stub_mix(p: &Project) -> String {
+    let bin = p.dir.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let mix = bin.join("mix");
+    std::fs::write(
+        &mix,
+        "#!/bin/sh\nprintf '%s %s\\n' \"$1\" \"${MIX_ENV-unset}\" >> mix-calls\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&mix, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    )
+}
+
+#[test]
+fn elixir_init_declares_mix_env_once_and_every_job_inherits_it() {
+    for workflow in [None, Some("ci")] {
+        let p = Project::new("");
+        let mut args = vec!["init", "--template", "elixir", "--force"];
+        if let Some(name) = workflow {
+            args.extend(["--workflow", name]);
+        }
+        success(&p.run(&args));
+        let text = p.read("goodflows.toml");
+        assert_eq!(text.matches("MIX_ENV").count(), 1, "{text}");
+        // The header warns that shared settings env reaches later-added workflows.
+        assert!(
+            text.contains("# [settings.env] applies to every workflow; override per workflow with [workflows.NAME.settings.env]\n"),
+            "{text}"
+        );
+        let config: toml::Value = toml::from_str(&text).unwrap();
+        assert_eq!(config["settings"]["env"]["MIX_ENV"].as_str(), Some("test"));
+        let jobs = match workflow {
+            Some(name) => config["workflows"][name]["jobs"].clone(),
+            None => config["jobs"].clone(),
+        };
+        for job in jobs.as_array().unwrap() {
+            assert!(job.get("env").is_none(), "{text}");
+        }
+        success(&p.run(&["validate"]));
+        let path = stub_mix(&p);
+        let mut run = vec!["run"];
+        run.extend(workflow);
+        let output = p
+            .command()
+            .env("PATH", path)
+            .env("MIX_ENV", "dev")
+            .args(&run)
+            .output()
+            .unwrap();
+        success(&output);
+        let mut calls: Vec<_> = p.read("mix-calls").lines().map(str::to_owned).collect();
+        calls.sort();
+        assert_eq!(calls, ["compile test", "format test", "test test"]);
+    }
+}
+
+#[test]
+fn templates_without_env_defaults_omit_settings_env() {
+    let p = Project::new("");
+    std::fs::write(
+        p.dir.join("package.json"),
+        r#"{"scripts":{"test":"node --test"}}"#,
+    )
+    .unwrap();
+    for template in ["rust", "go", "node", "generic"] {
+        for workflow in [None, Some("ci")] {
+            let mut args = vec!["init", "--template", template, "--force"];
+            if let Some(name) = workflow {
+                args.extend(["--workflow", name]);
+            }
+            success(&p.run(&args));
+            let text = p.read("goodflows.toml");
+            let config: toml::Value = toml::from_str(&text).unwrap();
+            assert!(
+                config["settings"].get("env").is_none(),
+                "{template}: {text}"
+            );
+            assert!(!text.contains("[settings.env]"), "{template}: {text}");
+        }
     }
 }

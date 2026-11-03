@@ -314,6 +314,7 @@ async fn run(cli: &Cli, output: &mut Output, cancel: watch::Receiver<Option<i32>
             .map(reporting::Session::runner_env)
             .unwrap_or_default(),
         environment: cli.env.clone(),
+        settings_env: settings.env,
     };
     output.emit(json!({"type":"run_started", "parallelism":parallelism, "fail_fast":fail_fast, "jobs":config.jobs.iter().map(config::Job::instances).sum::<usize>(), "workdir":options.workdir})).await?;
     if let Some(session) = &session {

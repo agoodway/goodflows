@@ -28,6 +28,9 @@ pub const PARTITION_ENV: [&str; 2] = ["GOODFLOWS_PARTITION", "GOODFLOWS_PARTITIO
 
 /// Selected `--env` profile name. Set by the runner; absent when no profile is selected.
 pub const ENVIRONMENT_ENV: &str = "GOODFLOWS_ENVIRONMENT";
+/// Per-command output file path. Set by the runner for each command that may
+/// publish outputs; never inherited from the caller.
+pub const OUTPUT_ENV: &str = "GOODFLOWS_OUTPUT";
 pub const MAX_PARTITIONS: u32 = 64;
 const DEFAULT_SPOOL_DIR: &str = ".goodflows/reports";
 
@@ -96,7 +99,7 @@ pub fn validate_credential_env_names(url_env: &str, token_env: &str) -> Result<(
         if RESERVED_ENV.contains(&name)
             || PARTITION_ENV.contains(&name)
             || name == ENVIRONMENT_ENV
-            || name == "GOODFLOWS_OUTPUT"
+            || name == OUTPUT_ENV
         {
             bail!("reporting {field} must not name a reserved goodflows variable");
         }
@@ -139,6 +142,9 @@ pub struct Settings {
     #[serde(default = "default_true")]
     pub fail_fast: bool,
     pub workdir: Option<PathBuf>,
+    /// Command environment defaults, layered between the caller's environment and job env.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
 }
 
 impl Default for Settings {
@@ -147,6 +153,7 @@ impl Default for Settings {
             parallelism: None,
             fail_fast: true,
             workdir: None,
+            env: BTreeMap::new(),
         }
     }
 }
@@ -156,6 +163,9 @@ pub struct EffectiveSettings {
     pub parallelism: usize,
     pub fail_fast: bool,
     pub workdir: PathBuf,
+    /// Merged configured env defaults (shared < workflow < selected profile).
+    /// Never includes the caller's environment or job/step overrides.
+    pub env: BTreeMap<String, String>,
 }
 
 impl Settings {
@@ -176,6 +186,7 @@ impl Settings {
                 .workdir
                 .clone()
                 .context("config workdir has not been resolved")?,
+            env: self.env.clone(),
         })
     }
 }
@@ -384,18 +395,28 @@ pub struct SettingsOverrides {
     pub parallelism: Option<usize>,
     pub fail_fast: Option<bool>,
     pub workdir: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
 }
 
 impl SettingsOverrides {
     fn is_empty(&self) -> bool {
-        self.parallelism.is_none() && self.fail_fast.is_none() && self.workdir.is_none()
+        self.parallelism.is_none()
+            && self.fail_fast.is_none()
+            && self.workdir.is_none()
+            && self.env.is_empty()
     }
 
     fn apply(&self, shared: &Settings) -> Settings {
+        // Per-key merge: inherited keys survive unless overridden; an empty
+        // string is a real override.
+        let mut env = shared.env.clone();
+        env.extend(self.env.clone());
         Settings {
             parallelism: self.parallelism.or(shared.parallelism),
             fail_fast: self.fail_fast.unwrap_or(shared.fail_fast),
             workdir: self.workdir.clone().or_else(|| shared.workdir.clone()),
+            env,
         }
     }
 }
@@ -508,6 +529,17 @@ impl Config {
             reporting.validate().context("reporting")?;
         }
         let reporting = self.reporting.as_ref();
+        // Validate every authored settings map, including unselected workflows and
+        // profiles and entries a later scope overrides.
+        validate_settings_env(&self.settings.env, reporting).context("settings env")?;
+        for (name, workflow) in &self.workflows {
+            validate_settings_env(&workflow.settings.env, reporting)
+                .with_context(|| format!("workflow '{name}' settings env"))?;
+        }
+        for (name, environment) in &self.environments {
+            validate_settings_env(&environment.settings.env, reporting)
+                .with_context(|| format!("environment '{name}' settings env"))?;
+        }
         if !self.jobs.is_empty() {
             if self.workflows.contains_key("default") {
                 bail!("root jobs conflict with named workflow 'default'");
@@ -728,7 +760,10 @@ fn validate_command(command: &str, shell: bool) -> Result<()> {
     Ok(())
 }
 
-fn validate_env(env: &HashMap<String, String>, reporting: Option<&Reporting>) -> Result<()> {
+fn validate_env<'a>(
+    env: impl IntoIterator<Item = (&'a String, &'a String)>,
+    reporting: Option<&Reporting>,
+) -> Result<()> {
     for (key, value) in env {
         if key.is_empty() || key.contains(['=', '\0']) || value.contains('\0') {
             bail!("invalid environment variable");
@@ -745,6 +780,19 @@ fn validate_env(env: &HashMap<String, String>, reporting: Option<&Reporting>) ->
         }
     }
     Ok(())
+}
+
+/// Settings env additionally rejects `GOODFLOWS_OUTPUT`: the runner owns it for
+/// every command, so a settings default could only leak into expressions. Job and
+/// step env keep accepting it for compatibility with existing configs.
+fn validate_settings_env(
+    env: &BTreeMap<String, String>,
+    reporting: Option<&Reporting>,
+) -> Result<()> {
+    if env.contains_key(OUTPUT_ENV) {
+        bail!("env must not set reserved variable {OUTPUT_ENV}; goodflows sets it itself");
+    }
+    validate_env(env, reporting)
 }
 
 /// Names of the partitioned jobs in one workflow; they publish no job outputs.
@@ -1074,5 +1122,177 @@ mod tests {
         assert_eq!(ids, [id(1), id(2), id(3)]);
         let unpartitioned: Job = toml::from_str("name = 'a'\ncommand = 'true'").unwrap();
         assert_eq!(unpartitioned.partition_ids().collect::<Vec<_>>(), [None]);
+    }
+
+    fn parse(source: &str) -> std::result::Result<Config, String> {
+        toml::from_str::<Config>(source).map_err(|error| error.to_string())
+    }
+
+    fn validate(source: &str) -> std::result::Result<Config, String> {
+        let mut config = parse(source)?;
+        config.validate().map_err(|error| format!("{error:#}"))?;
+        Ok(config)
+    }
+
+    fn resolved_env(
+        config: &Config,
+        workflow: &str,
+        profile: Option<&str>,
+    ) -> BTreeMap<String, String> {
+        let environment = config.environment(profile).unwrap();
+        let (_, mut selected) = config.workflow(Some(workflow), environment).unwrap();
+        selected.settings.workdir = Some(PathBuf::from("/"));
+        selected.settings.resolve(None, None).unwrap().env
+    }
+
+    fn map(entries: &[(&str, &str)]) -> BTreeMap<String, String> {
+        entries
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect()
+    }
+
+    const JOB: &str = "[[workflows.ci.jobs]]\nname = 'a'\ncommand = 'true'\n[[workflows.other.jobs]]\nname = 'a'\ncommand = 'true'\n";
+
+    #[test]
+    fn settings_env_merges_per_key_and_keeps_empty_strings() {
+        let config = validate(&format!(
+            "{JOB}[settings.env]\nMIX_ENV = 'test'\nKEEP = 'shared'\nVALUE = 'shared'\n\
+             [workflows.ci.settings.env]\nMIX_ENV = 'dev'\n\
+             [workflows.other.settings.env]\n\
+             [environments.ci.settings.env]\nMIX_ENV = 'prod'\nCI = 'true'\nVALUE = ''\nLITERAL = '$HOME ${{X}}'\n"
+        ))
+        .unwrap();
+        assert_eq!(
+            resolved_env(&config, "ci", Some("ci")),
+            map(&[
+                ("CI", "true"),
+                ("KEEP", "shared"),
+                ("LITERAL", "$HOME ${X}"),
+                ("MIX_ENV", "prod"),
+                ("VALUE", ""),
+            ])
+        );
+        assert_eq!(
+            resolved_env(&config, "ci", None),
+            map(&[("KEEP", "shared"), ("MIX_ENV", "dev"), ("VALUE", "shared")])
+        );
+        // An empty workflow map inherits everything.
+        assert_eq!(
+            resolved_env(&config, "other", None),
+            map(&[("KEEP", "shared"), ("MIX_ENV", "test"), ("VALUE", "shared")])
+        );
+    }
+
+    #[test]
+    fn absent_settings_env_resolves_to_empty_map() {
+        let config = validate(JOB).unwrap();
+        assert!(resolved_env(&config, "ci", None).is_empty());
+        assert!(config.settings.env.is_empty());
+    }
+
+    #[test]
+    fn env_only_overrides_are_not_empty() {
+        let overrides: SettingsOverrides = toml::from_str("env = { A = '1' }").unwrap();
+        assert!(!overrides.is_empty());
+        assert!(SettingsOverrides::default().is_empty());
+        let config = validate(&format!(
+            "{JOB}[environments.local.settings.env]\nA = '1'\n"
+        ))
+        .unwrap();
+        let text = toml::to_string(&config).unwrap();
+        assert!(text.contains("[environments.local.settings.env]"), "{text}");
+        let shared = toml::to_string(&Settings::default()).unwrap();
+        assert!(!shared.contains("env"), "{shared}");
+    }
+
+    #[test]
+    fn settings_env_rejects_non_string_values() {
+        for scope in [
+            "settings",
+            "workflows.ci.settings",
+            "environments.local.settings",
+        ] {
+            for value in ["1", "true", "['a']", "{ a = 'b' }"] {
+                let error = parse(&format!("{JOB}[{scope}.env]\nVALUE = {value}\n")).unwrap_err();
+                assert!(error.contains("invalid type"), "{scope} {value}: {error}");
+            }
+        }
+    }
+
+    #[test]
+    fn settings_env_validates_every_scope_without_exposing_values() {
+        let custom = "[reporting]\nproject = 'demo'\ntoken_env = 'PRIVATE_TOKEN'\n";
+        let default = "[reporting]\nproject = 'demo'\n";
+        for (scope, context) in [
+            ("settings", "settings env"),
+            ("workflows.ci.settings", "workflow 'ci' settings env"),
+            ("workflows.other.settings", "workflow 'other' settings env"),
+            (
+                "environments.unused.settings",
+                "environment 'unused' settings env",
+            ),
+        ] {
+            for (entry, message) in [
+                (
+                    "GOODFLOWS_PARTITION = 'secret-value'",
+                    "reserved variable GOODFLOWS_PARTITION",
+                ),
+                (
+                    "GOODFLOWS_PARTITION_COUNT = 'secret-value'",
+                    "reserved variable",
+                ),
+                ("GOODFLOWS_RUN_ID = 'secret-value'", "reserved variable"),
+                ("GOODFLOWS_REPORT_DIR = 'secret-value'", "reserved variable"),
+                (
+                    "GOODFLOWS_ENVIRONMENT = 'secret-value'",
+                    "reserved variable GOODFLOWS_ENVIRONMENT",
+                ),
+                (
+                    "GOODFLOWS_OUTPUT = 'secret-value'",
+                    "reserved variable GOODFLOWS_OUTPUT",
+                ),
+                ("PRIVATE_TOKEN = 'secret-value'", "reporting token_env"),
+                ("'' = 'secret-value'", "invalid environment variable"),
+                ("'A=B' = 'secret-value'", "invalid environment variable"),
+                (
+                    "A = \"secret-value\\u0000\"",
+                    "invalid environment variable",
+                ),
+            ] {
+                let error =
+                    validate(&format!("{JOB}{custom}[{scope}.env]\n{entry}\n")).unwrap_err();
+                assert!(error.contains(context), "{scope} {entry}: {error}");
+                assert!(error.contains(message), "{scope} {entry}: {error}");
+                assert!(!error.contains("secret-value"), "{scope} {entry}: {error}");
+            }
+            // The default token_env is rejected the same way.
+            let entry = "GOODFLOWS_API_KEY = 'secret-value'";
+            let error = validate(&format!("{JOB}{default}[{scope}.env]\n{entry}\n")).unwrap_err();
+            assert!(error.contains(context), "{scope} {entry}: {error}");
+            assert!(
+                error.contains("GOODFLOWS_API_KEY: it is the reporting token_env"),
+                "{scope} {entry}: {error}"
+            );
+            assert!(!error.contains("secret-value"), "{scope} {entry}: {error}");
+        }
+    }
+
+    #[test]
+    fn job_and_step_env_may_still_set_goodflows_output() {
+        // Compatibility: only settings env rejects it; commands still get their own file.
+        validate(&format!(
+            "{JOB}[[jobs]]\nname = 'b'\nenv = {{ GOODFLOWS_OUTPUT = 'x' }}\n[[jobs.steps]]\nid = 's'\nenv = {{ GOODFLOWS_OUTPUT = 'y' }}\ncommand = 'true'\n"
+        ))
+        .unwrap();
+    }
+
+    #[test]
+    fn overridden_invalid_shared_entry_still_fails() {
+        let error = validate(&format!(
+            "{JOB}[settings.env]\nGOODFLOWS_PARTITION = 'x'\n[workflows.ci.settings.env]\nGOODFLOWS_PARTITION = 'y'\n"
+        ))
+        .unwrap_err();
+        assert!(error.starts_with("settings env"), "{error}");
     }
 }

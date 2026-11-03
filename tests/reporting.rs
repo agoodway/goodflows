@@ -2975,3 +2975,124 @@ fn replay_of_a_manifest_written_before_partitions_is_unchanged() {
     }
     assert_eq!(manifest(&dir), saved);
 }
+
+// ---- settings env ----
+
+#[test]
+fn settings_env_never_reveals_inherited_token_and_keeps_reporting_identity() {
+    let p = project(&format!(
+        r#"
+[settings.env]
+SHARED = "settings"
+[environments.local.settings.env]
+PROFILE = "profile"
+[[jobs]]
+name = "shell"
+condition = {{ expression = 'env.GOODFLOWS_API_KEY == null && env.SHARED == "settings"' }}
+command = 'env > shell-env.txt; {copy}'
+reports = ["exunit-timings"]
+[[jobs]]
+name = "stepped"
+outputs = {{ token = "env.GOODFLOWS_API_KEY ?? \"absent\"" }}
+[[jobs.steps]]
+id = "probe"
+condition = {{ shell = "env > step-condition-env.txt" }}
+command = 'env > step-env.txt'
+"#,
+        copy = copy(&["r1"])
+    ));
+    let output = p
+        .command()
+        .args(["--env", "local", "--json"])
+        .env("GOODFLOWS_URL", "http://flows.example.com")
+        .env("GOODFLOWS_API_KEY", SECRET)
+        .env("GOODFLOWS_RUN_ID", "inherited-run-id")
+        .output()
+        .unwrap();
+    success(&output);
+    for file in ["shell-env.txt", "step-condition-env.txt", "step-env.txt"] {
+        let env = p.read(file);
+        assert!(env.contains("SHARED=settings"), "{file}: {env}");
+        assert!(env.contains("PROFILE=profile"), "{file}: {env}");
+        assert!(!env.contains("GOODFLOWS_API_KEY="), "{file}: {env}");
+        assert!(!env.contains("inherited"), "{file}: {env}");
+    }
+    let run_id = manifest(&run_dirs(&p)[0])["workflow_run_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(p
+        .read("shell-env.txt")
+        .contains(&format!("GOODFLOWS_RUN_ID={run_id}")));
+    let summary = events(&output).last().unwrap().clone();
+    let stepped = summary["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["name"] == "stepped")
+        .unwrap()
+        .clone();
+    assert_eq!(stepped["outputs"]["token"], "absent");
+    assert_no_secret(&p, &output);
+}
+
+#[test]
+fn settings_env_never_supplies_the_publisher_endpoint() {
+    let mock = Mock::store();
+    let decoy = Mock::store();
+    let jobs = |url: &str| {
+        format!(
+            "[settings.env]\nGOODFLOWS_URL = \"{url}\"\n[[jobs]]\nname = \"test\"\ncommand = 'printf %s \"$GOODFLOWS_URL\" > seen-url; {}'\nreports = [\"exunit-timings\"]\n",
+            copy(&["r1"])
+        )
+    };
+    // The command sees the settings value while the publisher uses the caller's endpoint.
+    let p = project(&jobs(&decoy.url));
+    let output = run_with(&p, &["--json"], Some(&mock.url));
+    success(&output);
+    assert_eq!(p.read("seen-url"), decoy.url);
+    assert_eq!(mock.requests().len(), 1);
+    assert_eq!(decoy.connections(), 0);
+    assert_no_secret(&p, &output);
+    // Without a caller endpoint, settings do not make one available to the publisher.
+    let p = project(&jobs(&decoy.url));
+    let output = p
+        .command()
+        .arg("--json")
+        .env("GOODFLOWS_API_KEY", SECRET)
+        .output()
+        .unwrap();
+    success(&output);
+    assert_eq!(p.read("seen-url"), decoy.url);
+    let skipped = by_type(&events(&output), "reporting_skipped");
+    assert_eq!(skipped[0]["reason"], "credentials_unavailable");
+    assert_eq!(decoy.connections(), 0);
+    assert_eq!(mock.requests().len(), 1);
+}
+
+#[test]
+fn settings_env_never_supplies_a_custom_url_env_endpoint() {
+    let mock = Mock::store();
+    let decoy = Mock::store();
+    let p = project_with(
+        "[reporting]\nproject = \"goodcases\"\nurl_env = \"CUSTOM_URL\"\n",
+        &format!(
+            "[settings.env]\nCUSTOM_URL = \"{}\"\n[[jobs]]\nname = \"test\"\ncommand = 'printf %s \"$CUSTOM_URL\" > seen-url; {}'\nreports = [\"exunit-timings\"]\n",
+            decoy.url,
+            copy(&["r1"])
+        ),
+    );
+    let output = p
+        .command()
+        .arg("--json")
+        .env("CUSTOM_URL", &mock.url)
+        .env("GOODFLOWS_API_KEY", SECRET)
+        .output()
+        .unwrap();
+    success(&output);
+    // Commands see the settings value; the publisher uses the caller's endpoint.
+    assert_eq!(p.read("seen-url"), decoy.url);
+    assert_eq!(mock.requests().len(), 1);
+    assert_eq!(decoy.connections(), 0);
+    assert_no_secret(&p, &output);
+}

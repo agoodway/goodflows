@@ -278,9 +278,10 @@ fn render(json: bool, mut event: Value, out: &mut impl Write, err: &mut impl Wri
                 let settings = &event["settings"];
                 writeln!(
                     out,
-                    "Settings: fail_fast={} parallelism={}\nworkdir: {}",
+                    "Settings: fail_fast={} parallelism={} env={}\nworkdir: {}",
                     settings["fail_fast"],
                     settings["parallelism"],
+                    settings["env"],
                     text(settings, "workdir")
                 )?;
                 if let Some(reporting) = event.get("reporting") {
@@ -372,11 +373,12 @@ fn render(json: bool, mut event: Value, out: &mut impl Write, err: &mut impl Wri
                 for workflow in event["workflows"].as_array().into_iter().flatten() {
                     writeln!(
                         out,
-                        "  {}: {} jobs  parallelism={} fail_fast={}\n    workdir: {}",
+                        "  {}: {} jobs  parallelism={} fail_fast={} env={}\n    workdir: {}",
                         text(workflow, "name"),
                         workflow["jobs"],
                         workflow["settings"]["parallelism"],
                         workflow["settings"]["fail_fast"],
+                        workflow["settings"]["env"],
                         text(&workflow["settings"], "workdir")
                     )?;
                 }

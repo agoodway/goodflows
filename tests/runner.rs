@@ -408,3 +408,303 @@ command = "printf 'out %s' $GOODFLOWS_PARTITION; printf 'err %s' $GOODFLOWS_PART
         );
     }
 }
+
+#[test]
+fn settings_env_sits_between_caller_and_job_and_step_env() {
+    let p = Project::new(
+        r#"
+[settings.env]
+MIX_ENV = "test"
+VALUE = "settings"
+[[jobs]]
+name = "shell"
+command = 'printf %s "$MIX_ENV" > shell.out'
+[[jobs]]
+name = "direct"
+shell = false
+command = "sh -c 'printf %s \"$MIX_ENV\" > direct.out'"
+[[jobs]]
+name = "stepped"
+env = { VALUE = "job" }
+[[jobs.steps]]
+id = "override"
+env = { VALUE = "step" }
+command = 'printf %s "$VALUE" > step1.out'
+[[jobs.steps]]
+id = "after"
+command = 'printf %s "$VALUE" > step2.out'
+[[jobs]]
+name = "plain"
+command = 'printf %s "$VALUE" > plain.out'
+"#,
+    );
+    let output = p
+        .command()
+        .env("MIX_ENV", "dev")
+        .env("VALUE", "caller")
+        .output()
+        .unwrap();
+    success(&output);
+    assert_eq!(p.read("shell.out"), "test");
+    assert_eq!(p.read("direct.out"), "test");
+    assert_eq!(p.read("step1.out"), "step");
+    assert_eq!(p.read("step2.out"), "job");
+    assert_eq!(p.read("plain.out"), "settings");
+}
+
+#[test]
+fn without_settings_env_commands_see_the_caller_environment_unchanged() {
+    let p = Project::new(
+        r#"
+[[jobs]]
+name = "shell"
+env = { JOB = "job" }
+command = 'printf %s/%s "$MIX_ENV" "$JOB" > shell.out'
+"#,
+    );
+    let output = p.command().env("MIX_ENV", "dev").output().unwrap();
+    success(&output);
+    assert_eq!(p.read("shell.out"), "dev/job");
+}
+
+#[test]
+fn conditions_and_job_outputs_observe_settings_and_profile_env() {
+    let p = Project::new(
+        r#"
+[settings.env]
+VALUE = "settings"
+[environments.local.settings.env]
+RUN_CHECKS = "1"
+[[jobs]]
+name = "expression"
+condition = { expression = 'env.RUN_CHECKS == "1"' }
+command = 'test "$RUN_CHECKS" = 1 && touch expression'
+[[jobs]]
+name = "shell"
+condition = { shell = 'test "$RUN_CHECKS" = 1' }
+command = 'test "$RUN_CHECKS" = 1 && touch shell'
+[[jobs]]
+name = "stepped"
+outputs = { seen = "env.VALUE" }
+[[jobs.steps]]
+id = "a"
+env = { VALUE = "step" }
+condition = { expression = 'env.VALUE == "step"' }
+command = 'test "$VALUE" = step && touch step-expression'
+[[jobs.steps]]
+id = "b"
+env = { VALUE = "step" }
+condition = { shell = 'test "$VALUE" = step' }
+command = 'test "$VALUE" = step && touch step-shell'
+[[jobs]]
+name = "consumer"
+depends_on = ["stepped"]
+condition = { expression = 'needs.stepped.outputs.seen == "settings"' }
+command = "touch consumer"
+"#,
+    );
+    let output = p
+        .command()
+        .env("RUN_CHECKS", "0")
+        .args(["--env", "local", "--json"])
+        .output()
+        .unwrap();
+    success(&output);
+    for file in [
+        "expression",
+        "shell",
+        "step-expression",
+        "step-shell",
+        "consumer",
+    ] {
+        assert!(p.dir.join(file).exists(), "{file}: {}", stdout(&output));
+    }
+    let summary = events(&output).last().unwrap().clone();
+    let stepped = summary["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["name"] == "stepped")
+        .unwrap()
+        .clone();
+    assert_eq!(stepped["outputs"], serde_json::json!({"seen":"settings"}));
+    // Without the profile, the conditions observe the caller's value and skip.
+    let output = p
+        .command()
+        .env("RUN_CHECKS", "0")
+        .arg("--json")
+        .output()
+        .unwrap();
+    success(&output);
+    let summary = events(&output).last().unwrap().clone();
+    for name in ["expression", "shell"] {
+        let result = summary["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["name"] == name)
+            .unwrap()
+            .clone();
+        assert_eq!(result["status"], "skipped", "{name}");
+    }
+}
+
+#[test]
+fn runner_owned_variables_stay_authoritative_with_settings_env() {
+    let p = Project::new(
+        r#"
+[settings.env]
+SHARED = "yes"
+[environments.local.settings.env]
+PROFILE = "yes"
+[[jobs]]
+name = "split"
+partitions = 2
+condition = { expression = 'env.GOODFLOWS_PARTITION != null && env.GOODFLOWS_PARTITION_COUNT == "2" && env.GOODFLOWS_ENVIRONMENT == "local" && env.SHARED == "yes"' }
+command = 'printf %s/%s/%s "$GOODFLOWS_PARTITION" "$GOODFLOWS_PARTITION_COUNT" "$GOODFLOWS_ENVIRONMENT" > split.$GOODFLOWS_PARTITION'
+[[jobs]]
+name = "plain"
+condition = { expression = 'env.GOODFLOWS_PARTITION == null && env.GOODFLOWS_PARTITION_COUNT == null && env.GOODFLOWS_ENVIRONMENT == "local"' }
+outputs = { profile = "env.GOODFLOWS_ENVIRONMENT" }
+[[jobs.steps]]
+id = "a"
+condition = { shell = 'test -z "${GOODFLOWS_PARTITION+x}${GOODFLOWS_PARTITION_COUNT+x}" && test "$GOODFLOWS_ENVIRONMENT" = local' }
+command = 'test -z "${GOODFLOWS_PARTITION+x}${GOODFLOWS_PARTITION_COUNT+x}" && test "$GOODFLOWS_ENVIRONMENT" = local && test -n "$GOODFLOWS_OUTPUT" && test "$GOODFLOWS_OUTPUT" != /nonexistent/outer && test "$PROFILE" = yes && touch plain'
+"#,
+    );
+    let run = |args: &[&str]| {
+        p.command()
+            .env("GOODFLOWS_PARTITION", "9")
+            .env("GOODFLOWS_PARTITION_COUNT", "9")
+            .env("GOODFLOWS_ENVIRONMENT", "outer")
+            .env("GOODFLOWS_OUTPUT", "/nonexistent/outer")
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let output = run(&["--env", "local", "--json"]);
+    success(&output);
+    assert_eq!(p.read("split.1"), "1/2/local");
+    assert_eq!(p.read("split.2"), "2/2/local");
+    assert!(p.dir.join("plain").exists());
+    let summary = events(&output).last().unwrap().clone();
+    let plain = summary["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["name"] == "plain")
+        .unwrap()
+        .clone();
+    // Job output expressions see the profile name.
+    assert_eq!(plain["outputs"]["profile"], "local");
+
+    // Without a profile, inherited GOODFLOWS_ENVIRONMENT is removed everywhere.
+    let p = Project::new(
+        r#"
+[settings.env]
+SHARED = "yes"
+[[jobs]]
+name = "plain"
+condition = { expression = 'env.GOODFLOWS_ENVIRONMENT == null && env.SHARED == "yes"' }
+outputs = { profile = "env.GOODFLOWS_ENVIRONMENT ?? \"none\"" }
+[[jobs.steps]]
+id = "a"
+condition = { shell = 'test -z "${GOODFLOWS_ENVIRONMENT+x}"' }
+command = 'test -z "${GOODFLOWS_ENVIRONMENT+x}" && touch hidden'
+"#,
+    );
+    let output = p
+        .command()
+        .env("GOODFLOWS_ENVIRONMENT", "outer")
+        .arg("--json")
+        .output()
+        .unwrap();
+    success(&output);
+    assert!(p.dir.join("hidden").exists());
+    let summary = events(&output).last().unwrap().clone();
+    assert_eq!(summary["results"][0]["outputs"]["profile"], "none");
+}
+
+#[test]
+fn inherited_goodflows_output_never_reaches_expressions() {
+    let p = Project::new(
+        r#"
+[[jobs]]
+name = "command"
+condition = { expression = 'env.GOODFLOWS_OUTPUT == null' }
+command = 'test -n "$GOODFLOWS_OUTPUT" && test "$GOODFLOWS_OUTPUT" != /nonexistent/outer'
+[[jobs]]
+name = "stepped"
+outputs = { path = "env.GOODFLOWS_OUTPUT ?? \"none\"" }
+[[jobs.steps]]
+id = "a"
+condition = { expression = 'env.GOODFLOWS_OUTPUT == null' }
+command = 'test -n "$GOODFLOWS_OUTPUT" && test "$GOODFLOWS_OUTPUT" != /nonexistent/outer'
+[[jobs]]
+name = "explicit"
+env = { GOODFLOWS_OUTPUT = "job" }
+outputs = { path = "env.GOODFLOWS_OUTPUT ?? \"none\"" }
+[[jobs.steps]]
+id = "a"
+command = 'test "$GOODFLOWS_OUTPUT" != job'
+"#,
+    );
+    let output = p
+        .command()
+        .env("GOODFLOWS_OUTPUT", "/nonexistent/outer")
+        .arg("--json")
+        .output()
+        .unwrap();
+    success(&output);
+    let summary = events(&output).last().unwrap().clone();
+    let results = summary["results"].as_array().unwrap();
+    let path = |name: &str| {
+        let result = results.iter().find(|r| r["name"] == name).unwrap();
+        assert_eq!(result["status"], "passed", "{name}: {result}");
+        result["outputs"]["path"].clone()
+    };
+    // The command-only job's condition and command checks passed.
+    path("command");
+    assert_eq!(path("stepped"), "none");
+    // An explicit job env value keeps its existing expression behavior.
+    assert_eq!(path("explicit"), "job");
+}
+
+#[test]
+fn job_shell_conditions_see_profile_and_settings_but_not_the_token() {
+    let config = |condition: &str| {
+        format!(
+            r#"
+[reporting]
+project = "goodcases"
+[settings.env]
+SHARED = "yes"
+[environments.local.settings]
+fail_fast = true
+[[jobs]]
+name = "guarded"
+condition = {{ shell = '{condition}' }}
+command = "touch ran"
+"#
+        )
+    };
+    let run = |p: &Project, args: &[&str]| {
+        p.command()
+            .env("GOODFLOWS_API_KEY", "secret-value")
+            .env("GOODFLOWS_ENVIRONMENT", "outer")
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let p = Project::new(&config(
+        r#"test "$GOODFLOWS_ENVIRONMENT" = local && test -z "${GOODFLOWS_API_KEY+x}" && test "$SHARED" = yes"#,
+    ));
+    success(&run(&p, &["--env", "local"]));
+    assert!(p.dir.join("ran").exists());
+    // Without --env, the inherited profile name is removed as well.
+    let p = Project::new(&config(
+        r#"test -z "${GOODFLOWS_ENVIRONMENT+x}" && test -z "${GOODFLOWS_API_KEY+x}" && test "$SHARED" = yes"#,
+    ));
+    success(&run(&p, &[]));
+    assert!(p.dir.join("ran").exists());
+}

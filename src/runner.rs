@@ -148,6 +148,9 @@ pub struct Options {
     pub reporting: Arc<ReportingEnv>,
     /// Selected `--env` profile. `None` when the run did not select one.
     pub environment: Option<String>,
+    /// Resolved settings env defaults, layered over the caller's environment
+    /// and under job and step env.
+    pub settings_env: BTreeMap<String, String>,
 }
 
 /// Environment adjustments for reporting. Applied after job/step overrides.
@@ -210,6 +213,7 @@ struct Shared {
     output: Output,
     reporting: Arc<ReportingEnv>,
     environment: Option<String>,
+    settings_env: BTreeMap<String, String>,
 }
 
 async fn record(
@@ -268,6 +272,7 @@ pub async fn execute(
         output: options.output.clone(),
         reporting: options.reporting.clone(),
         environment: options.environment.clone(),
+        settings_env: options.settings_env.clone(),
     });
 
     loop {
@@ -484,8 +489,12 @@ async fn run_job(
                 json!({"type":"job_started", "name":job.name}),
             ))
             .await?;
+        // The caller's GOODFLOWS_OUTPUT belongs to an enclosing command; drop it so
+        // expressions never observe it. Commands get their own file (or none).
         let mut env: HashMap<String, String> = std::env::vars_os()
             .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
+            .filter(|(key, _)| key != config::OUTPUT_ENV)
+            .chain(shared.settings_env.clone())
             .chain(job.env.clone())
             .collect();
         // Expressions read this map, so the token must be gone before any evaluation.
@@ -853,9 +862,9 @@ impl JobExecution<'_> {
             }
         }
         if let Some(file) = &output_file {
-            command.env("GOODFLOWS_OUTPUT", file.path());
+            command.env(config::OUTPUT_ENV, file.path());
         } else {
-            command.env_remove("GOODFLOWS_OUTPUT");
+            command.env_remove(config::OUTPUT_ENV);
         }
         if let Some(result) = self.stopped() {
             return Ok(result);
