@@ -774,7 +774,9 @@ fn validate_jobs(jobs: &[Job], reporting: Option<&Reporting>) -> Result<Vec<Opti
         if job.timeout_secs == Some(0) {
             bail!("job '{}' timeout_secs must be greater than zero", job.name);
         }
-        if job.name.contains(['\n', '\r', '\0']) {
+        // Names appear in text output and rerun hints, so no control characters
+        // (including escape sequences). Other name rules are unchanged.
+        if job.name.chars().any(char::is_control) {
             bail!(
                 "job '{}' contains invalid control characters",
                 job.name.escape_debug()
@@ -1199,6 +1201,26 @@ mod tests {
         let mut config = parse(source)?;
         config.validate().map_err(|error| format!("{error:#}"))?;
         Ok(config)
+    }
+
+    #[test]
+    fn job_names_reject_control_characters_only() {
+        for escape in ["\\n", "\\r", "\\u0000", "\\t", "\\u001b", "\\u009b"] {
+            let error = validate(&format!(
+                "[[jobs]]\nname = \"a{escape}b\"\ncommand = 'true'\n"
+            ))
+            .unwrap_err();
+            assert!(
+                error.contains("contains invalid control characters"),
+                "{error}"
+            );
+        }
+        // Spaces, commas and long names stay valid.
+        let long = "x".repeat(100);
+        validate(&format!(
+            "[[jobs]]\nname = 'a b,c'\ncommand = 'true'\n[[jobs]]\nname = '{long}'\ncommand = 'true'\n"
+        ))
+        .unwrap();
     }
 
     fn resolved_env(

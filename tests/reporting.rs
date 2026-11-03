@@ -456,7 +456,7 @@ fn local_only_collection_without_credentials() {
         "{text}"
     );
     assert!(text.contains("reporting skipped: credentials unavailable (3 reports kept locally)"));
-    assert!(text.trim_end().ends_with("All jobs passed"));
+    assert!(text.trim_end().ends_with("\n1 passed"), "{text}");
 }
 
 #[test]
@@ -1309,6 +1309,13 @@ fn offline_and_transient_failures_retry_then_stay_pending() {
     let summary = first.last().unwrap();
     assert_eq!(summary["type"], "summary");
     assert!(summary["results"][0]["duration_ms"].as_u64().unwrap() < 2000);
+    // The run's wall time includes reporting, so it covers the retries too.
+    let wall = summary["duration_ms"].as_u64().unwrap();
+    assert!(wall >= 3000, "{summary}");
+    assert!(
+        wall >= summary["results"][0]["duration_ms"].as_u64().unwrap(),
+        "{summary}"
+    );
 
     // 503 with Retry-After is retried, then succeeds.
     let rows = std::sync::Mutex::new(Default::default());
@@ -1366,8 +1373,11 @@ fn text_output_shows_delivery_and_summary_stays_last() {
         "{text}"
     );
     assert!(text.contains("report test/r1 uploaded"));
-    let summary = text.find("Summary:").unwrap();
-    assert!(text.find("report test/r1 uploaded").unwrap() < summary);
+    // The run report follows every reporting line and nothing follows it.
+    let report = text.find("\ndefault  PASSED  in ").unwrap();
+    assert!(text.find("report test/r1 uploaded").unwrap() < report);
+    assert!(text.trim_end().ends_with("\n1 passed"), "{text}");
+    assert!(!text[report..].contains("report"), "{text}");
     let p2 = project(&format!(
         "[[jobs]]\nname = \"test\"\ncommand = '{}'\nreports = [\"exunit-timings\"]\n",
         copy(&["r1"])
@@ -1408,7 +1418,7 @@ fn text_output_shows_delivery_and_summary_stays_last() {
         text.contains("report test/r1 uploaded (already stored)"),
         "{text}"
     );
-    assert!(text.trim_end().ends_with("All jobs passed"), "{text}");
+    assert!(text.trim_end().ends_with("\n1 passed"), "{text}");
 
     // Delivery skips.
     let text = stdout(&run_with(&p3, &[], Some("http://flows.example.com")));
@@ -1428,7 +1438,7 @@ fn text_output_shows_delivery_and_summary_stays_last() {
         text.contains("reporting skipped: spool unavailable\n"),
         "{text}"
     );
-    assert!(text.trim_end().ends_with("All jobs passed"), "{text}");
+    assert!(text.trim_end().ends_with("\n1 passed"), "{text}");
 }
 
 // ---- 4.x replay ----

@@ -333,6 +333,7 @@ async fn run(cli: &Cli, output: &mut Output, cancel: watch::Receiver<Option<i32>
     if let Some(session) = &session {
         session.announce(output).await;
     }
+    let run_start = std::time::Instant::now();
     let results = match runner::execute(&config.jobs, &options, cancel.clone()).await {
         Ok(results) => results,
         Err(error) => {
@@ -350,8 +351,27 @@ async fn run(cli: &Cli, output: &mut Output, cancel: watch::Receiver<Option<i32>
     let success = results
         .iter()
         .all(|r| matches!(r.status, Status::Passed | Status::Skipped));
-    output.emit(json!({"type":"summary", "success":success, "passed":count(Status::Passed), "failed":count(Status::Failed), "timed_out":count(Status::TimedOut), "skipped":count(Status::Skipped), "cancelled":count(Status::Cancelled), "results":results})).await?;
+    // `started` is projected only here; live job_finished events never carry it.
+    let summary_results: Vec<_> = results
+        .iter()
+        .map(|result| {
+            let mut value = json!(result);
+            value["started"] = json!(result.started);
+            value
+        })
+        .collect();
+    let mut summary = json!({"type":"summary", "success":success, "passed":count(Status::Passed), "failed":count(Status::Failed), "timed_out":count(Status::TimedOut), "skipped":count(Status::Skipped), "cancelled":count(Status::Cancelled), "results":summary_results});
+    if let Some(dir) = &options.log_dir {
+        // A non-UTF-8 path cannot be a JSON string; show it lossily.
+        summary["log_dir"] = json!(dir.to_string_lossy());
+    }
+    summary["duration_ms"] = json!(run_start.elapsed().as_millis() as u64);
+    // One snapshot decides both the report's outcome and the exit code.
     let signal = *cancel.borrow();
+    let config_path = cli.config.as_ref().map(|path| path.to_string_lossy());
+    output
+        .emit_summary(summary, config_path.as_deref(), signal.is_some())
+        .await?;
     Ok(signal
         .map(|s| (128 + s) as u8)
         .unwrap_or(if success { 0 } else { 1 }))

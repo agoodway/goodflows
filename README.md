@@ -398,6 +398,9 @@ partitions = 3
 See [Scheduling and failures](#scheduling-and-failures) for how instances are
 scheduled and [Logs and machine output](#logs-and-machine-output) for how they are
 reported.
+The text run report printed at the end of a run counts configured jobs and shows a
+partitioned job as one row (for example `FAIL  test  3ms  1/3 failed`), while the
+JSON `summary` counts and `run_started.jobs` count instances.
 
 `list` displays every job field: name, command or steps, conditions, output mappings,
 dependencies, timeout, configured environment, shell mode, and partitions (effective
@@ -457,7 +460,9 @@ explicit overrides. Both shared and workflow-relative `workdir` values resolve
 from the config file's directory.
 
 Job names and dependencies are scoped to their workflow. For example, both ci and
-integration can have a job named test. Dependencies must refer to local jobs;
+integration can have a job named test. Job names must be nonempty and cannot
+contain control characters (such as newlines, tabs or terminal escape sequences);
+other characters, including spaces and commas, are allowed. Dependencies must refer to local jobs;
 cross-workflow dependencies are not supported. The entire config, including every
 workflow's graph and effective workdir, is validated before anything runs.
 
@@ -1124,16 +1129,24 @@ add `partition` with `index` (1-based) and `count`. `job_started`, `step_started
 `step_finished`, `job_output` and `job_finished` results all carry it, including
 results for instances skipped or cancelled before they started. Use
 `(name, partition.index)` as the instance key. Events for unpartitioned jobs have
-no `partition` field. `run_started.jobs` and the `summary` counts count instances,
-so `compile` plus a 3-partition `test` reports 4 jobs.
+no `partition` field. `run_started.jobs` and the JSON `summary` counts count
+instances, so `compile` plus a 3-partition `test` reports 4 jobs. The text run
+report counts configured jobs instead, so the same run reads `2 passed`.
 
 ```json
 {"data":"2/3\n","name":"test","partition":{"count":3,"index":2},"schema_version":1,"stream":"stdout","type":"job_output","workflow":"default"}
 ```
 
-The final `summary` contains `success`, counts for every status, and `results` in
-config order, with a partitioned job's instances in index order at its position. Each result contains `name`, `command`, `status`, `duration_ms`,
-nullable `exit_code`, nullable `error`, and `outputs`. Stepped jobs additionally
+The final `summary` contains `success`, counts for every status (`passed`,
+`failed`, `timed_out`, `skipped`, `cancelled`), integer `duration_ms` (the run's
+wall-clock time, including reporting), `log_dir` (the effective log directory,
+including a named workflow's subdirectory; present only with `--log-dir`), and
+`results` in config order, with a partitioned job's instances in index order at its
+position. Each result contains `name`, `command`, `status`, `duration_ms`,
+nullable `exit_code`, nullable `error`, and `outputs`. Summary results also carry
+boolean `started`: true when the instance entered execution (including one a
+condition then skipped), false when it was skipped or cancelled while still
+queued. `started` appears only in `summary.results`, never in `job_finished`. Stepped jobs additionally
 include `steps` in config order, each with `id`, `command`, `status`, `duration_ms`,
 nullable `exit_code`, nullable `error`, and `outputs`. Their job-level `command` is
 null unless a step failed, in which case it identifies that step's command.
@@ -1144,8 +1157,8 @@ The tails are captured incrementally and capped at **4096 UTF-8 bytes per stream
 with truncation flags indicating omitted leading content. Non-UTF-8 bytes are
 decoded lossily and character boundaries are preserved when trimming the tails.
 Empty output produces empty tails with false truncation flags; other statuses
-omit the tail fields. Human failure output shows the command and nonempty tails.
-Full output remains available in the events and optional raw log files.
+omit the tail fields. Full output remains available in the events and optional raw
+log files.
 Configuration/runtime failures produce an
 `error` event instead of a completed summary.
 
@@ -1160,6 +1173,73 @@ Output backpressure never blocks timeout or signal handling. On interruption, if
 the downstream consumer stops reading, goodflows allows 250 ms for pending output
 before discarding further events so it can exit. A final summary cannot be
 guaranteed when the output pipe is blocked or closed.
+
+### Run report
+
+In text mode a run ends with a report built from the `summary` event, printed after
+every job and reporting line. A failed `job_finished` line shows only its status,
+duration, exit code and error; the command and output tails appear once, in the
+report. For a config with top-level `[[jobs]]` `fmt`, `lint`, a 2-partition `test`
+that fails and a dependent `deploy`, run with `--log-dir logs` (a named workflow
+shows its subdirectory, such as `Logs: logs/ci`):
+
+```text
+default  FAILED  in 207ms
+  PASS  fmt     203ms
+  PASS  lint      2ms
+  FAIL  test      3ms  2/2 failed
+  SKIP  deploy         dependency did not pass
+2 passed, 1 failed, 1 skipped
+
+Failures
+--- test (1/2)  FAILED  exit 1
+  command: echo boom-$GOODFLOWS_PARTITION >&2; exit 1
+  error: exited with 1
+  stderr tail:
+    boom-1
+
+--- test (2/2)  FAILED  exit 1
+  command: echo boom-$GOODFLOWS_PARTITION >&2; exit 1
+  error: exited with 1
+  stderr tail:
+    boom-2
+
+Logs: logs
+Rerun failed: goodflows run default --jobs='test,deploy'
+```
+
+- The header shows the workflow, the outcome (`FAILED` if any instance failed or
+  timed out, otherwise `CANCELLED` if any was cancelled or a signal arrived before
+  the report, otherwise `PASSED`) and the wall-clock time. The time runs from just
+  before the first job until the report, so it includes reporting (collection and
+  uploads) after the last job finished.
+- There is one row per selected configured job, including prerequisites. A
+  partitioned job's row takes its most severe instance status (failed, timed out,
+  cancelled, passed, skipped) and lists nonzero non-passed instance counts. The
+  duration is the longest among instances that started; jobs that never started
+  show none. Skipped rows list their distinct skip reasons.
+- Counts are per configured job, with zero counts omitted.
+- Columns are aligned by character count, which assumes narrow characters; wide
+  characters (for example CJK) in job names shift the rest of that row.
+- Failures has one entry per failed or timed-out instance: the instance, its status
+  and exit code (when present), then the failing step when one failed or timed
+  out, then the command and error when present, then the job-level stderr and
+  stdout tails (which can include output of earlier steps).
+- Control characters other than tab in commands, errors, skip reasons and tails are
+  shown escaped (for example `\u{1b}`), here and in live failure lines, so job
+  output cannot rewrite the report.
+- `Logs:` appears with `--log-dir`. When a job failed or timed out, the report ends
+  with a shell-quoted rerun command keeping the workflow, `--env` and an explicitly
+  passed `--config`, and selecting the failed jobs plus jobs skipped because a
+  dependency did not pass, in row order (`--jobs` adds their dependencies). It does
+  not repeat `--parallelism` or fail-fast flags. A selected job whose name contains
+  a comma cannot be selected with `--jobs`, so the report explains that and
+  suggests rerunning the whole workflow.
+
+**Compatibility:** the text `Summary: N passed, ...` line and the `All jobs passed`
+and `All checks succeeded (some jobs skipped)` lines were replaced by the run report.
+Scripts should use `--json`, whose `summary` event only gained fields
+(`duration_ms`, `log_dir`, `results[].started`).
 
 ## Development and releases
 

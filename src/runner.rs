@@ -59,6 +59,10 @@ pub struct JobResult {
     /// Whether the job started (as opposed to being skipped or cancelled before launch).
     #[serde(skip)]
     pub executed: bool,
+    /// Whether execution entered `run_job`, even if a condition then skipped it.
+    /// Projected only into the run summary, never into live events.
+    #[serde(skip)]
+    pub started: bool,
 }
 
 impl JobResult {
@@ -94,6 +98,7 @@ impl JobResult {
             stdout_truncated: None,
             stderr_truncated: None,
             executed: false,
+            started: false,
         }
     }
 
@@ -443,6 +448,7 @@ async fn run_job(
     let start = Instant::now();
     let tails = Arc::new(Mutex::new(Tails::default()));
     let mut result = JobResult::new(job, partition, Status::Passed, None);
+    result.started = true;
     // Set only when the main command or a step command spawns, never by a condition.
     let spawned = AtomicBool::new(false);
     let execution: Result<()> = async {

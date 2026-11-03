@@ -1,6 +1,9 @@
+mod report;
+
 use anyhow::{Context, Result};
 use colored::Colorize;
 use serde_json::{json, Value};
+use std::borrow::Cow;
 use std::fs::File;
 use std::io::{self, Write};
 use std::sync::{
@@ -65,6 +68,24 @@ impl Output {
         let mut output = self.clone();
         output.environment = Some(name.into());
         output
+    }
+
+    /// Emits the run `summary`. Text mode alone also receives the explicit
+    /// `--config` path for the rerun hint and whether a signal arrived; neither
+    /// is part of the JSON event.
+    pub async fn emit_summary(
+        &self,
+        mut event: Value,
+        config: Option<&str>,
+        interrupted: bool,
+    ) -> Result<()> {
+        if !self.json {
+            if let Some(config) = config {
+                event[report::CONFIG] = json!(config);
+            }
+            event[report::INTERRUPTED] = json!(interrupted);
+        }
+        self.emit(event).await
     }
 
     pub async fn emit(&self, mut event: Value) -> Result<()> {
@@ -160,7 +181,7 @@ fn render(json: bool, mut event: Value, out: &mut impl Write, err: &mut impl Wri
                     result["duration_ms"]
                 )?;
                 if let Some(error) = result["error"].as_str() {
-                    writeln!(out, "    {error}")?;
+                    writeln!(out, "    {}", visible(error))?;
                 }
             }
             "job_output" => {
@@ -195,48 +216,11 @@ fn render(json: bool, mut event: Value, out: &mut impl Write, err: &mut impl Wri
                 }
                 writeln!(out)?;
                 if let Some(error) = result["error"].as_str() {
-                    writeln!(out, "  {error}")?;
+                    writeln!(out, "  {}", visible(error))?;
                 }
-                if matches!(text(result, "status"), "failed" | "timed_out") {
-                    writeln!(out, "  command: {}", text(result, "command"))?;
-                    for stream in ["stdout", "stderr"] {
-                        let tail = text(result, &format!("{stream}_tail"));
-                        if !tail.is_empty() {
-                            let truncated = if result[format!("{stream}_truncated")] == true {
-                                " (truncated)"
-                            } else {
-                                ""
-                            };
-                            writeln!(out, "  {stream} tail{truncated}:")?;
-                            for line in tail.lines() {
-                                writeln!(out, "    {line}")?;
-                            }
-                        }
-                    }
-                }
+                // The command and output tails are in the run report's Failures section.
             }
-            "summary" => {
-                writeln!(
-                    out,
-                    "\nSummary: {} passed, {} failed, {} timed out, {} skipped, {} cancelled",
-                    event["passed"],
-                    event["failed"],
-                    event["timed_out"],
-                    event["skipped"],
-                    event["cancelled"]
-                )?;
-                if event["success"] == true {
-                    writeln!(
-                        out,
-                        "{}",
-                        if event["skipped"] == 0 {
-                            "All jobs passed"
-                        } else {
-                            "All checks succeeded (some jobs skipped)"
-                        }
-                    )?;
-                }
-            }
+            "summary" => report::report(&event, out)?,
             "config_valid" => {
                 if let Some(workflows) = event["workflows"].as_array() {
                     writeln!(
@@ -487,6 +471,24 @@ fn text<'a>(event: &'a Value, key: &str) -> &'a str {
     event[key].as_str().unwrap_or_default()
 }
 
+/// Escapes control characters other than tab (for example `\u{1b}` or `\r`)
+/// so job-provided text cannot move the cursor or restyle the terminal.
+fn visible(text: &str) -> Cow<'_, str> {
+    let control = |c: char| c.is_control() && c != '\t';
+    if !text.chars().any(control) {
+        return Cow::Borrowed(text);
+    }
+    let mut escaped = String::with_capacity(text.len() + 8);
+    for c in text.chars() {
+        if control(c) {
+            escaped.extend(c.escape_default());
+        } else {
+            escaped.push(c);
+        }
+    }
+    Cow::Owned(escaped)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -526,5 +528,32 @@ mod tests {
                 format!("report {job}/r1 pending: state write failed\n")
             );
         }
+    }
+
+    #[test]
+    fn visible_escapes_control_characters_except_tab() {
+        assert!(matches!(
+            visible("plain\ttext é"),
+            Cow::Borrowed("plain\ttext é")
+        ));
+        assert_eq!(
+            visible("a\x1b[2Jb\rc\nd\0\u{9b}"),
+            "a\\u{1b}[2Jb\\rc\\nd\\u{0}\\u{9b}"
+        );
+    }
+
+    #[test]
+    fn live_failure_errors_are_escaped() {
+        colored::control::set_override(false);
+        let text = rendered(
+            json!({"type": "job_finished", "result": {"name": "a", "status": "failed",
+            "duration_ms": 1, "exit_code": 1, "error": "bad\x1b[2J\rworse"}}),
+        );
+        assert_eq!(text, "a FAILED  1ms exit=1\n  bad\\u{1b}[2J\\rworse\n");
+        let text = rendered(
+            json!({"type": "step_finished", "name": "a", "result": {"id": "s",
+            "status": "failed", "duration_ms": 1, "error": "x\x07"}}),
+        );
+        assert_eq!(text, "  a/s FAILED  1ms\n    x\\u{7}\n");
     }
 }
