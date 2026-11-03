@@ -25,6 +25,9 @@ pub const RESERVED_ENV: [&str; 2] = ["GOODFLOWS_RUN_ID", "GOODFLOWS_REPORT_DIR"]
 /// Partition identity injected into every partitioned instance. Deliberately
 /// separate from `RESERVED_ENV`, which reporting scrubs from every command.
 pub const PARTITION_ENV: [&str; 2] = ["GOODFLOWS_PARTITION", "GOODFLOWS_PARTITION_COUNT"];
+
+/// Selected `--env` profile name. Set by the runner; absent when no profile is selected.
+pub const ENVIRONMENT_ENV: &str = "GOODFLOWS_ENVIRONMENT";
 pub const MAX_PARTITIONS: u32 = 64;
 const DEFAULT_SPOOL_DIR: &str = ".goodflows/reports";
 
@@ -92,6 +95,7 @@ pub fn validate_credential_env_names(url_env: &str, token_env: &str) -> Result<(
         }
         if RESERVED_ENV.contains(&name)
             || PARTITION_ENV.contains(&name)
+            || name == ENVIRONMENT_ENV
             || name == "GOODFLOWS_OUTPUT"
         {
             bail!("reporting {field} must not name a reserved goodflows variable");
@@ -729,7 +733,10 @@ fn validate_env(env: &HashMap<String, String>, reporting: Option<&Reporting>) ->
         if key.is_empty() || key.contains(['=', '\0']) || value.contains('\0') {
             bail!("invalid environment variable");
         }
-        if RESERVED_ENV.contains(&key.as_str()) || PARTITION_ENV.contains(&key.as_str()) {
+        if RESERVED_ENV.contains(&key.as_str())
+            || PARTITION_ENV.contains(&key.as_str())
+            || key == ENVIRONMENT_ENV
+        {
             bail!("env must not set reserved variable {key}; goodflows sets it itself");
         }
         if reporting.is_some_and(|r| r.token_env == *key) {

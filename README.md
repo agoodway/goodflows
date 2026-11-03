@@ -593,7 +593,10 @@ inherit independently, with precedence **CLI overrides > environment settings >
 workflow settings > shared settings > built-in defaults**. Explicit `false` and
 `0` values are preserved (`parallelism = 0` uses the logical CPU count). Relative
 profile workdirs resolve from the config file's directory, not the inherited
-workdir. Profiles do not change jobs, dependencies, or job environment variables.
+workdir. Profiles do not change jobs, dependencies, or configured job environment variables.
+Every command and expression sees the selected profile as `GOODFLOWS_ENVIRONMENT`.
+Goodflows sets that variable itself, so job and step `env` cannot. A run without
+`--env` removes it, even when the parent process exported it.
 
 Unknown profile names fail with the available names before jobs run. Names follow
 the same case-sensitive, nonempty, 64-byte, no-control-character rules as workflow

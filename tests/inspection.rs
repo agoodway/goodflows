@@ -219,6 +219,8 @@ fn invalid_partition_configs_fail_validation_before_execution() {
         ("name='test'\npartitions=2\noutputs={x='steps.a.outputs.x'}\n[[JOBS.steps]]\nid='a'\ncommand='true'\n", "partitioned jobs publish no job outputs"),
         ("name='test'\ncommand='true'\npartitions=2\nenv={GOODFLOWS_PARTITION='1'}\n", "reserved variable GOODFLOWS_PARTITION"),
         ("name='test'\ncommand='true'\nenv={GOODFLOWS_PARTITION_COUNT='1'}\n", "reserved variable GOODFLOWS_PARTITION_COUNT"),
+        ("name='test'\ncommand='true'\nenv={GOODFLOWS_ENVIRONMENT='local'}\n", "reserved variable GOODFLOWS_ENVIRONMENT"),
+        ("name='test'\n[[JOBS.steps]]\nid='a'\ncommand='true'\nenv={GOODFLOWS_ENVIRONMENT='local'}\n", "reserved variable GOODFLOWS_ENVIRONMENT"),
         ("name='test'\n[[JOBS.steps]]\nid='a'\ncommand='true'\nenv={GOODFLOWS_PARTITION='1'}\n", "reserved variable GOODFLOWS_PARTITION"),
         ("name='test'\ncommand='true'\npartitions=2\n[[JOBS]]\nname='after'\ncommand='true'\ndepends_on=['test']\ncondition={expression='needs.test.outputs.x == 1'}\n", "partitioned job 'test' publishes no outputs"),
         ("name='test'\ncommand='true'\npartitions=2\n[[JOBS]]\nname='after'\ndepends_on=['test']\n[[JOBS.steps]]\nid='a'\ncommand='true'\ncondition={expression='needs.test.outputs.x'}\n", "partitioned job 'test' publishes no outputs"),
@@ -254,6 +256,8 @@ fn invalid_partition_configs_fail_validation_before_execution() {
         ("url_env", "GOODFLOWS_PARTITION"),
         ("token_env", "GOODFLOWS_PARTITION_COUNT"),
         ("url_env", "GOODFLOWS_PARTITION_COUNT"),
+        ("token_env", "GOODFLOWS_ENVIRONMENT"),
+        ("url_env", "GOODFLOWS_ENVIRONMENT"),
     ] {
         for jobs in [
             format!("[[jobs]]\n{SAFE}"),

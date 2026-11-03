@@ -254,6 +254,66 @@ command = "touch first.$GOODFLOWS_PARTITION"
 }
 
 #[test]
+fn selected_profile_reaches_commands_and_unselected_runs_hide_it() {
+    let p = Project::new(
+        r#"
+[environments.local.settings]
+parallelism = 1
+[[jobs]]
+name = "seen"
+condition = { expression = 'env.GOODFLOWS_ENVIRONMENT == "local"' }
+command = 'test "$GOODFLOWS_ENVIRONMENT" = local && touch seen'
+[[jobs]]
+name = "direct"
+shell = false
+command = "sh -c 'test \"$GOODFLOWS_ENVIRONMENT\" = local && touch direct'"
+[[jobs]]
+name = "stepped"
+[[jobs.steps]]
+id = "a"
+condition = { shell = 'test "$GOODFLOWS_ENVIRONMENT" = local' }
+command = 'test "$GOODFLOWS_ENVIRONMENT" = local && touch stepped'
+"#,
+    );
+    let output = p
+        .command()
+        .args(["--env", "local", "--json"])
+        .output()
+        .unwrap();
+    success(&output);
+    for file in ["seen", "direct", "stepped"] {
+        assert!(p.dir.join(file).exists(), "{file}: {}", stdout(&output));
+    }
+
+    let hidden = Project::new(
+        r#"
+[[jobs]]
+name = "plain"
+condition = { expression = 'env.GOODFLOWS_ENVIRONMENT == null' }
+command = 'test -z "${GOODFLOWS_ENVIRONMENT+x}" && touch plain'
+[[jobs]]
+name = "direct"
+shell = false
+command = "sh -c 'test -z \"${GOODFLOWS_ENVIRONMENT+x}\" && touch direct'"
+"#,
+    );
+    let output = hidden
+        .command()
+        .env("GOODFLOWS_ENVIRONMENT", "orb")
+        .arg("--json")
+        .output()
+        .unwrap();
+    success(&output);
+    for file in ["plain", "direct"] {
+        assert!(
+            hidden.dir.join(file).exists(),
+            "{file}: {}",
+            stdout(&output)
+        );
+    }
+}
+
+#[test]
 fn unpartitioned_jobs_never_see_inherited_partition_variables() {
     let p = Project::new(
         r#"

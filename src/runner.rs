@@ -146,6 +146,8 @@ pub struct Options {
     pub log_dir: Option<PathBuf>,
     pub output: Output,
     pub reporting: Arc<ReportingEnv>,
+    /// Selected `--env` profile. `None` when the run did not select one.
+    pub environment: Option<String>,
 }
 
 /// Environment adjustments for reporting. Applied after job/step overrides.
@@ -207,6 +209,7 @@ struct Shared {
     log_dir: Option<PathBuf>,
     output: Output,
     reporting: Arc<ReportingEnv>,
+    environment: Option<String>,
 }
 
 async fn record(
@@ -264,6 +267,7 @@ pub async fn execute(
         log_dir: options.log_dir.clone(),
         output: options.output.clone(),
         reporting: options.reporting.clone(),
+        environment: options.environment.clone(),
     });
 
     loop {
@@ -408,6 +412,19 @@ fn dependency_state(results: &[Option<JobResult>], units: &[usize]) -> Dependenc
     }
 }
 
+/// The selected profile wins over job, step and inherited values. A run with no
+/// profile removes the variable so a parent goodflows cannot leak its own.
+fn apply_profile(env: &mut HashMap<String, String>, name: Option<&str>) {
+    match name {
+        Some(name) => {
+            env.insert(config::ENVIRONMENT_ENV.into(), name.to_owned());
+        }
+        None => {
+            env.remove(config::ENVIRONMENT_ENV);
+        }
+    }
+}
+
 async fn run_job(
     index: usize,
     partition: Option<Partition>,
@@ -455,6 +472,7 @@ async fn run_job(
             needs,
             reporting,
             partition,
+            environment: shared.environment.clone(),
             spawned: &spawned,
             deadline: job.timeout_secs.and_then(|secs| {
                 tokio::time::Instant::now().checked_add(Duration::from_secs(secs))
@@ -485,6 +503,7 @@ async fn run_job(
                 env.remove(count_key);
             }
         }
+        apply_profile(&mut env, shared.environment.as_deref());
         let condition = execution
             .condition(job.condition.as_ref(), &env, &[], None)
             .await?;
@@ -517,6 +536,7 @@ async fn run_job(
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect();
             reporting.scrub(&mut condition_env);
+            apply_profile(&mut condition_env, execution.environment.as_deref());
             let step_env = reporting.inject(&job.name, partition, &condition_env);
             output
                 .emit(Partition::tag(
@@ -620,6 +640,7 @@ struct JobExecution<'a> {
     needs: DependencyOutputs,
     reporting: &'a ReportingEnv,
     partition: Option<Partition>,
+    environment: Option<String>,
     spawned: &'a AtomicBool,
     deadline: Option<tokio::time::Instant>,
 }
@@ -821,6 +842,14 @@ impl JobExecution<'_> {
             None => {
                 command.env_remove(index_key);
                 command.env_remove(count_key);
+            }
+        }
+        match &self.environment {
+            Some(name) => {
+                command.env(config::ENVIRONMENT_ENV, name);
+            }
+            None => {
+                command.env_remove(config::ENVIRONMENT_ENV);
             }
         }
         if let Some(file) = &output_file {
