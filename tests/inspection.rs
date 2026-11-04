@@ -243,7 +243,7 @@ fn invalid_partition_configs_fail_validation_before_execution() {
     // Partitioned jobs may declare reports; each instance collects its own directory.
     for jobs in ["jobs", "workflows.ci.jobs"] {
         let p = Project::new(&format!(
-            "{REPORTING}[[{jobs}]]\n{SAFE}[[{jobs}]]\nname='test'\ncommand='true'\npartitions=3\nreports=['exunit-timings']\n"
+            "{REPORTING}[[{jobs}]]\n{SAFE}[[{jobs}]]\nname='test'\ncommand='true'\npartitions=3\nreports=['test-timings']\n"
         ));
         let output = p.run(&["validate", "--json"]);
         success(&output);
@@ -439,4 +439,127 @@ test = 6
     success(&output);
     assert!(stdout(&output).contains("2 defined"), "{}", stdout(&output));
     assert!(!p.dir.join("ran").exists());
+}
+
+#[test]
+fn inspection_shows_default_history_settings_without_writing_history() {
+    let p = Project::new(
+        "[[jobs]]\nname='a'\ncommand='true'\n[[workflows.ci.jobs]]\nname='b'\ncommand='true'\n",
+    );
+    let history = p.dir.join("goodflows-history");
+    let expected = serde_json::json!({
+        "history": false,
+        "history_dir": history.to_str().unwrap(),
+        "log_runs": 10,
+        "history_runs": 1000,
+        "history_bytes": 10485760,
+    });
+    let check = |settings: &serde_json::Value| {
+        for (key, value) in expected.as_object().unwrap() {
+            assert_eq!(&settings[key], value, "{key}: {settings}");
+        }
+    };
+    let list = |args: &[&str]| -> serde_json::Value {
+        let output = p.run(args);
+        success(&output);
+        serde_json::from_slice(&output.stdout).unwrap()
+    };
+    check(&list(&["list", "--json"])["settings"]);
+    check(&list(&["validate", "--json"])["workflows"][0]["settings"]);
+    check(&list(&["list", "--workflows", "--json"])["workflows"][1]["settings"]);
+    check(&list(&["validate", "default", "--json"])["settings"]);
+    let output = p.run(&["list"]);
+    success(&output);
+    let text = stdout(&output);
+    assert!(
+        text.contains(
+            "History: history=false history_runs=1000 history_bytes=10485760 log_runs=10"
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("history_dir: {}", history.display())),
+        "{text}"
+    );
+    let output = p.run(&["list", "--workflows"]);
+    success(&output);
+    assert!(
+        stdout(&output).contains("    History: history=false"),
+        "{}",
+        stdout(&output)
+    );
+    // Inspection never writes history, even when history is forced on.
+    for args in [
+        vec!["list", "--history"],
+        vec!["validate", "--history"],
+        vec!["list", "--workflows", "--history"],
+        vec!["validate", "ci", "--history-dir", "runs"],
+    ] {
+        success(&p.run(&args));
+    }
+    assert!(!history.exists());
+    assert!(!p.dir.join("runs").exists());
+}
+
+#[test]
+fn inspection_applies_history_overrides_like_parallelism() {
+    let p = Project::new(
+        "[settings]\nhistory = true\nhistory_dir = 'shared'\nlog_runs = 3\n\
+         [[jobs]]\nname='a'\ncommand='true'\n\
+         [environments.quiet.settings]\nhistory = false\nhistory_dir = 'profile'\nhistory_runs = 7\n",
+    );
+    let settings = |args: &[&str]| -> serde_json::Value {
+        let output = p.run(args);
+        success(&output);
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()["settings"].clone()
+    };
+    let shared = settings(&["list", "--json"]);
+    assert_eq!(shared["history"], true);
+    assert_eq!(
+        shared["history_dir"],
+        p.dir.join("shared").to_str().unwrap()
+    );
+    assert_eq!(shared["log_runs"], 3);
+    let profile = settings(&["list", "--json", "--env", "quiet"]);
+    assert_eq!(profile["history"], false);
+    assert_eq!(
+        profile["history_dir"],
+        p.dir.join("profile").to_str().unwrap()
+    );
+    assert_eq!(profile["history_runs"], 7);
+    let cli = settings(&[
+        "validate",
+        "default",
+        "--json",
+        "--env",
+        "quiet",
+        "--history-dir",
+        "cli",
+        "--log-runs",
+        "4",
+        "--history-runs",
+        "5",
+        "--history-bytes",
+        "6",
+    ]);
+    assert_eq!(cli["history"], true);
+    assert_eq!(cli["history_dir"], p.dir.join("cli").to_str().unwrap());
+    assert_eq!(
+        (
+            &cli["log_runs"],
+            &cli["history_runs"],
+            &cli["history_bytes"]
+        ),
+        (&4.into(), &5.into(), &6.into())
+    );
+    assert_eq!(
+        settings(&["list", "--json", "--no-history"])["history"],
+        false
+    );
+    for flag in ["--log-runs", "--history-runs", "--history-bytes"] {
+        let output = p.run(&["list", flag, "0"]);
+        assert_eq!(output.status.code(), Some(2), "{flag}");
+    }
+    let output = p.run(&["list", "--history", "--no-history"]);
+    assert_eq!(output.status.code(), Some(2));
 }

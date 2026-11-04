@@ -1,0 +1,11 @@
+{
+  "name": "goodflows-jest-reporter-fixture",
+  "private": true,
+  "description": "Fixture suite for the goodflows Jest reporter drift guard. Fails on purpose.",
+  "scripts": {
+    "test": "jest"
+  },
+  "devDependencies": {
+    "jest": "30.5.2"
+  }
+}

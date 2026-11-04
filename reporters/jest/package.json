@@ -1,0 +1,25 @@
+{
+  "name": "goodflows-jest-reporter",
+  "version": "0.5.0",
+  "description": "Jest reporter that writes goodflows test-timings/1 reports",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/agoodway/goodflows-jest-reporter.git"
+  },
+  "main": "index.js",
+  "types": "index.d.ts",
+  "files": [
+    "index.js",
+    "index.d.ts"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "peerDependencies": {
+    "jest": ">=29.6.0"
+  },
+  "scripts": {
+    "test": "node --test test/reporter.test.js"
+  }
+}

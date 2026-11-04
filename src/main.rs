@@ -1,8 +1,11 @@
 mod config;
 mod expression;
+mod fsutil;
+mod history;
 mod init;
 mod output;
 mod reporting;
+mod retention;
 mod runner;
 mod tail;
 
@@ -46,9 +49,27 @@ struct Cli {
     /// Emit versioned JSON Lines events to stdout
     #[arg(long, global = true)]
     json: bool,
-    /// Save raw per-job stdout/stderr files in this directory
+    /// Save raw per-job stdout/stderr files in a new per-run directory under this directory
     #[arg(long, global = true)]
     log_dir: Option<PathBuf>,
+    /// Write a run history file for this run
+    #[arg(long, global = true, conflicts_with = "no_history")]
+    history: bool,
+    /// Do not write a run history file, even when settings enable it
+    #[arg(long, global = true)]
+    no_history: bool,
+    /// Write the run history file under this directory (enables history)
+    #[arg(long, global = true, value_name = "DIR")]
+    history_dir: Option<PathBuf>,
+    /// Log run directories to keep per workflow (default 10)
+    #[arg(long, global = true, value_name = "N", value_parser = clap::value_parser!(u64).range(1..))]
+    log_runs: Option<u64>,
+    /// History files to keep per workflow (default 1000)
+    #[arg(long, global = true, value_name = "N", value_parser = clap::value_parser!(u64).range(1..))]
+    history_runs: Option<u64>,
+    /// History bytes to keep per workflow (default 10485760)
+    #[arg(long, global = true, value_name = "BYTES", value_parser = clap::value_parser!(u64).range(1..))]
+    history_bytes: Option<u64>,
 }
 
 #[derive(Subcommand)]
@@ -97,6 +118,28 @@ enum ReportsCommand {
 }
 
 impl Cli {
+    /// History and retention flags. `--history-dir` resolves from the
+    /// invocation directory, like `--log-dir`.
+    fn history_overrides(&self) -> Result<config::HistoryOverrides> {
+        let history_dir = match &self.history_dir {
+            Some(dir) => Some(std::env::current_dir()?.join(dir)),
+            None => None,
+        };
+        Ok(config::HistoryOverrides {
+            history: if self.no_history {
+                Some(false)
+            } else if self.history || history_dir.is_some() {
+                Some(true)
+            } else {
+                None
+            },
+            history_dir,
+            log_runs: self.log_runs,
+            history_runs: self.history_runs,
+            history_bytes: self.history_bytes,
+        })
+    }
+
     fn workflow(&self) -> Option<&str> {
         match &self.command {
             Some(
@@ -212,6 +255,12 @@ async fn run(cli: &Cli, output: &mut Output, cancel: watch::Receiver<Option<i32>
             (cli.no_fail_fast, "--no-fail-fast"),
             (!cli.jobs.is_empty(), "--jobs"),
             (cli.log_dir.is_some(), "--log-dir"),
+            (cli.history, "--history"),
+            (cli.no_history, "--no-history"),
+            (cli.history_dir.is_some(), "--history-dir"),
+            (cli.log_runs.is_some(), "--log-runs"),
+            (cli.history_runs.is_some(), "--history-runs"),
+            (cli.history_bytes.is_some(), "--history-bytes"),
         ] {
             if set {
                 anyhow::bail!("{flag} cannot be used with reports upload");
@@ -221,6 +270,7 @@ async fn run(cli: &Cli, output: &mut Output, cancel: watch::Receiver<Option<i32>
         return reporting::replay::upload(run_directory, output, cancel, budget).await;
     }
     let (document, _) = Config::load(cli.config.as_deref())?;
+    let history_cli = cli.history_overrides()?;
     let profile = cli.env.as_deref();
     // Report an unknown --env before the --jobs check for all-workflow commands;
     // workflow() repeats this lookup.
@@ -260,7 +310,7 @@ async fn run(cli: &Cli, output: &mut Output, cancel: watch::Receiver<Option<i32>
         for name in document.workflow_names() {
             let (_, config) = document.workflow(Some(&name), profile)?;
             total += config.jobs.len();
-            workflows.push(json!({"name":name, "jobs":config.jobs.len(), "selected_jobs":config.jobs.iter().map(|j| &j.name).collect::<Vec<_>>(), "requested_jobs":[], "total_defined_jobs":config.jobs.len(), "settings":config.settings.resolve(cli.parallelism, fail_fast_override)?}));
+            workflows.push(json!({"name":name, "jobs":config.jobs.len(), "selected_jobs":config.jobs.iter().map(|j| &j.name).collect::<Vec<_>>(), "requested_jobs":[], "total_defined_jobs":config.jobs.len(), "settings":config.settings.resolve(cli.parallelism, fail_fast_override, &history_cli)?}));
         }
         output.emit(if list_workflows {
             json!({"type":"workflows", "workflows":workflows, "default_workflow":document.default_workflow()})
@@ -276,7 +326,7 @@ async fn run(cli: &Cli, output: &mut Output, cancel: watch::Receiver<Option<i32>
     config.select(&cli.jobs)?;
     let settings = config
         .settings
-        .resolve(cli.parallelism, fail_fast_override)?;
+        .resolve(cli.parallelism, fail_fast_override, &history_cli)?;
     match cli.command.as_ref() {
         Some(Commands::Validate { .. }) => {
             output
@@ -297,10 +347,16 @@ async fn run(cli: &Cli, output: &mut Output, cancel: watch::Receiver<Option<i32>
     }
     let parallelism = settings.parallelism;
     let fail_fast = settings.fail_fast;
+    // One identity names the log run directory, the history file and the
+    // reporting workflow_run_id. The host is sampled at run start too.
+    let identity = retention::RunIdentity::new();
+    let host = history::Host::current();
+    let graph_sha256 = history::graph_sha256(&config.jobs);
     let mut session = match &config.reporting {
         Some(reporting) => Some(
             reporting::Session::start(
                 reporting,
+                &identity.id,
                 &name,
                 cli.env.as_deref(),
                 &config.jobs,
@@ -310,17 +366,34 @@ async fn run(cli: &Cli, output: &mut Output, cancel: watch::Receiver<Option<i32>
         ),
         None => None,
     };
-    let options = Options {
+    // The commit and dirty state the run started from, for history only.
+    // Reuse the reporting session's capture rather than running git twice.
+    let source = if settings.history {
+        match session.as_ref().and_then(reporting::Session::source) {
+            Some(source) => Some(source.clone()),
+            None => Some(
+                reporting::capture_source(
+                    &settings.workdir,
+                    config.reporting.as_ref().map(|r| r.token_env.as_str()),
+                )
+                .await,
+            ),
+        }
+    } else {
+        None
+    };
+    let log_base = cli.log_dir.as_ref().map(|dir| {
+        if legacy_default && name == "default" {
+            dir.clone()
+        } else {
+            dir.join(config::path_component(&name))
+        }
+    });
+    let mut options = Options {
         parallelism,
         fail_fast,
         workdir: settings.workdir,
-        log_dir: cli.log_dir.as_ref().map(|dir| {
-            if legacy_default && name == "default" {
-                dir.clone()
-            } else {
-                dir.join(config::path_component(&name))
-            }
-        }),
+        log_dir: None,
         output: output.clone(),
         reporting: session
             .as_ref()
@@ -333,9 +406,30 @@ async fn run(cli: &Cli, output: &mut Output, cancel: watch::Receiver<Option<i32>
     if let Some(session) = &session {
         session.announce(output).await;
     }
+    // Held until this function returns, so a concurrent prune skips this run.
+    let _log_run = match &log_base {
+        Some(base) => match retention::LogRun::create(base, &identity.stem, settings.log_runs) {
+            Ok((log_run, pruned)) => {
+                if let Some(error) = pruned {
+                    eprintln!("goodflows: warning: {error:#}");
+                }
+                options.log_dir = Some(log_run.dir.clone());
+                Some(log_run)
+            }
+            Err(error) => {
+                if let Some(session) = &mut session {
+                    session.abort();
+                }
+                return Err(error);
+            }
+        },
+        None => None,
+    };
+    // After log setup and pruning: `duration_ms` runs from just before
+    // `runner::execute` until the summary, and `execute_ms` until it returns.
     let run_start = std::time::Instant::now();
-    let results = match runner::execute(&config.jobs, &options, cancel.clone()).await {
-        Ok(results) => results,
+    let execution = match runner::execute(&config.jobs, &options, cancel.clone()).await {
+        Ok(execution) => execution,
         Err(error) => {
             if let Some(session) = &mut session {
                 session.abort();
@@ -343,6 +437,8 @@ async fn run(cli: &Cli, output: &mut Output, cancel: watch::Receiver<Option<i32>
             return Err(error);
         }
     };
+    let execute_ms = run_start.elapsed().as_millis() as u64;
+    let results = execution.results;
     // Reporting runs after every job finished and before the summary, which stays last.
     if let Some(session) = &mut session {
         session.finish(&results, cancel.clone(), output).await;
@@ -351,23 +447,59 @@ async fn run(cli: &Cli, output: &mut Output, cancel: watch::Receiver<Option<i32>
     let success = results
         .iter()
         .all(|r| matches!(r.status, Status::Passed | Status::Skipped));
-    // `started` is projected only here; live job_finished events never carry it.
-    let summary_results: Vec<_> = results
-        .iter()
-        .map(|result| {
-            let mut value = json!(result);
-            value["started"] = json!(result.started);
-            value
-        })
-        .collect();
+    // `started` and the optimizer fields are projected only here; live
+    // job_finished events never carry them.
+    let summary_results: Vec<_> = results.iter().map(runner::JobResult::summary).collect();
     let mut summary = json!({"type":"summary", "success":success, "passed":count(Status::Passed), "failed":count(Status::Failed), "timed_out":count(Status::TimedOut), "skipped":count(Status::Skipped), "cancelled":count(Status::Cancelled), "results":summary_results});
     if let Some(dir) = &options.log_dir {
         // A non-UTF-8 path cannot be a JSON string; show it lossily.
         summary["log_dir"] = json!(dir.to_string_lossy());
     }
     summary["duration_ms"] = json!(run_start.elapsed().as_millis() as u64);
-    // One snapshot decides both the report's outcome and the exit code.
+    summary["execute_ms"] = json!(execute_ms);
+    // One snapshot decides the outcome in the history file and the summary,
+    // the report header and the exit code.
     let signal = *cancel.borrow();
+    let fields = history::RunFields {
+        run_id: identity.id.clone(),
+        started_at: identity.started_at.clone(),
+        outcome: history::outcome(&results, signal.is_some()),
+        parallelism,
+        graph_sha256,
+        max_in_flight: execution.max_in_flight,
+        host,
+    };
+    if let serde_json::Value::Object(run_fields) = json!(fields) {
+        for (key, value) in run_fields {
+            summary[key] = value;
+        }
+    }
+    if settings.history {
+        let target = history::HistoryTarget {
+            dir: &settings.history_dir,
+            // Legacy top-level jobs record under `default`, which is their workflow name.
+            workflow: &name,
+            environment: cli.env.as_deref(),
+            requested_jobs: &cli.jobs,
+            source: source.as_ref(),
+            stem: &identity.stem,
+            runs: settings.history_runs,
+            bytes: settings.history_bytes,
+            workdir: &options.workdir,
+            log_dir: options.log_dir.as_deref(),
+        };
+        // History covers the jobs only, not reporting uploads after them.
+        match history::write(&target, &fields, execute_ms, &results) {
+            Ok(written) => {
+                // A prune failure still leaves the new file in place.
+                if let Some(error) = written.pruned {
+                    eprintln!("goodflows: warning: run history: {error:#}");
+                }
+                summary["history_file"] = json!(written.path.to_string_lossy());
+            }
+            Err(error) => eprintln!("goodflows: warning: run history: {error:#}"),
+        }
+    }
     let config_path = cli.config.as_ref().map(|path| path.to_string_lossy());
     output
         .emit_summary(summary, config_path.as_deref(), signal.is_some())
@@ -401,4 +533,66 @@ fn cancellation() -> Result<Cancellation> {
         notify.send_replace(Some(2));
     });
     Ok((sender, receiver))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> std::result::Result<Cli, clap::Error> {
+        Cli::try_parse_from(std::iter::once("goodflows").chain(args.iter().copied()))
+    }
+
+    fn overrides(args: &[&str]) -> config::HistoryOverrides {
+        parse(args).unwrap().history_overrides().unwrap()
+    }
+
+    #[test]
+    fn history_flags_parse_into_overrides() {
+        let none = overrides(&["run"]);
+        assert_eq!(none.history, None);
+        assert!(none.history_dir.is_none());
+        assert_eq!(overrides(&["--history"]).history, Some(true));
+        assert_eq!(overrides(&["--no-history"]).history, Some(false));
+        let dir = overrides(&["--history-dir", "runs"]);
+        assert_eq!(dir.history, Some(true));
+        assert_eq!(
+            dir.history_dir,
+            Some(std::env::current_dir().unwrap().join("runs"))
+        );
+        // --no-history beats --history-dir.
+        assert_eq!(
+            overrides(&["--history-dir", "runs", "--no-history"]).history,
+            Some(false)
+        );
+        let caps = overrides(&[
+            "--log-runs",
+            "2",
+            "--history-runs",
+            "3",
+            "--history-bytes",
+            "4",
+        ]);
+        assert_eq!(
+            (caps.log_runs, caps.history_runs, caps.history_bytes),
+            (Some(2), Some(3), Some(4))
+        );
+    }
+
+    #[test]
+    fn history_flags_reject_conflicts_and_zero_caps() {
+        let error = parse(&["--history", "--no-history"]).err().unwrap();
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+        for flag in ["--log-runs", "--history-runs", "--history-bytes"] {
+            let error = parse(&[flag, "0"]).err().unwrap();
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::ValueValidation,
+                "{flag}"
+            );
+            assert!(parse(&[flag, "1"]).is_ok(), "{flag}");
+        }
+        // No upper bound on the byte cap.
+        assert!(parse(&["--history-bytes", "18446744073709551615"]).is_ok());
+    }
 }

@@ -1,0 +1,34 @@
+# Drift guard: runs each reporter's fixture suite and lets goodflows collect
+# the reports. Run it through scripts/check-reporters.sh, which fails when a
+# report is rejected or missing. The suites fail on purpose, so the workflow's
+# own result is ignored. No credentials are set, so nothing is uploaded.
+
+[settings]
+fail_fast = false
+
+[reporting]
+project = "goodflows-reporter-fixtures"
+url_env = "GOODFLOWS_FIXTURE_URL"
+token_env = "GOODFLOWS_FIXTURE_API_KEY"
+
+[[jobs]]
+name = "exunit"
+command = "cd exunit && mix test"
+reports = ["test-timings"]
+
+[[jobs]]
+name = "jest"
+command = "cd jest && npx --no-install jest"
+reports = ["test-timings"]
+
+# Two projects run the same files, and one of them retries a flaky test.
+[[jobs]]
+name = "jest-projects"
+command = "cd jest && npx --no-install jest -c jest.projects.config.js"
+reports = ["test-timings"]
+
+# Jest bails after the first failing file.
+[[jobs]]
+name = "jest-bail"
+command = "cd jest && npx --no-install jest -c jest.bail.config.js"
+reports = ["test-timings"]

@@ -13,16 +13,16 @@ pub mod replay;
 mod source;
 
 use crate::config::{self, Job, Partition, Reporting};
+use crate::fsutil::{dir_builder, real_dir, write_atomic};
 use crate::output::Output;
 use crate::runner::{JobResult, ReportingEnv, ReportingKey, Status};
-use anyhow::{Context, Result};
+use anyhow::Result;
 use collect::{Budget, Collection, Head, JobContext, Sink};
 use publish::{Credentials, Limits};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-pub use source::Source;
+pub use source::{capture as capture_source, Source};
 use std::collections::{BTreeMap, HashMap};
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::watch;
@@ -165,11 +165,6 @@ pub fn job_status(status: Option<Status>) -> &'static str {
     }
 }
 
-/// The server's only accepted `workflow_run_id` spelling.
-pub fn canonical_uuid(id: &str) -> bool {
-    uuid::Uuid::parse_str(id).is_ok_and(|uuid| uuid.hyphenated().to_string() == id)
-}
-
 /// On Linux, stop other processes of the same user from reading this
 /// process's memory or `/proc/<pid>/environ` (which still holds the key the
 /// CLI inherited). The flag is reset by `execve`, so jobs are unaffected.
@@ -181,41 +176,9 @@ pub fn protect_process() {
     }
 }
 
-/// Write a file by atomic replacement so readers never observe partial content.
-pub fn write_atomic(path: &Path, bytes: &[u8], replace: bool) -> Result<()> {
-    let parent = path.parent().context("path has no parent")?;
-    let mut file = tempfile::NamedTempFile::new_in(parent)?;
-    file.write_all(bytes)?;
-    file.as_file().sync_all()?;
-    if replace {
-        file.persist(path)?;
-    } else {
-        file.persist_noclobber(path)?;
-    }
-    Ok(())
-}
-
 pub fn write_manifest(run_dir: &Path, manifest: &Manifest) -> Result<()> {
     let bytes = serde_json::to_vec_pretty(manifest)?;
     write_atomic(&run_dir.join(MANIFEST), &bytes, true)
-}
-
-fn dir_builder(recursive: bool) -> std::fs::DirBuilder {
-    let mut builder = std::fs::DirBuilder::new();
-    builder.recursive(recursive);
-    // Reports, snapshots and acknowledgements are private to the invoking user.
-    #[cfg(unix)]
-    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
-    builder
-}
-
-/// Confirm a path is a real directory, never a symlink to one.
-pub fn real_dir(path: &Path) -> std::io::Result<()> {
-    if std::fs::symlink_metadata(path)?.is_dir() {
-        Ok(())
-    } else {
-        Err(std::io::Error::other("not a real directory"))
-    }
 }
 
 /// Create a private directory, or confirm an existing one is a real directory.
@@ -351,6 +314,8 @@ pub struct Session {
     key: Option<String>,
     run: Option<Run>,
     skipped: Option<&'static str>,
+    /// The source captured for the spool manifest, when one was created.
+    source: Option<Source>,
 }
 
 /// Reporting events are best-effort: a failed write (for example a closed
@@ -360,8 +325,10 @@ async fn emit(output: &Output, event: Value) {
 }
 
 impl Session {
+    /// `run_id` is the invocation's run id, used as the `workflow_run_id`.
     pub async fn start(
         reporting: &Reporting,
+        run_id: &str,
         workflow: &str,
         environment: Option<&str>,
         jobs: &[Job],
@@ -375,6 +342,7 @@ impl Session {
             key: read(&reporting.token_env),
             run: None,
             skipped: None,
+            source: None,
         };
         if session.key.is_some() {
             protect_process();
@@ -383,12 +351,26 @@ impl Session {
         if reporting_jobs.is_empty() {
             return session;
         }
-        let source = source::capture(workdir, &reporting.token_env).await;
-        match create_run(reporting, workflow, environment, &reporting_jobs, source) {
+        let source = source::capture(workdir, Some(&reporting.token_env)).await;
+        session.source = Some(source.clone());
+        match create_run(
+            reporting,
+            run_id,
+            workflow,
+            environment,
+            &reporting_jobs,
+            source,
+        ) {
             Ok(run) => session.run = Some(run),
             Err(_) => session.skipped = Some("spool_unavailable"),
         }
         session
+    }
+
+    /// The source context captured at start, if report-producing jobs made
+    /// the session capture one.
+    pub fn source(&self) -> Option<&Source> {
+        self.source.as_ref()
     }
 
     pub fn runner_env(&self) -> Arc<ReportingEnv> {
@@ -618,6 +600,7 @@ fn grouped_in_index_order(jobs: &[ManifestJob]) -> bool {
 
 fn create_run(
     reporting: &Reporting,
+    id: &str,
     workflow: &str,
     environment: Option<&str>,
     jobs: &[&Job],
@@ -625,7 +608,7 @@ fn create_run(
 ) -> Result<Run> {
     let spool = reporting.spool_dir();
     dir_builder(true).create(spool)?;
-    let id = uuid::Uuid::new_v4().hyphenated().to_string();
+    let id = id.to_owned();
     let dir = spool.join(&id);
     // A non-recursive create fails rather than sharing a directory with another invocation.
     dir_builder(false).create(&dir)?;
@@ -842,21 +825,6 @@ mod tests {
             (None, "unknown"),
         ] {
             assert_eq!(job_status(status), expected);
-        }
-    }
-
-    #[test]
-    fn workflow_run_ids_must_be_canonical_lowercase() {
-        assert!(canonical_uuid("67f7946d-136b-4608-ab01-e1f251a09754"));
-        for bad in [
-            "67F7946D-136B-4608-AB01-E1F251A09754",
-            "67f7946d136b4608ab01e1f251a09754",
-            "{67f7946d-136b-4608-ab01-e1f251a09754}",
-            "urn:uuid:67f7946d-136b-4608-ab01-e1f251a09754",
-            "../67f7946d-136b-4608-ab01-e1f251a09754",
-            "",
-        ] {
-            assert!(!canonical_uuid(bad), "{bad}");
         }
     }
 

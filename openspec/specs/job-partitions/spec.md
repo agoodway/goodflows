@@ -121,7 +121,7 @@ Fail-fast, cancellation, condition and step rules SHALL apply to each instance e
 - **THEN** instances 1 and 3 and every job waiting on `test` are recorded as cancelled
 
 ### Requirement: Output identifies each instance
-Text output SHALL show instances as `<name> (<index>/<count>)`. JSON job and step events and job results for an instance SHALL include `partition: {"index": i, "count": N}`. Events for unpartitioned jobs MUST keep their current shape. With a log directory, each instance SHALL write its own stdout and stderr log files. JSON run summary counts and the `run_started` job count SHALL count instances. The text run report SHALL count configured jobs and show a partitioned job as one row, as specified by `run-report`.
+Text output SHALL show instances as `<name> (<index>/<count>)`. JSON job and step events and job results for an instance SHALL include `partition: {"index": i, "count": N}`. Events for unpartitioned jobs MUST keep their current shape. With a log directory, each instance SHALL write its own stdout and stderr log files inside that invocation's run directory, as specified by `run-logs`. A later run MUST NOT truncate a run directory that retention still keeps. JSON run summary counts and the `run_started` job count SHALL count instances. The text run report SHALL count configured jobs and show a partitioned job as one row, as specified by `run-report`.
 
 #### Scenario: Text output
 - **WHEN** instance 2 of `test` with 3 partitions starts in text mode
@@ -137,7 +137,7 @@ Text output SHALL show instances as `<name> (<index>/<count>)`. JSON job and ste
 
 #### Scenario: Separate logs
 - **WHEN** a 3-partition job runs with `--log-dir`
-- **THEN** three distinct stdout logs and three distinct stderr logs are written, named with the zero-padded partition index (for example `002-test.p01.stdout.log`), none overwriting another
+- **THEN** three distinct stdout logs and three distinct stderr logs are written inside that run's directory, named with the zero-padded partition index (for example `002-test.p01.stdout.log`), none overwriting another
 
 #### Scenario: Summary counts instances
 - **WHEN** a workflow has `compile` and a 3-partition `test`, everything passes, and the CLI runs with `--json`
@@ -146,6 +146,10 @@ Text output SHALL show instances as `<name> (<index>/<count>)`. JSON job and ste
 #### Scenario: Text report counts configured jobs
 - **WHEN** a workflow has `compile` and a 3-partition `test`, everything passes, and the CLI runs in text mode
 - **THEN** the run report shows one row for `compile`, one row for `test`, and counts 2 passed
+
+#### Scenario: Later run keeps instance logs
+- **WHEN** a 3-partition job runs twice with `--log-dir` and `log_runs` at least 2
+- **THEN** the first run's six log files remain in their original directory and the second run writes six files in a different directory
 
 ### Requirement: Inspection shows partition configuration
 `goodflows list` SHALL show each partitioned job's effective partition count and strategy, in text and in the JSON `jobs` event, without running commands. The effective count is the job's declared count, replaced by the selected profile when that profile sets the job. `goodflows validate` and `goodflows list` defined-job and selected-job counts SHALL keep counting configured jobs, not instances.

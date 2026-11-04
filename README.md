@@ -261,6 +261,8 @@ node --test tests/amp-plugin.test.mjs
 parallelism = 4       # Maximum running jobs; 0 or omitted = logical CPU count
 fail_fast = true      # Default, including when [settings] is omitted
 workdir = "."        # Relative to the config file's directory; absolute paths work
+history = false       # Opt-in run history files (see Run history)
+log_runs = 10         # --log-dir run directories kept per workflow
 
 [settings.env]        # Command environment defaults inherited by every job
 CARGO_TERM_COLOR = "always"
@@ -332,7 +334,10 @@ the caller's environment.
 Without `--config`, goodflows looks in the current directory for `goodflows.toml`, then
 `.goodflows.toml`. Commands default to that file's directory. A configured relative
 `workdir` is also resolved from that directory, regardless of where you invoke
-goodflows. `--log-dir` is resolved from the invocation directory.
+goodflows. `--log-dir` is resolved from the invocation directory. A configured
+`history_dir` (and the default `goodflows-history`) resolves from the config file's
+directory, while `--history-dir` resolves from the invocation directory like
+`--log-dir` (see [Run history](#run-history)).
 
 The whole config is validated before any command runs—even when selecting a subset.
 Unknown fields, duplicate/empty names, empty commands, missing or duplicate
@@ -657,8 +662,8 @@ workflow. Without `--env`, no profile is applied; goodflows does not detect the
 machine or read an environment variable to select one. The Amp plugin likewise
 uses no environment profile.
 
-Each profile can override `parallelism`, `fail_fast`, `workdir`, and `env` under
-`settings`, and the counts of partitioned jobs under `partitions` (see
+Each profile can override `parallelism`, `fail_fast`, `workdir`, `env`, `history`,
+`history_dir`, `log_runs`, `history_runs`, and `history_bytes` under `settings`, and the counts of partitioned jobs under `partitions` (see
 [Profile partition counts](#profile-partition-counts)). Omitted fields
 inherit independently, with precedence **CLI overrides > environment settings >
 workflow settings > shared settings > built-in defaults**. Explicit `false` and
@@ -675,8 +680,14 @@ Goodflows sets that variable itself, so job, step, and settings `env` cannot. A 
 Unknown profile names fail with the available names before jobs run. Names follow
 the same case-sensitive, nonempty, 64-byte, no-control-character rules as workflow
 names. Every declared profile, including its workdir, is validated even when not
-selected. `--env` works with run, list, and validate, but not init. Log paths stay
-unchanged; use separate `--log-dir` values to retain logs from different profiles.
+selected. `--env` works with run, list, and validate, but not init. The profile does
+not change the log layout: with `--log-dir`, every run writes a new per-run directory
+under the workflow's log directory, and each run then prunes that whole directory to
+the newest `log_runs` runs, whichever profile produced them, using the cap of the run
+doing the prune (see [Logs and machine output](#logs-and-machine-output)). A profile's
+`log_runs` therefore does not reserve room for that profile's runs; to keep one
+profile's runs apart, give it its own `--log-dir`. History retention works the same way
+per workflow history directory (see [Run history](#run-history)).
 
 Human output identifies the selected environment. JSON events include
 `environment` when `--env` is supplied and omit it otherwise. Selected-workflow
@@ -806,9 +817,12 @@ queued work and emits a final summary.
 
 ## Test timing reports
 
-goodflows can publish per-test timing reports (the `exunit-timings` JSONL format)
-to GoodFlows. Reporting is opt-in: configs without a `[reporting]` block behave
-exactly as before, create no spool directory, and make no network requests.
+goodflows can publish per-test timing reports (the runner-neutral
+`test-timings/1` JSON Lines format) to GoodFlows. Reporting is opt-in: configs
+without a `[reporting]` block behave exactly as before, create no spool
+directory, and make no network requests. goodflows ships reporters for
+[ExUnit and Jest](#test-reporters); any other runner can produce the
+[format](#the-test-timings1-contract) directly.
 
 ```toml
 [reporting]
@@ -820,7 +834,7 @@ spool_dir = ".goodflows/reports" # Default; relative to this config file's direc
 [[jobs]]
 name = "test"
 command = "mix test.parallel"
-reports = ["exunit-timings"]
+reports = ["test-timings"]
 ```
 
 - `project` must be 1-64 bytes matching `[a-z0-9][a-z0-9_-]*`. It is the slug of a
@@ -838,9 +852,12 @@ reports = ["exunit-timings"]
 - `spool_dir` is resolved against the config file's directory, independent of
   `workdir` and of where goodflows is invoked. Add it to your project's
   `.gitignore` (for the default, `/.goodflows/`).
-- `reports` currently supports only `exunit-timings`. Unknown or duplicate formats,
-  `reports` without a `[reporting]` block, and reporting job names longer than 64
-  UTF-8 bytes or containing control characters are validation errors.
+- `reports` currently supports only `test-timings`, which names the format
+  family: reports are collected as the version this goodflows defines
+  (`test-timings/1`). Unknown or duplicate formats (including the retired
+  `exunit-timings`), `reports` without a `[reporting]` block, and reporting job
+  names longer than 64 UTF-8 bytes or containing control characters are
+  validation errors.
 - `GOODFLOWS_RUN_ID` and `GOODFLOWS_REPORT_DIR` are reserved: setting either in any
   job, step, or settings `env` is a validation error. `url_env` and `token_env` must
   differ and must not name a reserved variable (`GOODFLOWS_RUN_ID`,
@@ -938,18 +955,28 @@ so when the instances together exceed a cap the highest-numbered instances lose
 reports first: two instances with 130 reports each collect 130 and 126),
 100,000 records and 32 MiB encoded per report. Source files over 33 MiB are
 rejected (`request_too_large`) without being parsed, and each valid report is
-frozen as soon as it is built, so only one report body is held in memory. An invalid final unterminated line
-(for example a worker killed mid-write) is dropped and the report is sent with
-`truncated: true`; an invalid earlier line, a disallowed field, mismatched
-suite/report identities, an invalid partition, U+0000, an oversized field, a
-duplicate object key, nesting deeper than the server's 16-level body limit, a
-number with a fraction or exponent (or an integer above 2^53-1), a filter tag
-that is not an identifier (1 to 128 bytes of ASCII letters, digits, `.`, `_` or
-`-`, starting with a letter or digit), a non-boolean filter value, a `filters`
-that is not an object holding both `include` and `exclude` as arrays, either
-list longer than 256 entries, or a `report_id` reused by two reports in the same job (including
+frozen as soon as it is built, so only one report body is held in memory. An
+invalid final unterminated line (for example a worker killed mid-write) is
+dropped and the report is sent with `truncated: true`; an invalid earlier line
+rejects the report. Every record is then validated in full against the
+[contract](#the-test-timings1-contract) before anything is frozen, so a frozen
+snapshot is one the server accepts: unknown events or keys, missing core keys,
+wrong types, mismatched suite/report identities, an invalid partition, invalid
+`meta`, an unpaired or duplicated started/finished event, unfinished counts that
+disagree with the records, U+0000, an oversized field, a duplicate object key,
+nesting deeper than the 16-level body limit, a number with a fraction or
+exponent (or an integer beyond ±(2^53-1)), a filter that breaks the tag
+grammar, or a `report_id` reused by two reports in the same job (including
 across its instances, which rejects every copy as `duplicate_report_id`) rejects
-that report locally. A snapshot that cannot be written is counted as
+that report locally. The codes are `unsupported_format`, `unsupported_event`,
+`unsupported_field`, `missing_field`, `invalid_field`, `field_too_long`,
+`invalid_order`, `identity_mismatch`, `invalid_identifier`,
+`invalid_partition`, `invalid_partition_count`, `unsupported_filter`,
+`invalid_meta`, `unpaired_event`, `unfinished_mismatch`, `duplicate_key`,
+`nul_character`, `non_integer_number`, `integer_out_of_range`,
+`nested_too_deeply`, `malformed_record`, `invalid_utf8`, `empty_report` and
+`missing_suite_started`, plus `too_large`, `record_limit` and
+`request_too_large` for limits. A snapshot that cannot be written is counted as
 `snapshot_write_failed` (and, if it was also a duplicate, only as that). Each
 rejected file is counted under exactly one code, except that a rejected
 duplicate whose already-frozen snapshot cannot be removed is also counted as
@@ -957,18 +984,110 @@ duplicate whose already-frozen snapshot cannot be removed is also counted as
 file (it is never listed in the manifest or sent). Only regular files that were
 read count toward the 256-report limit. Rejections appear only as codes and
 counts in `reports_collected.rejected`; source files are never modified and
-record contents are never printed.
+record contents are never printed. A signal that arrives while reports are
+being collected stops collection between files (`collection_interrupted`).
 
-The field and event allowlists, the limits and the identifier grammar shared by
-suite ids, report ids and filter tags mirror the GoodFlows server contract and
-live in one versioned module (`src/reporting/contract.rs`), currently the
-GoodFlows change `2026-11-01-generalize-test-report-filters`. An older server
-accepts only five filter tags, so it permanently rejects (422) a report with
-any other tag. A report using vocabulary a newer server accepts but this goodflows does
-not know (for example a new event or field) is rejected locally and is not
-replayable; upgrade goodflows before producers emit new vocabulary. A signal
-that arrives while reports are being collected stops collection between files
-(`collection_interrupted`).
+### The `test-timings/1` contract
+
+goodflows owns the contract: the field tables, limits and identifier grammar
+live in one versioned module (`src/reporting/contract.rs`, contract version
+`generalize-test-timings`) and the
+[`test-timing-contract` spec](openspec/specs/test-timing-contract/spec.md),
+and the GoodFlows server mirrors them. In short:
+
+- A report is JSON Lines. Every record has `event`, `suite_id`, `report_id`
+  (identifiers: 1-128 bytes of `[A-Za-z0-9._-]`, starting with a letter or
+  digit, equal in every record) and `received_offset_us`, and may have `meta`.
+- Events are `suite_started` (first, and only first), `group_started`,
+  `group_finished`, `test_started`, `test_finished`, `interrupted`,
+  `max_failures_reached` and `suite_finished` (last, when present). Each event
+  carries all of its core keys (nullable ones as `null`) and nothing else.
+- `suite_started` has `format: "test-timings/1"`, `started_at`, `runner`
+  (`{name, version}`), `partition`, `partition_count`, `seed` and `filters`
+  (`null`, or boolean identifier tags in `include` and `exclude`).
+- A *group* is the runner's scheduling unit (an ExUnit module, a Jest file):
+  `group`, `file`, `execution_id`, `started_offset_us`, plus `duration_us`,
+  `outcome` and `counts` when finished. A *test* has `group`, `path` (describe
+  blocks, outermost first), `name`, `file`, `line`, `execution_id` and
+  `started_offset_us`, plus `duration_us` and `outcome` when finished. A
+  finished event repeats its started event's core values exactly.
+- Outcomes are `passed`, `failed`, `skipped` and `errored`. Times are integer
+  microseconds. `suite_finished` has `aborted`, `unfinished_tests`,
+  `unfinished_groups` (which must equal the started events left unfinished),
+  `counts` and `duration_us`.
+- `meta` holds runner-specific details: at most 32 identifier keys whose values
+  are null, booleans, safe integers or strings of at most 256 bytes. It never
+  holds logs, failure messages, assertion values or stack traces.
+
+### Test reporters
+
+goodflows maintains two zero-dependency reporters in `reporters/`, released in
+lockstep with the CLI (each reporter's version equals the goodflows version) and
+published on every release tag to read-only mirrors. The reporters ship starting
+with goodflows v0.6.0, the first release that contains them; earlier goodflows
+tags have no reporter tag. Pin the mirror tag equal to your goodflows version
+(v0.6.0 or later):
+
+- **ExUnit** (Elixir `~> 1.18`), from
+  [`agoodway/goodflows-exunit-reporter`](https://github.com/agoodway/goodflows-exunit-reporter):
+
+  ```elixir
+  # mix.exs
+  {:goodflows_exunit_reporter,
+   github: "agoodway/goodflows-exunit-reporter", tag: "v0.6.0", only: :test}
+  ```
+
+  ```elixir
+  # test/test_helper.exs
+  ExUnit.start()
+  Goodflows.ExUnitReporter.configure()
+  ```
+
+- **Jest** (Jest 29.6 or newer, Node.js 18 or newer), from
+  [`agoodway/goodflows-jest-reporter`](https://github.com/agoodway/goodflows-jest-reporter):
+
+  ```json
+  "devDependencies": {
+    "goodflows-jest-reporter": "github:agoodway/goodflows-jest-reporter#v0.6.0"
+  }
+  ```
+
+  ```js
+  // jest.config.js
+  module.exports = { reporters: ['default', 'goodflows-jest-reporter'] };
+  ```
+
+Both write each run to a new `<report_id>.jsonl` in `GOODFLOWS_REPORT_DIR` when
+goodflows runs them, take their partition from `GOODFLOWS_PARTITION` and
+`GOODFLOWS_PARTITION_COUNT` when both are valid (otherwise the runner's own
+partitioning, when it is complete, otherwise `null` and `1`), and take their
+suite id from the reporter's option, then `TEST_TIMING_SUITE_ID`, then
+`GOODFLOWS_RUN_ID` (so every report of one goodflows run shares it), then the
+report id. Each `suite_started.meta` names the reporter (`reporter`,
+`reporter_version`) and says whether the run was `filtered` by name, tag or
+path. A reporter's own directory option (`:test_timing_directory`,
+`outputDirectory`) wins over `GOODFLOWS_REPORT_DIR`; because goodflows then
+cannot collect the report, the reporter prints a warning when both are set and
+differ, so leave the option unset in goodflows jobs. See each reporter's README
+for its options, mapping and duration semantics. Changes go to this repository;
+CI (and every release, before publishing) runs both reporters over fixture
+suites with Jest at its minimum peer version and the latest, and fails if
+goodflows rejects any report they write, if a report is truncated, or if its
+outcomes and counts differ from the fixture's (`scripts/check-reporters.sh`).
+
+### Upgrading from `exunit-timings`
+
+- Change `reports = ["exunit-timings"]` to `reports = ["test-timings"]`, and
+  replace a copied `GC.TestTimingFormatter` with the ExUnit reporter (see [Test
+  reporters](#test-reporters); the suite option is now `:test_timing_suite_id`
+  and `TEST_TIMING_SUITE_ID`). Until you do, validation fails with "format
+  'exunit-timings' was retired", which links here.
+- The GoodFlows server must support `test-timings/1` before you upload with this
+  version. Until it does, uploads are rejected (`rejected_by_server`); delete the
+  matching `acks/NNN.rejected.json` files to resend them once it does.
+- Pending snapshots frozen in the old format are never sent: `reports upload`
+  counts each as `invalid_snapshot` and exits nonzero. Their raw JSONL stays on
+  disk.
 
 ### Spool layout and retention
 
@@ -1028,11 +1147,9 @@ different instances, is not sent at all: every copy is reported as
 Replay a run with the goodflows version that wrote it or a newer one: an older
 goodflows refuses a version 2 manifest with an unsupported-version error. The
 same rule covers snapshot contents, because every snapshot is re-validated
-against the replaying goodflows's contract before it is sent: an older goodflows
-refuses (`invalid_snapshot`) a snapshot with a filter tag outside its five-name
-list, and a newer one refuses a snapshot its rules no longer accept (for example
-one frozen without both `filters.include` and `filters.exclude`, or with a filter
-list over 256 entries). A refused
+against the replaying goodflows's contract before it is sent: a newer goodflows
+refuses (`invalid_snapshot`) a snapshot its rules no longer accept, such as one
+frozen in the retired `exunit-timings` format. A refused
 snapshot is never sent; its raw JSONL stays in `reports/`. Because the manifest chooses which of your
 environment variables become the endpoint and key, only replay run directories
 produced by your own invocations. It does
@@ -1081,20 +1198,54 @@ Optionally save raw stdout and stderr separately:
 goodflows --log-dir .goodflows-logs
 ```
 
+Each invocation writes its logs in a new run directory named
+`YYYYMMDDTHHMMSSZ-<run-id>`: the run's UTC start second and a lowercase UUID run id
+(the same id names the run's history file and, when reporting is configured, is the
+reporting `workflow_run_id`). Named workflows keep their own subdirectory, so
+workflow `ci` writes `.goodflows-logs/ci/20261104T093000Z-<run-id>/001-fmt.stdout.log`;
+legacy top-level jobs write `.goodflows-logs/20261104T093000Z-<run-id>/001-fmt.stdout.log`
+(no `default/` subdirectory). Besides the logs, the run directory holds only
+`.goodflows.lock`, which the run locks for as long as it runs.
+
 Files use indexed, sanitized job names such as `001-fmt.stdout.log` and
-`001-fmt.stderr.log`. Named workflows get their own subdirectory, for example
-`.goodflows-logs/ci/001-fmt.stdout.log`. Each instance of a partitioned job writes
+`001-fmt.stderr.log`, with raw stdout and stderr bytes (including output from shell
+conditions and every step) and no prefixes or timestamps. An instance that never
+starts creates no files. Each instance of a partitioned job writes
 its own pair of files, with the partition index zero-padded to two digits after the
 job name so instance logs sort in index order: a 3-partition `test` at position 2 in
 the selected job list writes `002-test.p01.stdout.log` through
 `002-test.p03.stdout.log` and the matching `.stderr.log` files. Workflow names are encoded as safe path
 components: lowercase ASCII letters, digits, `_`, and `-` remain unchanged;
 other UTF-8 bytes are percent-encoded (including uppercase letters, avoiding
-collisions on case-insensitive filesystems). Legacy top-level jobs keep their
-existing flat log paths. Indexes follow the selected jobs' config order; files from
-the same selection are overwritten on subsequent runs. Use a fresh directory for
-each run to keep historical logs. Add your log directory to your project's
-`.gitignore` if desired.
+collisions on case-insensitive filesystems). Indexes follow the selected jobs'
+config order.
+
+A later run never truncates an earlier run's files. After creating its run
+directory, goodflows keeps the newest `log_runs` run directories (default 10,
+minimum 1) in that workflow's log directory, by name, and deletes older ones. That
+count covers every run in the directory, whichever profile produced it, and uses the
+cap of the run doing the prune; to keep one profile's runs apart, give it its own
+`--log-dir`. The
+new directory is never deleted, nor is one whose run is still active (its lock is
+held; a run builds its directory as `.<name>.tmp` and renames it only once locked),
+so overlapping runs sharing `--log-dir` can briefly exceed the cap. A run directory
+whose lock file exists but cannot be opened is kept and reported. A leftover
+`.<name>.tmp` directory from a crash during setup is an unrelated name and stays. A run that
+crashed still counts toward the cap. Prune removes only names matching the run
+directory pattern and never follows or removes a symlink; other files stay. Set
+`log_runs` in shared, workflow, or profile `settings`, or pass `--log-runs N`
+(precedence: CLI, profile, workflow, shared, default). It has no effect without
+`--log-dir`. Failing to create the run directory fails the run before jobs start;
+a prune failure is reported on stderr and does not change the exit code. An entry
+a concurrent run already deleted counts as pruned. Directories goodflows creates for
+logs are private to the invoking user (mode 0700), and each log file is created new
+with mode 0600, never following or truncating an existing entry.
+
+**Compatibility:** earlier versions wrote flat files such as
+`.goodflows-logs/001-fmt.stdout.log` and overwrote them on every run. Those paths now
+sit one directory deeper, and `summary.log_dir` names the run directory. Old flat
+files are left in place (they do not match the run directory pattern); delete them
+by hand. Add your log directory to your project's `.gitignore`.
 
 For agents and CI integrations:
 
@@ -1138,14 +1289,20 @@ report counts configured jobs instead, so the same run reads `2 passed`.
 
 The final `summary` contains `success`, counts for every status (`passed`,
 `failed`, `timed_out`, `skipped`, `cancelled`), integer `duration_ms` (the run's
-wall-clock time, including reporting), `log_dir` (the effective log directory,
-including a named workflow's subdirectory; present only with `--log-dir`), and
-`results` in config order, with a partitioned job's instances in index order at its
+wall-clock time, including reporting), integer `execute_ms` (the part spent running
+jobs, excluding reporting after them), `log_dir` (this run's log directory, such as
+`logs/ci/20261104T093000Z-<run-id>`; present only with `--log-dir`, and converted
+lossily when the path is not UTF-8), the optimizer fields described in
+[Run history](#run-history) (`run_id`, `started_at`, `outcome`, `parallelism`,
+`graph_sha256`, `max_in_flight`, `host`, and `history_file` when a history file was
+written), and `results` in config order, with a partitioned job's instances in index order at its
 position. Each result contains `name`, `command`, `status`, `duration_ms`,
 nullable `exit_code`, nullable `error`, and `outputs`. Summary results also carry
 boolean `started`: true when the instance entered execution (including one a
 condition then skipped), false when it was skipped or cancelled while still
-queued. `started` appears only in `summary.results`, never in `job_finished`. Stepped jobs additionally
+queued. Summary results also carry `blocked_ms`, `queued_ms` and, when a process
+was spawned, `commands` (see [Run history](#run-history)). `started` and these
+fields appear only in `summary.results`, never in `job_finished`. Stepped jobs additionally
 include `steps` in config order, each with `id`, `command`, `status`, `duration_ms`,
 nullable `exit_code`, nullable `error`, and `outputs`. Their job-level `command` is
 null unless a step failed, in which case it identifies that step's command.
@@ -1180,7 +1337,7 @@ every job and reporting line. A failed `job_finished` line shows only its status
 duration, exit code and error; the command and output tails appear once, in the
 report. For a config with top-level `[[jobs]]` `fmt`, `lint`, a 2-partition `test`
 that fails and a dependent `deploy`, run with `--log-dir logs` (a named workflow
-shows its subdirectory, such as `Logs: logs/ci`):
+shows its subdirectory, such as `Logs: logs/ci/20261104T093000Z-<run-id>`):
 
 ```text
 default  FAILED  in 207ms
@@ -1203,7 +1360,7 @@ Failures
   stderr tail:
     boom-2
 
-Logs: logs
+Logs: logs/20261104T093000Z-67f7946d-136b-4608-ab01-e1f251a09754
 Rerun failed: goodflows run default --jobs='test,deploy'
 ```
 
@@ -1227,7 +1384,9 @@ Rerun failed: goodflows run default --jobs='test,deploy'
 - Control characters other than tab in commands, errors, skip reasons and tails are
   shown escaped (for example `\u{1b}`), here and in live failure lines, so job
   output cannot rewrite the report.
-- `Logs:` appears with `--log-dir`. When a job failed or timed out, the report ends
+- `Logs:` appears with `--log-dir` and names this run's log directory. `History:`
+  follows it (or stands alone without `--log-dir`) only when a history file was
+  written. When a job failed or timed out, the report ends
   with a shell-quoted rerun command keeping the workflow, `--env` and an explicitly
   passed `--config`, and selecting the failed jobs plus jobs skipped because a
   dependency did not pass, in row order (`--jobs` adds their dependencies). It does
@@ -1238,7 +1397,168 @@ Rerun failed: goodflows run default --jobs='test,deploy'
 **Compatibility:** the text `Summary: N passed, ...` line and the `All jobs passed`
 and `All checks succeeded (some jobs skipped)` lines were replaced by the run report.
 Scripts should use `--json`, whose `summary` event only gained fields
-(`duration_ms`, `log_dir`, `results[].started`).
+(`duration_ms`, `execute_ms`, `log_dir`, `results[].started`, and the run history
+fields), except
+that `log_dir` now names the per-run log directory.
+
+## Run history
+
+Run history is an opt-in record of every run, small and stable enough to commit, so
+an agent can compare queue wait, CPU time, and memory across commits while tuning
+`parallelism`, partitions, and timeouts. Each run writes one new JSON file for that
+run only; earlier files are never rewritten.
+
+Enable it in shared, workflow, or profile settings, or per run:
+
+```toml
+[settings]
+history = true                  # default false
+history_dir = "goodflows-history" # default; relative to the config file's directory
+history_runs = 1000             # files kept per workflow (default 1000, minimum 1)
+history_bytes = 10485760        # bytes kept per workflow (default 10 MiB, minimum 1)
+log_runs = 10                   # --log-dir run directories kept (default 10, minimum 1)
+
+[environments.local.settings]
+history = false                 # an explicit false beats a lower true
+```
+
+```bash
+goodflows run ci --history                 # enable for this run
+goodflows run ci --no-history              # disable even when settings enable it
+goodflows run ci --history-dir runs        # enable, writing under ./runs
+goodflows run ci --history --history-runs 50 --history-bytes 1048576 --log-runs 3
+```
+
+Precedence is the same as `parallelism`: **CLI > selected profile > workflow > shared >
+default**. `--no-history` forces history off and conflicts with `--history`;
+otherwise `--history` or `--history-dir` turns it on. `--log-runs`, `--history-runs`
+and `--history-bytes` override the resolved settings; `0` is an argument error
+(exit 2) and `0` in a config fails validation. `history_bytes` has no upper bound:
+the 10 MiB value is a default, not a maximum, so set it lower or higher as needed.
+`list` and `validate` (JSON `settings`, and the `History:` lines of human `list`
+output) show the effective `history`, resolved `history_dir`, `log_runs`,
+`history_runs` and `history_bytes` with CLI overrides applied. `validate`, `list`,
+`init` and `reports upload` never write history, and `reports upload` rejects all
+six flags.
+
+**Layout.** A history file is
+`<history dir>/<workflow>/YYYYMMDDTHHMMSSZ-<run-id>.json`, using the same encoded
+workflow component as log directories and the same stem as the run's log directory.
+Legacy top-level jobs record under `default`. The default directory is
+`goodflows-history` beside the config file; a configured `history_dir` resolves from
+the config file's directory, `--history-dir` from the invocation directory, and
+absolute paths are used as given. A symlink at the history directory or the workflow
+directory is refused. Directories goodflows creates there are private to the invoking
+user (mode 0700) and history files have mode 0600; the workflow directory is opened
+once and the file is written and pruned relative to it, so a path swapped for a symlink
+mid-run cannot redirect the write.
+
+**When.** A file is written exactly when the run emits a `summary`, including a run
+cancelled by a signal (its `outcome` is `cancelled`). A run that errors before the
+summary (for example when the log run directory cannot be created) writes none. The
+file is created atomically (written to a `.tmp<random>` file, then linked to its name)
+and never replaces an existing file. A write failure is reported on stderr, leaves the
+exit code unchanged and omits `summary.history_file`. A prune failure after a
+successful write is reported on stderr too, but `summary.history_file` still names the
+new file.
+
+**Retention.** After writing, goodflows deletes the oldest files of that workflow by
+name until at most `history_runs` files and `history_bytes` bytes remain. The caps
+are those of the run doing the prune and cover every file in the workflow directory,
+whichever profile wrote it; to keep one profile's history apart, give it its own
+`history_dir`. The new file is always kept, even when it alone exceeds
+`history_bytes`. Unrelated names, other workflows and symlinks are left alone, except
+that a `.tmp<random>` file older than an hour, left by a crash mid-write, is removed. A
+file a concurrent run already deleted counts as pruned.
+
+**Contents.** Each file is one compact UTF-8 JSON object with a trailing LF:
+
+```json
+{"schema_version":1,"workflow":"ci","environment":"local","requested_jobs":["test"],"run_id":"67f7946d-136b-4608-ab01-e1f251a09754","started_at":"2026-11-04T09:30:00Z","outcome":"passed","duration_ms":2310,"parallelism":4,"graph_sha256":"…","max_in_flight":3,"host":{"os":"linux","arch":"x86_64","logical_cpus":8,"mem_total_bytes":16777216000,"mem_available_bytes":9000000000},"source":{"commit":"0123456789abcdef0123456789abcdef01234567","dirty":false},"results":[{"name":"test","partition":{"index":1,"count":2},"status":"passed","exit_code":0,"command":"mix test","error":null,"duration_ms":1980,"started":true,"blocked_ms":204,"queued_ms":0,"commands":[{"kind":"command","wall_ms":1978,"cpu_user_ms":5120,"cpu_system_ms":610,"peak_rss_bytes":412000000}]}]}
+```
+
+- `outcome` is `failed` if any instance failed or timed out, otherwise `cancelled` if
+  any was cancelled or a signal arrived before the summary, otherwise `passed`. The
+  same snapshot sets `summary.outcome`, the text report header and the exit code.
+- `environment` is the `--env` profile (omitted without one) and `requested_jobs` the
+  `--jobs` selection as given (omitted when every job ran), so runs of different
+  selections are not compared by accident. `source` holds the `commit` the run
+  started from and whether tracked files were `dirty` (the same git capture reporting
+  uses, never the branch or remotes); it is omitted outside a git checkout.
+- `duration_ms` is the time spent running jobs, matching `summary.execute_ms`; it
+  excludes reporting uploads after the last job, which `summary.duration_ms` includes.
+  `parallelism` is the effective value; `max_in_flight` is the most instances
+  executing at once. `host` is sampled at run start, before any job: `os` and `arch`
+  (Rust's names, such as `linux`/`macos` and `x86_64`/`aarch64`) and `logical_cpus`
+  are always present; `mem_total_bytes` and `mem_available_bytes` come from Linux
+  `/proc/meminfo` and are omitted elsewhere.
+- `graph_sha256` hashes the selected jobs (names, commands, dependencies, effective
+  partitions, timeouts, shell flags, conditions and steps), never env values or
+  paths, so equal hashes mean the same job graph.
+- Per instance: `blocked_ms` is the time from the start of scheduling until every
+  dependency passed (or until an earlier skip or cancel); `queued_ms` is the wait
+  after that for a free slot. A job skipped because a dependency failed has `started`
+  false, `queued_ms` 0 and no `commands`.
+- `commands` has one entry per spawned shell condition (`kind` `condition`) or
+  command (`kind` `command`), with the `step` id for steps, `wall_ms`, and, when the
+  platform measures them, `cpu_user_ms`, `cpu_system_ms` and `peak_rss_bytes`. CPU
+  time includes descendants the process waited for; for a timed-out or cancelled
+  command it is a lower bound, because the process group is killed before the shell
+  reaps its children. Peak RSS (Linux only) is the peak of samples of the summed
+  resident memory of the processes still in the command's process group. One sampler
+  serves the whole run, scanning `/proc` once per sample for every running command,
+  on output at most every 50 ms and otherwise every 200 ms; processes that left the
+  group or exited between samples are not counted, and it is omitted (never 0) when no
+  sample saw a live, resident process. macOS records CPU and omits RSS.
+- `command` and `error` are cut to 1024 bytes on a character boundary (the summary
+  keeps them whole). In `error`, wherever it begins a whole path anywhere in the
+  string, the log run directory together with anything below it (including the log
+  filename) becomes `<log>`, and the workdir becomes `<workdir>` (a path below it
+  keeps its tail, as in `<workdir>/src`). Only whole paths match, so workdir
+  `/home/u/proj` leaves `/home/u/proj2/x` and `/x/home/u/proj` alone. Configured
+  command text is stored verbatim.
+- Stdout, stderr, output tails, job and step `outputs`, env values and log filenames
+  are never written. `history_file` appears only on the `summary`.
+
+**Git.** History files are designed to be committed, so a branch carries the
+measurements of its own commits; the log directory and the reporting spool are never
+meant to be. Before committing history, note:
+
+- History files contain configured command text (up to 1 KiB per job) verbatim. If a
+  command inlines a secret instead of reading it from the environment, do not commit
+  history.
+- Prefer enabling history where measurements are comparable, for example in a CI
+  profile (`[environments.ci.settings] history = true`) or with `--history` in the CI
+  command, rather than in shared `[settings]`, so every local run does not add a file.
+- A run writes a new untracked file, so a clean-tree check after the run (such as
+  `git status --porcelain` or `git diff --exit-code` with untracked files) sees it.
+  Run such checks before goodflows, or point `--history-dir` outside the checkout.
+- Files from different machines in one directory are not directly comparable; `host`
+  identifies each, and a separate `history_dir` per machine class keeps them apart.
+
+A typical setup that commits history:
+
+```gitignore
+# .gitignore
+.goodflows-logs/
+.goodflows/
+```
+
+```gitattributes
+# .gitattributes
+goodflows-history/** text eol=lf linguist-generated
+```
+
+To keep history local instead, ignore it too:
+
+```gitignore
+# .gitignore
+goodflows-history/
+```
+
+goodflows does not edit either file. Prune only drops files from the next commit's
+tree: records that were committed and later deleted stay in git history, so the caps
+bound the checkout, not `.git`.
 
 ## Development and releases
 
@@ -1263,11 +1583,119 @@ in a Debian 12 container so the binary runs on Ampcode orbs (glibc 2.36).
 Workflows use GitHub's documented
 [runner labels](https://docs.github.com/en/actions/reference/runners/github-hosted-runners).
 
-The Release workflow can be dispatched manually to build artifacts without publishing.
+The Release workflow can be dispatched manually to build artifacts without publishing
+(its `mirror-dry-run` job prints the reporter splits and pushes nothing).
 Pushing a `v<version>` tag matching `Cargo.toml` builds and publishes archives,
-individual SHA-256 checksums, and `SHA256SUMS`. Maintainers should bump the package
-version, update the lockfile, and review CI before pushing a release tag. No release
-is published merely by running `goodflows` or pushing a regular branch.
+individual SHA-256 checksums, and `SHA256SUMS`, and then pushes each bundled
+reporter to its read-only mirror with the same tag. No release is published merely
+by running `goodflows` or pushing a regular branch.
+
+On a tag push the jobs run in this order, and each stops the release if it fails:
+
+1. `verify-versions`: the CLI and both reporter versions, and the tag, agree.
+2. `mirror-check` (in the `reporter-mirrors` environment): both deploy keys are
+   set, the tag names a commit on `main`, and each mirror's `main` is an ancestor
+   of the new split (`scripts/mirror-reporters.sh <tag> --verify`). Nothing is
+   pushed. `reporters` runs the same reporter drift guard as CI, alongside.
+3. `build` and then `publish` create the GitHub release.
+4. `mirror-reporters` (in the `reporter-mirrors` environment) repeats the checks
+   and pushes each mirror's `main` and tag, only after the release is published,
+   so no mirror ever has a tag without a CLI release. If it fails after publish
+   (for example a network error), fix the cause and use **Re-run failed jobs**:
+   a mirror that was already pushed is up to date, so the re-run only pushes the
+   rest.
+
+Releases are tagged on `main` only. A tag on any other branch fails
+`mirror-check` before anything is built, because the mirrors' `main` could not
+fast-forward to it later. A fix for an older release ships as the next patch
+version from `main`; there are no maintenance-branch releases.
+
+To cut a release:
+
+1. Bump the version in `Cargo.toml` (and run `cargo update -p goodflows` to update
+   `Cargo.lock`), `reporters/exunit/mix.exs` (`@version`) and
+   `reporters/jest/package.json` together. The reporters are versioned in lockstep
+   with the CLI; CI's `release-scripts` job fails on every commit where the three
+   versions disagree, and the Release workflow's `verify-versions` job also fails
+   unless the tag agrees. Check locally with `scripts/verify-versions.sh v<version>`.
+2. Review CI on `main`, including the `reporters` and `release-scripts` jobs.
+3. Make sure the `reporter-mirrors` environment, both mirror deploy keys and the
+   `v*` tag ruleset are configured (below); a tag push fails before building when
+   either secret is missing.
+4. Push the `v<version>` tag from `main` (`git tag v<version> origin/main`, then
+   `git push origin v<version>`).
+
+`scripts/test-release-scripts.sh` (run in CI) tests `verify-versions.sh` and
+`mirror-reporters.sh` against local bare repositories: version drift, a tag
+that does not match, missing keys, first and fast-forward releases, `--verify`
+and `--dry-run`, a mirror edited directly, and tags off `main` or off `HEAD`.
+
+### Reporter mirror deploy keys
+
+The `mirror-reporters` job pushes `reporters/exunit` to
+`agoodway/goodflows-exunit-reporter` and `reporters/jest` to
+`agoodway/goodflows-jest-reporter` (`scripts/mirror-reporters.sh`), after
+`mirror-check` has fetched and checked both. Each mirror has
+its own write-enabled deploy key, whose private half is a secret of the
+`reporter-mirrors` environment in `agoodway/goodflows`. Only `v*` tags may deploy
+to that environment, so no branch, pull request or `workflow_dispatch` run can
+read the keys, and a tag ruleset limits who can create `v*` tags:
+
+| Environment secret | Deploy key on (with write access) |
+|---|---|
+| `EXUNIT_REPORTER_DEPLOY_KEY` | `agoodway/goodflows-exunit-reporter` |
+| `JEST_REPORTER_DEPLOY_KEY` | `agoodway/goodflows-jest-reporter` |
+
+One-time setup, by a repository admin:
+
+1. Create both mirror repositories empty, if they do not exist yet.
+2. Generate one key pair per mirror, without a passphrase:
+
+   ```bash
+   ssh-keygen -t ed25519 -N "" -C "goodflows release: goodflows-exunit-reporter" -f exunit_reporter_deploy_key
+   ssh-keygen -t ed25519 -N "" -C "goodflows release: goodflows-jest-reporter" -f jest_reporter_deploy_key
+   ```
+
+3. In each mirror, open **Settings → Deploy keys → Add deploy key**, paste that
+   mirror's `.pub` file and check **Allow write access**.
+4. In `agoodway/goodflows`, open **Settings → Environments → New environment**,
+   name it `reporter-mirrors` and, under **Deployment branches and tags**, choose
+   **Selected branches and tags** and add a rule with **Ref type: Tag** and name
+   pattern `v*`. Add no other branch or tag rule.
+5. In that environment, under **Environment secrets → Add environment secret**,
+   add each private key file's full contents under the secret name above (or
+   `gh secret set EXUNIT_REPORTER_DEPLOY_KEY --env reporter-mirrors -R
+   agoodway/goodflows < exunit_reporter_deploy_key`, and the same for Jest). If
+   either name exists as a repository secret (**Settings → Secrets and variables
+   → Actions → Repository secrets**), delete it (`gh secret delete
+   EXUNIT_REPORTER_DEPLOY_KEY -R agoodway/goodflows`), so the keys live only in
+   the environment.
+6. Delete the local key files.
+7. Protect release tags: open **Settings → Rules → Rulesets → New ruleset → New
+   tag ruleset**, name it `release tags`, set **Enforcement status** to
+   **Active**, add the target **Include by pattern** `v*`, and enable **Restrict
+   creations**, **Restrict updates**, **Restrict deletions** and **Block force
+   pushes**. Under **Bypass list**, add only the role allowed to cut releases
+   (for example **Repository admin**). Since a `v*` tag is what unlocks the
+   deploy keys, this keeps anyone else from creating one.
+8. Confirm the split without the keys: **Actions → Release → Run workflow** on
+   `main`. The `mirror-dry-run` log prints `source: ... is on origin/main`, each
+   mirror's split SHA and "secret ... is not set; skipping the mirror fetch"
+   (that job never gets the keys), and ends with "dry run: nothing pushed". The
+   keys themselves are checked by `mirror-check` on the first tag push, before
+   anything is built: a missing secret fails it with an error that names each
+   missing secret and links here, and a key without access fails with "cannot
+   reach".
+
+SSH trusts only GitHub's published host keys, pinned in the script. Mirrors are
+read-only: when a mirror's `main` has commits that are not in the new split, the
+release fails instead of overwriting them. To test the script without GitHub,
+point `MIRROR_URL_BASE` at a directory of bare repositories
+(`MIRROR_URL_BASE=/tmp/mirrors/` with
+`/tmp/mirrors/agoodway/goodflows-{exunit,jest}-reporter.git`), as
+`scripts/test-release-scripts.sh` does; `MIRROR_SOURCE_REMOTE` and
+`MIRROR_SOURCE_BRANCH` (default `origin` and `main`) name the branch a tag must be
+on.
 
 To exercise packaging locally, Linux targets need Docker and produce a Debian 12
 binary. macOS targets build natively:

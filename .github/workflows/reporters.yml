@@ -1,0 +1,69 @@
+name: Reporters
+
+# Drift guard for the bundled test reporters, shared by CI (every push and pull
+# request) and Release (before anything is published): each reporter runs a
+# fixture suite and the CLI built from this commit collects the output. Any
+# rejected, missing, truncated or unexpected report fails.
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  reporters:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        # The minimum peer version (the first with onTestCaseStart) and the latest.
+        jest: ["29.6.0", latest]
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup override set stable
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+      # The reporter's `~> 1.18` floor on an OTP release Elixir 1.18 supports;
+      # 1.18.6 is the first 1.18 whose built-in JSON decoder has the
+      # quantity-limit fix. Third-party action, pinned to the commit of v1.24.1.
+      - uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1.24.1
+        with:
+          elixir-version: "1.18.6"
+          otp-version: "27"
+      # Neither reporter's own unit tests load Jest (the Jest reporter's replay
+      # recorded payloads), so they run once, in the latest leg. Both legs run
+      # every fixture through check-reporters.sh, which is what the Jest
+      # version matrix exercises.
+      - name: Test ExUnit reporter
+        if: matrix.jest == 'latest'
+        working-directory: reporters/exunit
+        run: |
+          mix format --check-formatted
+          mix compile --warnings-as-errors
+          mix test
+      - name: Test Jest reporter
+        if: matrix.jest == 'latest'
+        working-directory: reporters/jest
+        run: node --test test/reporter.test.js
+      - name: Install Jest fixture
+        working-directory: reporters/fixtures/jest
+        env:
+          JEST_VERSION: ${{ matrix.jest }}
+        run: |
+          if [ "$JEST_VERSION" = latest ]; then
+            npm ci --no-audit --no-fund
+            npm install --no-save --no-audit --no-fund jest@latest
+          else
+            # Resolve the whole tree as of that release, so its own
+            # dependencies are the versions it shipped with.
+            rm package-lock.json
+            npm install --no-save --no-audit --no-fund --before=2023-07-05 "jest@$JEST_VERSION"
+          fi
+          npx --no-install jest --version
+      - name: Check reporters against the CLI
+        run: scripts/check-reporters.sh

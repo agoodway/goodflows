@@ -16,11 +16,13 @@ pub struct Source {
     pub dirty: Option<bool>,
 }
 
-async fn git(workdir: &Path, token_env: &str, args: &[&str]) -> Option<String> {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(workdir)
-        .env_remove(token_env)
+async fn git(workdir: &Path, token_env: Option<&str>, args: &[&str]) -> Option<String> {
+    let mut command = Command::new("git");
+    command.args(args).current_dir(workdir);
+    if let Some(token_env) = token_env {
+        command.env_remove(token_env);
+    }
+    let output = command
         .env("GIT_OPTIONAL_LOCKS", "0")
         .stdin(Stdio::null())
         .stderr(Stdio::null())
@@ -34,7 +36,9 @@ async fn git(workdir: &Path, token_env: &str, args: &[&str]) -> Option<String> {
     String::from_utf8(output.stdout).ok()
 }
 
-pub async fn capture(workdir: &Path, token_env: &str) -> Source {
+/// `token_env`, the publisher's credential variable when reporting is
+/// configured, is removed from every git process.
+pub async fn capture(workdir: &Path, token_env: Option<&str>) -> Source {
     let gather = async {
         let (commit, branch, status) = tokio::join!(
             git(workdir, token_env, &["rev-parse", "HEAD"]),
@@ -90,6 +94,6 @@ mod tests {
     #[tokio::test]
     async fn non_git_directory_yields_null_fields() {
         let dir = tempfile::tempdir().unwrap();
-        assert_eq!(capture(dir.path(), "X").await, Source::default());
+        assert_eq!(capture(dir.path(), Some("X")).await, Source::default());
     }
 }

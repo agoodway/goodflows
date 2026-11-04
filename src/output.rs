@@ -268,6 +268,7 @@ fn render(json: bool, mut event: Value, out: &mut impl Write, err: &mut impl Wri
                     settings["env"],
                     text(settings, "workdir")
                 )?;
+                history_settings(settings, "", out)?;
                 if let Some(reporting) = event.get("reporting") {
                     writeln!(
                         out,
@@ -365,6 +366,7 @@ fn render(json: bool, mut event: Value, out: &mut impl Write, err: &mut impl Wri
                         workflow["settings"]["env"],
                         text(&workflow["settings"], "workdir")
                     )?;
+                    history_settings(&workflow["settings"], "    ", out)?;
                 }
             }
             "reports_collected" => {
@@ -437,6 +439,20 @@ fn render(json: bool, mut event: Value, out: &mut impl Write, err: &mut impl Wri
         }
     }
     out.flush()?;
+    Ok(())
+}
+
+/// The effective history and log retention settings, one line each.
+fn history_settings(settings: &Value, indent: &str, out: &mut impl Write) -> Result<()> {
+    writeln!(
+        out,
+        "{indent}History: history={} history_runs={} history_bytes={} log_runs={}\n{indent}history_dir: {}",
+        settings["history"],
+        settings["history_runs"],
+        settings["history_bytes"],
+        settings["log_runs"],
+        text(settings, "history_dir")
+    )?;
     Ok(())
 }
 

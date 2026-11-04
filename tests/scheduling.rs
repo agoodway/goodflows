@@ -63,7 +63,12 @@ command = "touch unrelated"
             .count(),
         1
     );
-    assert_eq!(p.read("logs/001-conditional.stdout.log"), "checked");
+    // The shell condition and the command share one raw stdout file in the run directory.
+    let run = run_dir(&p.dir.join("logs"));
+    assert_eq!(
+        std::fs::read_to_string(run.join("001-conditional.stdout.log")).unwrap(),
+        "checked"
+    );
 
     let output = p.run(&["--jobs", "disabled"]);
     success(&output);
@@ -829,4 +834,269 @@ fn a_signal_ends_the_text_report_cancelled() {
     for absent in ["Failures", "Rerun"] {
         assert!(!report.contains(absent), "{absent}: {text}");
     }
+}
+
+fn summary_of(output: &std::process::Output) -> serde_json::Value {
+    let summary: serde_json::Value =
+        serde_json::from_str(stdout(output).lines().last().unwrap()).unwrap();
+    assert_eq!(summary["type"], "summary");
+    summary
+}
+
+#[test]
+fn log_runs_keep_the_newest_ten_and_leave_unrelated_entries() {
+    let p = Project::new("[[jobs]]\nname='a'\ncommand='echo hi'\n");
+    let logs = p.dir.join("logs");
+    std::fs::create_dir(&logs).unwrap();
+    std::fs::write(logs.join("notes.txt"), "keep").unwrap();
+    // A matching name that is a symlink is never followed or removed.
+    let target = p.dir.join("target-dir");
+    std::fs::create_dir(&target).unwrap();
+    std::fs::write(target.join("precious"), "keep").unwrap();
+    let link = logs.join("20000101T000000Z-00000000-0000-4000-8000-000000000000");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    let mut last = None;
+    for _ in 0..11 {
+        let output = p.run(&["--json", "--log-dir", "logs"]);
+        success(&output);
+        last = Some(summary_of(&output)["log_dir"].as_str().unwrap().to_owned());
+    }
+    let runs = run_dirs(&logs);
+    assert_eq!(runs.len(), 10, "{runs:?}");
+    assert!(p.dir.join(last.unwrap()).join("001-a.stdout.log").exists());
+    assert_eq!(
+        std::fs::read_to_string(logs.join("notes.txt")).unwrap(),
+        "keep"
+    );
+    assert!(std::fs::symlink_metadata(&link)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    assert!(target.join("precious").exists());
+    // Each kept run directory holds its logs and its lock file.
+    for run in &runs {
+        assert_eq!(
+            log_names(run),
+            ["001-a.stderr.log", "001-a.stdout.log"],
+            "{}",
+            run.display()
+        );
+        assert!(run.join(".goodflows.lock").exists());
+    }
+}
+
+#[test]
+fn log_runs_follow_profile_cli_and_workflow_settings() {
+    let p = Project::new(
+        "[settings]\nlog_runs = 2\n\
+         [[workflows.ci.jobs]]\nname='a'\ncommand='true'\n\
+         [workflows.other.settings]\nlog_runs = 5\n\
+         [[workflows.other.jobs]]\nname='a'\ncommand='true'\n\
+         [environments.tight.settings]\nlog_runs = 1\n",
+    );
+    for _ in 0..3 {
+        success(&p.run(&["run", "ci", "--log-dir", "logs"]));
+        success(&p.run(&["run", "other", "--log-dir", "logs"]));
+    }
+    assert_eq!(run_dirs(&p.dir.join("logs/ci")).len(), 2);
+    // The workflow setting applies to its workflow only.
+    assert_eq!(run_dirs(&p.dir.join("logs/other")).len(), 3);
+    for _ in 0..5 {
+        success(&p.run(&["run", "ci", "--log-dir", "logs", "--log-runs", "4"]));
+    }
+    assert_eq!(run_dirs(&p.dir.join("logs/ci")).len(), 4);
+    success(&p.run(&["run", "ci", "--env", "tight", "--log-dir", "logs"]));
+    assert_eq!(run_dirs(&p.dir.join("logs/ci")).len(), 1);
+    // Without --log-dir the setting has no effect and nothing is created.
+    success(&p.run(&["run", "ci", "--log-runs", "1"]));
+    assert_eq!(run_dirs(&p.dir.join("logs/ci")).len(), 1);
+    let output = p.run(&["run", "ci", "--log-dir", "logs", "--log-runs", "0"]);
+    assert_eq!(output.status.code(), Some(2));
+}
+
+#[test]
+fn log_runs_profile_cap_of_two() {
+    let p = Project::new(
+        "[[jobs]]\nname='a'\ncommand='true'\n[environments.ci.settings]\nlog_runs = 2\n",
+    );
+    for _ in 0..3 {
+        success(&p.run(&["--env", "ci", "--log-dir", "logs"]));
+    }
+    assert_eq!(run_dirs(&p.dir.join("logs")).len(), 2);
+}
+
+#[test]
+fn overlapping_runs_never_prune_a_live_log_directory() {
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+    let p = Project::new(
+        "[[jobs]]\nname='a'\ncommand='echo first; touch started; i=0; while [ $i -lt 500 ] && ! test -f release; do sleep 0.01; i=$((i+1)); done; echo after'\n",
+    );
+    let release = Release(p.dir.join("release"));
+    let first = p
+        .command()
+        .args(["--json", "--log-dir", "logs", "--log-runs", "1"])
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let start = Instant::now();
+    while !p.dir.join("started").exists() {
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "first run did not start"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let live = run_dir(&p.dir.join("logs"));
+    // The second run must not wait for the first, so it gets its own job.
+    std::fs::write(
+        p.dir.join("second.toml"),
+        "[[jobs]]\nname='a'\ncommand='echo second'\n",
+    )
+    .unwrap();
+    let second = p.run(&[
+        "--json",
+        "--config",
+        "second.toml",
+        "--log-dir",
+        "logs",
+        "--log-runs",
+        "1",
+    ]);
+    success(&second);
+    assert!(live.exists(), "live run directory was pruned");
+    drop(release);
+    let first = first.wait_with_output().unwrap();
+    success(&first);
+    let log = std::fs::read_to_string(live.join("001-a.stdout.log")).unwrap();
+    assert_eq!(log, "first\nafter\n");
+    assert_eq!(
+        summary_of(&first)["log_dir"],
+        format!("logs/{}", live.file_name().unwrap().to_str().unwrap())
+    );
+}
+
+#[test]
+fn queue_and_dependency_waits_are_measured_per_instance() {
+    let p = Project::new(
+        "[settings]\nparallelism = 1\nfail_fast = false\n\
+         [[jobs]]\nname='first'\ncommand='sleep 0.3'\n\
+         [[jobs]]\nname='second'\ncommand='true'\n\
+         [[jobs]]\nname='broken'\ncommand='exit 1'\n\
+         [[jobs]]\nname='dependent'\ndepends_on=['broken']\ncommand='true'\n",
+    );
+    let output = p.run(&["--json"]);
+    assert_eq!(output.status.code(), Some(1));
+    let summary = summary_of(&output);
+    let result = |name: &str| {
+        summary["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["name"] == name)
+            .unwrap()
+            .clone()
+    };
+    assert_eq!(summary["max_in_flight"], 1);
+    // Ready from the start, then waited for the single slot: its blocked
+    // time ends before `first` finishes, and the queue wait covers the rest.
+    let first = result("first");
+    let second = result("second");
+    let first_ms = first["duration_ms"].as_u64().unwrap();
+    assert!(
+        second["blocked_ms"].as_u64().unwrap() < first_ms,
+        "{first} {second}"
+    );
+    assert!(second["queued_ms"].as_u64().unwrap() >= 250, "{second}");
+    // Skipped for a failed dependency: blocked until the skip, never queued.
+    let dependent = result("dependent");
+    assert_eq!(dependent["status"], "skipped");
+    assert_eq!(dependent["started"], false);
+    assert_eq!(dependent["queued_ms"], 0);
+    assert!(
+        dependent["blocked_ms"].as_u64().unwrap() >= 250,
+        "{dependent}"
+    );
+    assert!(dependent.get("commands").is_none(), "{dependent}");
+}
+
+#[test]
+fn max_in_flight_counts_concurrent_instances() {
+    let p = Project::new(
+        "[settings]\nparallelism = 3\n[[jobs]]\nname='t'\npartitions=3\ncommand='sleep 0.2'\n",
+    );
+    let output = p.run(&["--json"]);
+    success(&output);
+    assert_eq!(summary_of(&output)["max_in_flight"], 3);
+}
+
+#[test]
+fn a_ready_job_skipped_by_fail_fast_keeps_its_queue_wait() {
+    let p = Project::new(
+        "[settings]\nparallelism = 1\nfail_fast = true\n\
+         [[jobs]]\nname='first'\ncommand='sleep 0.3; exit 1'\n\
+         [[jobs]]\nname='second'\ncommand='touch ran'\n",
+    );
+    let output = p.run(&["--json"]);
+    assert_eq!(output.status.code(), Some(1));
+    let summary = summary_of(&output);
+    let first = &summary["results"][0];
+    let second = &summary["results"][1];
+    assert_eq!(second["status"], "skipped");
+    assert_eq!(second["error"], "fail_fast: previous job failed");
+    assert_eq!(second["started"], false);
+    // Ready at once, then waited for the slot until the skip.
+    assert!(
+        second["blocked_ms"].as_u64().unwrap() < first["duration_ms"].as_u64().unwrap(),
+        "{first} {second}"
+    );
+    assert!(second["queued_ms"].as_u64().unwrap() >= 250, "{second}");
+    assert!(second.get("commands").is_none(), "{second}");
+    assert!(!p.dir.join("ran").exists());
+}
+
+#[test]
+fn workflow_log_runs_isolate_workflows() {
+    let p = Project::new(
+        "[workflows.ci.settings]\nlog_runs = 2\n\
+         [[workflows.ci.jobs]]\nname='a'\ncommand='true'\n\
+         [[workflows.other.jobs]]\nname='a'\ncommand='true'\n",
+    );
+    for _ in 0..3 {
+        success(&p.run(&["run", "ci", "--log-dir", "logs"]));
+    }
+    for _ in 0..11 {
+        success(&p.run(&["run", "other", "--log-dir", "logs"]));
+    }
+    assert_eq!(run_dirs(&p.dir.join("logs/ci")).len(), 2);
+    // `other` sets nothing, so it keeps the default of ten.
+    assert_eq!(run_dirs(&p.dir.join("logs/other")).len(), 10);
+}
+
+#[test]
+fn a_log_prune_failure_warns_and_keeps_the_exit_code() {
+    // SAFETY: geteuid has no preconditions.
+    if unsafe { libc::geteuid() } == 0 {
+        return; // Permissions do not stop root.
+    }
+    use std::os::unix::fs::PermissionsExt;
+    let p = Project::new("[[jobs]]\nname='a'\ncommand='true'\n");
+    let old = p
+        .dir
+        .join("logs/20000101T000000Z-00000000-0000-4000-8000-000000000000");
+    std::fs::create_dir_all(&old).unwrap();
+    let lock = old.join(".goodflows.lock");
+    std::fs::write(&lock, "").unwrap();
+    std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let output = p.run(&["--json", "--log-dir", "logs", "--log-runs", "1"]);
+    success(&output);
+    assert!(
+        stderr(&output).contains("failed to prune log runs"),
+        "{}",
+        stderr(&output)
+    );
+    // The unopenable lock keeps its directory, beside the new run.
+    assert!(old.exists());
+    assert_eq!(run_dirs(&p.dir.join("logs")).len(), 2);
+    assert!(summary_of(&output)["log_dir"].is_string());
 }
