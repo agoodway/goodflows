@@ -1,9 +1,10 @@
-//! Bounded, structural collection of `exunit-timings` JSONL reports.
+//! Bounded, structural collection of `test-timings/1` JSONL reports.
 //!
 //! Only direct regular `*.jsonl` files in a job's own report directory are
 //! read. Rejected files are never modified and are reported by structural code
 //! only; record contents never appear in diagnostics. Every server vocabulary
-//! enforced here comes from [`super::contract`].
+//! enforced here comes from [`super::contract`], which collection applies in
+//! full before a snapshot is frozen.
 
 use super::contract::{self, *};
 use super::Source;
@@ -11,7 +12,7 @@ use crate::config::Partition;
 use serde::de::{DeserializeSeed, Deserializer, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde_json::{json, Map, Value};
 use std::cell::Cell;
-use std::collections::{BTreeMap, BinaryHeap, HashMap};
+use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
 use std::fmt;
 use std::io::Read;
 #[cfg(unix)]
@@ -382,11 +383,15 @@ impl std::io::Write for Count {
 
 /// Parse ordered JSONL. A final unterminated invalid fragment is dropped and
 /// marks the report truncated; any other invalid line rejects the report.
-/// Parsing stops as soon as the records alone could not fit one request.
+/// Each record is fully validated (types, widths, identity, order, pairing)
+/// as soon as its line is decoded, so memory spent on a bad report is bounded
+/// by its valid prefix plus one line, and parsing stops at the first bad line
+/// or as soon as the records alone could not fit one request.
 pub fn parse_report(bytes: &[u8]) -> Result<Report, &'static str> {
     let text = std::str::from_utf8(bytes).map_err(|_| "invalid_utf8")?;
     let mut lines = text.split('\n').peekable();
     let mut records = Vec::new();
+    let mut validator = Validator::default();
     let mut truncated = false;
     // Exact compact size of the records array contents built so far.
     let mut size = 0usize;
@@ -407,6 +412,7 @@ pub fn parse_report(bytes: &[u8]) -> Result<Report, &'static str> {
                 if size > MAX_REQUEST_BYTES {
                     return Err("request_too_large");
                 }
+                validator.push(&records, &value)?;
                 records.push(value);
             }
             Ok(_) => return Err("malformed_record"),
@@ -416,10 +422,10 @@ pub fn parse_report(bytes: &[u8]) -> Result<Report, &'static str> {
             Err(code) => return Err(code),
         }
     }
-    validate_records(&records)?;
+    validator.finish(&records)?;
     let first = &records[0];
     Ok(Report {
-        suite_id: first["run_id"].as_str().unwrap_or_default().to_owned(),
+        suite_id: first["suite_id"].as_str().unwrap_or_default().to_owned(),
         report_id: first["report_id"].as_str().unwrap_or_default().to_owned(),
         partition: first.get("partition").cloned().unwrap_or(Value::Null),
         partition_count: first.get("partition_count").cloned().unwrap_or(Value::Null),
@@ -492,9 +498,11 @@ impl<'de> Visitor<'de> for Strict<'_> {
         Ok(Value::Bool(v))
     }
 
-    fn visit_i64<E>(self, v: i64) -> Result<Value, E> {
-        // serde_json only uses i64 for negative integers; the server is the
-        // authority on their range.
+    fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<Value, E> {
+        // serde_json only uses i64 for negative integers.
+        if v.unsigned_abs() > MAX_SAFE_INTEGER {
+            return Err(self.fail("integer_out_of_range"));
+        }
         Ok(Value::from(v))
     }
 
@@ -609,8 +617,13 @@ pub fn validate_envelope(bytes: &[u8]) -> Result<Head, &'static str> {
     let Value::Object(body) = body else {
         return Err(invalid);
     };
-    if !exact_keys(&body, ENVELOPE) || body["format"] != REPORT_FORMAT {
+    if !exact_keys(&body, ENVELOPE) {
         return Err(invalid);
+    }
+    // A snapshot frozen in a retired format (such as `exunit-timings`) is
+    // never sent; replay counts it as `invalid_snapshot`.
+    if body["format"] != REPORT_FORMAT {
+        return Err("unsupported_format");
     }
     let string = |value: &Value| value.as_str().map(str::to_owned).ok_or(invalid);
     let name = |value: &Value| {
@@ -665,7 +678,7 @@ pub fn validate_envelope(bytes: &[u8]) -> Result<Head, &'static str> {
     validate_records(records)?;
     let first = &records[0];
     let initial = |key: &str| first.get(key).unwrap_or(&Value::Null);
-    if report["suite_id"] != first["run_id"]
+    if report["suite_id"] != first["suite_id"]
         || report["report_id"] != first["report_id"]
         || report["partition"] != *initial("partition")
         || report["partition_count"] != *initial("partition_count")
@@ -685,29 +698,6 @@ pub fn validate_envelope(bytes: &[u8]) -> Result<Head, &'static str> {
     })
 }
 
-fn valid_partition(value: &Value) -> bool {
-    match value {
-        Value::Null => true,
-        Value::String(p) => {
-            !p.is_empty()
-                && p.len() <= 64
-                && p.bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
-        }
-        _ => false,
-    }
-}
-
-fn valid_partition_count(value: &Value) -> bool {
-    match value {
-        Value::Null => true,
-        Value::Number(n) => n
-            .as_u64()
-            .is_some_and(|n| (1..=MAX_SAFE_INTEGER).contains(&n)),
-        _ => false,
-    }
-}
-
 fn contains_nul(value: &Value) -> bool {
     match value {
         Value::String(s) => s.contains('\0'),
@@ -717,167 +707,120 @@ fn contains_nul(value: &Value) -> bool {
     }
 }
 
-fn keys_within(value: &Value, allowed: &[&str]) -> bool {
-    match value {
-        Value::Object(map) => map.keys().all(|k| allowed.contains(&k.as_str())),
-        _ => true,
-    }
-}
-
-fn too_long(map: &Map<String, Value>) -> bool {
-    let over = |fields: &[&str], limit: usize| {
-        fields.iter().any(|f| {
-            map.get(*f)
-                .and_then(Value::as_str)
-                .is_some_and(|s| s.len() > limit)
-        })
-    };
-    over(LONG_FIELDS, 4096) || over(VERSION_FIELDS, 128)
-}
-
-fn validate_nested(map: &Map<String, Value>) -> Result<(), &'static str> {
-    let unsupported_field = Err("unsupported_field");
-    let unsupported_filter = Err("unsupported_filter");
-    if map.get("counts").is_some_and(|c| !keys_within(c, OUTCOMES)) {
-        return unsupported_field;
-    }
-    if map.get("times_us").is_some_and(|t| !keys_within(t, TIMES)) {
-        return unsupported_field;
-    }
-    if let Some(filters) = map.get("filters") {
-        if !keys_within(filters, &["include", "exclude"]) {
-            return unsupported_field;
-        }
-        for list in ["include", "exclude"] {
-            // The server requires `filters` to be an object holding both lists
-            // as arrays, and caps each list; anything else would freeze and
-            // then 422.
-            let Some(entries) = filters.get(list).and_then(Value::as_array) else {
-                return unsupported_filter;
-            };
-            if entries.len() > MAX_FILTER_ENTRIES {
-                return unsupported_filter;
-            }
-            for entry in entries {
-                if !keys_within(entry, &["tag", "value"]) {
-                    return unsupported_field;
-                }
-                // Tags follow the server's identifier grammar and values are booleans.
-                let tag = entry.get("tag").and_then(Value::as_str);
-                if !tag.is_some_and(valid_filter_tag)
-                    || !entry.get("value").is_some_and(Value::is_boolean)
-                {
-                    return unsupported_filter;
-                }
-            }
-        }
-    }
-    for file in map
-        .get("files")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-    {
-        let file_keys: Vec<&str> = BUCKET.iter().chain(FILE_EXTRA).copied().collect();
-        if !keys_within(file, &file_keys) {
-            return unsupported_field;
-        }
-        if let Value::Object(file) = file {
-            if file
-                .get("file")
-                .and_then(Value::as_str)
-                .is_some_and(|f| f.len() > 4096)
-            {
-                return Err("field_too_long");
-            }
-            for bucket in ["async", "sync", "unknown"] {
-                if let Some(bucket) = file.get(bucket) {
-                    if !keys_within(bucket, BUCKET) {
-                        return unsupported_field;
-                    }
-                    if bucket
-                        .get("counts")
-                        .is_some_and(|c| !keys_within(c, OUTCOMES))
-                    {
-                        return unsupported_field;
-                    }
-                }
-            }
-            if file
-                .get("counts")
-                .is_some_and(|c| !keys_within(c, OUTCOMES))
-            {
-                return unsupported_field;
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Structural checks shared with the server contract. The server remains the
-/// authority on full type validation; these checks stop locally knowable
-/// rejections before a request is ever frozen.
+/// Full local validation against [`super::contract`] of a whole records
+/// array; see [`Validator`].
 fn validate_records(records: &[Value]) -> Result<(), &'static str> {
-    let Some(first) = records.first() else {
-        return Err("empty_report");
-    };
-    if first["event"] != "suite_started" {
-        return Err("missing_suite_started");
-    }
-    if first["format"] != REPORT_FORMAT {
-        return Err("unsupported_format");
-    }
-    let suite_id = first["run_id"].as_str().ok_or("invalid_identifier")?;
-    let report_id = first["report_id"].as_str().ok_or("invalid_identifier")?;
-    if !valid_identifier(suite_id) || !valid_identifier(report_id) {
-        return Err("invalid_identifier");
-    }
-    if !valid_partition(first.get("partition").unwrap_or(&Value::Null)) {
-        return Err("invalid_partition");
-    }
-    if !valid_partition_count(first.get("partition_count").unwrap_or(&Value::Null)) {
-        return Err("invalid_partition_count");
-    }
-    let last = records.len() - 1;
+    let mut validator = Validator::default();
     for (index, record) in records.iter().enumerate() {
+        validator.push(&records[..index], record)?;
+    }
+    validator.finish(records)
+}
+
+/// Started events of one kind: the open ones by `execution_id` (with the
+/// index of their record, whose core values the finished event repeats) and
+/// every id seen so far.
+type Open = (HashMap<u64, usize>, HashSet<u64>);
+
+/// Full local validation against [`super::contract`], one record at a time,
+/// so a record is typed as soon as it is decoded and a report is rejected at
+/// its first bad line rather than after the whole file is parsed: every
+/// record is typed against its event's table (keys, required keys, widths,
+/// `meta`), identities must agree, `suite_started` comes first and
+/// `suite_finished` last, every finished event pairs with an open started
+/// event of its kind with identical core values, and `suite_finished`'s
+/// unfinished counts equal the started events left open. Memory beyond the
+/// accepted records is two ids per started event, bounded by [`MAX_RECORDS`].
+#[derive(Default)]
+struct Validator {
+    groups: Open,
+    tests: Open,
+    /// Set by `suite_finished`: any later record is out of order, otherwise
+    /// this is the report's result (the unfinished-count check).
+    finished: Option<Result<(), &'static str>>,
+}
+
+impl Validator {
+    /// Check `record`, which follows `before`, the records already accepted.
+    fn push(&mut self, before: &[Value], record: &Value) -> Result<(), &'static str> {
+        let Some(first) = before.first() else {
+            if record.get("event").and_then(Value::as_str) != Some("suite_started") {
+                return Err("missing_suite_started");
+            }
+            // The format is checked first, so a retired producer gets a format
+            // code rather than one for whichever of its keys the table no
+            // longer knows.
+            if record.get("format").and_then(Value::as_str) != Some(REPORT_FORMAT) {
+                return Err("unsupported_format");
+            }
+            return self.check(before, record, None);
+        };
+        if self.finished.is_some() {
+            return Err("invalid_order");
+        }
+        let ids = (first["suite_id"].as_str(), first["report_id"].as_str());
+        self.check(before, record, Some(ids))
+    }
+
+    fn check(
+        &mut self,
+        before: &[Value],
+        record: &Value,
+        ids: Option<(Option<&str>, Option<&str>)>,
+    ) -> Result<(), &'static str> {
         let Value::Object(map) = record else {
             return Err("malformed_record");
         };
         if contains_nul(record) {
             return Err("nul_character");
         }
-        let event = map
-            .get("event")
-            .and_then(Value::as_str)
-            .ok_or("missing_field")?;
-        for key in map.keys() {
-            match contract::allowed(event, key) {
-                None => return Err("unsupported_event"),
-                Some(false) => return Err("unsupported_field"),
-                Some(true) => {}
-            }
-        }
-        if map.get("run_id").and_then(Value::as_str) != Some(suite_id)
-            || map.get("report_id").and_then(Value::as_str) != Some(report_id)
-        {
+        let shape = contract::check_record(map)?;
+        if ids.is_some_and(|ids| ids != (map["suite_id"].as_str(), map["report_id"].as_str())) {
             return Err("identity_mismatch");
         }
-        match map.get("received_offset_us").and_then(Value::as_u64) {
-            Some(offset) if offset <= MAX_SAFE_INTEGER => {}
-            _ => return Err("invalid_field"),
+        match map["event"].as_str() {
+            Some("suite_started") if ids.is_some() => return Err("invalid_order"),
+            Some("suite_finished") => {
+                let unfinished = |key: &str| map[key].as_u64().unwrap_or_default() as usize;
+                let matches = unfinished("unfinished_groups") == self.groups.0.len()
+                    && unfinished("unfinished_tests") == self.tests.0.len();
+                self.finished = Some(if matches {
+                    Ok(())
+                } else {
+                    Err("unfinished_mismatch")
+                });
+            }
+            _ => {}
         }
-        if event == "suite_started" && index != 0 {
-            return Err("invalid_order");
+        let Some((kind, started)) = shape.pairing else {
+            return Ok(());
+        };
+        let (open, seen) = match kind {
+            Kind::Group => &mut self.groups,
+            Kind::Test => &mut self.tests,
+        };
+        let id = map["execution_id"].as_u64().unwrap_or_default();
+        if started {
+            if !seen.insert(id) {
+                return Err("unpaired_event");
+            }
+            open.insert(id, before.len());
+            return Ok(());
         }
-        if event == "suite_finished" && index != last {
-            return Err("invalid_order");
+        let start = &before[open.remove(&id).ok_or("unpaired_event")?];
+        if shape.base.iter().any(|(key, _)| start[*key] != map[*key]) {
+            return Err("unpaired_event");
         }
-        if too_long(map) {
-            return Err("field_too_long");
-        }
-        validate_nested(map)?;
+        Ok(())
     }
-    Ok(())
+
+    /// The result once every record has been pushed.
+    fn finish(self, records: &[Value]) -> Result<(), &'static str> {
+        if records.is_empty() {
+            return Err("empty_report");
+        }
+        self.finished.unwrap_or(Ok(()))
+    }
 }
 
 #[cfg(test)]
@@ -886,26 +829,45 @@ mod tests {
     use serde_json::json;
 
     pub fn suite_started(report_id: &str, partition: Value) -> Value {
-        json!({"event":"suite_started","run_id":"suite-1","report_id":report_id,"received_offset_us":0,
-            "format":"exunit-timings","started_at":"2026-11-01T00:00:00Z","partition":partition,
-            "partition_count":3,"seed":1,"max_cases":8,"schedulers":8,"elixir_version":"1.18.0",
-            "otp_release":"27","filters":{"include":[],"exclude":[{"tag":"chrome","value":true}]}})
+        json!({"event":"suite_started","suite_id":"suite-1","report_id":report_id,"received_offset_us":0,
+            "format":"test-timings/1","started_at":"2026-11-01T00:00:00Z",
+            "runner":{"name":"exunit","version":"1.18.0"},"partition":partition,"partition_count":3,"seed":1,
+            "filters":{"include":[],"exclude":[{"tag":"chrome","value":true}]},
+            "meta":{"elixir_version":"1.18.0","otp_release":"27","max_cases":8,"schedulers":8}})
+    }
+
+    fn group_started(report_id: &str) -> Value {
+        json!({"event":"group_started","suite_id":"suite-1","report_id":report_id,"received_offset_us":2,
+            "group":"MyTest","file":"test/my_test.exs","execution_id":1,"started_offset_us":2,
+            "meta":{"async":true,"setup_all":false,"parameter_id":null}})
+    }
+
+    fn group_finished(report_id: &str) -> Value {
+        json!({"event":"group_finished","suite_id":"suite-1","report_id":report_id,"received_offset_us":60,
+            "group":"MyTest","file":"test/my_test.exs","execution_id":1,"started_offset_us":2,
+            "duration_us":50,"outcome":"passed","counts":{"passed":1}})
+    }
+
+    fn test_started(report_id: &str) -> Value {
+        json!({"event":"test_started","suite_id":"suite-1","report_id":report_id,"received_offset_us":5,
+            "group":"MyTest","path":[],"name":"test works","file":"test/my_test.exs","line":3,
+            "execution_id":1,"started_offset_us":5,"meta":{"async":true,"parameter_id":null}})
     }
 
     fn test_finished(report_id: &str, outcome: &str) -> Value {
-        json!({"event":"test_finished","run_id":"suite-1","report_id":report_id,"received_offset_us":10,
-            "module":"MyTest","name":"test works","description":null,"file":"test/my_test.exs","line":3,
-            "describe":null,"async":true,"parameter_id":null,"execution_id":1,"started_offset_us":5,
-            "duration_us":42,"outcome":outcome})
+        json!({"event":"test_finished","suite_id":"suite-1","report_id":report_id,"received_offset_us":10,
+            "group":"MyTest","path":[],"name":"test works","file":"test/my_test.exs","line":3,
+            "execution_id":1,"started_offset_us":5,"duration_us":42,"outcome":outcome})
     }
 
     fn suite_finished(report_id: &str) -> Value {
-        let bucket = json!({"test_count":1,"module_count":1,"counts":{"passed":1},"test_duration_us":42,"observed_module_duration_us":50});
-        json!({"event":"suite_finished","run_id":"suite-1","report_id":report_id,"received_offset_us":99,
-            "aborted":false,"unfinished_tests":0,"unfinished_modules":0,"counts":{"passed":1,"failed":0},
-            "files":[{"file":"test/my_test.exs","test_count":1,"module_count":1,"counts":{"passed":1},
-                "test_duration_us":42,"observed_module_duration_us":50,"async":bucket,"sync":bucket,"unknown":bucket}],
-            "times_us":{"run":100,"async":60,"sync":40,"load":null,"total":100}})
+        json!({"event":"suite_finished","suite_id":"suite-1","report_id":report_id,"received_offset_us":99,
+            "aborted":false,"unfinished_tests":0,"unfinished_groups":0,"counts":{"passed":1,"failed":0},
+            "duration_us":100,"meta":{"run_us":100,"async_us":60,"sync_us":40,"load_us":null,"total_us":100}})
+    }
+
+    fn interrupted(report_id: &str) -> Value {
+        json!({"event":"interrupted","suite_id":"suite-1","report_id":report_id,"received_offset_us":1})
     }
 
     pub fn jsonl(records: &[Value]) -> Vec<u8> {
@@ -916,12 +878,20 @@ mod tests {
             .into_bytes()
     }
 
-    pub fn complete(report_id: &str) -> Vec<u8> {
-        jsonl(&[
+    /// A complete report: one group holding one passing test.
+    fn complete_records(report_id: &str) -> Vec<Value> {
+        vec![
             suite_started(report_id, json!("1")),
+            group_started(report_id),
+            test_started(report_id),
             test_finished(report_id, "passed"),
+            group_finished(report_id),
             suite_finished(report_id),
-        ])
+        ]
+    }
+
+    pub fn complete(report_id: &str) -> Vec<u8> {
+        jsonl(&complete_records(report_id))
     }
 
     /// Keeps frozen bodies in memory, as the spool writer keeps them on disk.
@@ -1023,9 +993,10 @@ mod tests {
         assert_eq!(body["report"]["report_id"], "report-1");
         assert_eq!(body["report"]["partition"], "1");
         assert_eq!(body["report"]["partition_count"], 3);
+        assert_eq!(body["format"], "test-timings/1");
         assert_eq!(body["report"]["truncated"], false);
-        assert_eq!(body["report"]["records"].as_array().unwrap().len(), 3);
-        assert_eq!(body["report"]["records"][1]["duration_us"], 42);
+        assert_eq!(body["report"]["records"].as_array().unwrap().len(), 6);
+        assert_eq!(body["report"]["records"][3]["duration_us"], 42);
     }
 
     #[test]
@@ -1039,21 +1010,26 @@ mod tests {
         }
         let failed = jsonl(&[
             suite_started("r", Value::Null),
+            test_started("r"),
             test_finished("r", "failed"),
             suite_finished("r"),
         ]);
         assert_eq!(
-            parse_report(&failed).unwrap().records[1]["outcome"],
+            parse_report(&failed).unwrap().records[2]["outcome"],
             "failed"
         );
     }
 
     #[test]
     fn partial_reports_stay_partial() {
-        let partial = jsonl(&[suite_started("r", json!("2")), test_finished("r", "passed")]);
+        let partial = jsonl(&[
+            suite_started("r", json!("2")),
+            test_started("r"),
+            test_finished("r", "passed"),
+        ]);
         let report = parse_report(&partial).unwrap();
         assert!(!report.truncated);
-        assert_eq!(report.records.len(), 2);
+        assert_eq!(report.records.len(), 3);
         assert_ne!(report.records.last().unwrap()["event"], "suite_finished");
     }
 
@@ -1063,16 +1039,17 @@ mod tests {
         unterminated.pop();
         let report = parse_report(&unterminated).unwrap();
         assert!(!report.truncated);
-        assert_eq!(report.records.len(), 3);
+        assert_eq!(report.records.len(), 6);
 
         let mut fragment = jsonl(&[
             suite_started("r", Value::Null),
+            test_started("r"),
             test_finished("r", "passed"),
         ]);
         fragment.extend_from_slice(br#"{"event":"test_fini"#);
         let report = parse_report(&fragment).unwrap();
         assert!(report.truncated);
-        assert_eq!(report.records.len(), 2);
+        assert_eq!(report.records.len(), 3);
 
         let mut earlier = jsonl(&[suite_started("r", Value::Null)]);
         earlier.extend_from_slice(b"{not json}\n");
@@ -1096,7 +1073,7 @@ mod tests {
             "identity_mismatch"
         );
         let mut other_suite = test_finished("r", "passed");
-        other_suite["run_id"] = json!("suite-2");
+        other_suite["suite_id"] = json!("suite-2");
         assert_eq!(
             parse_report(&jsonl(&[suite_started("r", Value::Null), other_suite])).unwrap_err(),
             "identity_mismatch"
@@ -1130,19 +1107,23 @@ mod tests {
             parse_report(&jsonl(&[suite_started("r", Value::Null), extra])).unwrap_err(),
             "unsupported_field"
         );
-        let mut nested = suite_finished("r");
-        nested["times_us"]["wall"] = json!(1);
+        // The retired ExUnit aggregates are unknown keys now.
+        for (key, value) in [("files", json!([])), ("times_us", json!({}))] {
+            let mut retired = suite_finished("r");
+            retired[key] = value;
+            assert_eq!(
+                parse_report(&jsonl(&[suite_started("r", Value::Null), retired])).unwrap_err(),
+                "unsupported_field"
+            );
+        }
+        let mut excluded = suite_finished("r");
+        excluded["counts"]["excluded"] = json!(1);
         assert_eq!(
-            parse_report(&jsonl(&[suite_started("r", Value::Null), nested])).unwrap_err(),
+            parse_report(&jsonl(&[suite_started("r", Value::Null), excluded])).unwrap_err(),
             "unsupported_field"
         );
-        let mut bucket = suite_finished("r");
-        bucket["files"][0]["async"]["file"] = json!("x");
-        assert_eq!(
-            parse_report(&jsonl(&[suite_started("r", Value::Null), bucket])).unwrap_err(),
-            "unsupported_field"
-        );
-        let log = json!({"event":"log","run_id":"suite-1","report_id":"r","received_offset_us":1});
+        let log =
+            json!({"event":"log","suite_id":"suite-1","report_id":"r","received_offset_us":1});
         assert_eq!(
             parse_report(&jsonl(&[suite_started("r", Value::Null), log])).unwrap_err(),
             "unsupported_event"
@@ -1178,16 +1159,17 @@ mod tests {
             "nul_character"
         );
         let mut long = test_finished("r", "passed");
-        long["module"] = json!("é".repeat(2049)); // 4098 bytes, 2049 chars
+        long["group"] = json!("é".repeat(2049)); // 4098 bytes, 2049 chars
         assert_eq!(
             parse_report(&jsonl(&[suite_started("r", Value::Null), long])).unwrap_err(),
             "field_too_long"
         );
-        let mut fits = test_finished("r", "passed");
-        fits["module"] = json!("m".repeat(4096));
-        assert!(parse_report(&jsonl(&[suite_started("r", Value::Null), fits])).is_ok());
+        let (mut start, mut fits) = (test_started("r"), test_finished("r", "passed"));
+        start["group"] = json!("m".repeat(4096));
+        fits["group"] = json!("m".repeat(4096));
+        assert!(parse_report(&jsonl(&[suite_started("r", Value::Null), start, fits])).is_ok());
         let mut version = suite_started("r", Value::Null);
-        version["otp_release"] = json!("1".repeat(129));
+        version["runner"]["version"] = json!("1".repeat(129));
         assert_eq!(
             parse_report(&jsonl(&[version])).unwrap_err(),
             "field_too_long"
@@ -1198,7 +1180,7 @@ mod tests {
     #[test]
     fn record_and_request_limits() {
         let started = suite_started("r", Value::Null);
-        let tiny = json!({"event":"interrupted","run_id":"suite-1","report_id":"r","received_offset_us":1});
+        let tiny = interrupted("r");
         let mut records = vec![started.clone()];
         records.extend(std::iter::repeat_n(tiny.clone(), MAX_RECORDS - 1));
         assert!(parse_report(&jsonl(&records)).is_ok());
@@ -1206,8 +1188,13 @@ mod tests {
         assert_eq!(parse_report(&jsonl(&records)).unwrap_err(), "record_limit");
 
         let source = Source::default();
-        let mut big = test_finished("r", "passed");
-        big["description"] = json!("d".repeat(4000));
+        // A valid filler record of about 4 KiB: flat meta at its string limit.
+        let mut big = interrupted("r");
+        big["meta"] = Value::Object(
+            (0..15)
+                .map(|i| (format!("pad{i}"), json!("d".repeat(256))))
+                .collect(),
+        );
         let mut records = vec![started];
         records.extend(std::iter::repeat_n(big, MAX_REQUEST_BYTES / 4000 + 1));
         // Parsing stops as soon as the records alone exceed one request.
@@ -1223,7 +1210,7 @@ mod tests {
             used += size(&records[1]);
             fits.push(records[1].clone());
         }
-        let tiny = json!({"event":"interrupted","run_id":"suite-1","report_id":"r","received_offset_us":1});
+        let tiny = interrupted("r");
         while used + size(&tiny) < MAX_REQUEST_BYTES - 50 {
             used += size(&tiny);
             fits.push(tiny.clone());
@@ -1292,7 +1279,7 @@ mod tests {
     }
 
     fn line(record: &str) -> Vec<u8> {
-        let mut bytes = jsonl(&[suite_started("r", Value::Null)]);
+        let mut bytes = jsonl(&[suite_started("r", Value::Null), test_started("r")]);
         bytes.extend_from_slice(record.as_bytes());
         bytes.push(b'\n');
         bytes
@@ -1304,14 +1291,6 @@ mod tests {
         let start = record.find(&marker).unwrap() + marker.len();
         let end = start + record[start..].find([',', '}']).unwrap();
         format!("{}{raw}{}", &record[..start], &record[end..])
-    }
-
-    fn depth(value: &Value) -> usize {
-        match value {
-            Value::Array(items) => 1 + items.iter().map(depth).max().unwrap_or(0),
-            Value::Object(map) => 1 + map.values().map(depth).max().unwrap_or(0),
-            _ => 0,
-        }
     }
 
     #[test]
@@ -1332,20 +1311,21 @@ mod tests {
 
     #[test]
     fn nesting_is_bounded_by_the_server_body_depth() {
-        // The record is level 1, so 12 nested arrays reach record depth 13.
+        // The record is level 1, so 12 nested arrays reach record depth 13:
+        // that still decodes (and is then refused by the field's type), which
+        // places a record's deepest level at body level 16.
         let nested = |levels: usize| format!("{}{}", "[".repeat(levels), "]".repeat(levels));
-        let fits = parse_report(&line(&finished_with("description", &nested(12)))).unwrap();
-        let source = Source::default();
-        let body: Value =
-            serde_json::from_slice(&envelope(&ctx(&source, "passed"), &fits).unwrap()).unwrap();
-        assert_eq!(depth(&body), MAX_BODY_DEPTH);
+        let record = finished_with("file", &nested(12));
+        assert!(decode(&record, MAX_RECORD_DEPTH).is_ok());
+        assert_eq!(MAX_RECORD_DEPTH + 3, MAX_BODY_DEPTH);
+        assert_eq!(parse_report(&line(&record)).unwrap_err(), "invalid_field");
         assert_eq!(
-            parse_report(&line(&finished_with("description", &nested(13)))).unwrap_err(),
+            parse_report(&line(&finished_with("file", &nested(13)))).unwrap_err(),
             "nested_too_deeply"
         );
         // Deeper than serde_json's own recursion limit still gets the structural code.
         assert_eq!(
-            parse_report(&line(&finished_with("description", &nested(500)))).unwrap_err(),
+            parse_report(&line(&finished_with("file", &nested(500)))).unwrap_err(),
             "nested_too_deeply"
         );
         // The real contract's deepest structure stays well inside the limit.
@@ -1374,10 +1354,25 @@ mod tests {
             "integer_out_of_range"
         );
         let max = parse_report(&line(&finished_with("duration_us", "9007199254740991"))).unwrap();
-        assert_eq!(max.records[1]["duration_us"], MAX_SAFE_INTEGER);
+        assert_eq!(max.records[2]["duration_us"], MAX_SAFE_INTEGER);
         let mut seed = suite_started("r", Value::Null);
         seed["seed"] = json!(-5);
         assert!(parse_report(&jsonl(&[seed])).is_ok());
+        let seed = suite_started("r", Value::Null).to_string().replacen(
+            r#""seed":1"#,
+            r#""seed":-9007199254740992"#,
+            1,
+        );
+        assert_eq!(
+            parse_report(format!("{seed}\n").as_bytes()).unwrap_err(),
+            "integer_out_of_range"
+        );
+        let seed = suite_started("r", Value::Null).to_string().replacen(
+            r#""seed":1"#,
+            r#""seed":-9007199254740991"#,
+            1,
+        );
+        assert!(parse_report(format!("{seed}\n").as_bytes()).is_ok());
     }
 
     #[test]
@@ -1536,7 +1531,7 @@ mod tests {
                 );
             }
         }
-        for filters in [Value::Null, json!([]), json!("x")] {
+        for filters in [json!([]), json!("x")] {
             let mut started = suite_started("r", Value::Null);
             started["filters"] = filters;
             assert_eq!(
@@ -1544,6 +1539,259 @@ mod tests {
                 "unsupported_filter"
             );
         }
+        // A runner without tags sends null; the key itself is a required core key.
+        let mut started = suite_started("r", Value::Null);
+        started["filters"] = Value::Null;
+        assert!(parse_report(&jsonl(&[started])).is_ok());
+        let mut started = suite_started("r", Value::Null);
+        started.as_object_mut().unwrap().remove("filters");
+        assert_eq!(
+            parse_report(&jsonl(&[started])).unwrap_err(),
+            "missing_field"
+        );
+    }
+
+    fn rejects(records: &[Value]) -> &'static str {
+        parse_report(&jsonl(records)).unwrap_err()
+    }
+
+    #[test]
+    fn records_are_typed_against_the_contract() {
+        let ss = || suite_started("r", Value::Null);
+        // Every core key is required, even a nullable one.
+        let mut missing = test_finished("r", "passed");
+        missing.as_object_mut().unwrap().remove("duration_us");
+        assert_eq!(
+            rejects(&[ss(), test_started("r"), missing]),
+            "missing_field"
+        );
+        let mut missing = ss();
+        missing.as_object_mut().unwrap().remove("seed");
+        assert_eq!(rejects(&[missing]), "missing_field");
+        // Wrong-typed core values are caught before a snapshot is frozen.
+        for (key, value) in [
+            ("duration_us", json!("12")),
+            ("duration_us", json!(-5)),
+            ("outcome", json!("todo")),
+            ("outcome", json!("excluded")),
+            ("line", json!(0)),
+            ("path", Value::Array(vec![json!("d"); 33])),
+            ("execution_id", json!(0)),
+        ] {
+            let mut finished = test_finished("r", "passed");
+            finished[key] = value;
+            assert_eq!(
+                rejects(&[ss(), test_started("r"), finished]),
+                "invalid_field",
+                "{key}"
+            );
+        }
+        let mut long = group_started("r");
+        long["group"] = json!("g".repeat(4097));
+        assert_eq!(rejects(&[ss(), long]), "field_too_long");
+        // The retired record keys are unknown keys.
+        let mut retired = ss();
+        let id = retired.as_object_mut().unwrap().remove("suite_id").unwrap();
+        retired["run_id"] = id;
+        assert_eq!(rejects(&[retired]), "unsupported_field");
+        let mut reason = interrupted("r");
+        reason["reason"] = json!("sigint");
+        assert_eq!(rejects(&[ss(), reason]), "unsupported_field");
+        // Runner identity and a negative seed.
+        let mut jest = ss();
+        jest["runner"] = json!({"name": "jest", "version": "30.0.0"});
+        jest["seed"] = json!(-1843);
+        jest["filters"] = Value::Null;
+        assert!(parse_report(&jsonl(&[jest])).is_ok());
+        let mut spaced = ss();
+        spaced["runner"]["name"] = json!("jest runner");
+        assert_eq!(rejects(&[spaced]), "invalid_field");
+        let mut retired = ss();
+        retired["format"] = json!("exunit-timings");
+        assert_eq!(rejects(&[retired]), "unsupported_format");
+        let mut later = ss();
+        later["format"] = json!("test-timings/2");
+        assert_eq!(rejects(&[later]), "unsupported_format");
+        // Nested describes, and a group that failed to load with empty counts.
+        let (mut start, mut finish) = (test_started("r"), test_finished("r", "passed"));
+        start["path"] = json!(["math", "sum"]);
+        finish["path"] = json!(["math", "sum"]);
+        let mut errored = group_finished("r");
+        errored["outcome"] = json!("errored");
+        errored["counts"] = json!({});
+        let report =
+            parse_report(&jsonl(&[ss(), group_started("r"), start, finish, errored])).unwrap();
+        assert_eq!(report.records[3]["path"], json!(["math", "sum"]));
+        // Millisecond producers send their values unchanged.
+        let mut ms = test_finished("r", "passed");
+        ms["duration_us"] = json!(12000);
+        let report = parse_report(&jsonl(&[ss(), test_started("r"), ms])).unwrap();
+        assert_eq!(report.records[2]["duration_us"], 12000);
+        // A report that ends with an interruption is accepted (as incomplete).
+        assert!(parse_report(&jsonl(&[ss(), test_started("r"), interrupted("r")])).is_ok());
+        // A runner that stopped at its failure limit says so, then finishes.
+        let mut stopped = interrupted("r");
+        stopped["event"] = json!("max_failures_reached");
+        stopped["meta"] = json!({"max_failures": 1});
+        let mut finished = suite_finished("r");
+        finished["aborted"] = json!(true);
+        let report = parse_report(&jsonl(&[ss(), stopped, finished])).unwrap();
+        assert_eq!(report.records[1]["event"], "max_failures_reached");
+        let mut reason = interrupted("r");
+        reason["event"] = json!("max_failures_reached");
+        reason["failures"] = json!(1);
+        assert_eq!(rejects(&[ss(), reason]), "unsupported_field");
+        // A group whose tests were all skipped.
+        let mut skipped = group_finished("r");
+        skipped["outcome"] = json!("skipped");
+        skipped["counts"] = json!({"skipped": 2});
+        let report = parse_report(&jsonl(&[ss(), group_started("r"), skipped])).unwrap();
+        assert_eq!(report.records[2]["counts"], json!({"skipped": 2}));
+    }
+
+    #[test]
+    fn each_record_is_validated_as_its_line_is_decoded() {
+        let ss = || suite_started("r", Value::Null);
+        let mut long = test_started("r");
+        long["name"] = json!("n".repeat(MAX_TEXT_BYTES + 1));
+        // The over-wide record is rejected before the next line is decoded:
+        // the later duplicate key (a decode error) is never reached.
+        let mut bytes = jsonl(&[ss(), long]);
+        bytes.extend_from_slice(b"{\"event\":\"interrupted\",\"event\":\"interrupted\"}\n");
+        assert_eq!(parse_report(&bytes).unwrap_err(), "field_too_long");
+        // Nor does a bad record wait for the request size limit: a later line
+        // that would overflow it is never parsed.
+        let mut bytes = jsonl(&[ss(), interrupted("other")]);
+        let mut huge = interrupted("r");
+        huge["meta"] = json!({"blob": "x".repeat(MAX_REQUEST_BYTES)});
+        bytes.extend(jsonl(&[huge]));
+        assert_eq!(parse_report(&bytes).unwrap_err(), "identity_mismatch");
+        // A record after `suite_finished` is out of order even when the
+        // unfinished counts are also wrong; a final one is checked for them.
+        let mut finished = suite_finished("r");
+        finished["unfinished_tests"] = json!(1);
+        assert_eq!(
+            rejects(&[ss(), finished.clone(), interrupted("r")]),
+            "invalid_order"
+        );
+        assert_eq!(rejects(&[ss(), finished]), "unfinished_mismatch");
+        assert_eq!(
+            rejects(&[ss(), suite_finished("r"), suite_finished("r")]),
+            "invalid_order"
+        );
+    }
+
+    #[test]
+    fn meta_is_flat_and_bounded() {
+        let ss = || suite_started("r", Value::Null);
+        for meta in [
+            json!({"tags": ["a", "b"]}),
+            json!({"x": {"x": 1}}),
+            json!({"s": "s".repeat(257)}),
+            json!({"bad key": 1}),
+            json!("flat"),
+            Value::Object((0..33).map(|i| (format!("k{i}"), json!(i))).collect()),
+        ] {
+            let mut started = test_started("r");
+            started["meta"] = meta.clone();
+            assert_eq!(rejects(&[ss(), started]), "invalid_meta", "{meta}");
+        }
+        let mut started = ss();
+        started["meta"] = json!({"elixir_version": "1.20.0", "otp_release": "28", "max_cases": 16});
+        assert!(parse_report(&jsonl(&[started])).is_ok());
+        // `meta` is not compared during pairing.
+        let mut finished = test_finished("r", "skipped");
+        finished["meta"] = json!({"skip_reason": "excluded"});
+        assert!(parse_report(&jsonl(&[ss(), test_started("r"), finished])).is_ok());
+        let mut interrupted = interrupted("r");
+        interrupted["meta"] = json!({"signal": "SIGINT"});
+        assert!(parse_report(&jsonl(&[ss(), interrupted])).is_ok());
+    }
+
+    #[test]
+    fn finished_events_pair_with_started_events() {
+        let ss = || suite_started("r", Value::Null);
+        // Finish without start, for tests and groups.
+        assert_eq!(
+            rejects(&[ss(), test_finished("r", "passed")]),
+            "unpaired_event"
+        );
+        assert_eq!(rejects(&[ss(), group_finished("r")]), "unpaired_event");
+        // A test's start does not pair a group's finish.
+        assert_eq!(
+            rejects(&[ss(), test_started("r"), group_finished("r")]),
+            "unpaired_event"
+        );
+        // Finish changes identity.
+        for (key, value) in [
+            ("name", json!("other")),
+            ("path", json!(["x"])),
+            ("line", Value::Null),
+            ("started_offset_us", json!(6)),
+        ] {
+            let mut finished = test_finished("r", "passed");
+            finished[key] = value;
+            assert_eq!(
+                rejects(&[ss(), test_started("r"), finished]),
+                "unpaired_event",
+                "{key}"
+            );
+        }
+        // Finished twice, started twice (even after finishing).
+        let pair = [test_started("r"), test_finished("r", "passed")];
+        assert_eq!(
+            rejects(&[ss(), pair[0].clone(), pair[1].clone(), pair[1].clone()]),
+            "unpaired_event"
+        );
+        assert_eq!(
+            rejects(&[ss(), test_started("r"), test_started("r")]),
+            "unpaired_event"
+        );
+        assert_eq!(
+            rejects(&[
+                ss(),
+                pair[0].clone(),
+                pair[1].clone(),
+                pair[0].clone(),
+                pair[1].clone()
+            ]),
+            "unpaired_event"
+        );
+        assert_eq!(
+            rejects(&[ss(), group_started("r"), group_started("r")]),
+            "unpaired_event"
+        );
+        // Group and test execution ids are separate namespaces.
+        assert!(parse_report(&complete("r")).is_ok());
+        // Started but never finished: accepted, and counted as unfinished.
+        assert!(parse_report(&jsonl(&[ss(), group_started("r"), test_started("r")])).is_ok());
+        let mut finished = suite_finished("r");
+        finished["unfinished_tests"] = json!(1);
+        finished["unfinished_groups"] = json!(1);
+        finished["aborted"] = json!(true);
+        assert!(parse_report(&jsonl(&[
+            ss(),
+            group_started("r"),
+            test_started("r"),
+            finished
+        ]))
+        .is_ok());
+    }
+
+    #[test]
+    fn unfinished_counts_must_match_the_open_events() {
+        let ss = || suite_started("r", Value::Null);
+        assert_eq!(
+            rejects(&[ss(), test_started("r"), suite_finished("r")]),
+            "unfinished_mismatch"
+        );
+        assert_eq!(
+            rejects(&[ss(), group_started("r"), suite_finished("r")]),
+            "unfinished_mismatch"
+        );
+        let mut over = suite_finished("r");
+        over["unfinished_tests"] = json!(1);
+        assert_eq!(rejects(&[ss(), over]), "unfinished_mismatch");
     }
 
     #[test]
@@ -1631,6 +1879,7 @@ mod tests {
         let source = Source::default();
         let mut fragment = jsonl(&[
             suite_started("r", Value::Null),
+            test_started("r"),
             test_finished("r", "passed"),
         ]);
         fragment.extend_from_slice(br#"{"event":"test_fin"#);
@@ -1638,7 +1887,7 @@ mod tests {
         let body = envelope(&ctx(&source, "failed"), &report).unwrap();
         let value: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(value["report"]["truncated"], true);
-        assert_eq!(value["report"]["records"].as_array().unwrap().len(), 2);
+        assert_eq!(value["report"]["records"].as_array().unwrap().len(), 3);
         assert!(validate_envelope(&body).is_ok());
     }
 
@@ -1715,6 +1964,14 @@ mod tests {
                 "identity_mismatch",
             ),
             (
+                &|v: &mut Value| v["report"]["partition_count"] = json!(4),
+                "identity_mismatch",
+            ),
+            (
+                &|v: &mut Value| v["report"]["partition_count"] = Value::Null,
+                "identity_mismatch",
+            ),
+            (
                 &|v: &mut Value| v["report"]["report_id"] = json!("other"),
                 "identity_mismatch",
             ),
@@ -1740,6 +1997,23 @@ mod tests {
             (
                 &|v: &mut Value| v["workflow"] = json!("a\u{0}b"),
                 "nul_character",
+            ),
+            (
+                // A snapshot frozen by an older CLI in the retired format.
+                &|v: &mut Value| v["format"] = json!("exunit-timings"),
+                "unsupported_format",
+            ),
+            (
+                &|v: &mut Value| v["report"]["records"][0]["format"] = json!("test-timings/2"),
+                "unsupported_format",
+            ),
+            (
+                &|v: &mut Value| v["report"]["suite_id"] = json!("suite-2"),
+                "identity_mismatch",
+            ),
+            (
+                &|v: &mut Value| v["report"]["records"][3]["duration_us"] = json!("12"),
+                "invalid_field",
             ),
         ] {
             assert_eq!(tampered(edit).unwrap_err(), code);
@@ -1919,9 +2193,10 @@ mod tests {
 
     #[test]
     fn instance_identity_replaces_null_producer_partition() {
-        let mut started = suite_started("r", Value::Null);
-        started["partition_count"] = Value::Null;
-        let report = jsonl(&[started, test_finished("r", "passed"), suite_finished("r")]);
+        let mut records = complete_records("r");
+        records[0]["partition"] = Value::Null;
+        records[0]["partition_count"] = Value::Null;
+        let report = jsonl(&records);
         let (collection, sink) = collect_instance(&report, 2, 3);
         assert_eq!(collection.reports.len(), 1);
         assert_eq!(
@@ -1935,9 +2210,9 @@ mod tests {
 
     #[test]
     fn instance_identity_overrides_a_disagreeing_producer() {
-        let mut started = suite_started("r", json!("1"));
-        started["partition_count"] = json!(4);
-        let report = jsonl(&[started, test_finished("r", "passed"), suite_finished("r")]);
+        let mut records = complete_records("r");
+        records[0]["partition_count"] = json!(4);
+        let report = jsonl(&records);
         let (collection, sink) = collect_instance(&report, 2, 3);
         assert_eq!(collection.reports.len(), 1);
         assert_eq!(
@@ -1956,7 +2231,7 @@ mod tests {
             record.as_object_mut().unwrap().remove("partition_count");
         }
         assert_eq!(first, original);
-        assert_eq!(value["report"]["records"][1], test_finished("r", "passed"));
+        assert_eq!(value["report"]["records"][3], test_finished("r", "passed"));
     }
 
     #[test]

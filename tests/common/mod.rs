@@ -237,21 +237,37 @@ pub mod mock {
     }
 }
 
-/// One complete synthetic `exunit-timings` report as JSONL.
+/// One complete synthetic `test-timings/1` report as JSONL: one group holding
+/// a test inside a describe path, with runner metadata in `meta`.
 pub fn timing_report(report_id: &str, partition: Option<&str>) -> String {
     let partition = serde_json::json!(partition);
+    let group = serde_json::json!({"group":"MyTest","file":"test/my_test.exs","execution_id":1,"started_offset_us":2});
+    let test = serde_json::json!({"group":"MyTest","path":["math"],"name":"test works","file":"test/my_test.exs",
+        "line":3,"execution_id":1,"started_offset_us":5});
+    let record = |event: &str, offset: u64, core: &serde_json::Value, extra: serde_json::Value| {
+        let mut record = serde_json::json!({"event":event,"suite_id":"suite-1","report_id":report_id,
+            "received_offset_us":offset});
+        for fields in [core, &extra] {
+            for (key, value) in fields.as_object().unwrap() {
+                record[key] = value.clone();
+            }
+        }
+        record
+    };
+    let none = serde_json::json!({});
     [
-        serde_json::json!({"event":"suite_started","run_id":"suite-1","report_id":report_id,"received_offset_us":0,
-            "format":"exunit-timings","started_at":"2026-11-01T00:00:00Z","partition":partition,"partition_count":3,
-            "seed":1,"max_cases":2,"schedulers":2,"elixir_version":"1.18.0","otp_release":"27",
-            "filters":{"include":[],"exclude":[]}}),
-        serde_json::json!({"event":"test_finished","run_id":"suite-1","report_id":report_id,"received_offset_us":10,
-            "module":"MyTest","name":"test works","description":null,"file":"test/my_test.exs","line":3,
-            "describe":null,"async":true,"parameter_id":null,"execution_id":1,"started_offset_us":5,
-            "duration_us":42,"outcome":"passed"}),
-        serde_json::json!({"event":"suite_finished","run_id":"suite-1","report_id":report_id,"received_offset_us":99,
-            "aborted":false,"unfinished_tests":0,"unfinished_modules":0,"counts":{"passed":1},"files":[],
-            "times_us":{"run":100,"async":60,"sync":40,"load":null,"total":100}}),
+        record("suite_started", 0, &none, serde_json::json!({"format":"test-timings/1",
+            "started_at":"2026-11-01T00:00:00Z","runner":{"name":"exunit","version":"1.18.0"},
+            "partition":partition,"partition_count":3,"seed":1,"filters":{"include":[],"exclude":[]},
+            "meta":{"elixir_version":"1.18.0","otp_release":"27","max_cases":2,"schedulers":2}})),
+        record("group_started", 2, &group, serde_json::json!({"meta":{"async":true}})),
+        record("test_started", 5, &test, serde_json::json!({"meta":{"async":true}})),
+        record("test_finished", 10, &test, serde_json::json!({"duration_us":42,"outcome":"passed"})),
+        record("group_finished", 60, &group, serde_json::json!({"duration_us":50,"outcome":"passed",
+            "counts":{"passed":1}})),
+        record("suite_finished", 99, &none, serde_json::json!({"aborted":false,"unfinished_tests":0,
+            "unfinished_groups":0,"counts":{"passed":1},"duration_us":100,
+            "meta":{"run_us":100,"async_us":60,"sync_us":40,"load_us":null,"total_us":100}})),
     ]
     .iter()
     .map(|r| format!("{r}\n"))

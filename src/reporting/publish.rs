@@ -228,7 +228,7 @@ impl Publisher {
         let mut builder = reqwest::Client::builder()
             .redirect(redirect::Policy::none())
             .connect_timeout(limits.connect)
-            // Names the local contract copy so server logs can spot a stale publisher.
+            // Names the contract version so server logs can spot a stale publisher.
             .user_agent(format!(
                 "goodflows/{} test-reports/{}",
                 env!("CARGO_PKG_VERSION"),

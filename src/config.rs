@@ -20,7 +20,10 @@ pub struct Config {
     pub reporting: Option<Reporting>,
 }
 
-pub const REPORT_FORMAT: &str = crate::reporting::contract::REPORT_FORMAT;
+/// The report family a job requests in `reports`. The wire version it is
+/// collected as is [`crate::reporting::contract::REPORT_FORMAT`], so a later
+/// contract version needs no configuration change.
+pub const REPORT_FAMILY: &str = "test-timings";
 pub const RESERVED_ENV: [&str; 2] = ["GOODFLOWS_RUN_ID", "GOODFLOWS_REPORT_DIR"];
 /// Partition identity injected into every partitioned instance. Deliberately
 /// separate from `RESERVED_ENV`, which reporting scrubs from every command.
@@ -1081,9 +1084,18 @@ fn validate_reports(job: &Job, reporting: bool) -> Result<()> {
     }
     let mut seen = HashSet::new();
     for format in &job.reports {
-        if format != REPORT_FORMAT {
+        if format == "exunit-timings" {
             bail!(
-                "reports: unsupported format '{}' (supported: {REPORT_FORMAT})",
+                "reports: format 'exunit-timings' was retired (supported: {REPORT_FAMILY}); \
+                 use reports = [\"{REPORT_FAMILY}\"] and install the ExUnit reporter \
+                 (goodflows_exunit_reporter, Goodflows.ExUnitReporter); \
+                 see README.md, \"Upgrading from exunit-timings\" \
+                 (https://github.com/agoodway/goodflows#upgrading-from-exunit-timings)"
+            );
+        }
+        if format != REPORT_FAMILY {
+            bail!(
+                "reports: unsupported format '{}' (supported: {REPORT_FAMILY})",
                 format.escape_debug()
             );
         }
@@ -1352,6 +1364,34 @@ mod tests {
         let mut config = parse(source)?;
         config.validate().map_err(|error| format!("{error:#}"))?;
         Ok(config)
+    }
+
+    #[test]
+    fn reports_name_the_test_timings_family() {
+        assert_eq!(REPORT_FAMILY, "test-timings");
+        assert_eq!(crate::reporting::contract::REPORT_FORMAT, "test-timings/1");
+        let config = |reports: &str| {
+            format!(
+                "[reporting]\nproject = 'goodcases'\n[[jobs]]\nname = 'test'\ncommand = 'true'\nreports = {reports}\n"
+            )
+        };
+        assert!(validate(&config("['test-timings']")).is_ok());
+        let error = validate(&config("['exunit-timings']")).unwrap_err();
+        assert_eq!(
+            error,
+            "job 'test': reports: format 'exunit-timings' was retired (supported: test-timings); \
+             use reports = [\"test-timings\"] and install the ExUnit reporter \
+             (goodflows_exunit_reporter, Goodflows.ExUnitReporter); \
+             see README.md, \"Upgrading from exunit-timings\" \
+             (https://github.com/agoodway/goodflows#upgrading-from-exunit-timings)"
+        );
+        let error = validate(&config("['test-timings/1']")).unwrap_err();
+        assert!(
+            error.contains("unsupported format") && error.contains("(supported: test-timings)"),
+            "{error}"
+        );
+        let error = validate(&config("['test-timings', 'test-timings']")).unwrap_err();
+        assert!(error.contains("duplicate format"), "{error}");
     }
 
     #[test]

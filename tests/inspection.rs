@@ -243,7 +243,7 @@ fn invalid_partition_configs_fail_validation_before_execution() {
     // Partitioned jobs may declare reports; each instance collects its own directory.
     for jobs in ["jobs", "workflows.ci.jobs"] {
         let p = Project::new(&format!(
-            "{REPORTING}[[{jobs}]]\n{SAFE}[[{jobs}]]\nname='test'\ncommand='true'\npartitions=3\nreports=['exunit-timings']\n"
+            "{REPORTING}[[{jobs}]]\n{SAFE}[[{jobs}]]\nname='test'\ncommand='true'\npartitions=3\nreports=['test-timings']\n"
         ));
         let output = p.run(&["validate", "--json"]);
         success(&output);

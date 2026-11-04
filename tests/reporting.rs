@@ -117,10 +117,19 @@ fn invalid_reporting_config_fails_before_any_job_runs() {
         (REPORTING.to_owned(), job("reports = [\"junit\"]"), "unsupported format"),
         (
             REPORTING.to_owned(),
-            job("reports = [\"exunit-timings\", \"exunit-timings\"]"),
+            job("reports = [\"exunit-timings\"]"),
+            "format 'exunit-timings' was retired (supported: test-timings); \
+             use reports = [\"test-timings\"] and install the ExUnit reporter \
+             (goodflows_exunit_reporter, Goodflows.ExUnitReporter); \
+             see README.md, \"Upgrading from exunit-timings\" \
+             (https://github.com/agoodway/goodflows#upgrading-from-exunit-timings)",
+        ),
+        (
+            REPORTING.to_owned(),
+            job("reports = [\"test-timings\", \"test-timings\"]"),
             "duplicate format",
         ),
-        (String::new(), job("reports = [\"exunit-timings\"]"), "requires a top-level [reporting]"),
+        (String::new(), job("reports = [\"test-timings\"]"), "requires a top-level [reporting]"),
         (
             format!("{REPORTING}token = \"gfk_live_123\"\n"),
             job(""),
@@ -168,14 +177,14 @@ fn invalid_reporting_config_fails_before_any_job_runs() {
         (
             REPORTING.to_owned(),
             format!(
-                "[[jobs]]\nname = \"{}\"\ncommand = \"touch ran\"\nreports = [\"exunit-timings\"]\n",
+                "[[jobs]]\nname = \"{}\"\ncommand = \"touch ran\"\nreports = [\"test-timings\"]\n",
                 "j".repeat(65)
             ),
             "at most 64 UTF-8 bytes",
         ),
         (
             REPORTING.to_owned(),
-            "[[jobs]]\nname = \"te\\tst\"\ncommand = \"touch ran\"\nreports = [\"exunit-timings\"]\n".into(),
+            "[[jobs]]\nname = \"te\\tst\"\ncommand = \"touch ran\"\nreports = [\"test-timings\"]\n".into(),
             "control characters",
         ),
         (
@@ -213,7 +222,7 @@ fn job_level_reporting_errors_name_the_job() {
         (
             REPORTING.to_owned(),
             format!("{}a", "é".repeat(32)),
-            "reports = [\"exunit-timings\"]\ncommand = \"touch ran\"".to_owned(),
+            "reports = [\"test-timings\"]\ncommand = \"touch ran\"".to_owned(),
             "at most 64 UTF-8 bytes",
         ),
         (
@@ -258,12 +267,12 @@ token_env = "MY_KEY"
 [[jobs]]
 name = "{ascii}"
 command = "true"
-reports = ["exunit-timings"]
+reports = ["test-timings"]
 
 [[jobs]]
 name = "{multibyte}"
 command = "true"
-reports = ["exunit-timings"]
+reports = ["test-timings"]
 
 [[jobs]]
 name = "{long}"
@@ -283,7 +292,7 @@ env = {{ GOODFLOWS_API_KEY = "not the token here" }}
 fn inspection_never_creates_spools_or_contacts_the_endpoint() {
     let mock = Mock::store();
     let p = project(&format!(
-        "[[jobs]]\nname = \"test\"\ncommand = '{}'\nreports = [\"exunit-timings\"]\n",
+        "[[jobs]]\nname = \"test\"\ncommand = '{}'\nreports = [\"test-timings\"]\n",
         copy(&["r1"])
     ));
     for args in [
@@ -299,11 +308,11 @@ fn inspection_never_creates_spools_or_contacts_the_endpoint() {
         if args == ["list"] {
             let text = stdout(&output);
             assert!(text.contains("Reporting: project=goodcases url_env=GOODFLOWS_URL token_env=GOODFLOWS_API_KEY"), "{text}");
-            assert!(text.contains("reports: exunit-timings"));
+            assert!(text.contains("reports: test-timings"));
         }
         if args == ["list", "--json"] {
             let event: Value = serde_json::from_slice(&output.stdout).unwrap();
-            assert_eq!(event["jobs"][0]["reports"], json!(["exunit-timings"]));
+            assert_eq!(event["jobs"][0]["reports"], json!(["test-timings"]));
             assert_eq!(
                 event["reporting"],
                 json!({"project":"goodcases", "url_env":"GOODFLOWS_URL", "token_env":"GOODFLOWS_API_KEY",
@@ -342,12 +351,12 @@ command = "true"
 name = "test"
 command = 'cp r1.jsonl "$GOODFLOWS_REPORT_DIR/"'
 depends_on = ["setup"]
-reports = ["exunit-timings"]
+reports = ["test-timings"]
 
 [[workflows.ci.jobs]]
 name = "unselected"
 command = "touch unselected"
-reports = ["exunit-timings"]
+reports = ["test-timings"]
 "#,
     )
     .unwrap();
@@ -420,7 +429,7 @@ fn unconfigured_workflows_keep_their_event_stream() {
 #[test]
 fn local_only_collection_without_credentials() {
     let p = project(&format!(
-        "[[jobs]]\nname = \"test\"\ncommand = '{}'\nreports = [\"exunit-timings\"]\n",
+        "[[jobs]]\nname = \"test\"\ncommand = '{}'\nreports = [\"test-timings\"]\n",
         copy(&["r1", "r2", "r3"])
     ));
     let output = p.run(&["--json"]);
@@ -464,7 +473,7 @@ fn manifest_holds_only_structural_metadata_and_env_names() {
     let p = project_with(
         "[reporting]\nproject = \"goodcases\"\nurl_env = \"MY_FLOWS_URL\"\ntoken_env = \"MY_FLOWS_KEY\"\n",
         &format!(
-            "[[jobs]]\nname = \"test\"\ncommand = '{}'\nreports = [\"exunit-timings\"]\nenv = {{ UNRELATED = \"leak-me\" }}\n",
+            "[[jobs]]\nname = \"test\"\ncommand = '{}'\nreports = [\"test-timings\"]\nenv = {{ UNRELATED = \"leak-me\" }}\n",
             copy(&["r1"])
         ),
     );
@@ -519,7 +528,7 @@ fn concurrent_invocations_and_stale_files_stay_isolated() {
     let p = project(
         // Each job announces itself, then waits (bounded) for the other one, so
         // both invocations are provably inside their jobs at the same time.
-        "[[jobs]]\nname = \"test\"\ncommand = 'cp \"fixtures/$WHICH.jsonl\" \"$GOODFLOWS_REPORT_DIR/\"; touch \"started-$WHICH\"; i=0; while [ ! -e \"started-$OTHER\" ] && [ $i -lt 500 ]; do sleep 0.02; i=$((i+1)); done; [ -e \"started-$OTHER\" ] && touch \"overlapped-$WHICH\"'\nreports = [\"exunit-timings\"]\n",
+        "[[jobs]]\nname = \"test\"\ncommand = 'cp \"fixtures/$WHICH.jsonl\" \"$GOODFLOWS_REPORT_DIR/\"; touch \"started-$WHICH\"; i=0; while [ ! -e \"started-$OTHER\" ] && [ $i -lt 500 ]; do sleep 0.02; i=$((i+1)); done; [ -e \"started-$OTHER\" ] && touch \"overlapped-$WHICH\"'\nreports = [\"test-timings\"]\n",
     );
     // Historical files in the default formatter location and an older run are never read.
     std::fs::create_dir_all(p.dir.join(".goodflows/reports/old/test/reports")).unwrap();
@@ -564,7 +573,7 @@ fn concurrent_invocations_and_stale_files_stay_isolated() {
 #[test]
 fn distinct_job_names_get_distinct_reversible_directories() {
     let p = project(&format!(
-        "[[jobs]]\nname = \"Test\"\ncommand = '{}'\nreports = [\"exunit-timings\"]\n[[jobs]]\nname = \"test\"\ncommand = '{}'\nreports = [\"exunit-timings\"]\n[[jobs]]\nname = \"a/b c\"\ncommand = '{}'\nreports = [\"exunit-timings\"]\n",
+        "[[jobs]]\nname = \"Test\"\ncommand = '{}'\nreports = [\"test-timings\"]\n[[jobs]]\nname = \"test\"\ncommand = '{}'\nreports = [\"test-timings\"]\n[[jobs]]\nname = \"a/b c\"\ncommand = '{}'\nreports = [\"test-timings\"]\n",
         copy(&["r1"]),
         copy(&["r2"]),
         copy(&["r3"])
@@ -595,7 +604,7 @@ fn distinct_job_names_get_distinct_reversible_directories() {
 #[test]
 fn source_context_is_null_outside_git_and_captured_inside() {
     let p = project(&format!(
-        "[[jobs]]\nname = \"test\"\ncommand = '{}'\nreports = [\"exunit-timings\"]\n",
+        "[[jobs]]\nname = \"test\"\ncommand = '{}'\nreports = [\"test-timings\"]\n",
         copy(&["r1"])
     ));
     success(&p.run(&["--json"]));
@@ -637,7 +646,7 @@ fn unwritable_spool_runs_checks_without_reporting_env() {
         let p = project_with(
             "[reporting]\nproject = \"goodcases\"\nspool_dir = \"blocker/spool\"\n",
             &format!(
-                "[settings]\nfail_fast = false\n[[jobs]]\nname = \"test\"\ncommand = 'printf %s \"${{GOODFLOWS_REPORT_DIR-unset}}:${{GOODFLOWS_RUN_ID-unset}}\" > seen; {command}'\nreports = [\"exunit-timings\"]\n[[jobs]]\nname = \"plain\"\ncommand = 'printf %s \"${{GOODFLOWS_REPORT_DIR-unset}}:${{GOODFLOWS_RUN_ID-unset}}\" > plain-seen'\n"
+                "[settings]\nfail_fast = false\n[[jobs]]\nname = \"test\"\ncommand = 'printf %s \"${{GOODFLOWS_REPORT_DIR-unset}}:${{GOODFLOWS_RUN_ID-unset}}\" > seen; {command}'\nreports = [\"test-timings\"]\n[[jobs]]\nname = \"plain\"\ncommand = 'printf %s \"${{GOODFLOWS_REPORT_DIR-unset}}:${{GOODFLOWS_RUN_ID-unset}}\" > plain-seen'\n"
             ),
         );
         std::fs::write(p.dir.join("blocker"), "file, not a directory").unwrap();
@@ -699,7 +708,7 @@ fn token_is_scrubbed(reporting: &str, key: &str) {
 name = "shell"
 condition = "env > condition-env.txt"
 command = 'env > shell-env.txt; {copy}'
-reports = ["exunit-timings"]
+reports = ["test-timings"]
 
 [[jobs]]
 name = "exec"
@@ -780,7 +789,7 @@ command = "touch expression-was-null"
 #[test]
 fn failed_jobs_report_and_skipped_jobs_do_not() {
     let p = project(&format!(
-        "[[jobs]]\nname = \"test\"\ncommand = '{}; exit 4'\nreports = [\"exunit-timings\"]\n[[jobs]]\nname = \"after\"\ncommand = '{}'\ndepends_on = [\"test\"]\nreports = [\"exunit-timings\"]\n",
+        "[[jobs]]\nname = \"test\"\ncommand = '{}; exit 4'\nreports = [\"test-timings\"]\n[[jobs]]\nname = \"after\"\ncommand = '{}'\ndepends_on = [\"test\"]\nreports = [\"test-timings\"]\n",
         copy(&["r1"]),
         copy(&["r2"])
     ));
@@ -822,15 +831,15 @@ fail_fast = false
 name = "skipped"
 condition = {{ shell = '{}; exit 1' }}
 command = '{}'
-reports = ["exunit-timings"]
+reports = ["test-timings"]
 [[jobs]]
 name = "expr"
 condition = {{ expression = "env.GOODFLOWS_REPORT_DIR != null || env.GOODFLOWS_RUN_ID != null" }}
 command = "touch expr-ran"
-reports = ["exunit-timings"]
+reports = ["test-timings"]
 [[jobs]]
 name = "stepped"
-reports = ["exunit-timings"]
+reports = ["test-timings"]
 [[jobs.steps]]
 id = "probe"
 condition = {{ shell = '{}' }}
@@ -890,7 +899,7 @@ command = 'printf "%s" "$GOODFLOWS_REPORT_DIR" > step-dir'
 fn job_cancelled_before_its_command_spawns_is_not_executed() {
     let mock = Mock::store();
     let p = project(&format!(
-        "[[jobs]]\nname = \"test\"\ncondition = {{ shell = 'touch cond-started; sleep 10' }}\ncommand = '{}'\nreports = [\"exunit-timings\"]\n",
+        "[[jobs]]\nname = \"test\"\ncondition = {{ shell = 'touch cond-started; sleep 10' }}\ncommand = '{}'\nreports = [\"test-timings\"]\n",
         copy(&["r1"])
     ));
     let child = p
@@ -925,19 +934,19 @@ fail_fast = false
 [[jobs]]
 name = "removed"
 command = 'rmdir "$GOODFLOWS_REPORT_DIR"'
-reports = ["exunit-timings"]
+reports = ["test-timings"]
 [[jobs]]
 name = "empty"
 command = "true"
-reports = ["exunit-timings"]
+reports = ["test-timings"]
 [[jobs]]
 name = "escape"
 command = 'ln -s "$PWD/fixtures/r1.jsonl" "$GOODFLOWS_REPORT_DIR/r1.jsonl"'
-reports = ["exunit-timings"]
+reports = ["test-timings"]
 [[jobs]]
 name = "late"
 command = '(sleep 0.5; cp fixtures/r2.jsonl "$GOODFLOWS_REPORT_DIR/late.jsonl") & echo "$GOODFLOWS_REPORT_DIR" > late-dir'
-reports = ["exunit-timings"]
+reports = ["test-timings"]
 "#,
     );
     let output = run_with(&p, &["--json"], Some(&mock.url));
@@ -965,7 +974,7 @@ reports = ["exunit-timings"]
 #[test]
 fn parallel_producers_share_one_job_directory() {
     let p = project(
-        "[[jobs]]\nname = \"test\"\ncommand = 'for id in r1 r2 r3; do (sleep 0.1; cp \"fixtures/$id.jsonl\" \"$GOODFLOWS_REPORT_DIR/\") & done; wait'\nreports = [\"exunit-timings\"]\n",
+        "[[jobs]]\nname = \"test\"\ncommand = 'for id in r1 r2 r3; do (sleep 0.1; cp \"fixtures/$id.jsonl\" \"$GOODFLOWS_REPORT_DIR/\") & done; wait'\nreports = [\"test-timings\"]\n",
     );
     let output = p.run(&["--json"]);
     success(&output);
@@ -978,7 +987,7 @@ fn parallel_producers_share_one_job_directory() {
 #[test]
 fn invalid_and_duplicate_reports_are_rejected_without_touching_files() {
     let p = project(
-        "[[jobs]]\nname = \"test\"\ncommand = 'cp fixtures/r1.jsonl \"$GOODFLOWS_REPORT_DIR/a.jsonl\"; cp fixtures/r1.jsonl \"$GOODFLOWS_REPORT_DIR/b.jsonl\"; printf \"{bad\\n\" > \"$GOODFLOWS_REPORT_DIR/c.jsonl\"; cp fixtures/r2.jsonl \"$GOODFLOWS_REPORT_DIR/d.jsonl\"'\nreports = [\"exunit-timings\"]\n",
+        "[[jobs]]\nname = \"test\"\ncommand = 'cp fixtures/r1.jsonl \"$GOODFLOWS_REPORT_DIR/a.jsonl\"; cp fixtures/r1.jsonl \"$GOODFLOWS_REPORT_DIR/b.jsonl\"; printf \"{bad\\n\" > \"$GOODFLOWS_REPORT_DIR/c.jsonl\"; cp fixtures/r2.jsonl \"$GOODFLOWS_REPORT_DIR/d.jsonl\"'\nreports = [\"test-timings\"]\n",
     );
     let output = p.run(&["--json"]);
     success(&output);
@@ -1003,7 +1012,7 @@ fn invalid_and_duplicate_reports_are_rejected_without_touching_files() {
 fn invalid_filters_are_rejected_without_touching_files() {
     let mock = Mock::store();
     let p = project(
-        "[[jobs]]\nname = \"test\"\ncommand = 'cp fixtures/spaced.jsonl fixtures/long.jsonl \"$GOODFLOWS_REPORT_DIR/\"'\nreports = [\"exunit-timings\"]\n",
+        "[[jobs]]\nname = \"test\"\ncommand = 'cp fixtures/spaced.jsonl fixtures/long.jsonl \"$GOODFLOWS_REPORT_DIR/\"'\nreports = [\"test-timings\"]\n",
     );
     let with_include = |id: &str, include: Value| {
         let mut lines: Vec<String> = timing_report(id, Some("1"))
@@ -1044,7 +1053,7 @@ fn invalid_filters_are_rejected_without_touching_files() {
 #[test]
 fn scheduler_errors_mark_the_manifest_aborted() {
     let p = project(&format!(
-        "[[jobs]]\nname = \"test\"\ncommand = '{}'\nreports = [\"exunit-timings\"]\n",
+        "[[jobs]]\nname = \"test\"\ncommand = '{}'\nreports = [\"test-timings\"]\n",
         copy(&["r1"])
     ));
     std::fs::write(p.dir.join("logs"), "not a directory").unwrap();
@@ -1076,7 +1085,7 @@ fn wait_for(path: &Path) {
 fn signal_freezes_snapshots_locally_without_requests() {
     let mock = Mock::store();
     let p = project(&format!(
-        "[[jobs]]\nname = \"test\"\ncommand = '{}; touch written; sleep 10'\nreports = [\"exunit-timings\"]\n",
+        "[[jobs]]\nname = \"test\"\ncommand = '{}; touch written; sleep 10'\nreports = [\"test-timings\"]\n",
         copy(&["r1"])
     ));
     let mut command = p.command();
@@ -1110,7 +1119,7 @@ fn signal_freezes_snapshots_locally_without_requests() {
 fn three_partitions_upload_with_shared_identity() {
     let mock = Mock::store();
     let p = project(&format!(
-        "[[jobs]]\nname = \"test\"\ncommand = '{}'\nreports = [\"exunit-timings\"]\n",
+        "[[jobs]]\nname = \"test\"\ncommand = '{}'\nreports = [\"test-timings\"]\n",
         copy(&["r1", "r2", "r3"])
     ));
     let output = run_with(&p, &["--json"], Some(&mock.url));
@@ -1134,7 +1143,7 @@ fn three_partitions_upload_with_shared_identity() {
         assert_eq!(body["report"]["suite_id"], "suite-1");
         assert_eq!(body["report"]["partition_count"], 3);
         assert_eq!(body["report"]["truncated"], false);
-        assert_eq!(body["report"]["records"][1]["duration_us"], 42);
+        assert_eq!(body["report"]["records"][3]["duration_us"], 42);
         report_ids.push(body["report"]["report_id"].as_str().unwrap().to_owned());
     }
     assert_eq!(report_ids, ["r1", "r2", "r3"]);
@@ -1217,7 +1226,7 @@ fn delivery_failures_never_change_check_exit_status() {
         for (mock, reason, status) in &cases {
             let mock = mock();
             let p = project(&format!(
-                "[[jobs]]\nname = \"test\"\ncommand = '{}; {command}'\nreports = [\"exunit-timings\"]\n",
+                "[[jobs]]\nname = \"test\"\ncommand = '{}; {command}'\nreports = [\"test-timings\"]\n",
                 copy(&["r1"])
             ));
             let output = run_with(&p, &["--json"], Some(&mock.url));
@@ -1249,7 +1258,7 @@ fn redirects_are_not_followed_and_credentials_stay_put() {
         )
     });
     let p = project(&format!(
-        "[[jobs]]\nname = \"test\"\ncommand = '{}'\nreports = [\"exunit-timings\"]\n",
+        "[[jobs]]\nname = \"test\"\ncommand = '{}'\nreports = [\"test-timings\"]\n",
         copy(&["r1"])
     ));
     let output = run_with(&p, &["--json"], Some(&mock.url));
@@ -1273,7 +1282,7 @@ fn invalid_origins_skip_delivery_without_requests() {
         "http://flows.example.com".to_owned(),
     ] {
         let p = project(&format!(
-            "[[jobs]]\nname = \"test\"\ncommand = '{}'\nreports = [\"exunit-timings\"]\n",
+            "[[jobs]]\nname = \"test\"\ncommand = '{}'\nreports = [\"test-timings\"]\n",
             copy(&["r1"])
         ));
         let output = run_with(&p, &["--json"], Some(&url));
@@ -1294,7 +1303,7 @@ fn offline_and_transient_failures_retry_then_stay_pending() {
         .unwrap()
         .port();
     let p = project(&format!(
-        "[[jobs]]\nname = \"test\"\ncommand = '{}'\nreports = [\"exunit-timings\"]\n",
+        "[[jobs]]\nname = \"test\"\ncommand = '{}'\nreports = [\"test-timings\"]\n",
         copy(&["r1"])
     ));
     let start = Instant::now();
@@ -1339,7 +1348,7 @@ fn offline_and_transient_failures_retry_then_stay_pending() {
 fn ack_state_write_failure_keeps_snapshot_replayable() {
     let mock = Mock::store();
     let p = project(&format!(
-        "[[jobs]]\nname = \"test\"\ncommand = '{} && rmdir \"$GOODFLOWS_REPORT_DIR/../acks\" && touch \"$GOODFLOWS_REPORT_DIR/../acks\"'\nreports = [\"exunit-timings\"]\n",
+        "[[jobs]]\nname = \"test\"\ncommand = '{} && rmdir \"$GOODFLOWS_REPORT_DIR/../acks\" && touch \"$GOODFLOWS_REPORT_DIR/../acks\"'\nreports = [\"test-timings\"]\n",
         copy(&["r1"])
     ));
     let output = run_with(&p, &["--json"], Some(&mock.url));
@@ -1362,7 +1371,7 @@ fn ack_state_write_failure_keeps_snapshot_replayable() {
 fn text_output_shows_delivery_and_summary_stays_last() {
     let mock = Mock::store();
     let p = project(&format!(
-        "[[jobs]]\nname = \"test\"\ncommand = '{}'\nreports = [\"exunit-timings\"]\n",
+        "[[jobs]]\nname = \"test\"\ncommand = '{}'\nreports = [\"test-timings\"]\n",
         copy(&["r1"])
     ));
     let output = run_with(&p, &[], Some(&mock.url));
@@ -1379,7 +1388,7 @@ fn text_output_shows_delivery_and_summary_stays_last() {
     assert!(text.trim_end().ends_with("\n1 passed"), "{text}");
     assert!(!text[report..].contains("report"), "{text}");
     let p2 = project(&format!(
-        "[[jobs]]\nname = \"test\"\ncommand = '{}'\nreports = [\"exunit-timings\"]\n",
+        "[[jobs]]\nname = \"test\"\ncommand = '{}'\nreports = [\"test-timings\"]\n",
         copy(&["r1"])
     ));
     let conflict = Mock::start(|_, _| Reply::Status(409, vec![], String::new()));
@@ -1391,7 +1400,7 @@ fn text_output_shows_delivery_and_summary_stays_last() {
 
     // Rejection codes, the saved run directory and duplicate acknowledgements.
     let p3 = project(&format!(
-        "[[jobs]]\nname = \"test\"\ncommand = '{} && printf \"{{bad\\n\" > \"$GOODFLOWS_REPORT_DIR/bad.jsonl\"'\nreports = [\"exunit-timings\"]\n",
+        "[[jobs]]\nname = \"test\"\ncommand = '{} && printf \"{{bad\\n\" > \"$GOODFLOWS_REPORT_DIR/bad.jsonl\"'\nreports = [\"test-timings\"]\n",
         copy(&["r1"])
     ));
     let stored = Mock::start(|r, _| {
@@ -1428,7 +1437,7 @@ fn text_output_shows_delivery_and_summary_stays_last() {
     );
     let p4 = project_with(
         "[reporting]\nproject = \"goodcases\"\nspool_dir = \"blocker/spool\"\n",
-        "[[jobs]]\nname = \"test\"\ncommand = \"true\"\nreports = [\"exunit-timings\"]\n",
+        "[[jobs]]\nname = \"test\"\ncommand = \"true\"\nreports = [\"test-timings\"]\n",
     );
     std::fs::write(p4.dir.join("blocker"), "file").unwrap();
     let output = p4.run(&[]);
@@ -1447,7 +1456,7 @@ fn saved_run(mock_url: Option<&str>) -> (Project, PathBuf) {
     let p = project_with(
         "[reporting]\nproject = \"goodcases\"\nurl_env = \"SAVED_URL\"\ntoken_env = \"SAVED_KEY\"\n",
         &format!(
-            "[[jobs]]\nname = \"test\"\ncommand = '{}'\nreports = [\"exunit-timings\"]\n",
+            "[[jobs]]\nname = \"test\"\ncommand = '{}'\nreports = [\"test-timings\"]\n",
             copy(&["r1", "r2"])
         ),
     );
@@ -1736,7 +1745,7 @@ fn snapshot_of(dir: &Path, job: &str) -> Value {
 fn run_signal_during_publish_stops_promptly() {
     let mock = Mock::start(|_, _| Reply::Hang(Duration::from_secs(20)));
     let p = project(&format!(
-        "[[jobs]]\nname = \"test\"\ncommand = '{}'\nreports = [\"exunit-timings\"]\n",
+        "[[jobs]]\nname = \"test\"\ncommand = '{}'\nreports = [\"test-timings\"]\n",
         copy(&["r1"])
     ));
     let child = p
@@ -1783,10 +1792,10 @@ fail_fast = false
 name = "slow"
 timeout_secs = 1
 command = '{} && sleep 10'
-reports = ["exunit-timings"]
+reports = ["test-timings"]
 [[jobs]]
 name = "stepped"
-reports = ["exunit-timings"]
+reports = ["test-timings"]
 [[jobs.steps]]
 id = "write"
 command = '{}'
@@ -1795,7 +1804,7 @@ id = "fail"
 command = "exit 5"
 [[jobs]]
 name = "never"
-reports = ["exunit-timings"]
+reports = ["test-timings"]
 [[jobs.steps]]
 id = "a"
 condition = {{ expression = "false" }}
@@ -1841,11 +1850,11 @@ fail_fast = false
 [[jobs]]
 name = "blocked"
 command = '{} && rmdir "$GOODFLOWS_REPORT_DIR/../pending" && touch "$GOODFLOWS_REPORT_DIR/../pending"'
-reports = ["exunit-timings"]
+reports = ["test-timings"]
 [[jobs]]
 name = "linked"
 command = '{} && mkdir -p elsewhere && rmdir "$GOODFLOWS_REPORT_DIR/../pending" && ln -s "$PWD/elsewhere" "$GOODFLOWS_REPORT_DIR/../pending"'
-reports = ["exunit-timings"]
+reports = ["test-timings"]
 "#,
         copy(&["r1"]),
         copy(&["r2"])
@@ -1878,7 +1887,7 @@ fn finalize_failure_keeps_everything_local() {
     }
     let mock = Mock::store();
     let p = project(&format!(
-        "[[jobs]]\nname = \"test\"\ncommand = '{} && chmod 500 \"$GOODFLOWS_REPORT_DIR/../..\"'\nreports = [\"exunit-timings\"]\n",
+        "[[jobs]]\nname = \"test\"\ncommand = '{} && chmod 500 \"$GOODFLOWS_REPORT_DIR/../..\"'\nreports = [\"test-timings\"]\n",
         copy(&["r1"])
     ));
     let output = run_with(&p, &["--json"], Some(&mock.url));
@@ -1903,7 +1912,7 @@ fn finalize_failure_keeps_everything_local() {
 fn closed_stdout_still_finalizes_the_run() {
     use std::io::BufRead;
     let p = project(&format!(
-        "[[jobs]]\nname = \"test\"\ncommand = '{}'\nreports = [\"exunit-timings\"]\n",
+        "[[jobs]]\nname = \"test\"\ncommand = '{}'\nreports = [\"test-timings\"]\n",
         copy(&["r1"])
     ));
     let mut child = p
@@ -1934,7 +1943,7 @@ fn truncated_reports_upload_and_oversized_sources_stay_on_disk() {
         r#"[[jobs]]
 name = "test"
 command = 'head -n 2 fixtures/r1.jsonl > "$GOODFLOWS_REPORT_DIR/a.jsonl" && printf "{\"event\":\"test_fin" >> "$GOODFLOWS_REPORT_DIR/a.jsonl" && truncate -s 40M "$GOODFLOWS_REPORT_DIR/big.jsonl"'
-reports = ["exunit-timings"]
+reports = ["test-timings"]
 "#,
     );
     let mock = Mock::store();
@@ -1956,7 +1965,7 @@ reports = ["exunit-timings"]
 fn state_directories_are_private_and_exist_before_jobs_run() {
     use std::os::unix::fs::PermissionsExt;
     let p = project(
-        "[[jobs]]\nname = \"test\"\ncommand = 'ls -d \"$GOODFLOWS_REPORT_DIR/../pending\" \"$GOODFLOWS_REPORT_DIR/../acks\" > seen'\nreports = [\"exunit-timings\"]\n",
+        "[[jobs]]\nname = \"test\"\ncommand = 'ls -d \"$GOODFLOWS_REPORT_DIR/../pending\" \"$GOODFLOWS_REPORT_DIR/../acks\" > seen'\nreports = [\"test-timings\"]\n",
     );
     success(&p.run(&["--json"]));
     assert_eq!(p.read("seen").lines().count(), 2);
@@ -2082,6 +2091,40 @@ fn replay_derives_paths_and_refuses_escapes() {
 }
 
 #[test]
+fn replay_refuses_a_pre_upgrade_exunit_timings_snapshot() {
+    let (p, dir) = saved_run(None);
+    // Rewrite one pending snapshot into the retired format an older CLI froze.
+    let path = dir.join("test/pending/000.json");
+    let mut value: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    value["format"] = json!("exunit-timings");
+    for record in value["report"]["records"].as_array_mut().unwrap() {
+        let record = record.as_object_mut().unwrap();
+        let suite_id = record.remove("suite_id").unwrap();
+        record.insert("run_id".into(), suite_id);
+        if record["event"] == "suite_started" {
+            record.insert("format".into(), json!("exunit-timings"));
+        }
+    }
+    let retired = serde_json::to_vec(&value).unwrap();
+    std::fs::write(&path, &retired).unwrap();
+    let mock = Mock::store();
+    let output = replay(&p.dir, &dir, Some(&mock.url), &["--json"]);
+    assert_eq!(output.status.code(), Some(1));
+    let events = events(&output);
+    let pending = by_type(&events, "report_upload_pending");
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0]["reason"], "invalid_snapshot");
+    assert_eq!(events.last().unwrap()["invalid"], 1);
+    // Only the current-format snapshot is sent; the retired one stays intact.
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 1);
+    assert!(requests
+        .iter()
+        .all(|r| r.json()["format"] == "test-timings/1"));
+    assert_eq!(std::fs::read(&path).unwrap(), retired);
+}
+
+#[test]
 fn replay_revalidates_snapshots_before_sending() {
     let mock = Mock::store();
     // A modified snapshot (extra field), a symlinked snapshot and an oversized one.
@@ -2200,7 +2243,7 @@ fn server_rejections_are_recorded_and_not_resent() {
 #[test]
 fn replay_with_collection_rejections_sends_the_rest_and_exits_nonzero() {
     let p = project(&format!(
-        "[[jobs]]\nname = \"test\"\ncommand = '{} && printf \"{{bad\\n\" > \"$GOODFLOWS_REPORT_DIR/bad.jsonl\"'\nreports = [\"exunit-timings\"]\n",
+        "[[jobs]]\nname = \"test\"\ncommand = '{} && printf \"{{bad\\n\" > \"$GOODFLOWS_REPORT_DIR/bad.jsonl\"'\nreports = [\"test-timings\"]\n",
         copy(&["r1"])
     ));
     success(&p.run(&["--json"]));
@@ -2244,7 +2287,7 @@ fn unpartitioned_jobs_never_see_inherited_partition_variables_with_reporting_ena
 name = "reporter"
 condition = {{ expression = 'env.GOODFLOWS_PARTITION == null && env.GOODFLOWS_PARTITION_COUNT == null' }}
 command = '''{unset} && test -n "$GOODFLOWS_REPORT_DIR" && {copy} && touch reporter'''
-reports = ["exunit-timings"]
+reports = ["test-timings"]
 [[jobs]]
 name = "plain"
 condition = {{ shell = '''{unset}''' }}
@@ -2255,7 +2298,7 @@ shell = false
 command = "sh -c '{direct} && touch direct'"
 [[jobs]]
 name = "stepped"
-reports = ["exunit-timings"]
+reports = ["test-timings"]
 [[jobs.steps]]
 id = "a"
 condition = {{ shell = '''{unset}''' }}
@@ -2302,7 +2345,7 @@ fn partitioned_without_fail_fast(tail: &str) -> Project {
 
 fn partitioned_with(settings: &str, tail: &str) -> Project {
     project(&format!(
-        "{settings}[[jobs]]\nname = \"test\"\npartitions = 3\ncommand = 'printf \"%s %s\" \"$GOODFLOWS_RUN_ID\" \"$GOODFLOWS_REPORT_DIR\" > seen-$GOODFLOWS_PARTITION && cp fixtures/r$((4 - GOODFLOWS_PARTITION)).jsonl \"$GOODFLOWS_REPORT_DIR/\"{tail}'\nreports = [\"exunit-timings\"]\n"
+        "{settings}[[jobs]]\nname = \"test\"\npartitions = 3\ncommand = 'printf \"%s %s\" \"$GOODFLOWS_RUN_ID\" \"$GOODFLOWS_REPORT_DIR\" > seen-$GOODFLOWS_PARTITION && cp fixtures/r$((4 - GOODFLOWS_PARTITION)).jsonl \"$GOODFLOWS_REPORT_DIR/\"{tail}'\nreports = [\"test-timings\"]\n"
     ))
 }
 
@@ -2387,7 +2430,7 @@ fn instance_state_directories_replaced_by_symlinks_are_refused() {
     let mock = Mock::store();
     // Instance 2 points pending/ outside; instance 3 replaces acks/ with a link.
     let p = project(
-        "[[jobs]]\nname = \"test\"\npartitions = 3\ncommand = 'cp fixtures/r$GOODFLOWS_PARTITION.jsonl \"$GOODFLOWS_REPORT_DIR/\"; d=$(dirname \"$GOODFLOWS_REPORT_DIR\"); mkdir -p \"$PWD/outside-$GOODFLOWS_PARTITION\"; case $GOODFLOWS_PARTITION in 2) rmdir \"$d/pending\"; ln -s \"$PWD/outside-2\" \"$d/pending\";; 3) rmdir \"$d/acks\"; ln -s \"$PWD/outside-3\" \"$d/acks\";; esac'\nreports = [\"exunit-timings\"]\n",
+        "[[jobs]]\nname = \"test\"\npartitions = 3\ncommand = 'cp fixtures/r$GOODFLOWS_PARTITION.jsonl \"$GOODFLOWS_REPORT_DIR/\"; d=$(dirname \"$GOODFLOWS_REPORT_DIR\"); mkdir -p \"$PWD/outside-$GOODFLOWS_PARTITION\"; case $GOODFLOWS_PARTITION in 2) rmdir \"$d/pending\"; ln -s \"$PWD/outside-2\" \"$d/pending\";; 3) rmdir \"$d/acks\"; ln -s \"$PWD/outside-3\" \"$d/acks\";; esac'\nreports = [\"test-timings\"]\n",
     );
     let output = run_with(&p, &["--json"], Some(&mock.url));
     success(&output);
@@ -2418,7 +2461,7 @@ fn instance_state_directories_replaced_by_symlinks_are_refused() {
 #[test]
 fn unpartitioned_reporting_layout_and_manifest_are_unchanged() {
     let p = project(&format!(
-        "[[jobs]]\nname = \"test\"\ncommand = 'printf \"%s\" \"$GOODFLOWS_REPORT_DIR\" > seen && {}'\nreports = [\"exunit-timings\"]\n",
+        "[[jobs]]\nname = \"test\"\ncommand = 'printf \"%s\" \"$GOODFLOWS_REPORT_DIR\" > seen && {}'\nreports = [\"test-timings\"]\n",
         copy(&["r1"])
     ));
     let output = p.run(&["--json"]);
@@ -2488,7 +2531,7 @@ fn partitioned_manifest_has_one_entry_per_instance_with_its_own_status() {
 #[test]
 fn skipped_instances_are_recorded_as_not_executed() {
     let p = project(
-        "[settings]\nparallelism = 1\n[[jobs]]\nname = \"test\"\npartitions = 3\ncondition = { expression = \"env.GOODFLOWS_PARTITION != '2'\" }\ncommand = 'cp fixtures/r$GOODFLOWS_PARTITION.jsonl \"$GOODFLOWS_REPORT_DIR/\"'\nreports = [\"exunit-timings\"]\n",
+        "[settings]\nparallelism = 1\n[[jobs]]\nname = \"test\"\npartitions = 3\ncondition = { expression = \"env.GOODFLOWS_PARTITION != '2'\" }\ncommand = 'cp fixtures/r$GOODFLOWS_PARTITION.jsonl \"$GOODFLOWS_REPORT_DIR/\"'\nreports = [\"test-timings\"]\n",
     );
     let output = p.run(&["--json"]);
     success(&output);
@@ -2563,7 +2606,7 @@ fn duplicate_report_ids_across_instances_reject_every_copy() {
     let mock = Mock::store();
     // Instances 1 and 3 both produce r1; instance 2 produces r2.
     let p = project(
-        "[[jobs]]\nname = \"test\"\npartitions = 3\ncommand = 'if [ $GOODFLOWS_PARTITION = 2 ]; then id=r2; else id=r1; fi; cp fixtures/$id.jsonl \"$GOODFLOWS_REPORT_DIR/\"'\nreports = [\"exunit-timings\"]\n",
+        "[[jobs]]\nname = \"test\"\npartitions = 3\ncommand = 'if [ $GOODFLOWS_PARTITION = 2 ]; then id=r2; else id=r1; fi; cp fixtures/$id.jsonl \"$GOODFLOWS_REPORT_DIR/\"'\nreports = [\"test-timings\"]\n",
     );
     let output = run_with(&p, &["--json"], Some(&mock.url));
     success(&output);
@@ -2598,7 +2641,7 @@ fn duplicate_report_ids_across_instances_reject_every_copy() {
 #[test]
 fn instance_directory_replaced_by_a_symlink_is_refused() {
     let p = project(
-        "[[jobs]]\nname = \"test\"\npartitions = 2\ncommand = 'cp fixtures/r$GOODFLOWS_PARTITION.jsonl \"$GOODFLOWS_REPORT_DIR/\"; if [ $GOODFLOWS_PARTITION = 2 ]; then d=$(dirname \"$GOODFLOWS_REPORT_DIR\"); mv \"$d\" \"$PWD/moved\"; ln -s \"$PWD/moved\" \"$d\"; fi'\nreports = [\"exunit-timings\"]\n",
+        "[[jobs]]\nname = \"test\"\npartitions = 2\ncommand = 'cp fixtures/r$GOODFLOWS_PARTITION.jsonl \"$GOODFLOWS_REPORT_DIR/\"; if [ $GOODFLOWS_PARTITION = 2 ]; then d=$(dirname \"$GOODFLOWS_REPORT_DIR\"); mv \"$d\" \"$PWD/moved\"; ln -s \"$PWD/moved\" \"$d\"; fi'\nreports = [\"test-timings\"]\n",
     );
     let output = p.run(&["--json"]);
     success(&output);
@@ -2621,7 +2664,7 @@ fn instance_directory_replaced_by_a_symlink_is_refused() {
 #[test]
 fn partitioned_instances_share_the_job_report_cap() {
     let p = project(
-        "[[jobs]]\nname = \"test\"\npartitions = 2\ncommand = 'cp fixtures/p$GOODFLOWS_PARTITION/*.jsonl \"$GOODFLOWS_REPORT_DIR/\"'\nreports = [\"exunit-timings\"]\n",
+        "[[jobs]]\nname = \"test\"\npartitions = 2\ncommand = 'cp fixtures/p$GOODFLOWS_PARTITION/*.jsonl \"$GOODFLOWS_REPORT_DIR/\"'\nreports = [\"test-timings\"]\n",
     );
     for i in 1..=2 {
         let dir = p.dir.join(format!("fixtures/p{i}"));
@@ -2665,7 +2708,7 @@ fn partitioned_steps_receive_their_instance_report_dir() {
 [[jobs]]
 name = "test"
 partitions = 2
-reports = ["exunit-timings"]
+reports = ["test-timings"]
 [[jobs.steps]]
 id = "a"
 condition = { shell = 'printf "%s" "${GOODFLOWS_REPORT_DIR-unset}" > cond-a-$GOODFLOWS_PARTITION' }
@@ -2704,7 +2747,7 @@ command = 'printf "%s" "$GOODFLOWS_REPORT_DIR" > step-b-$GOODFLOWS_PARTITION && 
 fn saved_partitioned_run() -> (Project, PathBuf) {
     let p = project_with(
         "[reporting]\nproject = \"goodcases\"\nurl_env = \"SAVED_URL\"\ntoken_env = \"SAVED_KEY\"\n",
-        "[[jobs]]\nname = \"test\"\npartitions = 3\ncommand = 'cp fixtures/r$GOODFLOWS_PARTITION.jsonl \"$GOODFLOWS_REPORT_DIR/\"'\nreports = [\"exunit-timings\"]\n",
+        "[[jobs]]\nname = \"test\"\npartitions = 3\ncommand = 'cp fixtures/r$GOODFLOWS_PARTITION.jsonl \"$GOODFLOWS_REPORT_DIR/\"'\nreports = [\"test-timings\"]\n",
     );
     success(&p.run(&["--json"]));
     let dir = run_dirs(&p).pop().unwrap();
@@ -3000,7 +3043,7 @@ PROFILE = "profile"
 name = "shell"
 condition = {{ expression = 'env.GOODFLOWS_API_KEY == null && env.SHARED == "settings"' }}
 command = 'env > shell-env.txt; {copy}'
-reports = ["exunit-timings"]
+reports = ["test-timings"]
 [[jobs]]
 name = "stepped"
 outputs = {{ token = "env.GOODFLOWS_API_KEY ?? \"absent\"" }}
@@ -3052,7 +3095,7 @@ fn settings_env_never_supplies_the_publisher_endpoint() {
     let decoy = Mock::store();
     let jobs = |url: &str| {
         format!(
-            "[settings.env]\nGOODFLOWS_URL = \"{url}\"\n[[jobs]]\nname = \"test\"\ncommand = 'printf %s \"$GOODFLOWS_URL\" > seen-url; {}'\nreports = [\"exunit-timings\"]\n",
+            "[settings.env]\nGOODFLOWS_URL = \"{url}\"\n[[jobs]]\nname = \"test\"\ncommand = 'printf %s \"$GOODFLOWS_URL\" > seen-url; {}'\nreports = [\"test-timings\"]\n",
             copy(&["r1"])
         )
     };
@@ -3087,7 +3130,7 @@ fn settings_env_never_supplies_a_custom_url_env_endpoint() {
     let p = project_with(
         "[reporting]\nproject = \"goodcases\"\nurl_env = \"CUSTOM_URL\"\n",
         &format!(
-            "[settings.env]\nCUSTOM_URL = \"{}\"\n[[jobs]]\nname = \"test\"\ncommand = 'printf %s \"$CUSTOM_URL\" > seen-url; {}'\nreports = [\"exunit-timings\"]\n",
+            "[settings.env]\nCUSTOM_URL = \"{}\"\n[[jobs]]\nname = \"test\"\ncommand = 'printf %s \"$CUSTOM_URL\" > seen-url; {}'\nreports = [\"test-timings\"]\n",
             decoy.url,
             copy(&["r1"])
         ),
@@ -3113,7 +3156,7 @@ fn settings_env_never_supplies_a_custom_url_env_endpoint() {
 fn saved_profile_count_run() -> (Project, PathBuf, std::process::Output) {
     let p = project_with(
         "[reporting]\nproject = \"goodcases\"\nurl_env = \"SAVED_URL\"\ntoken_env = \"SAVED_KEY\"\n",
-        "[[jobs]]\nname = \"test\"\npartitions = 3\ncommand = 'cp fixtures/q$GOODFLOWS_PARTITION.jsonl \"$GOODFLOWS_REPORT_DIR/\"'\nreports = [\"exunit-timings\"]\n[environments.local.partitions]\ntest = 6\n",
+        "[[jobs]]\nname = \"test\"\npartitions = 3\ncommand = 'cp fixtures/q$GOODFLOWS_PARTITION.jsonl \"$GOODFLOWS_REPORT_DIR/\"'\nreports = [\"test-timings\"]\n[environments.local.partitions]\ntest = 6\n",
     );
     for i in 1..=6 {
         std::fs::write(
@@ -3195,7 +3238,7 @@ fn profile_partition_count_drives_report_collection_and_replay() {
 fn one_run_id_names_logs_history_and_the_reporting_run() {
     let mock = Mock::store();
     let p = project(&format!(
-        "[[jobs]]\nname = \"test\"\ncommand = '{}'\nreports = [\"exunit-timings\"]\n",
+        "[[jobs]]\nname = \"test\"\ncommand = '{}'\nreports = [\"test-timings\"]\n",
         copy(&["r1"])
     ));
     let output = run_with(
@@ -3232,7 +3275,7 @@ fn a_signal_after_the_last_job_cancels_the_json_outcome() {
         Reply::Hang(Duration::from_secs(5))
     });
     let p = project(&format!(
-        "[[jobs]]\nname = \"test\"\ncommand = '{}'\nreports = [\"exunit-timings\"]\n",
+        "[[jobs]]\nname = \"test\"\ncommand = '{}'\nreports = [\"test-timings\"]\n",
         copy(&["r1"])
     ));
     let child = p
