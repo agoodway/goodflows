@@ -2,7 +2,7 @@ defmodule Goodflows.ExUnitReporter.MixProject do
   use Mix.Project
 
   # Kept in lockstep with the goodflows CLI version (Cargo.toml).
-  @version "0.5.0"
+  @version "0.6.0"
 
   def project do
     [

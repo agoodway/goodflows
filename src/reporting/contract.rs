@@ -17,7 +17,7 @@
 use serde_json::{Map, Value};
 
 /// The id of the OpenSpec change that defines the contract these tables
-/// implement (`openspec/changes/generalize-test-timings`, shared with the
+/// implement (`openspec/changes/archive/2026-11-04-generalize-test-timings`, shared with the
 /// GoodFlows server, which pins its mirror of this module to the same change).
 ///
 /// It is not a wire format: it is only sent in the publisher's User-Agent
@@ -28,7 +28,7 @@ use serde_json::{Map, Value};
 /// change independently: rename this when an archived change gets its dated
 /// id or a later change revises the tables; bump [`REPORT_FORMAT`] only for an
 /// incompatible wire change.
-pub const CONTRACT_VERSION: &str = "generalize-test-timings";
+pub const CONTRACT_VERSION: &str = "2026-11-04-generalize-test-timings";
 
 /// The wire format in the envelope and in every `suite_started` record: the
 /// [`crate::config::REPORT_FAMILY`] a job requests plus its major version.
@@ -556,7 +556,7 @@ mod tests {
 
     #[test]
     fn contract_is_versioned_and_names_its_format() {
-        assert_eq!(CONTRACT_VERSION, "generalize-test-timings");
+        assert_eq!(CONTRACT_VERSION, "2026-11-04-generalize-test-timings");
         assert_eq!(REPORT_FORMAT, "test-timings/1");
         assert_eq!(MAX_REQUEST_BYTES, 33_554_432);
         assert_eq!(MAX_FILTER_ENTRIES, 256);

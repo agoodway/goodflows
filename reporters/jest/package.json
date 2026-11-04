@@ -1,6 +1,6 @@
 {
   "name": "goodflows-jest-reporter",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Jest reporter that writes goodflows test-timings/1 reports",
   "license": "MIT",
   "repository": {
