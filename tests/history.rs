@@ -647,6 +647,7 @@ fn skipped_instances_are_recorded_without_commands() {
     assert_eq!(record["results"][0]["commands"][0]["kind"], "command");
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn non_utf8_history_dir_is_reported_lossily() {
     use std::os::unix::ffi::OsStrExt;
