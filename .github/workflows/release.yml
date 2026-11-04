@@ -123,7 +123,11 @@ jobs:
   # split SHAs and the source check, and pushes nothing. It gets no deploy
   # keys, so it does not fetch the mirrors; mirror-check does that on a tag.
   mirror-dry-run:
-    if: github.event_name != 'push'
+    # mirror-check, which build needs, is skipped on workflow_dispatch, and a
+    # bare `if` would skip this job along with it.
+    if: >-
+      !cancelled() && github.event_name != 'push' &&
+      needs.build.result == 'success' && needs.reporters.result == 'success'
     needs: [build, reporters]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
