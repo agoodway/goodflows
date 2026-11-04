@@ -46,7 +46,7 @@ When the run used a log directory, the report SHALL show that run's log director
 - **THEN** the report has no history path
 
 ### Requirement: JSON summary carries run duration and log directory
-The JSON `summary` event SHALL include integer `duration_ms`, measured immediately before `runner::execute` until summary construction after reporting finishes, and, when a log directory is in use, `log_dir` with that run's log directory as specified by `run-logs`, converted lossily when the path is not valid UTF-8. Without a log directory, `log_dir` MUST be absent. The event SHALL include the optimizer fields specified by `run-history`, including `history_file` only when a history file was written, as the resolved path the run wrote, converted lossily when the path is not valid UTF-8. Each `summary.results` entry SHALL additionally include boolean `started`, true if it entered `run_job` and false if skipped or cancelled before launch; this field MUST NOT be added to live `job_finished` events. Optimizer fields MUST NOT be added to live `job_finished` events. Every existing `summary` field MUST keep its name and meaning, including per-instance counts, except that `log_dir` names the per-run directory.
+The JSON `summary` event SHALL include integer `duration_ms`, measured immediately before `runner::execute` until summary construction after reporting finishes, integer `execute_ms`, measured from the same start until `runner::execute` returns, and, when a log directory is in use, `log_dir` with that run's log directory as specified by `run-logs`, converted lossily when the path is not valid UTF-8. Without a log directory, `log_dir` MUST be absent. The event SHALL include the optimizer fields specified by `run-history`, including `history_file` only when a history file was written, as the resolved path the run wrote, converted lossily when the path is not valid UTF-8. Each `summary.results` entry SHALL additionally include boolean `started`, true if it entered `run_job` and false if skipped or cancelled before launch; this field MUST NOT be added to live `job_finished` events. Optimizer fields MUST NOT be added to live `job_finished` events. Every existing `summary` field MUST keep its name and meaning, including per-instance counts, except that `log_dir` names the per-run directory.
 
 #### Scenario: Summary fields
 - **WHEN** a workflow runs with `--json --log-dir logs`
@@ -54,7 +54,7 @@ The JSON `summary` event SHALL include integer `duration_ms`, measured immediate
 
 #### Scenario: Wall time covers jobs and reporting
 - **WHEN** a job runs `sleep 0.2`
-- **THEN** `duration_ms` is at least 200 and at least every result's `duration_ms`, and it also covers reporting retries after the last job
+- **THEN** `duration_ms` is at least 200 and at least every result's `duration_ms`, and it also covers reporting retries after the last job, while `execute_ms` is at least 200 and does not cover them
 
 #### Scenario: Non-UTF-8 log directory
 - **WHEN** `--log-dir` names a path that is not valid UTF-8
