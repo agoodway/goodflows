@@ -288,3 +288,56 @@ pub fn files_under(dir: &std::path::Path) -> Vec<PathBuf> {
     files.sort();
     files
 }
+
+/// Whether a name is a run stem: `YYYYMMDDTHHMMSSZ-<lowercase uuid>`.
+pub fn is_stem(name: &str) -> bool {
+    let b = name.as_bytes();
+    b.len() == 53
+        && b[..8].iter().all(u8::is_ascii_digit)
+        && b[8] == b'T'
+        && b[9..15].iter().all(u8::is_ascii_digit)
+        && b[15] == b'Z'
+        && b[16] == b'-'
+        && name[17..]
+            .bytes()
+            .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c) || c == b'-')
+}
+
+/// Log run directories (stem-named directories, never history files) directly
+/// under `dir`, oldest first, as absolute paths.
+pub fn run_dirs(dir: &std::path::Path) -> Vec<PathBuf> {
+    let mut dirs: Vec<_> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.file_type().unwrap().is_dir())
+        .map(|e| e.path())
+        .filter(|p| is_stem(p.file_name().unwrap().to_str().unwrap_or_default()))
+        .collect();
+    dirs.sort();
+    dirs
+}
+
+/// The single log run directory directly under `dir`, as an absolute path.
+/// Panics unless there is exactly one.
+pub fn run_dir(dir: &std::path::Path) -> PathBuf {
+    let dirs = run_dirs(dir);
+    assert_eq!(
+        dirs.len(),
+        1,
+        "expected one run directory in {}: {dirs:?}",
+        dir.display()
+    );
+    dirs.into_iter().next().unwrap()
+}
+
+/// Log file names in a run directory, excluding the run's lock file.
+pub fn log_names(dir: &std::path::Path) -> Vec<String> {
+    let mut names: Vec<_> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .filter(|name| name != ".goodflows.lock")
+        .collect();
+    names.sort();
+    names
+}

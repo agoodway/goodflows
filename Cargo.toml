@@ -20,6 +20,7 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 rustls = { version = "0.23", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 shell-words = "1"
 tempfile = "3"
 tokio = { version = "1", features = ["full"] }

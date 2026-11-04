@@ -33,6 +33,12 @@ pub const ENVIRONMENT_ENV: &str = "GOODFLOWS_ENVIRONMENT";
 pub const OUTPUT_ENV: &str = "GOODFLOWS_OUTPUT";
 pub const MAX_PARTITIONS: u32 = 64;
 const DEFAULT_SPOOL_DIR: &str = ".goodflows/reports";
+/// History directory beside the config file when `history_dir` is unset.
+pub const DEFAULT_HISTORY_DIR: &str = "goodflows-history";
+pub const DEFAULT_LOG_RUNS: u64 = 10;
+pub const DEFAULT_HISTORY_RUNS: u64 = 1000;
+/// A default, not a maximum: settings and flags may raise it.
+pub const DEFAULT_HISTORY_BYTES: u64 = 10_485_760;
 
 /// Opt-in publishing of job reports. Only environment variable *names* are
 /// configured; the endpoint and key values are read by the publisher at runtime.
@@ -145,6 +151,18 @@ pub struct Settings {
     /// Command environment defaults, layered between the caller's environment and job env.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub env: BTreeMap<String, String>,
+    /// Write one run history file per run. Off by default.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub history: bool,
+    /// Resolved against the config file's directory by `Config::load`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history_dir: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_runs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history_runs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history_bytes: Option<u64>,
 }
 
 impl Default for Settings {
@@ -154,6 +172,11 @@ impl Default for Settings {
             fail_fast: true,
             workdir: None,
             env: BTreeMap::new(),
+            history: false,
+            history_dir: None,
+            log_runs: None,
+            history_runs: None,
+            history_bytes: None,
         }
     }
 }
@@ -166,6 +189,23 @@ pub struct EffectiveSettings {
     /// Merged configured env defaults (shared < workflow < selected profile).
     /// Never includes the caller's environment or job/step overrides.
     pub env: BTreeMap<String, String>,
+    pub history: bool,
+    pub history_dir: PathBuf,
+    pub log_runs: u64,
+    pub history_runs: u64,
+    pub history_bytes: u64,
+}
+
+/// Run history and log retention flags. `history_dir` is already resolved
+/// against the invocation directory.
+#[derive(Debug, Default, Clone)]
+pub struct HistoryOverrides {
+    /// `Some(false)` for `--no-history`, `Some(true)` for `--history` or `--history-dir`.
+    pub history: Option<bool>,
+    pub history_dir: Option<PathBuf>,
+    pub log_runs: Option<u64>,
+    pub history_runs: Option<u64>,
+    pub history_bytes: Option<u64>,
 }
 
 impl Settings {
@@ -173,6 +213,7 @@ impl Settings {
         &self,
         parallelism: Option<usize>,
         fail_fast: Option<bool>,
+        cli: &HistoryOverrides,
     ) -> Result<EffectiveSettings> {
         Ok(EffectiveSettings {
             parallelism: match parallelism.or(self.parallelism) {
@@ -187,8 +228,53 @@ impl Settings {
                 .clone()
                 .context("config workdir has not been resolved")?,
             env: self.env.clone(),
+            history: cli.history.unwrap_or(self.history),
+            history_dir: cli
+                .history_dir
+                .clone()
+                .or_else(|| self.history_dir.clone())
+                .context("config history_dir has not been resolved")?,
+            log_runs: cli.log_runs.or(self.log_runs).unwrap_or(DEFAULT_LOG_RUNS),
+            history_runs: cli
+                .history_runs
+                .or(self.history_runs)
+                .unwrap_or(DEFAULT_HISTORY_RUNS),
+            history_bytes: cli
+                .history_bytes
+                .or(self.history_bytes)
+                .unwrap_or(DEFAULT_HISTORY_BYTES),
         })
     }
+
+    /// Reject a zero retention cap in shared settings.
+    fn validate_history(&self) -> Result<()> {
+        validate_caps(self.log_runs, self.history_runs, self.history_bytes)
+    }
+}
+
+fn validate_caps(
+    log_runs: Option<u64>,
+    history_runs: Option<u64>,
+    history_bytes: Option<u64>,
+) -> Result<()> {
+    for (name, value) in [
+        ("log_runs", log_runs),
+        ("history_runs", history_runs),
+        ("history_bytes", history_bytes),
+    ] {
+        if value == Some(0) {
+            bail!("{name} must be at least 1");
+        }
+    }
+    Ok(())
+}
+
+/// Join a configured history directory to the config file's directory.
+fn resolve_history_dir(base: &Path, dir: &Path) -> Result<PathBuf> {
+    if dir.as_os_str().is_empty() {
+        bail!("history_dir must not be empty");
+    }
+    Ok(base.join(dir))
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -403,14 +489,35 @@ pub struct SettingsOverrides {
     pub workdir: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub env: BTreeMap<String, String>,
+    /// An explicit `false` wins over a lower `true`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history_dir: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_runs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history_runs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history_bytes: Option<u64>,
 }
 
 impl SettingsOverrides {
+    /// Reject a zero retention cap in workflow or profile settings.
+    fn validate_history(&self) -> Result<()> {
+        validate_caps(self.log_runs, self.history_runs, self.history_bytes)
+    }
+
     fn is_empty(&self) -> bool {
         self.parallelism.is_none()
             && self.fail_fast.is_none()
             && self.workdir.is_none()
             && self.env.is_empty()
+            && self.history.is_none()
+            && self.history_dir.is_none()
+            && self.log_runs.is_none()
+            && self.history_runs.is_none()
+            && self.history_bytes.is_none()
     }
 
     fn apply(&self, shared: &Settings) -> Settings {
@@ -423,6 +530,14 @@ impl SettingsOverrides {
             fail_fast: self.fail_fast.unwrap_or(shared.fail_fast),
             workdir: self.workdir.clone().or_else(|| shared.workdir.clone()),
             env,
+            history: self.history.unwrap_or(shared.history),
+            history_dir: self
+                .history_dir
+                .clone()
+                .or_else(|| shared.history_dir.clone()),
+            log_runs: self.log_runs.or(shared.log_runs),
+            history_runs: self.history_runs.or(shared.history_runs),
+            history_bytes: self.history_bytes.or(shared.history_bytes),
         }
     }
 }
@@ -512,6 +627,33 @@ impl Config {
                 );
             }
         }
+        // History directories resolve like workdir: from the config file's directory.
+        config.settings.history_dir = Some(
+            resolve_history_dir(
+                base,
+                config
+                    .settings
+                    .history_dir
+                    .as_deref()
+                    .unwrap_or(Path::new(DEFAULT_HISTORY_DIR)),
+            )
+            .context("settings")?,
+        );
+        for (name, workflow) in &mut config.workflows {
+            if let Some(dir) = &workflow.settings.history_dir {
+                workflow.settings.history_dir = Some(
+                    resolve_history_dir(base, dir).with_context(|| format!("workflow '{name}'"))?,
+                );
+            }
+        }
+        for (name, environment) in &mut config.environments {
+            if let Some(dir) = &environment.settings.history_dir {
+                environment.settings.history_dir = Some(
+                    resolve_history_dir(base, dir)
+                        .with_context(|| format!("environment '{name}'"))?,
+                );
+            }
+        }
         if let Some(reporting) = &mut config.reporting {
             // Joining an empty path would yield `base` and hide the empty value from validate().
             if reporting
@@ -538,13 +680,22 @@ impl Config {
         // Validate every authored settings map, including unselected workflows and
         // profiles and entries a later scope overrides.
         validate_settings_env(&self.settings.env, reporting).context("settings env")?;
+        self.settings.validate_history().context("settings")?;
         for (name, workflow) in &self.workflows {
             validate_settings_env(&workflow.settings.env, reporting)
                 .with_context(|| format!("workflow '{name}' settings env"))?;
+            workflow
+                .settings
+                .validate_history()
+                .with_context(|| format!("workflow '{name}' settings"))?;
         }
         for (name, environment) in &self.environments {
             validate_settings_env(&environment.settings.env, reporting)
                 .with_context(|| format!("environment '{name}' settings env"))?;
+            environment
+                .settings
+                .validate_history()
+                .with_context(|| format!("environment '{name}' settings"))?;
         }
         if !self.jobs.is_empty() {
             if self.workflows.contains_key("default") {
@@ -1230,7 +1381,12 @@ mod tests {
     ) -> BTreeMap<String, String> {
         let (_, mut selected) = config.workflow(Some(workflow), profile).unwrap();
         selected.settings.workdir = Some(PathBuf::from("/"));
-        selected.settings.resolve(None, None).unwrap().env
+        selected.settings.history_dir = Some(PathBuf::from("/history"));
+        selected
+            .settings
+            .resolve(None, None, &HistoryOverrides::default())
+            .unwrap()
+            .env
     }
 
     fn map(entries: &[(&str, &str)]) -> BTreeMap<String, String> {
@@ -1526,6 +1682,142 @@ mod tests {
         .unwrap();
         let text = toml::to_string(&config).unwrap();
         assert!(text.contains("[environments.local.partitions]"), "{text}");
+    }
+
+    fn history_settings(
+        config: &Config,
+        workflow: &str,
+        profile: Option<&str>,
+        cli: &HistoryOverrides,
+    ) -> EffectiveSettings {
+        let (_, mut selected) = config.workflow(Some(workflow), profile).unwrap();
+        selected.settings.workdir = Some(PathBuf::from("/"));
+        if selected.settings.history_dir.is_none() {
+            selected.settings.history_dir = Some(PathBuf::from("/default"));
+        }
+        selected.settings.resolve(None, None, cli).unwrap()
+    }
+
+    #[test]
+    fn history_settings_follow_shared_workflow_profile_precedence() {
+        let config = validate(&format!(
+            "{JOB}[settings]\nhistory = true\nhistory_dir = 'shared'\nlog_runs = 3\nhistory_runs = 30\nhistory_bytes = 300\n\
+             [workflows.ci.settings]\nlog_runs = 4\nhistory_dir = 'wf'\n\
+             [environments.off.settings]\nhistory = false\nhistory_dir = 'profile'\nhistory_bytes = 5\n\
+             [environments.on.settings]\nhistory_runs = 6\n"
+        ))
+        .unwrap();
+        let none = HistoryOverrides::default();
+        // Shared values apply where nothing overrides them.
+        let other = history_settings(&config, "other", None, &none);
+        assert!(other.history);
+        assert_eq!(other.history_dir, PathBuf::from("shared"));
+        assert_eq!(
+            (other.log_runs, other.history_runs, other.history_bytes),
+            (3, 30, 300)
+        );
+        // Workflow beats shared.
+        let ci = history_settings(&config, "ci", None, &none);
+        assert_eq!(ci.history_dir, PathBuf::from("wf"));
+        assert_eq!(ci.log_runs, 4);
+        // An explicit profile false beats a shared true; the profile directory wins.
+        let off = history_settings(&config, "ci", Some("off"), &none);
+        assert!(!off.history);
+        assert_eq!(off.history_dir, PathBuf::from("profile"));
+        assert_eq!((off.log_runs, off.history_bytes), (4, 5));
+        let on = history_settings(&config, "ci", Some("on"), &none);
+        assert!(on.history);
+        assert_eq!(on.history_runs, 6);
+        // CLI overrides beat every scope.
+        let cli = HistoryOverrides {
+            history: Some(true),
+            history_dir: Some(PathBuf::from("/cli")),
+            log_runs: Some(7),
+            history_runs: Some(8),
+            history_bytes: Some(9),
+        };
+        let forced = history_settings(&config, "ci", Some("off"), &cli);
+        assert!(forced.history);
+        assert_eq!(forced.history_dir, PathBuf::from("/cli"));
+        assert_eq!(
+            (forced.log_runs, forced.history_runs, forced.history_bytes),
+            (7, 8, 9)
+        );
+        let disabled = HistoryOverrides {
+            history: Some(false),
+            ..HistoryOverrides::default()
+        };
+        assert!(!history_settings(&config, "other", None, &disabled).history);
+    }
+
+    #[test]
+    fn history_settings_default_when_unset() {
+        let config = validate(JOB).unwrap();
+        let settings = history_settings(&config, "ci", None, &HistoryOverrides::default());
+        assert!(!settings.history);
+        assert_eq!(settings.history_dir, PathBuf::from("/default"));
+        assert_eq!(
+            (
+                settings.log_runs,
+                settings.history_runs,
+                settings.history_bytes
+            ),
+            (10, 1000, 10_485_760)
+        );
+    }
+
+    #[test]
+    fn zero_retention_caps_fail_validation_in_every_scope() {
+        for scope in [
+            "settings",
+            "workflows.ci.settings",
+            "environments.unused.settings",
+        ] {
+            for cap in ["log_runs", "history_runs", "history_bytes"] {
+                let error = validate(&format!("{JOB}[{scope}]\n{cap} = 0\n")).unwrap_err();
+                assert!(
+                    error.contains(&format!("{cap} must be at least 1")),
+                    "{scope} {cap}: {error}"
+                );
+            }
+        }
+        validate(&format!(
+            "{JOB}[settings]\nlog_runs = 1\nhistory_runs = 1\nhistory_bytes = 1\n"
+        ))
+        .unwrap();
+    }
+
+    #[test]
+    fn load_resolves_history_dirs_from_the_config_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let path = base.join("goodflows.toml");
+        std::fs::write(
+            &path,
+            format!("{JOB}[workflows.ci.settings]\nhistory_dir = 'wf'\n[environments.p.settings]\nhistory_dir = '/abs/profile'\n"),
+        )
+        .unwrap();
+        let (config, _) = Config::load(Some(&path)).unwrap();
+        assert_eq!(
+            config.settings.history_dir,
+            Some(base.join(DEFAULT_HISTORY_DIR))
+        );
+        assert_eq!(
+            config.workflows["ci"].settings.history_dir,
+            Some(base.join("wf"))
+        );
+        assert_eq!(
+            config.environments["p"].settings.history_dir,
+            Some(PathBuf::from("/abs/profile"))
+        );
+        let (_, other) = config.workflow(Some("other"), None).unwrap();
+        assert_eq!(
+            other.settings.history_dir,
+            Some(base.join(DEFAULT_HISTORY_DIR))
+        );
+        std::fs::write(&path, format!("{JOB}[settings]\nhistory_dir = ''\n")).unwrap();
+        let error = format!("{:#}", Config::load(Some(&path)).unwrap_err());
+        assert!(error.contains("history_dir must not be empty"), "{error}");
     }
 
     #[test]

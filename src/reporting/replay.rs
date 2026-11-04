@@ -8,11 +8,12 @@
 
 use super::publish::{self, Ack, Limits};
 use super::{
-    canonical_uuid, deliver, emit, manifest_version, protect_process, Head, Item, JobDirs,
-    Manifest, ManifestPartition, ManifestState, Rejection, MANIFEST, MANIFEST_VERSION,
+    deliver, emit, manifest_version, protect_process, Head, Item, JobDirs, Manifest,
+    ManifestPartition, ManifestState, Rejection, MANIFEST, MANIFEST_VERSION,
     PARTITIONED_MANIFEST_VERSION,
 };
 use crate::config::{self, Partition};
+use crate::fsutil::canonical_uuid;
 use crate::output::Output;
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};

@@ -41,7 +41,11 @@ fn condition_timeout_cleans_up_and_command_shares_the_timeout_budget() {
             serde_json::from_str(stdout(&output).lines().last().unwrap()).unwrap();
         assert_eq!(summary["results"][0]["status"], "timed_out");
         assert_eq!(summary["results"][0]["stdout_tail"], expected_tail);
-        assert_eq!(p.read("logs/001-timeout.stdout.log"), expected_tail);
+        assert_eq!(
+            std::fs::read_to_string(run_dir(&p.dir.join("logs")).join("001-timeout.stdout.log"))
+                .unwrap(),
+            expected_tail
+        );
         assert!(!p.dir.join("ran").exists());
         assert_eq!(
             p.dir.join("started").exists(),
@@ -87,7 +91,11 @@ command = "touch later"
         tail,
         "first" | "firstcondition" | "firstconditionsecond"
     ));
-    assert_eq!(p.read("logs/001-timeout.stdout.log"), tail);
+    assert_eq!(
+        std::fs::read_to_string(run_dir(&p.dir.join("logs")).join("001-timeout.stdout.log"))
+            .unwrap(),
+        tail
+    );
     std::thread::sleep(Duration::from_millis(600));
     assert!(!p.dir.join("escaped").exists());
     assert!(!p.dir.join("later").exists());
@@ -163,7 +171,132 @@ fn interrupt_and_termination_kill_descendants_and_emit_summary() {
             assert_eq!(summary["results"][0]["steps"][0]["status"], "cancelled");
             assert_eq!(summary["results"][0]["steps"][1]["status"], "cancelled");
         }
+        // The cancelled child was still reaped by goodflows, with its CPU time.
+        let running = &summary["results"][0];
+        assert_eq!(
+            running["error"].as_str().map(|e| e.contains("wait")),
+            Some(false)
+        );
+        let cost = &running["commands"][0];
+        assert_eq!(
+            cost["kind"],
+            if field == "condition" {
+                "condition"
+            } else {
+                "command"
+            }
+        );
+        assert!(cost["wall_ms"].is_u64(), "{running}");
+        assert!(cost["cpu_user_ms"].is_u64(), "{running}");
+        assert!(cost["cpu_system_ms"].is_u64(), "{running}");
+        assert_eq!(cost["step"].as_str(), is_step.then_some("running"));
     }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn spawned_commands_record_wall_cpu_and_peak_rss() {
+    let p = Project::new(
+        "[settings]\nfail_fast = false\n\
+         [[jobs]]\nname='sleepy'\ncommand='sleep 0.3'\n\
+         [[jobs]]\nname='quick'\ncommand='true'\n\
+         [[jobs]]\nname='expr'\ncondition = { expression = 'env.NOPE == \"1\"' }\ncommand='true'\n\
+         [[jobs]]\nname='stepped'\n[[jobs.steps]]\nid='check'\ncondition = { shell = 'true' }\ncommand='true'\n",
+    );
+    let output = p.run(&["--json"]);
+    success(&output);
+    let summary: serde_json::Value =
+        serde_json::from_str(stdout(&output).lines().last().unwrap()).unwrap();
+    let results = summary["results"].as_array().unwrap();
+    let sleepy = &results[0]["commands"];
+    assert_eq!(sleepy.as_array().unwrap().len(), 1, "{sleepy}");
+    assert_eq!(sleepy[0]["kind"], "command");
+    assert!(sleepy[0].get("step").is_none());
+    assert!(sleepy[0]["wall_ms"].as_u64().unwrap() >= 250, "{sleepy}");
+    assert!(sleepy[0]["cpu_user_ms"].is_u64(), "{sleepy}");
+    assert!(sleepy[0]["cpu_system_ms"].is_u64(), "{sleepy}");
+    assert!(
+        sleepy[0]["peak_rss_bytes"].as_u64().unwrap() > 0,
+        "{sleepy}"
+    );
+    // A command that exits before a live sample may omit peak RSS, but a
+    // recorded peak is never 0 (a process caught starting or exiting).
+    let quick = &results[1]["commands"][0];
+    assert!(
+        quick["wall_ms"].is_u64() && quick["cpu_user_ms"].is_u64(),
+        "{quick}"
+    );
+    assert!(
+        quick
+            .get("peak_rss_bytes")
+            .is_none_or(|bytes| bytes.as_u64().is_some_and(|bytes| bytes > 0)),
+        "{quick}"
+    );
+    // An expression condition spawns nothing.
+    assert_eq!(results[2]["status"], "skipped");
+    assert!(results[2].get("commands").is_none(), "{}", results[2]);
+    // A step's shell condition and command both record, with the step id.
+    let stepped = results[3]["commands"].as_array().unwrap();
+    let kinds: Vec<_> = stepped
+        .iter()
+        .map(|c| (c["kind"].clone(), c["step"].clone()))
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            (serde_json::json!("condition"), serde_json::json!("check")),
+            (serde_json::json!("command"), serde_json::json!("check")),
+        ]
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn cpu_time_includes_reaped_grandchildren() {
+    // The shell waits for a CPU-bound grandchild (the trailing `true` keeps
+    // it from exec'ing awk directly), so the shell's rusage includes it.
+    let p = Project::new(
+        "[[jobs]]\nname='burn'\ncommand='awk \"BEGIN { for (i = 0; i < 20000000; i++) s += i }\"; true'\n",
+    );
+    let output = p.run(&["--json"]);
+    success(&output);
+    let summary: serde_json::Value =
+        serde_json::from_str(stdout(&output).lines().last().unwrap()).unwrap();
+    let cost = &summary["results"][0]["commands"][0];
+    let cpu = cost["cpu_user_ms"].as_u64().unwrap() + cost["cpu_system_ms"].as_u64().unwrap();
+    let wall = cost["wall_ms"].as_u64().unwrap();
+    let cpus = summary["host"]["logical_cpus"].as_u64().unwrap();
+    assert!(cpu >= 100, "{cost}");
+    // CPU time can never exceed wall time on every CPU (plus rounding).
+    assert!(cpu <= wall * cpus + 50, "{cost} on {cpus} CPUs");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn timed_out_commands_are_reaped_without_zombies() {
+    let p = Project::new(
+        "[settings]\nparallelism = 1\nfail_fast = false\n\
+         [[jobs]]\nname='slow'\ntimeout_secs=1\ncommand='sleep 5'\n\
+         [[jobs]]\nname='probe'\ndepends_on=[]\ncommand='ps -o stat= --ppid $PPID > children'\n",
+    );
+    let output = p.run(&["--json"]);
+    assert_eq!(output.status.code(), Some(1));
+    let summary: serde_json::Value =
+        serde_json::from_str(stdout(&output).lines().last().unwrap()).unwrap();
+    let slow = &summary["results"][0];
+    assert_eq!(slow["status"], "timed_out");
+    assert_eq!(summary["outcome"], "failed");
+    assert!(!slow["error"].as_str().unwrap().contains("wait"), "{slow}");
+    assert!(slow["commands"][0]["cpu_user_ms"].is_u64(), "{slow}");
+    assert!(
+        slow["commands"][0]["wall_ms"].as_u64().unwrap() >= 900,
+        "{slow}"
+    );
+    // The probe ran after the timeout: goodflows' only children are the probe's own shell.
+    assert_eq!(summary["results"][1]["status"], "passed", "{summary}");
+    let children = p.read("children");
+    assert!(!children.trim().is_empty());
+    assert!(!children.contains('Z'), "zombie child: {children:?}");
 }
 
 #[test]

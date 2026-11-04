@@ -3190,3 +3190,76 @@ fn profile_partition_count_drives_report_collection_and_replay() {
     assert_eq!(uploaded.len(), 6);
     assert!(uploaded.iter().all(|e| e["partition"]["count"] == 6));
 }
+
+#[test]
+fn one_run_id_names_logs_history_and_the_reporting_run() {
+    let mock = Mock::store();
+    let p = project(&format!(
+        "[[jobs]]\nname = \"test\"\ncommand = '{}'\nreports = [\"exunit-timings\"]\n",
+        copy(&["r1"])
+    ));
+    let output = run_with(
+        &p,
+        &["--json", "--history", "--log-dir", "logs"],
+        Some(&mock.url),
+    );
+    success(&output);
+    let summary = events(&output).pop().unwrap();
+    let run_id = summary["run_id"].as_str().unwrap();
+    let dir = &run_dirs(&p)[0];
+    assert_eq!(manifest(dir)["workflow_run_id"], run_id);
+    assert!(dir.ends_with(run_id));
+    assert!(summary["log_dir"].as_str().unwrap().ends_with(run_id));
+    assert!(summary["history_file"]
+        .as_str()
+        .unwrap()
+        .ends_with(&format!("{run_id}.json")));
+    assert_eq!(
+        mock.requests()[0].json()["workflow_run_id"],
+        run_id,
+        "the published run id"
+    );
+}
+
+#[test]
+fn a_signal_after_the_last_job_cancels_the_json_outcome() {
+    let requested = std::sync::Arc::new(std::sync::Mutex::new(false));
+    let seen = requested.clone();
+    // Hold the upload open so the signal lands after every job finished but
+    // before the summary.
+    let mock = Mock::start(move |_, _| {
+        *seen.lock().unwrap() = true;
+        Reply::Hang(Duration::from_secs(5))
+    });
+    let p = project(&format!(
+        "[[jobs]]\nname = \"test\"\ncommand = '{}'\nreports = [\"exunit-timings\"]\n",
+        copy(&["r1"])
+    ));
+    let child = p
+        .command()
+        .args(["--json", "--history"])
+        .env("GOODFLOWS_URL", &mock.url)
+        .env("GOODFLOWS_API_KEY", SECRET)
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let start = Instant::now();
+    while !*requested.lock().unwrap() {
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "upload never started"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGTERM) }, 0);
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(143));
+    let summary = events(&output).pop().unwrap();
+    assert_eq!(summary["type"], "summary");
+    assert_eq!(summary["results"][0]["status"], "passed");
+    assert_eq!(summary["outcome"], "cancelled");
+    let record: Value =
+        serde_json::from_slice(&std::fs::read(summary["history_file"].as_str().unwrap()).unwrap())
+            .unwrap();
+    assert_eq!(record["outcome"], "cancelled");
+}

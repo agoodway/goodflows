@@ -19,10 +19,8 @@ fn output_is_prefixed_and_optional_logs_preserve_raw_streams() {
     success(&output);
     assert!(stdout(&output).contains("[../unsafe/name stdout] hello"));
     assert!(stdout(&output).contains("[../unsafe/name stderr] error"));
-    let files: Vec<_> = std::fs::read_dir(p.dir.join("logs"))
-        .unwrap()
-        .map(|f| f.unwrap().path())
-        .collect();
+    let run = run_dir(&p.dir.join("logs"));
+    let files: Vec<_> = log_names(&run).iter().map(|f| run.join(f)).collect();
     assert_eq!(files.len(), 2);
     let out = files
         .iter()
@@ -81,7 +79,7 @@ fn non_utf8_and_large_partial_lines_are_streamed_without_corrupting_logs() {
         .collect();
     assert!(data.starts_with('\u{fffd}'));
     assert_eq!(data.chars().count(), 100001);
-    let raw = std::fs::read(p.dir.join("logs/001-bytes.stdout.log")).unwrap();
+    let raw = std::fs::read(run_dir(&p.dir.join("logs")).join("001-bytes.stdout.log")).unwrap();
     assert_eq!(raw.len(), 100001);
     assert_eq!(raw[0], 255);
 }
@@ -108,15 +106,25 @@ command = """printf '\\377'; head -c 8190 /dev/zero | tr '\\000' x; printf '\\34
 #[cfg(target_os = "linux")]
 #[test]
 fn log_write_failure_stops_the_process_without_waiting_for_its_command() {
-    use std::os::unix::fs::symlink;
     use std::time::{Duration, Instant};
+    // Log files are created fresh and never follow a symlink, so the write
+    // error comes from a file size limit: with SIGXFSZ ignored, a write past
+    // `ulimit -f` fails with EFBIG. Pipes are not limited, so only the log
+    // write fails.
     let p = Project::new(
         "[[jobs]]\nname='io'\ncommand='head -c 200000 /dev/zero; sleep 3; touch escaped'",
     );
-    std::fs::create_dir(p.dir.join("logs")).unwrap();
-    symlink("/dev/full", p.dir.join("logs/001-io.stdout.log")).unwrap();
     let start = Instant::now();
-    let output = p.run(&["--log-dir", "logs", "--json"]);
+    let output = std::process::Command::new("sh")
+        .args([
+            "-c",
+            "trap '' XFSZ; ulimit -f 50; exec \"$0\" --log-dir logs --json",
+            env!("CARGO_BIN_EXE_goodflows"),
+        ])
+        .current_dir(&p.dir)
+        .env("NO_COLOR", "1")
+        .output()
+        .unwrap();
     assert!(!output.status.success());
     assert!(
         start.elapsed() < Duration::from_secs(2),
@@ -130,6 +138,39 @@ fn log_write_failure_stops_the_process_without_waiting_for_its_command() {
         .as_str()
         .unwrap()
         .contains("output"));
+}
+
+#[test]
+fn log_files_are_private_and_never_follow_a_planted_symlink() {
+    use std::os::unix::fs::PermissionsExt;
+    // A first job plants a symlink where the second job's stdout log goes.
+    let p = Project::new(
+        "[settings]\nfail_fast = false\n\
+         [[jobs]]\nname='seed'\ncommand='for d in logs/*/; do ln -s ../../target \"${d}002-io.stdout.log\"; done'\n\
+         [[jobs]]\nname='io'\ndepends_on=['seed']\ncommand='echo written; touch ran'",
+    );
+    std::fs::write(p.dir.join("target"), "untouched").unwrap();
+    let output = p.run(&["--log-dir", "logs", "--json"]);
+    assert_eq!(output.status.code(), Some(1));
+    let summary = events(&output).pop().unwrap();
+    assert_eq!(summary["results"][0]["status"], "passed");
+    assert_eq!(summary["results"][1]["status"], "failed");
+    let error = summary["results"][1]["error"].as_str().unwrap();
+    assert!(error.contains("failed to create log"), "{error}");
+    assert!(!p.dir.join("ran").exists());
+    assert_eq!(p.read("target"), "untouched");
+    // The run directory and the logs it holds are private to the user.
+    let run = run_dir(&p.dir.join("logs"));
+    let mode = |path: &std::path::Path| {
+        std::fs::symlink_metadata(path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777
+    };
+    assert_eq!(mode(&run), 0o700);
+    assert_eq!(mode(&run.join("001-seed.stdout.log")), 0o600);
+    assert_eq!(mode(&run.join("001-seed.stderr.log")), 0o600);
 }
 
 #[test]
@@ -156,16 +197,25 @@ command = """printf 'EARLY'; head -c 10000 /dev/zero | tr '\\000' x; printf 'OUT
     assert_eq!(result["stdout_truncated"], true);
     assert_eq!(result["stderr_truncated"], true);
     let finished = events.iter().find(|e| e["type"] == "job_finished").unwrap();
-    // The summary result adds only `started`; the live event never carries it.
+    // The summary result adds only `started` and the optimizer fields; the
+    // live event never carries them.
     let mut projected = result.clone();
-    assert_eq!(
-        projected.as_object_mut().unwrap().remove("started"),
-        Some(true.into())
-    );
+    let projected_fields = projected.as_object_mut().unwrap();
+    assert_eq!(projected_fields.remove("started"), Some(true.into()));
+    for field in ["blocked_ms", "queued_ms", "commands"] {
+        assert!(
+            projected_fields.remove(field).is_some(),
+            "{field}: {result}"
+        );
+    }
     assert_eq!(finished["result"], projected);
     assert!(finished["result"].get("stdout_tail").is_some());
     assert!(finished["result"].get("stderr_tail").is_some());
-    assert!(p.read("logs/001-fail.stdout.log").starts_with("EARLY"));
+    assert!(
+        std::fs::read_to_string(run_dir(&p.dir.join("logs")).join("001-fail.stdout.log"))
+            .unwrap()
+            .starts_with("EARLY")
+    );
     let full: String = events
         .iter()
         .filter(|e| e["type"] == "job_output" && e["stream"] == "stdout")
@@ -578,12 +628,53 @@ fn json_summary_carries_duration_log_dir_and_instance_counts() {
         assert_eq!(summary["results"].as_array().unwrap().len(), 4);
         match log_dir {
             Some(dir) => {
-                assert_eq!(summary["log_dir"], dir);
-                assert!(p.dir.join(dir).join("001-compile.stdout.log").exists());
+                let run = run_dirs(&p.dir.join(dir)).pop().unwrap();
+                let run_name = run.file_name().unwrap().to_str().unwrap();
+                assert_eq!(summary["log_dir"], format!("{dir}/{run_name}"));
+                assert!(run_name.ends_with(summary["run_id"].as_str().unwrap()));
+                assert!(run.join("001-compile.stdout.log").exists());
             }
-            None => assert!(summary.get("log_dir").is_none(), "{summary}"),
+            None => {
+                assert!(summary.get("log_dir").is_none(), "{summary}");
+                // No new log run directory beside the earlier `--log-dir` run.
+                assert_eq!(run_dirs(&p.dir.join("logs")).len(), 1);
+            }
+        }
+        // Optimizer fields are present with history off; history_file is not.
+        assert!(summary.get("history_file").is_none(), "{summary}");
+        assert_eq!(summary["outcome"], "passed");
+        assert_eq!(summary["parallelism"], events[0]["parallelism"]);
+        assert!(summary["max_in_flight"].as_u64().unwrap() >= 1);
+        assert_eq!(summary["graph_sha256"].as_str().unwrap().len(), 64);
+        assert!(summary["host"]["logical_cpus"].as_u64().unwrap() >= 1);
+        assert!(summary["started_at"].as_str().unwrap().ends_with('Z'));
+        for result in summary["results"].as_array().unwrap() {
+            assert!(result["blocked_ms"].is_u64(), "{result}");
+            assert!(result["queued_ms"].is_u64(), "{result}");
+            assert_eq!(result["commands"][0]["kind"], "command", "{result}");
+        }
+        // `test` waits for `compile` (sleep 0.2): that wait is blocked time.
+        assert!(summary["results"][1]["blocked_ms"].as_u64().unwrap() >= 150);
+        assert!(!p.dir.join("goodflows-history").exists());
+        for event in events.iter().filter(|e| e["type"] == "job_finished") {
+            for field in ["blocked_ms", "queued_ms", "commands", "started"] {
+                assert!(event["result"].get(field).is_none(), "{event}");
+            }
         }
     }
+    // A second run gets its own directory and keeps the first.
+    let output = named.run(&["run", "ci", "--json", "--log-dir", "logs"]);
+    success(&output);
+    let runs = run_dirs(&named.dir.join("logs/ci"));
+    assert_eq!(runs.len(), 2);
+    let summary = events(&output).pop().unwrap();
+    let newest = runs.iter().find(|r| {
+        summary["log_dir"]
+            .as_str()
+            .unwrap()
+            .ends_with(r.file_name().unwrap().to_str().unwrap())
+    });
+    assert!(newest.is_some(), "{summary}");
 }
 
 #[test]
@@ -791,11 +882,22 @@ fn non_utf8_log_dir_still_gets_a_summary() {
     success(&output);
     let summary = events(&output).pop().unwrap();
     assert_eq!(summary["type"], "summary");
-    assert_eq!(summary["log_dir"], "l\u{fffd}");
-    assert!(p.dir.join(dir).join("001-a.stdout.log").exists());
+    let run = run_dir(&p.dir.join(dir));
+    let run_name = run.file_name().unwrap().to_str().unwrap().to_owned();
+    assert_eq!(summary["log_dir"], format!("l\u{fffd}/{run_name}"));
+    assert!(run.join("001-a.stdout.log").exists());
     let output = p.command().arg("--log-dir").arg(dir).output().unwrap();
     success(&output);
-    assert!(stdout(&output).ends_with("\n1 passed\n\nLogs: l\u{fffd}\n"));
+    let newest = run_dirs(&p.dir.join(dir))
+        .into_iter()
+        .find(|r| *r != run)
+        .unwrap();
+    let newest = newest.file_name().unwrap().to_str().unwrap();
+    assert!(
+        stdout(&output).ends_with(&format!("\n1 passed\n\nLogs: l\u{fffd}/{newest}\n")),
+        "{}",
+        stdout(&output)
+    );
 }
 
 #[test]

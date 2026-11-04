@@ -116,9 +116,11 @@ fn row_label(status: &str) -> (&'static str, colored::Color) {
 pub(super) fn report(event: &Value, out: &mut impl Write) -> Result<()> {
     let results: &[Value] = event["results"].as_array().map_or(&[], Vec::as_slice);
     let has = |status: &str| results.iter().any(|r| text(r, "status") == status);
-    let (outcome, failed) = if has("failed") || has("timed_out") {
+    // `outcome` comes from the same signal snapshot as the exit code; the
+    // fallback covers summaries without it.
+    let (outcome, failed) = if event["outcome"] == "failed" || has("failed") || has("timed_out") {
         ("FAILED".red(), true)
-    } else if has("cancelled") || event[INTERRUPTED] == true {
+    } else if event["outcome"] == "cancelled" || has("cancelled") || event[INTERRUPTED] == true {
         // A signal after every job finished still makes the run exit 128+n.
         ("CANCELLED".yellow(), false)
     } else {
@@ -209,6 +211,7 @@ pub(super) fn report(event: &Value, out: &mut impl Write) -> Result<()> {
     }
 
     let log_dir = event["log_dir"].as_str();
+    let history_file = event["history_file"].as_str();
     let failed_rows = rows
         .iter()
         .any(|r| matches!(r.status, "failed" | "timed_out"));
@@ -221,11 +224,14 @@ pub(super) fn report(event: &Value, out: &mut impl Write) -> Result<()> {
         })
         .map(|r| r.name)
         .collect();
-    if log_dir.is_some() || !rerun_jobs.is_empty() {
+    if log_dir.is_some() || history_file.is_some() || !rerun_jobs.is_empty() {
         writeln!(out)?;
     }
     if let Some(dir) = log_dir {
         writeln!(out, "Logs: {}", visible(dir))?;
+    }
+    if let Some(file) = history_file {
+        writeln!(out, "History: {}", visible(file))?;
     }
     if !rerun_jobs.is_empty() {
         let context = Rerun {
@@ -558,6 +564,14 @@ mod tests {
     }
 
     #[test]
+    fn header_follows_the_summary_outcome() {
+        let mut event = summary(vec![result("a", "passed", true, 1)]);
+        event["outcome"] = json!("cancelled");
+        colored::control::set_override(false);
+        assert!(rendered(event).starts_with("\nci  CANCELLED  in "));
+    }
+
+    #[test]
     fn durations_use_the_coarsest_readable_unit() {
         for (ms, text) in [
             (0, "0ms"),
@@ -805,6 +819,20 @@ mod tests {
         let report = rendered(with(success, "log_dir", json!("logs")));
         assert!(report.ends_with("1 passed\n\nLogs: logs\n"), "{report}");
         assert!(!report.contains("Rerun") && !report.contains("Failures"));
+
+        // The history file follows the log directory, or stands alone.
+        let success = summary(vec![result("a", "passed", true, 1)]);
+        let logged = with(success.clone(), "log_dir", json!("logs/run"));
+        let report = rendered(with(logged, "history_file", json!("/w/h/ci/run.json")));
+        assert!(
+            report.ends_with("1 passed\n\nLogs: logs/run\nHistory: /w/h/ci/run.json\n"),
+            "{report}"
+        );
+        let report = rendered(with(success, "history_file", json!("/w/h/ci/run.json")));
+        assert!(
+            report.ends_with("1 passed\n\nHistory: /w/h/ci/run.json\n"),
+            "{report}"
+        );
 
         let comma = summary(vec![result("test,unit", "failed", true, 1)]);
         let report = rendered(comma);

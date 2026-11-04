@@ -621,7 +621,7 @@ pub fn validate_envelope(bytes: &[u8]) -> Result<Head, &'static str> {
         })
     };
     let workflow_run_id = string(&body["workflow_run_id"])?;
-    if !super::canonical_uuid(&workflow_run_id) {
+    if !crate::fsutil::canonical_uuid(&workflow_run_id) {
         return Err(invalid);
     }
     let environment = match &body["environment"] {

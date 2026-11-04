@@ -10,11 +10,10 @@ use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
-use tokio::process::Command;
 use tokio::sync::watch;
 use tokio::task::JoinSet;
 
@@ -63,9 +62,78 @@ pub struct JobResult {
     /// Projected only into the run summary, never into live events.
     #[serde(skip)]
     pub started: bool,
+    /// From the start of `execute` until every dependency passed, or until an
+    /// earlier skip or cancel. Summary and history only.
+    #[serde(skip)]
+    pub blocked_ms: u64,
+    /// After `blocked_ms`, the wait for a slot until launch, skip or cancel.
+    #[serde(skip)]
+    pub queued_ms: u64,
+    /// One entry per spawned condition, command or step. Summary and history only.
+    #[serde(skip)]
+    pub commands: Vec<CommandCost>,
+}
+
+/// What a spawned process was for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandKind {
+    Condition,
+    Command,
+}
+
+/// The measured cost of one spawned process. Unavailable measurements are omitted.
+#[derive(Clone, Debug, Serialize)]
+pub struct CommandCost {
+    pub kind: CommandKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub step: Option<String>,
+    pub wall_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_user_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_system_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peak_rss_bytes: Option<u64>,
+}
+
+/// The fields each `summary.results` entry and each history instance add
+/// to a result: never part of live `job_finished` events.
+#[derive(Serialize)]
+pub struct Scheduling<'a> {
+    pub started: bool,
+    pub blocked_ms: u64,
+    pub queued_ms: u64,
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    pub commands: &'a [CommandCost],
+}
+
+/// One `summary.results` entry: the live result plus its scheduling fields.
+#[derive(Serialize)]
+pub struct SummaryResult<'a> {
+    #[serde(flatten)]
+    pub result: &'a JobResult,
+    #[serde(flatten)]
+    pub scheduling: Scheduling<'a>,
 }
 
 impl JobResult {
+    pub fn scheduling(&self) -> Scheduling<'_> {
+        Scheduling {
+            started: self.started,
+            blocked_ms: self.blocked_ms,
+            queued_ms: self.queued_ms,
+            commands: &self.commands,
+        }
+    }
+
+    pub fn summary(&self) -> SummaryResult<'_> {
+        SummaryResult {
+            result: self,
+            scheduling: self.scheduling(),
+        }
+    }
+
     fn new(job: &Job, partition: Option<Partition>, status: Status, error: Option<String>) -> Self {
         Self {
             name: job.name.clone(),
@@ -99,6 +167,9 @@ impl JobResult {
             stderr_truncated: None,
             executed: false,
             started: false,
+            blocked_ms: 0,
+            queued_ms: 0,
+            commands: Vec::new(),
         }
     }
 
@@ -219,6 +290,7 @@ struct Shared {
     reporting: Arc<ReportingEnv>,
     environment: Option<String>,
     settings_env: BTreeMap<String, String>,
+    rss: Arc<RssMonitor>,
 }
 
 async fn record(
@@ -234,16 +306,29 @@ async fn record(
     Ok(())
 }
 
+/// The scheduler's results plus run-level measurements.
+pub struct Execution {
+    pub results: Vec<JobResult>,
+    /// The most units inside `run_job` at once.
+    pub max_in_flight: usize,
+}
+
+/// Blocked and queued time in milliseconds for a unit leaving the queue at
+/// `now`, given when its dependencies were satisfied (if they were).
+fn waits(start: Instant, ready: Option<Instant>, now: Instant) -> (u64, u64) {
+    let ms = |d: Duration| d.as_millis() as u64;
+    match ready {
+        Some(ready) => (ms(ready - start), ms(now - ready)),
+        None => (ms(now - start), 0),
+    }
+}
+
 pub async fn execute(
     jobs: &[Job],
     options: &Options,
     mut cancel: watch::Receiver<Option<i32>>,
-) -> Result<Vec<JobResult>> {
-    if let Some(dir) = &options.log_dir {
-        tokio::fs::create_dir_all(dir)
-            .await
-            .with_context(|| format!("failed to create log directory {}", dir.display()))?;
-    }
+) -> Result<Execution> {
+    let run_start = Instant::now();
     let names: HashMap<_, _> = jobs
         .iter()
         .enumerate()
@@ -269,8 +354,14 @@ pub async fn execute(
     }
     let mut results: Vec<Option<JobResult>> = vec![None; units.len()];
     let mut started = vec![false; units.len()];
+    // When each unit's dependencies were all satisfied, and its waits at launch.
+    let mut ready_at: Vec<Option<Instant>> = vec![None; units.len()];
+    let mut launch_waits = vec![(0, 0); units.len()];
+    let in_flight = Arc::new(InFlight::default());
     let mut running = JoinSet::new();
     let mut failed = false;
+    // One sampler for the whole run; it stops when this guard drops.
+    let (rss, _rss_task) = RssMonitor::start();
     let shared = Arc::new(Shared {
         workdir: options.workdir.clone(),
         log_dir: options.log_dir.clone(),
@@ -278,14 +369,38 @@ pub async fn execute(
         reporting: options.reporting.clone(),
         environment: options.environment.clone(),
         settings_env: options.settings_env.clone(),
+        rss,
     });
 
     loop {
         // Consume completed jobs before deciding whether to launch queued work.
         while let Some(completed) = running.try_join_next() {
-            let (index, result): (usize, JobResult) = completed?;
+            let (index, mut result): (usize, JobResult) = completed?;
+            (result.blocked_ms, result.queued_ms) = launch_waits[index];
             failed |= matches!(result.status, Status::Failed | Status::TimedOut);
             record(&mut results, index, result, &options.output).await?;
+        }
+        // Whether every dependency of each configured job passed. Only the
+        // skips recorded below change results before the launch loop, and a
+        // skip never makes a dependency pass, so one computation per pass
+        // serves the ready scan and the launch loop.
+        let deps_passed: Vec<bool> = deps
+            .iter()
+            .map(|deps| {
+                deps.iter()
+                    .all(|&d| dependency_state(&results, &job_units[d]) == Dependency::Passed)
+            })
+            .collect();
+        // Dependency satisfaction is observed right after the last dependency's result is recorded.
+        let now = Instant::now();
+        for (index, unit) in units.iter().enumerate() {
+            if ready_at[index].is_none()
+                && !started[index]
+                && results[index].is_none()
+                && deps_passed[unit.job]
+            {
+                ready_at[index] = Some(now);
+            }
         }
         let cancelled = cancel.borrow().is_some();
         // Repeat so transitive skips propagate even when configs are not topologically ordered.
@@ -317,13 +432,11 @@ pub async fn execute(
                     None
                 };
                 if let Some((status, error)) = reason {
-                    record(
-                        &mut results,
-                        index,
-                        JobResult::new(job, unit.partition, status, Some(error.into())),
-                        &options.output,
-                    )
-                    .await?;
+                    let mut result =
+                        JobResult::new(job, unit.partition, status, Some(error.into()));
+                    (result.blocked_ms, result.queued_ms) =
+                        waits(run_start, ready_at[index], Instant::now());
+                    record(&mut results, index, result, &options.output).await?;
                     changed = true;
                 }
             }
@@ -338,13 +451,11 @@ pub async fn execute(
             if started[index] || results[index].is_some() {
                 continue;
             }
-            if !deps[unit.job]
-                .iter()
-                .all(|&d| dependency_state(&results, &job_units[d]) == Dependency::Passed)
-            {
+            if !deps_passed[unit.job] {
                 continue;
             }
             started[index] = true;
+            launch_waits[index] = waits(run_start, ready_at[index], Instant::now());
             let job = jobs[unit.job].clone();
             let shared = shared.clone();
             let cancel = cancel.clone();
@@ -360,7 +471,9 @@ pub async fn execute(
                     (result.name.clone(), result.outputs.clone())
                 })
                 .collect();
+            let in_flight = in_flight.clone();
             running.spawn(async move {
+                let _inside = in_flight.enter();
                 let result = run_job(unit.job, unit.partition, &job, &shared, cancel, needs).await;
                 (index, result)
             });
@@ -379,13 +492,42 @@ pub async fn execute(
             biased;
             changed = cancel.changed(), if !cancelled => { changed.context("signal monitor stopped")?; }
             completed = running.join_next() => {
-                let (index, result) = completed.context("job scheduler stopped")??;
+                let (index, mut result) = completed.context("job scheduler stopped")??;
+                (result.blocked_ms, result.queued_ms) = launch_waits[index];
                 failed |= matches!(result.status, Status::Failed | Status::TimedOut);
                 record(&mut results, index, result, &options.output).await?;
             }
         }
     }
-    Ok(results.into_iter().flatten().collect())
+    Ok(Execution {
+        results: results.into_iter().flatten().collect(),
+        max_in_flight: in_flight.max.load(Ordering::SeqCst),
+    })
+}
+
+/// Units currently inside `run_job` and their high water mark. A finished
+/// task the scheduler has not joined yet no longer counts.
+#[derive(Default)]
+struct InFlight {
+    now: AtomicUsize,
+    max: AtomicUsize,
+}
+
+impl InFlight {
+    /// Count one unit in until the guard drops, even if `run_job` panics.
+    fn enter(&self) -> InFlightGuard<'_> {
+        let now = self.now.fetch_add(1, Ordering::SeqCst) + 1;
+        self.max.fetch_max(now, Ordering::SeqCst);
+        InFlightGuard(self)
+    }
+}
+
+struct InFlightGuard<'a>(&'a InFlight);
+
+impl Drop for InFlightGuard<'_> {
+    fn drop(&mut self) {
+        self.0.now.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -451,6 +593,7 @@ async fn run_job(
     result.started = true;
     // Set only when the main command or a step command spawns, never by a condition.
     let spawned = AtomicBool::new(false);
+    let commands = Mutex::new(Vec::new());
     let execution: Result<()> = async {
         let safe_name: String = job
             .name
@@ -485,9 +628,11 @@ async fn run_job(
             partition,
             environment: shared.environment.clone(),
             spawned: &spawned,
+            commands: &commands,
             deadline: job.timeout_secs.and_then(|secs| {
                 tokio::time::Instant::now().checked_add(Duration::from_secs(secs))
             }),
+            rss: shared.rss.clone(),
         };
         output
             .emit(Partition::tag(
@@ -633,6 +778,7 @@ async fn run_job(
         result.finish(CommandResult::failed(error));
     }
     result.executed = spawned.load(Ordering::Relaxed);
+    result.commands = commands.into_inner().expect("command cost mutex poisoned");
     result.duration_ms = start.elapsed().as_millis();
     if matches!(result.status, Status::Failed | Status::TimedOut) {
         let [(stdout, stdout_truncated), (stderr, stderr_truncated)] =
@@ -657,7 +803,9 @@ struct JobExecution<'a> {
     partition: Option<Partition>,
     environment: Option<String>,
     spawned: &'a AtomicBool,
+    commands: &'a Mutex<Vec<CommandCost>>,
     deadline: Option<tokio::time::Instant>,
+    rss: Arc<RssMonitor>,
 }
 
 impl JobExecution<'_> {
@@ -750,9 +898,14 @@ impl JobExecution<'_> {
     }
 }
 
-// A guard also cleans up if an I/O error aborts the scheduler or a task panics.
+/// Kills a command's process group, and the child itself if it left the
+/// group and is not reaped yet. A guard, so an early return, a dropped
+/// future, an I/O error that aborts the scheduler or a panicking task still
+/// cleans up.
 struct ProcessGroup {
     id: Option<u32>,
+    /// Set by the reaper, under this lock, once `wait4` reaped the child.
+    reaped: Arc<Mutex<bool>>,
 }
 
 impl ProcessGroup {
@@ -760,11 +913,21 @@ impl ProcessGroup {
         let Some(id) = self.id.take() else {
             return;
         };
-        #[cfg(unix)]
         // SAFETY: process_group(0) creates a private group whose ID is this child PID.
         // Negative PID targets that group, never the CLI's own process group.
         unsafe {
             libc::kill(-(id as i32), libc::SIGKILL);
+        }
+        // The group kill misses a child that left its own group. The reaper
+        // sets the flag under this lock only after `wait4`, and until then the
+        // child is unreaped (at worst a zombie), so its pid cannot have been
+        // reused while the flag is still false.
+        let reaped = self.reaped.lock().unwrap_or_else(|e| e.into_inner());
+        if !*reaped {
+            // SAFETY: kill takes only integer arguments.
+            unsafe {
+                libc::kill(id as i32, libc::SIGKILL);
+            }
         }
     }
 }
@@ -813,13 +976,15 @@ impl JobExecution<'_> {
             }
         };
         tokio::pin!(deadline);
+        // A std command: goodflows reaps the child itself with `wait4` (for its
+        // rusage), so tokio must never wait on, try_wait or kill this pid.
         let mut command = if shell {
-            let mut c = Command::new("sh");
+            let mut c = std::process::Command::new("sh");
             c.arg("-c").arg(script);
             c
         } else {
             let args = shell_words::split(script)?;
-            let mut c = Command::new(&args[0]);
+            let mut c = std::process::Command::new(&args[0]);
             c.args(&args[1..]);
             c
         };
@@ -828,10 +993,8 @@ impl JobExecution<'_> {
             .envs(env)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        #[cfg(unix)]
-        command.process_group(0);
+            .stderr(Stdio::piped());
+        std::os::unix::process::CommandExt::process_group(&mut command, 0);
         // .envs() only adds to the inherited CLI environment, so the token and any
         // inherited reserved values (from an enclosing goodflows run) must be removed.
         if let Some(token) = &self.reporting.scrub {
@@ -876,15 +1039,24 @@ impl JobExecution<'_> {
             return Ok(result);
         }
         let cancel = &mut self.cancel;
+        let spawn_start = Instant::now();
         let mut child = command
             .spawn()
             .with_context(|| format!("failed to spawn '{}'", job.name))?;
+        let pid = child.id();
+        // The guard and the reaper exist before anything else can fail, so an
+        // early return still kills the group (and a child that left it) and
+        // reaps the child.
+        let reaped_flag = Arc::new(Mutex::new(false));
+        let mut group = ProcessGroup {
+            id: Some(pid),
+            reaped: reaped_flag.clone(),
+        };
+        let mut reaper = spawn_reaper(pid, reaped_flag);
         if !is_condition {
             self.spawned.store(true, Ordering::Relaxed);
         }
-        let mut group = ProcessGroup {
-            id: Some(child.id().context("child has no PID")?),
-        };
+        let rss = self.rss.register(pid as i32);
         let mut readers = JoinSet::new();
         // The fields every `job_output` event of this command shares.
         let mut source = Partition::tag(
@@ -894,7 +1066,7 @@ impl JobExecution<'_> {
         if let Some(step) = step {
             source["step"] = json!(step);
         }
-        let pipe = child.stdout.take().context("missing stdout pipe")?;
+        let pipe = receiver(child.stdout.take().context("missing stdout pipe")?.into())?;
         readers.spawn(drain(
             pipe,
             source.clone(),
@@ -905,8 +1077,9 @@ impl JobExecution<'_> {
             },
             output.clone(),
             tails.clone(),
+            self.rss.clone(),
         ));
-        let pipe = child.stderr.take().context("missing stderr pipe")?;
+        let pipe = receiver(child.stderr.take().context("missing stderr pipe")?.into())?;
         readers.spawn(drain(
             pipe,
             source.clone(),
@@ -917,7 +1090,9 @@ impl JobExecution<'_> {
             },
             output.clone(),
             tails.clone(),
+            self.rss.clone(),
         ));
+        let mut reaped: Option<Rusage> = None;
 
         let mut result = loop {
             tokio::select! {
@@ -925,8 +1100,11 @@ impl JobExecution<'_> {
                 _ = async {
                     if cancel.borrow().is_none() { let _ = cancel.changed().await; }
                 } => break CommandResult::new(Status::Cancelled, Some("cancelled by signal".into())),
-                status = child.wait() => {
-                    let status = status.context("failed to wait for child")?;
+                waited = &mut reaper => {
+                    let (status, usage) = waited
+                        .context("child reaper stopped")?
+                        .context("failed to wait for child")?;
+                    reaped = Some(usage);
                     let skipped = is_condition && !status.success() && status.code().is_some();
                     let mut result = CommandResult::new(if status.success() {Status::Passed} else if skipped {Status::Skipped} else {Status::Failed}, None);
                     result.exit_code = status.code();
@@ -947,12 +1125,36 @@ impl JobExecution<'_> {
                 }
             }
         };
-        // Stop descendants before draining pipes: they may otherwise keep the pipes open forever.
+        // Stop descendants before draining pipes: they may otherwise keep the
+        // pipes open forever. This also kills a child that left its group.
         group.kill();
-        if child.try_wait()?.is_none() {
-            let _ = child.kill().await;
-            child.wait().await.context("failed to reap child")?;
-        }
+        let usage = match reaped {
+            Some(usage) => usage,
+            None => {
+                reaper
+                    .await
+                    .context("child reaper stopped")?
+                    .context("failed to reap child")?
+                    .1
+            }
+        };
+        let wall_ms = spawn_start.elapsed().as_millis() as u64;
+        let peak_rss_bytes = rss.finish();
+        self.commands
+            .lock()
+            .expect("command cost mutex poisoned")
+            .push(CommandCost {
+                kind: if is_condition {
+                    CommandKind::Condition
+                } else {
+                    CommandKind::Command
+                },
+                step: step.map(str::to_owned),
+                wall_ms,
+                cpu_user_ms: Some(usage.user_ms),
+                cpu_system_ms: Some(usage.system_ms),
+                peak_rss_bytes,
+            });
         while let Some(reader) = readers.join_next().await {
             if let Err(error) = reader? {
                 result.status = Status::Failed;
@@ -975,6 +1177,264 @@ impl JobExecution<'_> {
         }
         Ok(result)
     }
+}
+
+/// User and system CPU of a reaped child, including descendants it waited for.
+#[derive(Clone, Copy, Debug)]
+struct Rusage {
+    user_ms: u64,
+    system_ms: u64,
+}
+
+/// Block until `pid` exits and reap it with `wait4`, keeping its rusage.
+/// `waitid(WNOWAIT)` first waits without reaping, so the exited child stays a
+/// zombie; the reap and the `reaped` flag then happen together under the lock
+/// a late `kill(pid)` takes, so that kill can never reach a reused pid.
+fn reap(pid: u32, reaped: &Mutex<bool>) -> std::io::Result<(std::process::ExitStatus, Rusage)> {
+    use std::os::unix::process::ExitStatusExt;
+    loop {
+        // SAFETY: siginfo_t is plain old data; waitid fills it on success.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out-pointer for this call only; the pid is our unreaped child.
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOWAIT,
+            )
+        };
+        if result == 0 {
+            break;
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+    let mut reaped = reaped.lock().unwrap_or_else(|e| e.into_inner());
+    let mut status = 0;
+    // SAFETY: rusage is plain old data; wait4 fills it on success.
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    loop {
+        // SAFETY: valid out-pointers for this call only; the pid is our unreaped child.
+        let result = unsafe { libc::wait4(pid as libc::pid_t, &mut status, 0, &mut usage) };
+        if result == pid as libc::pid_t {
+            break;
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+    *reaped = true;
+    drop(reaped);
+    let ms = |time: libc::timeval| time.tv_sec as u64 * 1000 + time.tv_usec as u64 / 1000;
+    Ok((
+        std::process::ExitStatus::from_raw(status),
+        Rusage {
+            user_ms: ms(usage.ru_utime),
+            system_ms: ms(usage.ru_stime),
+        },
+    ))
+}
+
+type Reaped = std::io::Result<(std::process::ExitStatus, Rusage)>;
+
+/// The reaper's stack: `reap` needs only a few hundred bytes.
+const REAPER_STACK: usize = 64 * 1024;
+
+/// Reap `pid` on a dedicated thread, so a blocked `waitid` never holds one
+/// of tokio's blocking-pool threads, which log writes and RSS scans share.
+/// Without a thread to spare, fall back to the blocking pool.
+fn spawn_reaper(pid: u32, reaped: Arc<Mutex<bool>>) -> tokio::sync::oneshot::Receiver<Reaped> {
+    type Task = Arc<Mutex<Option<(tokio::sync::oneshot::Sender<Reaped>, Arc<Mutex<bool>>)>>>;
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    let task: Task = Arc::new(Mutex::new(Some((sender, reaped))));
+    let run = |task: Task| {
+        move || {
+            let taken = task.lock().unwrap_or_else(|e| e.into_inner()).take();
+            if let Some((sender, reaped)) = taken {
+                let _ = sender.send(reap(pid, &reaped));
+            }
+        }
+    };
+    let thread = std::thread::Builder::new()
+        .name("goodflows-reaper".into())
+        .stack_size(REAPER_STACK)
+        .spawn(run(task.clone()));
+    if thread.is_err() {
+        tokio::task::spawn_blocking(run(task));
+    }
+    receiver
+}
+
+fn receiver(fd: std::os::fd::OwnedFd) -> Result<tokio::net::unix::pipe::Receiver> {
+    tokio::net::unix::pipe::Receiver::from_owned_fd(fd).context("failed to read child output pipe")
+}
+
+/// The slow poll while commands are quiet, and the minimum gap between
+/// scans requested by output reads (a `/proc` scan per 4 KiB read is too costly).
+const RSS_POLL: Duration = Duration::from_millis(200);
+const RSS_ON_OUTPUT: Duration = Duration::from_millis(50);
+
+/// Peak sampled resident set sums of the process groups of running commands.
+/// One sampler serves the whole run: each scan reads `/proc` once, on the
+/// blocking pool rather than a runtime worker, and updates every registered
+/// group. Linux only; elsewhere no scan is ever taken and peaks are omitted.
+struct RssMonitor {
+    /// Registered groups and their peak so far (0 until a live sample).
+    peaks: Mutex<HashMap<i32, u64>>,
+    wake: tokio::sync::Notify,
+}
+
+/// Aborts the run's sampler task when dropped.
+struct RssTask(Option<tokio::task::JoinHandle<()>>);
+
+impl Drop for RssTask {
+    fn drop(&mut self) {
+        if let Some(task) = self.0.take() {
+            task.abort();
+        }
+    }
+}
+
+impl RssMonitor {
+    fn start() -> (Arc<Self>, RssTask) {
+        let monitor = Arc::new(Self {
+            peaks: Mutex::new(HashMap::new()),
+            wake: tokio::sync::Notify::new(),
+        });
+        let task = cfg!(target_os = "linux").then(|| tokio::spawn(monitor.clone().sample()));
+        (monitor, RssTask(task))
+    }
+
+    /// Track `group` until the returned guard finishes or drops. A new group
+    /// is sampled as soon as the minimum gap allows.
+    fn register(self: &Arc<Self>, group: i32) -> RssGroup {
+        self.lock().insert(group, 0);
+        self.wake.notify_one();
+        RssGroup {
+            monitor: self.clone(),
+            group,
+        }
+    }
+
+    /// Ask for a scan soon; output reads call this.
+    fn request(&self) {
+        self.wake.notify_one();
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<i32, u64>> {
+        self.peaks.lock().expect("rss mutex poisoned")
+    }
+
+    /// Scan on request (at most every `RSS_ON_OUTPUT`) and otherwise every
+    /// `RSS_POLL` while any group is registered.
+    async fn sample(self: Arc<Self>) {
+        let mut last: Option<Instant> = None;
+        loop {
+            if self.lock().is_empty() {
+                self.wake.notified().await;
+            } else {
+                tokio::select! {
+                    _ = self.wake.notified() => {}
+                    _ = tokio::time::sleep(RSS_POLL) => {}
+                }
+            }
+            if let Some(gap) = last.and_then(|last| RSS_ON_OUTPUT.checked_sub(last.elapsed())) {
+                tokio::time::sleep(gap).await;
+            }
+            last = Some(Instant::now());
+            let wanted: Vec<i32> = self.lock().keys().copied().collect();
+            if wanted.is_empty() {
+                continue;
+            }
+            let Ok(sums) = tokio::task::spawn_blocking(move || group_rss(&wanted)).await else {
+                continue;
+            };
+            let mut peaks = self.lock();
+            for (group, sum) in sums {
+                // A group that finished during the scan is no longer registered.
+                if let Some(peak) = peaks.get_mut(&group) {
+                    *peak = (*peak).max(sum);
+                }
+            }
+        }
+    }
+}
+
+/// One command's registration with the run's `RssMonitor`.
+struct RssGroup {
+    monitor: Arc<RssMonitor>,
+    group: i32,
+}
+
+impl RssGroup {
+    /// Stop tracking and return the peak, `None` when no sample saw a live,
+    /// resident process. A scan still running may miss this command.
+    fn finish(self) -> Option<u64> {
+        self.monitor
+            .lock()
+            .remove(&self.group)
+            .filter(|&peak| peak > 0)
+    }
+}
+
+impl Drop for RssGroup {
+    fn drop(&mut self) {
+        self.monitor.lock().remove(&self.group);
+    }
+}
+
+/// The process group and resident bytes of one `/proc/<pid>/stat` line, or
+/// `None` for a zombie or dead process or one with nothing resident (caught
+/// starting or exiting), so such a sample never records a peak of 0.
+fn stat_rss(stat: &str, page: u64) -> Option<(i32, u64)> {
+    // Fields after the parenthesized command name, which may contain spaces:
+    // state(3) ppid(4) pgrp(5) ... rss(24, in pages).
+    let fields: Vec<&str> = stat[stat.rfind(')')? + 1..].split_whitespace().collect();
+    if fields.len() < 22 || matches!(fields[0], "Z" | "X" | "x") {
+        return None;
+    }
+    let group = fields[2].parse().ok()?;
+    let pages = fields[21].parse::<u64>().ok().filter(|&pages| pages > 0)?;
+    Some((group, pages * page))
+}
+
+/// Summed resident bytes per wanted group from one `/proc` scan. A group
+/// with no live, resident process is absent.
+#[cfg(target_os = "linux")]
+fn group_rss(wanted: &[i32]) -> HashMap<i32, u64> {
+    // SAFETY: sysconf takes only an integer argument.
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(1) as u64;
+    let mut sums = HashMap::new();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return sums;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(pid) = name
+            .to_str()
+            .filter(|n| n.bytes().all(|b| b.is_ascii_digit()))
+        else {
+            continue;
+        };
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            continue;
+        };
+        if let Some((group, bytes)) = stat_rss(&stat, page) {
+            if wanted.contains(&group) {
+                *sums.entry(group).or_insert(0) += bytes;
+            }
+        }
+    }
+    sums
+}
+
+#[cfg(not(target_os = "linux"))]
+fn group_rss(_wanted: &[i32]) -> HashMap<i32, u64> {
+    HashMap::new()
 }
 
 async fn read_outputs(path: &Path) -> Result<Map<String, Value>> {
@@ -1008,13 +1468,22 @@ async fn read_outputs(path: &Path) -> Result<Map<String, Value>> {
     Ok(outputs)
 }
 
+/// Create a new log file, private to the invoking user, inside this run's
+/// directory. An existing entry (never one of this run's own) or a symlink
+/// is refused rather than followed or truncated.
 async fn open_log(dir: Option<&Path>, filename: &str) -> Result<Option<tokio::fs::File>> {
     match dir {
         Some(dir) => {
             let path = dir.join(filename);
-            Ok(Some(tokio::fs::File::create(&path).await.with_context(
-                || format!("failed to create log {}", path.display()),
-            )?))
+            let file = tokio::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(&path)
+                .await
+                .with_context(|| format!("failed to create log {}", path.display()))?;
+            Ok(Some(file))
         }
         None => Ok(None),
     }
@@ -1027,6 +1496,7 @@ async fn drain<R: AsyncRead + Unpin>(
     mut log: Option<tokio::fs::File>,
     output: Output,
     tails: SharedTails,
+    rss: Arc<RssMonitor>,
 ) -> Result<()> {
     let event = |data: &[u8]| {
         let mut event = source.clone();
@@ -1041,6 +1511,7 @@ async fn drain<R: AsyncRead + Unpin>(
         if count == 0 {
             break;
         }
+        rss.request();
         tails
             .lock()
             .expect("tail mutex poisoned")
@@ -1081,4 +1552,66 @@ async fn drain<R: AsyncRead + Unpin>(
         file.flush().await?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn in_flight_counts_only_units_inside_run_job() {
+        let in_flight = InFlight::default();
+        let first = in_flight.enter();
+        let second = in_flight.enter();
+        drop(first);
+        // A finished unit no longer counts, even before it is joined.
+        let third = in_flight.enter();
+        assert_eq!(in_flight.max.load(Ordering::SeqCst), 2);
+        drop((second, third));
+        assert_eq!(in_flight.now.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn stat_rss_skips_dead_and_empty_processes() {
+        let line = |state: &str, rss: &str| {
+            format!("42 (a (b) c) {state} 1 7 7 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 100 4096 {rss} 0")
+        };
+        assert_eq!(stat_rss(&line("S", "3"), 4096), Some((7, 3 * 4096)));
+        assert_eq!(stat_rss(&line("R", "1"), 100), Some((7, 100)));
+        for state in ["Z", "X", "x"] {
+            assert_eq!(stat_rss(&line(state, "3"), 4096), None, "{state}");
+        }
+        assert_eq!(stat_rss(&line("S", "0"), 4096), None);
+        assert_eq!(stat_rss("42 (truncated", 4096), None);
+        assert_eq!(stat_rss("42 (a) S 1 7", 4096), None);
+    }
+
+    #[tokio::test]
+    async fn rss_monitor_samples_registered_groups_only() {
+        let (monitor, task) = RssMonitor::start();
+        // SAFETY: getpgrp has no preconditions.
+        let own = monitor.register(unsafe { libc::getpgrp() });
+        // No process lives in group i32::MAX.
+        let empty = monitor.register(i32::MAX);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while cfg!(target_os = "linux")
+            && monitor.lock().values().all(|&peak| peak == 0)
+            && Instant::now() < deadline
+        {
+            monitor.request();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let peak = own.finish();
+        if cfg!(target_os = "linux") {
+            assert!(peak.is_some_and(|bytes| bytes > 0), "{peak:?}");
+        } else {
+            assert!(peak.is_none());
+        }
+        assert_eq!(empty.finish(), None);
+        // Finished and dropped registrations are gone.
+        let dropped = monitor.register(1);
+        drop(dropped);
+        assert!(monitor.lock().is_empty());
+        drop(task);
+    }
 }

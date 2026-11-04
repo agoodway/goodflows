@@ -99,7 +99,11 @@ command = "touch unselected"
         !std::path::Path::new(&p.read("app/output-path")).exists(),
         "temporary output file leaked"
     );
-    assert_eq!(p.read("logs/ci/002-detect.stdout.log"), "scanrunverify");
+    let run = run_dir(&p.dir.join("logs/ci"));
+    assert_eq!(
+        std::fs::read_to_string(run.join("002-detect.stdout.log")).unwrap(),
+        "scanrunverify"
+    );
 }
 
 #[test]

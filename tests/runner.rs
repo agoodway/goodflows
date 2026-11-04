@@ -379,13 +379,9 @@ command = "printf 'out %s' $GOODFLOWS_PARTITION; printf 'err %s' $GOODFLOWS_PART
 "#,
     );
     success(&p.run(&["--log-dir", "logs"]));
-    let mut names: Vec<_> = std::fs::read_dir(p.dir.join("logs"))
-        .unwrap()
-        .map(|f| f.unwrap().file_name().into_string().unwrap())
-        .collect();
-    names.sort();
+    let run = run_dir(&p.dir.join("logs"));
     assert_eq!(
-        names,
+        log_names(&run),
         [
             "001-compile.stderr.log",
             "001-compile.stdout.log",
@@ -397,16 +393,37 @@ command = "printf 'out %s' $GOODFLOWS_PARTITION; printf 'err %s' $GOODFLOWS_PART
             "002-test.p03.stdout.log",
         ]
     );
+    let read = |name: String| std::fs::read_to_string(run.join(name)).unwrap();
     for index in 1..=3 {
         assert_eq!(
-            p.read(&format!("logs/002-test.p{index:02}.stdout.log")),
+            read(format!("002-test.p{index:02}.stdout.log")),
             format!("out {index}")
         );
         assert_eq!(
-            p.read(&format!("logs/002-test.p{index:02}.stderr.log")),
+            read(format!("002-test.p{index:02}.stderr.log")),
             format!("err {index}")
         );
     }
+    // A later run keeps the first run's six instance logs in their directory.
+    let first: Vec<_> = log_names(&run)
+        .into_iter()
+        .filter(|name| name.starts_with("002-"))
+        .map(|name| (name.clone(), read(name)))
+        .collect();
+    assert_eq!(first.len(), 6);
+    success(&p.run(&["--log-dir", "logs", "--log-runs", "2"]));
+    let runs = run_dirs(&p.dir.join("logs"));
+    assert_eq!(runs.len(), 2);
+    assert!(runs.contains(&run));
+    for (name, content) in &first {
+        assert_eq!(&read(name.clone()), content);
+    }
+    let second = runs.iter().find(|dir| **dir != run).unwrap();
+    let second_logs: Vec<_> = log_names(second)
+        .into_iter()
+        .filter(|name| name.starts_with("002-"))
+        .collect();
+    assert_eq!(second_logs.len(), 6);
 }
 
 #[test]
@@ -778,11 +795,8 @@ fn selected_profile_count_drives_instances_identity_and_logs() {
             serde_json::json!({"index": index + 1, "count": 6})
         );
     }
-    let mut names: Vec<_> = std::fs::read_dir(p.dir.join("logs"))
-        .unwrap()
-        .map(|f| f.unwrap().file_name().into_string().unwrap())
-        .collect();
-    names.sort();
+    let run = run_dir(&p.dir.join("logs"));
+    let names = log_names(&run);
     let expected: Vec<_> = (1..=6)
         .flat_map(|i| {
             [
@@ -792,13 +806,14 @@ fn selected_profile_count_drives_instances_identity_and_logs() {
         })
         .collect();
     assert_eq!(names, expected);
+    let read = |name: String| std::fs::read_to_string(run.join(name)).unwrap();
     for index in 1..=6 {
         assert_eq!(
-            p.read(&format!("logs/001-test.p{index:02}.stdout.log")),
+            read(format!("001-test.p{index:02}.stdout.log")),
             format!("out {index}")
         );
         assert_eq!(
-            p.read(&format!("logs/001-test.p{index:02}.stderr.log")),
+            read(format!("001-test.p{index:02}.stderr.log")),
             format!("err {index}")
         );
     }

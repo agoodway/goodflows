@@ -184,9 +184,22 @@ fn named_log_paths_are_separate_and_cannot_escape_the_log_directory() {
     for name in ["ci", "release", "../escape"] {
         success(&p.run(&["run", name, "--log-dir", "logs"]));
     }
-    assert_eq!(p.read("logs/ci/001-a.stdout.log"), "ci\n");
-    assert_eq!(p.read("logs/release/001-a.stdout.log"), "release\n");
-    assert_eq!(p.read("logs/%2E%2E%2Fescape/001-a.stdout.log"), "safe\n");
+    assert_eq!(
+        std::fs::read_to_string(run_dir(&p.dir.join("logs/ci")).join("001-a.stdout.log")).unwrap(),
+        "ci\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(run_dir(&p.dir.join("logs/release")).join("001-a.stdout.log"))
+            .unwrap(),
+        "release\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(
+            run_dir(&p.dir.join("logs/%2E%2E%2Fescape")).join("001-a.stdout.log")
+        )
+        .unwrap(),
+        "safe\n"
+    );
     assert!(!p.dir.join("escape").exists());
 }
 
@@ -240,9 +253,20 @@ fn log_encoding_distinguishes_case_and_literal_percent_names() {
     for name in ["ci", "CI", "%43%49"] {
         success(&p.run(&["run", name, "--log-dir", "logs"]));
     }
-    assert_eq!(p.read("logs/ci/001-a.stdout.log"), "lower\n");
-    assert_eq!(p.read("logs/%43%49/001-a.stdout.log"), "upper\n");
-    assert_eq!(p.read("logs/%2543%2549/001-a.stdout.log"), "percent\n");
+    assert_eq!(
+        std::fs::read_to_string(run_dir(&p.dir.join("logs/ci")).join("001-a.stdout.log")).unwrap(),
+        "lower\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(run_dir(&p.dir.join("logs/%43%49")).join("001-a.stdout.log"))
+            .unwrap(),
+        "upper\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(run_dir(&p.dir.join("logs/%2543%2549")).join("001-a.stdout.log"))
+            .unwrap(),
+        "percent\n"
+    );
 }
 
 #[test]
