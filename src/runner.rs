@@ -1390,6 +1390,7 @@ impl Drop for RssGroup {
 /// The process group and resident bytes of one `/proc/<pid>/stat` line, or
 /// `None` for a zombie or dead process or one with nothing resident (caught
 /// starting or exiting), so such a sample never records a peak of 0.
+#[cfg(any(target_os = "linux", test))]
 fn stat_rss(stat: &str, page: u64) -> Option<(i32, u64)> {
     // Fields after the parenthesized command name, which may contain spaces:
     // state(3) ppid(4) pgrp(5) ... rss(24, in pages).
