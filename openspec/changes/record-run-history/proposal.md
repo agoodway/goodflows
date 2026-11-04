@@ -8,12 +8,12 @@ A workflow run leaves no history an agent can compare. `--log-dir` overwrites th
 
 - Keep each `--log-dir` invocation in its own directory and retain the newest runs, default 10, instead of truncating the previous run's files. The cap is configurable. A run that does not finish still occupies a slot.
 - Add an opt-in run history, enabled by a config setting or a CLI flag, and disabled by a CLI flag when the config enables it. Each enabled run writes one new immutable JSON file for that run only. Files are never rewritten. The default directory is `goodflows-history/` next to the config file.
-- Cap history per workflow by file count (default 1000) and total bytes (default 10 MB). Either cap drops the oldest files. The byte cap is a default, not a maximum: a setting or flag may set it lower or higher. The caps bound the checkout. Records that were committed and later deleted remain in git history.
-- Record, in that file and on the JSON `summary` event, the data an agent needs to tune the workflow: run outcome and wall time, configured parallelism, logical CPUs, host memory, max jobs in flight, a hash of the selected job graph, and per instance blocked time, queued time, wall time, CPU time, peak RSS when measurable, status, exit, truncated command, and per spawned command or step the same costs. Stdout, stderr, environment values, and absolute paths stay out of the file.
+- Cap history per workflow by file count (default 1000) and total bytes (default 10 MiB, 10485760 bytes). Either cap drops the oldest files. The byte cap is a default, not a maximum: a setting or flag may set it lower or higher. The caps bound the checkout. Records that were committed and later deleted remain in git history.
+- Record, in that file and on the JSON `summary` event, the data an agent needs to tune the workflow: run id, start time, run outcome and wall time, configured parallelism, logical CPUs, host memory, max jobs in flight, a hash of the selected job graph, and per instance blocked time, queued time, wall time, status, exit code, truncated command and error, and per spawned condition, command, or step its wall time, CPU time, and peak RSS when measurable. Stdout, stderr, environment values, and absolute paths stay out of the file.
 - Show the per-run log directory, and the history file when one was written, in the text run report.
 - **BREAKING** for `--log-dir` consumers: log files move under a per-run directory, and `summary.log_dir` names that directory. Basenames stay the same. JSON `summary` additions are additive.
 
-Out of scope: committing or pruning git history, fetching logs or history from a pool run, copying command output into the history file, and sampling a memory timeline.
+Out of scope: committing or pruning git history, copying command output into the history file, and sampling a memory timeline.
 
 ## Capabilities
 
@@ -31,7 +31,7 @@ Out of scope: committing or pruning git history, fetching logs or history from a
 
 - `src/main.rs`: history and log-retention flags, summary fields, history write and prune after the run.
 - `src/config.rs`: history and retention settings on shared, workflow, and profile settings, with the same precedence as parallelism.
-- `src/runner.rs`: per-run log directory, blocked and queued time, per-command CPU time and peak RSS.
+- `src/runner.rs`: per-run log directory and its lock, blocked and queued time, per-command CPU time and peak RSS. On Unix the child is spawned with `std::process::Command` and reaped by a blocking `wait4` instead of tokio `Child::wait`.
 - `src/output.rs` and `src/output/report.rs`: render the new paths; leave the job table unchanged.
 - `README.md`: log layout, history files, settings, and git guidance (history is safe to commit; log and spool directories stay gitignored).
-- `tests/` for scheduling, output, and config. Add `sha2` for the job-graph hash. Pool execution is unchanged and does not retrieve these files.
+- `tests/` for scheduling, output, and config. Add `sha2` for the job-graph hash. UTC timestamps use a small days-to-civil helper, so no date crate is added. Tests that hard-code flat log paths (`tests/process.rs`, `tests/runner.rs`, `tests/scheduling.rs`, `tests/steps.rs`, `tests/output.rs`) move to the per-run directory.

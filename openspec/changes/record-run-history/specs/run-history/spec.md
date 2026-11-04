@@ -7,7 +7,7 @@ Records an opt-in, immutable JSON file for each workflow run so an agent can com
 ## ADDED Requirements
 
 ### Requirement: History is opt-in
-A run SHALL write history only when enabled by shared, workflow, or selected-profile `history = true`, by `--history`, or by `--history-dir`. The default SHALL be off. `--no-history` SHALL force history off and SHALL conflict with `--history`. `--history-dir` SHALL enable history unless `--no-history` is set. CLI flags SHALL beat profile settings, which beat workflow settings, which beat shared settings. `validate`, `list`, and `init` MUST NOT write a history file.
+A run SHALL write history only when enabled by shared, workflow, or selected-profile `history = true`, by `--history`, or by `--history-dir`. The default SHALL be off. `--no-history` SHALL force history off and SHALL conflict with `--history`. `--history-dir` SHALL enable history unless `--no-history` is set. CLI flags SHALL beat profile settings, which beat workflow settings, which beat shared settings, and an explicit `history = false` SHALL beat a lower `true`. `validate`, `list`, `init`, and `reports upload` MUST NOT write a history file. `reports upload` SHALL reject `--history`, `--no-history`, `--history-dir`, `--log-runs`, `--history-runs`, and `--history-bytes`.
 
 #### Scenario: Default writes nothing
 - **WHEN** a run has no history setting and no history flag
@@ -17,6 +17,10 @@ A run SHALL write history only when enabled by shared, workflow, or selected-pro
 - **WHEN** shared settings set `history = true`
 - **THEN** the run writes one history file
 
+#### Scenario: Profile disables shared history
+- **WHEN** shared settings set `history = true` and the selected profile sets `history = false`
+- **THEN** no history file is written
+
 #### Scenario: Flag disables config
 - **WHEN** settings set `history = true` and the run passes `--no-history`
 - **THEN** no history file is written
@@ -25,8 +29,12 @@ A run SHALL write history only when enabled by shared, workflow, or selected-pro
 - **WHEN** history is unset and the run passes `--history-dir runs`
 - **THEN** the history file is written under `runs`
 
+#### Scenario: Reports upload rejects history flags
+- **WHEN** the user runs `goodflows reports upload <dir> --history`
+- **THEN** the command fails before uploading and names the rejected flag
+
 ### Requirement: History path follows the config file
-The default directory SHALL be `goodflows-history`, resolved from the config file's directory. A configured `history_dir` SHALL resolve the same way. `--history-dir` SHALL resolve from the invocation directory, like `--log-dir`. Absolute paths SHALL be used as given. The file SHALL be `<history dir>/<encoded workflow>/<YYYYMMDDTHHMMSS>Z-<run-id>.json`. Legacy top-level jobs SHALL use the workflow component `default`. The workflow component SHALL use the same encoding as workflow log directories.
+The default directory SHALL be `goodflows-history`, resolved from the config file's directory. A configured `history_dir` SHALL resolve the same way. `--history-dir` SHALL resolve from the invocation directory, like `--log-dir`. Absolute paths SHALL be used as given. The file SHALL be `<history dir>/<encoded workflow>/YYYYMMDDTHHMMSSZ-<run-id>.json`. Legacy top-level jobs SHALL use the workflow component `default`. The workflow component SHALL use the same encoding as workflow log directories.
 
 #### Scenario: Default beside the config
 - **WHEN** history is enabled and `goodflows.toml` is in `/work`
@@ -37,7 +45,7 @@ The default directory SHALL be `goodflows-history`, resolved from the config fil
 - **THEN** the file is written under `profile` resolved from the config file
 
 ### Requirement: Each history file is written once
-The file SHALL be one compact UTF-8 JSON object with LF newlines and a single trailing newline. Its `schema_version` SHALL be 1. After it is written, goodflows MUST NOT modify it. A symlink at the history directory or workflow directory SHALL be refused. A write or prune failure SHALL be reported and MUST NOT change the run's exit code. The new file SHALL still be kept when it alone exceeds `history_bytes`.
+A history file SHALL be written exactly when the run emits a `summary` event, including a run cancelled by a signal; a run that errors before a `summary` exists SHALL write none. The file SHALL be one compact UTF-8 JSON object with LF newlines and a single trailing newline. Its `schema_version` SHALL be 1. The file SHALL be created atomically without replacing an existing file, and after it is written goodflows MUST NOT modify it. A symlink at the history directory or workflow directory SHALL be refused. A write or prune failure SHALL be reported on stderr, MUST NOT change the run's exit code, and SHALL leave `history_file` absent. The new file SHALL still be kept when it alone exceeds `history_bytes`.
 
 #### Scenario: Second run leaves the first file untouched
 - **WHEN** two enabled runs of the same workflow finish
@@ -45,17 +53,33 @@ The file SHALL be one compact UTF-8 JSON object with LF newlines and a single tr
 
 #### Scenario: Disk error
 - **WHEN** the history directory cannot be created
-- **THEN** the jobs' exit code is unchanged and the failure is reported
+- **THEN** the jobs' exit code is unchanged, the failure is reported on stderr, and `summary` has no `history_file`
+
+#### Scenario: Cancelled run
+- **WHEN** a history-enabled run is interrupted by a signal and emits a `summary`
+- **THEN** a history file is written with `outcome` `cancelled`
+
+#### Scenario: Run errors before summary
+- **WHEN** a history-enabled run fails before any `summary` is emitted, for example because the log run directory cannot be created
+- **THEN** no history file is written
 
 ### Requirement: History records the run
-The file SHALL name the workflow, run id, UTC `started_at`, and `outcome` (`passed`, `failed`, or `cancelled`, using the run report's outcome rules). It SHALL include `duration_ms` with the same meaning as `summary.duration_ms`, effective `parallelism`, `graph_sha256`, `max_in_flight`, and host `logical_cpus`. Host `mem_total_bytes` and `mem_available_bytes` SHALL be included when the platform provides them and omitted otherwise.
+The file SHALL include `schema_version`, `workflow`, `run_id`, `started_at`, and `outcome`. `run_id` SHALL be the run's lowercase UUID. `started_at` SHALL be RFC 3339 UTC to the second (`YYYY-MM-DDTHH:MM:SSZ`), equal to the stem timestamp. `outcome` SHALL be `failed` if any instance is `failed` or `timed_out`; otherwise `cancelled` if any instance is `cancelled` or the signal state snapshotted for the exit code is set; otherwise `passed`. That one snapshot SHALL drive the history file, `summary.outcome`, the report header, and the exit code, in text and `--json` mode alike. The file SHALL include `duration_ms` with the same meaning as `summary.duration_ms`, effective `parallelism`, `graph_sha256`, `max_in_flight`, and a `host` object. `max_in_flight` SHALL be the largest number of instances in execution at once. `host` SHALL contain `logical_cpus`, and `mem_total_bytes` and `mem_available_bytes` when the platform provides them, omitted otherwise.
 
 #### Scenario: Passing run
 - **WHEN** every instance passes or is skipped and history is enabled
-- **THEN** the file's `outcome` is `passed` and it includes `parallelism` and `logical_cpus`
+- **THEN** the file's `outcome` is `passed` and it includes `parallelism` and `host.logical_cpus`
+
+#### Scenario: Timed-out run
+- **WHEN** one instance times out and the rest pass
+- **THEN** the file's `outcome` is `failed`
+
+#### Scenario: Signal after the last job in JSON mode
+- **WHEN** a `--json` run receives a signal after every job has finished but before the summary is emitted
+- **THEN** the history file, `summary.outcome`, and the exit code all report `cancelled`
 
 ### Requirement: History records each instance
-The file SHALL include one entry per instance in summary-result order, with `name`, `status`, `started`, `blocked_ms`, `queued_ms`, `duration_ms`, and partition when the instance has one. `blocked_ms` SHALL be the wait until dependencies pass, or until the instance is skipped or cancelled if that happens first. `queued_ms` SHALL be the wait after that until execution starts, or until a later skip or cancel. `max_in_flight` SHALL be the largest number of instances in execution at once.
+The file SHALL include one entry per instance in summary-result order, with `name`, partition when the instance has one, `status`, `started`, `exit_code` (null when none), `command` (null when none), `error` (null when none), `blocked_ms`, `queued_ms`, `duration_ms`, and `commands`. Only these fields SHALL be written; stdout and stderr tails and job or step `outputs` MUST NOT be written. `blocked_ms` SHALL be measured from the start of `runner::execute` until the last dependency's result is recorded, or until the instance is skipped or cancelled if that happens first; an instance with no dependencies SHALL have `blocked_ms` near 0. `queued_ms` SHALL be the wait after that until execution starts, or until a later skip or cancel. `command` and `error` strings SHALL be cut to 1024 bytes on a character boundary.
 
 #### Scenario: Ready job waited for a slot
 - **WHEN** parallelism is 1 and a second job is ready while the first is running
@@ -63,35 +87,47 @@ The file SHALL include one entry per instance in summary-result order, with `nam
 
 #### Scenario: Skipped before launch
 - **WHEN** a job is skipped because a dependency failed
-- **THEN** its entry has `started` false, `queued_ms` 0, and no `commands` entry
+- **THEN** its entry has `started` false, `queued_ms` 0, and its `commands` field is absent
+
+#### Scenario: Failed job
+- **WHEN** a job's command longer than 1024 bytes exits with code 3
+- **THEN** its entry has `exit_code` 3 and a `command` of at most 1024 bytes ending on a character boundary
 
 ### Requirement: History records command cost
-A spawned shell condition, job command, or step SHALL add a `commands` entry with `kind`, `wall_ms`, and the step id when it is a step. `cpu_user_ms` and `cpu_system_ms` SHALL be that process's user and system time, including descendants it waited for, when available. `peak_rss_bytes` SHALL be the peak concurrent resident set of its process group when observable. Unavailable measurements MUST be omitted. Command and error strings SHALL be cut to 1024 bytes on a character boundary.
+A spawned shell condition, job command, or step SHALL add a `commands` entry with `kind`, `wall_ms`, and `step` (the step id) when it is a step. `kind` SHALL be `condition` for a spawned shell condition of a job or step, and `command` for a job command or step command. `commands` SHALL be omitted when empty. `cpu_user_ms` and `cpu_system_ms` SHALL be that process's user and system time, including descendants it waited for, when available; for a `timed_out` or `cancelled` command they are a lower bound. `peak_rss_bytes` SHALL be the peak of sampled concurrent resident sets of the processes still in its process group, and SHALL be omitted when no live sample was taken. Unavailable measurements MUST be omitted.
 
-#### Scenario: Quiet platform
+#### Scenario: Platform without RSS
 - **WHEN** the platform cannot observe peak RSS
 - **THEN** finished commands omit `peak_rss_bytes` and still include `wall_ms`
 
+#### Scenario: Step kinds
+- **WHEN** a step has a shell condition and a command and both run
+- **THEN** the instance has a `condition` entry and a `command` entry, both with that step's `step` id
+
 ### Requirement: History omits command output and secrets
-The history file MUST NOT contain stdout, stderr, environment values, absolute paths, or log filenames.
+The history file MUST NOT contain stdout, stderr, environment values, or log filenames. goodflows MUST NOT add its own resolved paths (workdir, log directory, config path, history directory) to the file; a leading workdir or per-run log directory prefix in an `error` string SHALL be replaced with `<workdir>` or `<log>` before truncation. Configured command text SHALL be recorded verbatim, truncated, and is not path-scrubbed.
 
 #### Scenario: No command output stored
-- **WHEN** a job prints a secret to stdout
-- **THEN** the history file does not contain that text
+- **WHEN** a job prints a secret to stdout, a failed job's stderr tail contains a secret, and a job writes a secret to `GOODFLOWS_OUTPUT`
+- **THEN** the history file does not contain any of those secrets
+
+#### Scenario: Log path in an error
+- **WHEN** history is enabled and a job's log file cannot be created
+- **THEN** that instance's `error` names `<log>` rather than the absolute log directory
 
 ### Requirement: Summary carries the same optimizer fields
-The `summary` event SHALL include the same run, instance, and command-cost fields as the history file, plus `history_file` when a file was written. Existing summary fields SHALL keep their names and meanings. Those added fields MUST NOT appear on live `job_finished` events.
+The `summary` event SHALL include the same run fields as the history file (`run_id`, `started_at`, `outcome`, `parallelism`, `graph_sha256`, `max_in_flight`, `host`), each `summary.results` entry SHALL include `blocked_ms`, `queued_ms`, and `commands`, and `summary` SHALL include `history_file` when a file was written. `history_file` SHALL be the path the run wrote, as resolved for the run, converted lossily when not valid UTF-8; it SHALL NOT appear inside the history file. Existing summary fields SHALL keep their names and meanings, except that `log_dir` names the per-run log directory as specified by `run-logs`. Existing summary `command` and `error` strings SHALL NOT be truncated. Those added fields MUST NOT appear on live `job_finished` events.
 
 #### Scenario: JSON summary without history
 - **WHEN** a workflow runs with `--json` and history off
-- **THEN** `summary` includes `blocked_ms`, `queued_ms`, and `max_in_flight` for the run, and omits `history_file`
+- **THEN** `summary` includes run-level `max_in_flight`, `parallelism`, and `graph_sha256`, each `summary.results` entry includes `blocked_ms` and `queued_ms`, and `history_file` is absent
 
 #### Scenario: Live events stay unchanged
 - **WHEN** a job finishes with `--json`
 - **THEN** its `job_finished` event has no `blocked_ms`, `queued_ms`, or `commands` field
 
 ### Requirement: Graph hash ignores environment values
-`graph_sha256` SHALL be the lowercase hex SHA-256 of a canonical JSON document of the selected jobs, in configuration order, containing only job name, command, `depends_on`, partition count, `timeout_secs`, shell flag, step id and command, and condition text. It MUST exclude environment values, paths, and runtime output. The same selection SHALL hash the same on every run.
+`graph_sha256` SHALL be the lowercase hex SHA-256 of a canonical JSON document of the selected jobs, in configuration order, containing only job name, command, `depends_on`, effective partitions after selected-profile overrides (count and strategy), `timeout_secs`, shell flag, condition, and for each step its id, command, shell flag, and condition. Legacy and table shell conditions SHALL hash identically. It MUST exclude environment values, paths, and runtime output. The same selection SHALL hash the same on every run.
 
 #### Scenario: Env does not change the hash
 - **WHEN** two runs select the same jobs and differ only in settings env values
@@ -101,12 +137,20 @@ The `summary` event SHALL include the same run, instance, and command-cost field
 - **WHEN** a selected job's command changes
 - **THEN** `graph_sha256` changes
 
+#### Scenario: Step condition change
+- **WHEN** a selected job's step condition changes
+- **THEN** `graph_sha256` changes
+
 ### Requirement: History retention is per workflow
-Each workflow directory SHALL keep at most `history_runs` matching files, default 1000, and at most `history_bytes` bytes, default 10485760. Both minima SHALL be 1. After the new file is written, the oldest matching files by name SHALL be deleted until both caps hold. The new file MUST NOT be deleted. Unrelated names and other workflows MUST be left in place. Deletion MUST NOT follow or remove a symlink. Both caps SHALL use the same settings precedence as `history`.
+Each workflow directory SHALL keep at most `history_runs` matching files, default 1000, and at most `history_bytes` bytes, default 10485760. Both minima SHALL be 1. After the new file is written, the oldest matching files by name SHALL be deleted until both caps hold. The new file MUST NOT be deleted. Unrelated names and other workflows MUST be left in place. Deletion MUST NOT follow or remove a symlink. Both caps SHALL use the same settings precedence as `history`. A CLI value of 0 for `--history-runs` or `--history-bytes` SHALL be rejected as an argument error with exit code 2.
 
 #### Scenario: Byte cap drops the oldest
 - **WHEN** `history_bytes` is smaller than two finished records and `history_runs` is 1000
 - **THEN** only the newest file remains
+
+#### Scenario: Oversized newest file is kept
+- **WHEN** `history_bytes` is 1 and a run finishes
+- **THEN** that run's file remains and every older file is deleted
 
 #### Scenario: Count cap
 - **WHEN** `history_runs` is 2 and three runs finish under the byte cap
@@ -120,9 +164,13 @@ Each workflow directory SHALL keep at most `history_runs` matching files, defaul
 - **WHEN** configuration sets `history_runs = 0` or `history_bytes = 0`
 - **THEN** validation fails before jobs run
 
+#### Scenario: Invalid CLI cap
+- **WHEN** the run passes `--history-runs 0` or `--history-bytes 0`
+- **THEN** argument parsing fails with exit code 2
+
 ### Requirement: Inspection shows effective history settings
-`list` and `validate` JSON settings SHALL include effective `history`, `history_dir`, `log_runs`, `history_runs`, and `history_bytes`. Human `list` output SHALL show the same values. The displayed `history_dir` SHALL be the configured or default path before invocation-relative CLI resolution is applied to a run.
+`list` and `validate` JSON settings SHALL include effective `history`, `history_dir`, `log_runs`, `history_runs`, and `history_bytes`, applying CLI overrides the same way they apply `--parallelism`. Human `list` output SHALL show the same values. The displayed `history_dir` SHALL be the resolved path: the configured or default value joined to the config file's directory, or `--history-dir` joined to the invocation directory.
 
 #### Scenario: Defaults
-- **WHEN** the user runs `goodflows list` with no history settings
-- **THEN** the settings show history off, directory `goodflows-history`, `log_runs` 10, `history_runs` 1000, and `history_bytes` 10485760
+- **WHEN** the user runs `goodflows list` with no history settings and the config is in `/work`
+- **THEN** the settings show history off, directory `/work/goodflows-history`, `log_runs` 10, `history_runs` 1000, and `history_bytes` 10485760
