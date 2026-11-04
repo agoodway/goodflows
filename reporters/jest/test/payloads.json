@@ -1,0 +1,565 @@
+{
+ "jest": "30.5.2",
+ "globalConfig": {
+  "rootDir": "/fixture",
+  "seed": 297797230,
+  "maxWorkers": 1,
+  "bail": 0
+ },
+ "calls": [
+  [
+   "onRunStart",
+   {
+    "startTime": 1793808045268,
+    "numFailedTests": 0,
+    "numFailedTestSuites": 0,
+    "wasInterrupted": false
+   }
+  ],
+  [
+   "onTestFileStart",
+   {
+    "path": "/fixture/__tests__/outcomes.test.js",
+    "context": {
+     "config": {
+      "rootDir": "/fixture",
+      "displayName": {
+       "color": "white",
+       "name": "fixture"
+      }
+     }
+    }
+   }
+  ],
+  [
+   "onTestCaseStart",
+   {
+    "path": "/fixture/__tests__/outcomes.test.js",
+    "context": {
+     "config": {
+      "rootDir": "/fixture",
+      "displayName": {
+       "color": "white",
+       "name": "fixture"
+      }
+     }
+    }
+   },
+   {
+    "ancestorTitles": [],
+    "fullName": "passes",
+    "startedAt": 1793808045367,
+    "title": "passes"
+   }
+  ],
+  [
+   "onTestCaseResult",
+   {
+    "path": "/fixture/__tests__/outcomes.test.js",
+    "context": {
+     "config": {
+      "rootDir": "/fixture",
+      "displayName": {
+       "color": "white",
+       "name": "fixture"
+      }
+     }
+    }
+   },
+   {
+    "ancestorTitles": [],
+    "title": "passes",
+    "fullName": "passes",
+    "status": "passed",
+    "duration": 1,
+    "invocations": 1,
+    "location": null,
+    "failureMessages": [],
+    "numPassingAsserts": 1
+   }
+  ],
+  [
+   "onTestCaseStart",
+   {
+    "path": "/fixture/__tests__/outcomes.test.js",
+    "context": {
+     "config": {
+      "rootDir": "/fixture",
+      "displayName": {
+       "color": "white",
+       "name": "fixture"
+      }
+     }
+    }
+   },
+   {
+    "ancestorTitles": [],
+    "fullName": "fails on purpose",
+    "startedAt": 1793808045369,
+    "title": "fails on purpose"
+   }
+  ],
+  [
+   "onTestCaseResult",
+   {
+    "path": "/fixture/__tests__/outcomes.test.js",
+    "context": {
+     "config": {
+      "rootDir": "/fixture",
+      "displayName": {
+       "color": "white",
+       "name": "fixture"
+      }
+     }
+    }
+   },
+   {
+    "ancestorTitles": [],
+    "title": "fails on purpose",
+    "fullName": "fails on purpose",
+    "status": "failed",
+    "duration": 1,
+    "invocations": 1,
+    "location": null,
+    "failureMessages": [
+     "Error: expect(received).toBe(expected) // Object.is equality\n\nExpected: \"another value\"\nReceived: \"private assertion value\"\n    at Object.toBe (/fixture/__tests__/outcomes.test.js:8:37)\n    at Promise.finally.completed (/fixture/node_modules/jest-circus/build/jestAdapterInit.js:1834:28)\n    at new Promise (<anonymous>)\n    at callAsyncCircusFn (/fixture/node_modules/jest-circus/build/jestAdapterInit.js:1774:10)\n    at _callCircusTest (/fixture/node_modules/jest-circus/build/jestAdapterInit.js:1167:40)\n    at _runTestInContext (/fixture/node_modules/jest-circus/build/jestAdapterInit.js:1103:3)\n    at runTestWithContext (/fixture/node_modules/jest-circus/build/jestAdapterInit.js:996:5)\n    at _runTestsForDescribeBlockOnce (/fixture/node_modules/jest-circus/build/jestAdapterInit.js:1008:11)\n    at _runTestsForDescribeBlock (/fixture/node_modules/jest-circus/build/jestAdapterInit.js:824:5)\n    at run (/fixture/node_modules/jest-circus/build/jestAdapterInit.js:789:3)\n    at runAndTransformResultsToJestFormat (/fixture/node_modules/jest-circus/build/jestAdapterInit.js:2300:21)\n    at jestAdapter (/fixture/node_modules/jest-circus/build/runner.js:111:19)\n    at runTestInternal (/fixture/node_modules/jest-runner/build/index.js:247:16)\n    at runTest (/fixture/node_modules/jest-runner/build/index.js:315:7)"
+    ],
+    "numPassingAsserts": 0
+   }
+  ],
+  [
+   "onTestCaseResult",
+   {
+    "path": "/fixture/__tests__/outcomes.test.js",
+    "context": {
+     "config": {
+      "rootDir": "/fixture",
+      "displayName": {
+       "color": "white",
+       "name": "fixture"
+      }
+     }
+    }
+   },
+   {
+    "ancestorTitles": [],
+    "title": "is a todo",
+    "fullName": "is a todo",
+    "status": "todo",
+    "duration": null,
+    "invocations": 1,
+    "location": null,
+    "failureMessages": [],
+    "numPassingAsserts": 0
+   }
+  ],
+  [
+   "onTestFileResult",
+   {
+    "path": "/fixture/__tests__/outcomes.test.js",
+    "context": {
+     "config": {
+      "rootDir": "/fixture",
+      "displayName": {
+       "color": "white",
+       "name": "fixture"
+      }
+     }
+    }
+   },
+   {
+    "perfStats": {
+     "end": 1793808045380,
+     "loadTestEnvironmentEnd": 1793808045327,
+     "loadTestEnvironmentStart": 1793808045308,
+     "runtime": 52,
+     "setupAfterEnvEnd": 1793808045355,
+     "setupAfterEnvStart": 1793808045355,
+     "setupFilesEnd": 1793808045328,
+     "setupFilesStart": 1793808045328,
+     "slow": false,
+     "start": 1793808045328
+    },
+    "testResults": [
+     {
+      "ancestorTitles": [],
+      "title": "passes",
+      "fullName": "passes",
+      "status": "passed",
+      "duration": 1,
+      "invocations": 1,
+      "location": null,
+      "failureMessages": [],
+      "numPassingAsserts": 1
+     },
+     {
+      "ancestorTitles": [],
+      "title": "fails on purpose",
+      "fullName": "fails on purpose",
+      "status": "failed",
+      "duration": 1,
+      "invocations": 1,
+      "location": null,
+      "failureMessages": [
+       "Error: expect(received).toBe(expected) // Object.is equality\n\nExpected: \"another value\"\nReceived: \"private assertion value\"\n    at Object.toBe (/fixture/__tests__/outcomes.test.js:8:37)\n    at Promise.finally.completed (/fixture/node_modules/jest-circus/build/jestAdapterInit.js:1834:28)\n    at new Promise (<anonymous>)\n    at callAsyncCircusFn (/fixture/node_modules/jest-circus/build/jestAdapterInit.js:1774:10)\n    at _callCircusTest (/fixture/node_modules/jest-circus/build/jestAdapterInit.js:1167:40)\n    at _runTestInContext (/fixture/node_modules/jest-circus/build/jestAdapterInit.js:1103:3)\n    at runTestWithContext (/fixture/node_modules/jest-circus/build/jestAdapterInit.js:996:5)\n    at _runTestsForDescribeBlockOnce (/fixture/node_modules/jest-circus/build/jestAdapterInit.js:1008:11)\n    at _runTestsForDescribeBlock (/fixture/node_modules/jest-circus/build/jestAdapterInit.js:824:5)\n    at run (/fixture/node_modules/jest-circus/build/jestAdapterInit.js:789:3)\n    at runAndTransformResultsToJestFormat (/fixture/node_modules/jest-circus/build/jestAdapterInit.js:2300:21)\n    at jestAdapter (/fixture/node_modules/jest-circus/build/runner.js:111:19)\n    at runTestInternal (/fixture/node_modules/jest-runner/build/index.js:247:16)\n    at runTest (/fixture/node_modules/jest-runner/build/index.js:315:7)"
+      ],
+      "numPassingAsserts": 0
+     },
+     {
+      "ancestorTitles": [],
+      "title": "is skipped",
+      "fullName": "is skipped",
+      "status": "pending",
+      "duration": null,
+      "invocations": 1,
+      "location": null,
+      "failureMessages": [],
+      "numPassingAsserts": 0
+     },
+     {
+      "ancestorTitles": [],
+      "title": "is a todo",
+      "fullName": "is a todo",
+      "status": "todo",
+      "duration": null,
+      "invocations": 1,
+      "location": null,
+      "failureMessages": [],
+      "numPassingAsserts": 0
+     },
+     {
+      "ancestorTitles": [],
+      "title": "is filtered out by name",
+      "fullName": "is filtered out by name",
+      "status": "pending",
+      "duration": null,
+      "invocations": 1,
+      "location": null,
+      "failureMessages": [],
+      "numPassingAsserts": 0
+     }
+    ]
+   },
+   {
+    "startTime": 1793808045268,
+    "numFailedTests": 1,
+    "numFailedTestSuites": 1,
+    "wasInterrupted": false
+   }
+  ],
+  [
+   "onTestFileStart",
+   {
+    "path": "/fixture/__tests__/load-error.test.js",
+    "context": {
+     "config": {
+      "rootDir": "/fixture",
+      "displayName": {
+       "color": "white",
+       "name": "fixture"
+      }
+     }
+    }
+   }
+  ],
+  [
+   "onTestFileResult",
+   {
+    "path": "/fixture/__tests__/load-error.test.js",
+    "context": {
+     "config": {
+      "rootDir": "/fixture",
+      "displayName": {
+       "color": "white",
+       "name": "fixture"
+      }
+     }
+    }
+   },
+   {
+    "testExecError": {
+     "message": "fixture file fails to load"
+    },
+    "perfStats": {
+     "end": 0,
+     "loadTestEnvironmentEnd": 0,
+     "loadTestEnvironmentStart": 0,
+     "runtime": 0,
+     "setupAfterEnvEnd": 0,
+     "setupAfterEnvStart": 0,
+     "setupFilesEnd": 0,
+     "setupFilesStart": 0,
+     "slow": false,
+     "start": 0
+    },
+    "testResults": []
+   },
+   {
+    "startTime": 1793808045268,
+    "numFailedTests": 1,
+    "numFailedTestSuites": 2,
+    "wasInterrupted": false
+   }
+  ],
+  [
+   "onTestFileStart",
+   {
+    "path": "/fixture/__tests__/nested.test.js",
+    "context": {
+     "config": {
+      "rootDir": "/fixture",
+      "displayName": {
+       "color": "white",
+       "name": "fixture"
+      }
+     }
+    }
+   }
+  ],
+  [
+   "onTestCaseStart",
+   {
+    "path": "/fixture/__tests__/nested.test.js",
+    "context": {
+     "config": {
+      "rootDir": "/fixture",
+      "displayName": {
+       "color": "white",
+       "name": "fixture"
+      }
+     }
+    }
+   },
+   {
+    "ancestorTitles": [
+     "math",
+     "sum"
+    ],
+    "fullName": "math sum adds",
+    "startedAt": 1793808045400,
+    "title": "adds"
+   }
+  ],
+  [
+   "onTestCaseResult",
+   {
+    "path": "/fixture/__tests__/nested.test.js",
+    "context": {
+     "config": {
+      "rootDir": "/fixture",
+      "displayName": {
+       "color": "white",
+       "name": "fixture"
+      }
+     }
+    }
+   },
+   {
+    "ancestorTitles": [
+     "math",
+     "sum"
+    ],
+    "title": "adds",
+    "fullName": "math sum adds",
+    "status": "passed",
+    "duration": 0,
+    "invocations": 1,
+    "location": null,
+    "failureMessages": [],
+    "numPassingAsserts": 1
+   }
+  ],
+  [
+   "onTestCaseStart",
+   {
+    "path": "/fixture/__tests__/nested.test.js",
+    "context": {
+     "config": {
+      "rootDir": "/fixture",
+      "displayName": {
+       "color": "white",
+       "name": "fixture"
+      }
+     }
+    }
+   },
+   {
+    "ancestorTitles": [
+     "math",
+     "sum"
+    ],
+    "fullName": "math sum retries",
+    "startedAt": 1793808045400,
+    "title": "retries"
+   }
+  ],
+  [
+   "onTestCaseResult",
+   {
+    "path": "/fixture/__tests__/nested.test.js",
+    "context": {
+     "config": {
+      "rootDir": "/fixture",
+      "displayName": {
+       "color": "white",
+       "name": "fixture"
+      }
+     }
+    }
+   },
+   {
+    "ancestorTitles": [
+     "math",
+     "sum"
+    ],
+    "title": "retries",
+    "fullName": "math sum retries",
+    "status": "passed",
+    "duration": 0,
+    "invocations": 1,
+    "location": null,
+    "failureMessages": [],
+    "numPassingAsserts": 1
+   }
+  ],
+  [
+   "onTestCaseStart",
+   {
+    "path": "/fixture/__tests__/nested.test.js",
+    "context": {
+     "config": {
+      "rootDir": "/fixture",
+      "displayName": {
+       "color": "white",
+       "name": "fixture"
+      }
+     }
+    }
+   },
+   {
+    "ancestorTitles": [
+     "math"
+    ],
+    "fullName": "math multiplies",
+    "startedAt": 1793808045400,
+    "title": "multiplies"
+   }
+  ],
+  [
+   "onTestCaseResult",
+   {
+    "path": "/fixture/__tests__/nested.test.js",
+    "context": {
+     "config": {
+      "rootDir": "/fixture",
+      "displayName": {
+       "color": "white",
+       "name": "fixture"
+      }
+     }
+    }
+   },
+   {
+    "ancestorTitles": [
+     "math"
+    ],
+    "title": "multiplies",
+    "fullName": "math multiplies",
+    "status": "passed",
+    "duration": 0,
+    "invocations": 1,
+    "location": null,
+    "failureMessages": [],
+    "numPassingAsserts": 1
+   }
+  ],
+  [
+   "onTestFileResult",
+   {
+    "path": "/fixture/__tests__/nested.test.js",
+    "context": {
+     "config": {
+      "rootDir": "/fixture",
+      "displayName": {
+       "color": "white",
+       "name": "fixture"
+      }
+     }
+    }
+   },
+   {
+    "perfStats": {
+     "end": 1793808045400,
+     "loadTestEnvironmentEnd": 1793808045393,
+     "loadTestEnvironmentStart": 1793808045391,
+     "runtime": 7,
+     "setupAfterEnvEnd": 1793808045399,
+     "setupAfterEnvStart": 1793808045399,
+     "setupFilesEnd": 1793808045393,
+     "setupFilesStart": 1793808045393,
+     "slow": false,
+     "start": 1793808045393
+    },
+    "testResults": [
+     {
+      "ancestorTitles": [
+       "math",
+       "sum"
+      ],
+      "title": "adds",
+      "fullName": "math sum adds",
+      "status": "passed",
+      "duration": 0,
+      "invocations": 1,
+      "location": null,
+      "failureMessages": [],
+      "numPassingAsserts": 1
+     },
+     {
+      "ancestorTitles": [
+       "math",
+       "sum"
+      ],
+      "title": "retries",
+      "fullName": "math sum retries",
+      "status": "passed",
+      "duration": 0,
+      "invocations": 1,
+      "location": null,
+      "failureMessages": [],
+      "numPassingAsserts": 1
+     },
+     {
+      "ancestorTitles": [
+       "math"
+      ],
+      "title": "multiplies",
+      "fullName": "math multiplies",
+      "status": "passed",
+      "duration": 0,
+      "invocations": 1,
+      "location": null,
+      "failureMessages": [],
+      "numPassingAsserts": 1
+     }
+    ]
+   },
+   {
+    "startTime": 1793808045268,
+    "numFailedTests": 1,
+    "numFailedTestSuites": 2,
+    "wasInterrupted": false
+   }
+  ],
+  [
+   "onRunComplete",
+   null,
+   {
+    "startTime": 1793808045268,
+    "numFailedTests": 1,
+    "numFailedTestSuites": 2,
+    "wasInterrupted": false
+   }
+  ]
+ ]
+}
