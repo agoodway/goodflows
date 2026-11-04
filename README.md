@@ -1620,8 +1620,8 @@ To cut a release:
    unless the tag agrees. Check locally with `scripts/verify-versions.sh v<version>`.
 2. Review CI on `main`, including the `reporters` and `release-scripts` jobs.
 3. Make sure the `reporter-mirrors` environment, both mirror deploy keys and the
-   `v*` tag ruleset are configured (below); a tag push fails before building when
-   either secret is missing.
+   `v*` tag ruleset are configured; a tag push fails before building when either
+   secret is missing.
 4. Push the `v<version>` tag from `main` (`git tag v<version> origin/main`, then
    `git push origin v<version>`).
 
@@ -1629,73 +1629,6 @@ To cut a release:
 `mirror-reporters.sh` against local bare repositories: version drift, a tag
 that does not match, missing keys, first and fast-forward releases, `--verify`
 and `--dry-run`, a mirror edited directly, and tags off `main` or off `HEAD`.
-
-### Reporter mirror deploy keys
-
-The `mirror-reporters` job pushes `reporters/exunit` to
-`agoodway/goodflows-exunit-reporter` and `reporters/jest` to
-`agoodway/goodflows-jest-reporter` (`scripts/mirror-reporters.sh`), after
-`mirror-check` has fetched and checked both. Each mirror has
-its own write-enabled deploy key, whose private half is a secret of the
-`reporter-mirrors` environment in `agoodway/goodflows`. Only `v*` tags may deploy
-to that environment, so no branch, pull request or `workflow_dispatch` run can
-read the keys, and a tag ruleset limits who can create `v*` tags:
-
-| Environment secret | Deploy key on (with write access) |
-|---|---|
-| `EXUNIT_REPORTER_DEPLOY_KEY` | `agoodway/goodflows-exunit-reporter` |
-| `JEST_REPORTER_DEPLOY_KEY` | `agoodway/goodflows-jest-reporter` |
-
-One-time setup, by a repository admin:
-
-1. Create both mirror repositories empty, if they do not exist yet.
-2. Generate one key pair per mirror, without a passphrase:
-
-   ```bash
-   ssh-keygen -t ed25519 -N "" -C "goodflows release: goodflows-exunit-reporter" -f exunit_reporter_deploy_key
-   ssh-keygen -t ed25519 -N "" -C "goodflows release: goodflows-jest-reporter" -f jest_reporter_deploy_key
-   ```
-
-3. In each mirror, open **Settings → Deploy keys → Add deploy key**, paste that
-   mirror's `.pub` file and check **Allow write access**.
-4. In `agoodway/goodflows`, open **Settings → Environments → New environment**,
-   name it `reporter-mirrors` and, under **Deployment branches and tags**, choose
-   **Selected branches and tags** and add a rule with **Ref type: Tag** and name
-   pattern `v*`. Add no other branch or tag rule.
-5. In that environment, under **Environment secrets → Add environment secret**,
-   add each private key file's full contents under the secret name above (or
-   `gh secret set EXUNIT_REPORTER_DEPLOY_KEY --env reporter-mirrors -R
-   agoodway/goodflows < exunit_reporter_deploy_key`, and the same for Jest). If
-   either name exists as a repository secret (**Settings → Secrets and variables
-   → Actions → Repository secrets**), delete it (`gh secret delete
-   EXUNIT_REPORTER_DEPLOY_KEY -R agoodway/goodflows`), so the keys live only in
-   the environment.
-6. Delete the local key files.
-7. Protect release tags: open **Settings → Rules → Rulesets → New ruleset → New
-   tag ruleset**, name it `release tags`, set **Enforcement status** to
-   **Active**, add the target **Include by pattern** `v*`, and enable **Restrict
-   creations**, **Restrict updates**, **Restrict deletions** and **Block force
-   pushes**. Under **Bypass list**, add only the role allowed to cut releases
-   (for example **Repository admin**). Since a `v*` tag is what unlocks the
-   deploy keys, this keeps anyone else from creating one.
-8. Confirm the split without the keys: **Actions → Release → Run workflow** on
-   `main`. The `mirror-dry-run` log prints `source: ... is on origin/main`, each
-   mirror's split SHA and "secret ... is not set; skipping the mirror fetch"
-   (that job never gets the keys), and ends with "dry run: nothing pushed". The
-   keys themselves are checked by `mirror-check` on the first tag push, before
-   anything is built: a missing secret fails it with an error that names each
-   missing secret and links here, and a key without access fails with "cannot
-   reach".
-
-SSH trusts only GitHub's published host keys, pinned in the script. Mirrors are
-read-only: when a mirror's `main` has commits that are not in the new split, the
-release fails instead of overwriting them. To test the script without GitHub,
-point `MIRROR_URL_BASE` at a directory of bare repositories
-(`MIRROR_URL_BASE=/tmp/mirrors/` with
-`/tmp/mirrors/agoodway/goodflows-{exunit,jest}-reporter.git`), as
-`scripts/test-release-scripts.sh` does; `MIRROR_SOURCE_REMOTE` and
-`MIRROR_SOURCE_BRANCH` (default `origin` and `main`) name the branch a tag must be
-on.
 
 To exercise packaging locally, Linux targets need Docker and produce a Debian 12
 binary. macOS targets build natively:

@@ -33,9 +33,9 @@ jobs:
           fi
 
   # Before building anything, check that the mirrors can take this tag: both
-  # deploy keys are set (the error names each missing secret and links README.md,
-  # "Reporter mirror deploy keys"), the tag is on main, and each mirror's main
-  # is an ancestor of the new split. Nothing is pushed. The deploy keys are
+  # deploy keys are set (the error names each missing secret), the tag is on
+  # main, and each mirror's main is an ancestor of the new split. Nothing is
+  # pushed. The deploy keys are
   # secrets of the reporter-mirrors environment, which only v* tags may deploy
   # to, so no branch can read them.
   mirror-check:

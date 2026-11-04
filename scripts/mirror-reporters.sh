@@ -27,9 +27,8 @@
 #
 # Deploy keys come from EXUNIT_REPORTER_DEPLOY_KEY and JEST_REPORTER_DEPLOY_KEY
 # (private keys with write access to one mirror each, stored as secrets of the
-# `reporter-mirrors` environment; see "Reporter mirror deploy keys" in
-# README.md). A push or --verify fails before splitting anything when either
-# key is missing, naming the missing secrets.
+# `reporter-mirrors` environment). A push or --verify fails before splitting
+# anything when either key is missing, naming the missing secrets.
 #
 # SSH trusts only GitHub's published host keys (pinned below), never a key
 # learned on first use. MIRROR_URL_BASE (default git@github.com:) replaces the
@@ -55,7 +54,6 @@ github="git@github.com:"
 base="${MIRROR_URL_BASE:-$github}"
 source_remote="${MIRROR_SOURCE_REMOTE:-origin}"
 source_branch="${MIRROR_SOURCE_BRANCH:-main}"
-docs="README.md, \"Reporter mirror deploy keys\" (https://github.com/agoodway/goodflows#reporter-mirror-deploy-keys)"
 
 # prefix|mirror|deploy key variable
 mirrors=(
@@ -85,7 +83,7 @@ check_keys() {
   if [ "${#missing[@]}" -gt 0 ]; then
     local list
     list="$(printf '%s, ' "${missing[@]}")"
-    fail "missing secret(s): ${list%, }. Add a write-enabled deploy key to each mirror and its private half as that secret of the reporter-mirrors environment in agoodway/goodflows; see $docs. Nothing was pushed."
+    fail "missing secret(s): ${list%, }. Add a write-enabled deploy key to each mirror and its private half as that secret of the reporter-mirrors environment in agoodway/goodflows. Nothing was pushed."
   fi
   echo "deploy keys: all set"
 }
@@ -161,14 +159,14 @@ for entry in "${mirrors[@]}"; do
   ssh="$(ssh_for "$var")"
   if [ -z "$ssh" ] && [ "$base" = "$github" ]; then
     if $dry_run; then
-      echo "$mirror: secret $var is not set; skipping the mirror fetch (see $docs)"
+      echo "$mirror: secret $var is not set; skipping the mirror fetch"
       continue
     fi
-    fail "secret $var is not set; see $docs"
+    fail "secret $var is not set in the reporter-mirrors environment"
   fi
   url="$base$mirror.git"
   if ! heads="$(GIT_SSH_COMMAND="${ssh:-ssh}" git ls-remote --heads "$url" main)"; then
-    fail "cannot reach $mirror; check that the deploy key in $var is added to that repository with write access (see $docs)"
+    fail "cannot reach $mirror; check that the deploy key in $var is added to that repository with write access"
   fi
   if [ -z "$heads" ]; then
     echo "$mirror: no main yet (first release)"

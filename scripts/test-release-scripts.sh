@@ -84,8 +84,8 @@ expect 0 "" "this checkout's versions agree" -- bash "$root/scripts/verify-versi
 # ---- mirror-reporters.sh: deploy keys ----
 
 mirror="$root/scripts/mirror-reporters.sh"
-expect 1 "EXUNIT_REPORTER_DEPLOY_KEY.*JEST_REPORTER_DEPLOY_KEY.*reporter-mirror-deploy-keys" \
-  "missing keys are named with the setup docs" -- bash "$mirror" v0.1.0 --check-keys
+expect 1 "EXUNIT_REPORTER_DEPLOY_KEY.*JEST_REPORTER_DEPLOY_KEY.*reporter-mirrors environment" \
+  "missing keys are named with their environment" -- bash "$mirror" v0.1.0 --check-keys
 expect 1 "missing secret\(s\): JEST_REPORTER_DEPLOY_KEY \(write access" "only the missing key is named" -- \
   env EXUNIT_REPORTER_DEPLOY_KEY=x bash "$mirror" v0.1.0 --check-keys
 expect 0 "deploy keys: all set" "both keys set passes the key check" -- \
