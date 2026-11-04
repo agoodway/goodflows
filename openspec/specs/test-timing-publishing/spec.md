@@ -7,7 +7,7 @@ Publish test timing reports from Goodflows invocations to account-scoped storage
 ## Requirements
 
 ### Requirement: Reporting is explicitly configured
-The CLI SHALL support a top-level reporting block and per-job `reports = ["exunit-timings"]`. Configuration without reporting SHALL retain existing behavior. Unsupported or duplicate formats, `reports` declared without a reporting block, inline tokens, a project not matching `[a-z0-9][a-z0-9_-]*` (1-64 bytes), a reporting job name longer than 64 UTF-8 bytes or containing control characters, `url_env`/`token_env` values that are not environment variable names, name a reserved goodflows variable (`GOODFLOWS_RUN_ID`, `GOODFLOWS_REPORT_DIR`, `GOODFLOWS_OUTPUT`, `GOODFLOWS_PARTITION`, `GOODFLOWS_PARTITION_COUNT`, `GOODFLOWS_ENVIRONMENT`) or name the same variable, a job or step `env` entry for the configured `token_env`, and malformed reporting configuration MUST fail validation before jobs execute. Inspection commands MUST NOT create report directories or contact the server.
+The CLI SHALL support a top-level reporting block and per-job `reports = ["test-timings"]`. Configuration without reporting SHALL retain existing behavior. Unsupported or duplicate formats (including the retired `exunit-timings`), `reports` declared without a reporting block, inline tokens, a project not matching `[a-z0-9][a-z0-9_-]*` (1-64 bytes), a reporting job name longer than 64 UTF-8 bytes or containing control characters, `url_env`/`token_env` values that are not environment variable names, name a reserved goodflows variable (`GOODFLOWS_RUN_ID`, `GOODFLOWS_REPORT_DIR`, `GOODFLOWS_OUTPUT`, `GOODFLOWS_PARTITION`, `GOODFLOWS_PARTITION_COUNT`, `GOODFLOWS_ENVIRONMENT`) or name the same variable, a job or step `env` entry for the configured `token_env`, and malformed reporting configuration MUST fail validation before jobs execute. Inspection commands MUST NOT create report directories or contact the server.
 
 #### Scenario: Existing workflow
 - **WHEN** a workflow has no reporting configuration
@@ -17,8 +17,12 @@ The CLI SHALL support a top-level reporting block and per-job `reports = ["exuni
 - **WHEN** a job selects an unsupported report format
 - **THEN** validation identifies the configuration field and no jobs execute
 
+#### Scenario: Retired format
+- **WHEN** a job declares `reports = ["exunit-timings"]`
+- **THEN** validation fails naming `test-timings` as the supported format and no jobs execute
+
 #### Scenario: Duplicate format or missing reporting block
-- **WHEN** a job lists `exunit-timings` twice, or declares `reports` while no reporting block exists
+- **WHEN** a job lists `test-timings` twice, or declares `reports` while no reporting block exists
 - **THEN** validation fails and no jobs execute
 
 #### Scenario: Reporting job name too long
@@ -85,7 +89,7 @@ Each reporting invocation SHALL have a unique workflow run identity and persiste
 - **THEN** its report directory and manifest entry have the same layout as before partitions existed
 
 ### Requirement: Publishing uses the shared timing contract
-The publisher SHALL send one JSON request per report to `/api/v1/projects/<project>/test-reports`, where `<project>` is the configured project slug, using the server companion change's wire contract. The body MUST NOT contain `project` or `account_id`. It MUST attach the lowercase workflow invocation UUID, workflow/environment, job result (one of `passed`, `failed`, `timed_out`, `cancelled`, `skipped` or `unknown`) and captured Git context, while retaining the producer's suite/report identities and microsecond units. `report_id` values MUST be unique within a job; duplicates SHALL be rejected locally rather than uploaded.
+The publisher SHALL send one JSON request per report to `/api/v1/projects/<project>/test-reports`, where `<project>` is the configured project slug, using the `test-timings/1` wire format defined by the `test-timing-contract` capability. The body MUST NOT contain `project` or `account_id`. It MUST attach the lowercase workflow invocation UUID, workflow/environment, job result (one of `passed`, `failed`, `timed_out`, `cancelled`, `skipped` or `unknown`) and captured Git context, while retaining the producer's suite/report identities and microsecond units. `report_id` values MUST be unique within a job; duplicates SHALL be rejected locally rather than uploaded.
 
 #### Scenario: Three partitions
 - **WHEN** the test job produces three partition reports
@@ -106,6 +110,10 @@ The publisher SHALL send one JSON request per report to `/api/v1/projects/<proje
 #### Scenario: Working directory is not a Git checkout
 - **WHEN** Git context cannot be obtained
 - **THEN** source fields are null and otherwise valid reports remain publishable
+
+#### Scenario: Envelope declares the versioned format
+- **WHEN** any report is frozen
+- **THEN** its envelope `format` is `test-timings/1`
 
 ### Requirement: Completed and failed jobs both produce reports
 The CLI SHALL collect reports from jobs that executed, regardless of their result. Reporting MUST NOT depend on a separate success-dependent job. Partial reports SHALL remain partial and MUST NOT receive synthesized suite completion events.
@@ -222,7 +230,7 @@ Threat model: these rules keep the key away from jobs, logs and saved state. The
 - **THEN** no new request starts and the signal exit code takes precedence
 
 ### Requirement: Report processing is bounded and structural
-Collection SHALL enforce the server's 32 MiB request limit, 100,000-record report limit and timing-only field contract, taken from one versioned local copy of the server contract. A source file larger than 33 MiB (the request limit plus a 1 MiB allowance) SHALL be rejected without parsing, and parsing SHALL stop once the records alone exceed the request limit. Each valid request SHALL be frozen as it is built, so at most one report body is held in memory. It SHALL cap collection at 256 reports and 256 MiB of source data per job. A malformed final JSONL fragment SHALL be discarded and the envelope SHALL set `truncated: true` (the server derives incomplete status); earlier malformed records MUST reject that report. Original files MUST remain intact.
+Collection SHALL enforce the 32 MiB request limit, 100,000-record report limit and the complete type rules of the `test-timing-contract` capability, taken from one versioned local definition that the server mirrors. A source file larger than 33 MiB (the request limit plus a 1 MiB allowance) SHALL be rejected without parsing, and parsing SHALL stop once the records alone exceed the request limit. Each valid request SHALL be frozen as it is built, so at most one report body is held in memory. It SHALL cap collection at 256 reports and 256 MiB of source data per job. A malformed final JSONL fragment SHALL be discarded and the envelope SHALL set `truncated: true` (the server derives incomplete status); earlier malformed records MUST reject that report. Original files MUST remain intact.
 
 #### Scenario: Worker is killed during its final write
 - **WHEN** valid timing records end with one truncated JSON fragment
@@ -236,40 +244,9 @@ Collection SHALL enforce the server's 32 MiB request limit, 100,000-record repor
 - **WHEN** a report would exceed 32 MiB encoded or 100,000 records
 - **THEN** it is not uploaded, the file is retained and a structural code is emitted
 
-### Requirement: Suite filter tags are boolean identifiers
-Collection SHALL accept each `suite_started` filter entry whose `tag` is 1 to 128 bytes matching `[A-Za-z0-9][A-Za-z0-9._-]*` and whose `value` is a boolean. Include and exclude entries MUST be frozen in the supplied order, including a repeated tag. Tags are case-sensitive and MUST be frozen without normalization. When `filters` is present it MUST be an object whose `include` and `exclude` are both arrays, each holding at most 256 entries. A tag outside that grammar, a value that is not a boolean, a `filters` that is not such an object (including one missing `include` or `exclude`), or a list over 256 entries MUST reject that report with the structural code `unsupported_filter` before a snapshot is frozen, and the raw file MUST remain intact.
-
-#### Scenario: Boolean identifier tags
-- **WHEN** a report's `filters.include` is `[{"tag": "slow", "value": true}]` and `filters.exclude` is `[{"tag": "chrome", "value": true}]`
-- **THEN** the report is frozen with both entries unchanged
-
-#### Scenario: Repeated tags keep their order
-- **WHEN** `filters.exclude` lists `{"tag": "slow", "value": true}` and then `{"tag": "slow", "value": false}`
-- **THEN** the frozen array has those two entries in that order
-
-#### Scenario: Tag outside the identifier grammar
-- **WHEN** a filter `tag` is `slow test`, `ok?`, `slow` followed by a newline, `""`, or longer than 128 bytes
-- **THEN** the report is rejected with `unsupported_filter`, no snapshot is written and the raw file is untouched
-
-#### Scenario: Non-boolean filter value
-- **WHEN** a filter entry has `tag` `chrome` and `value` `yes`
-- **THEN** the report is rejected with `unsupported_filter`, no snapshot is written and the raw file is untouched
-
-#### Scenario: Filter list over the cap
-- **WHEN** `filters.include` has 257 entries
-- **THEN** the report is rejected with `unsupported_filter`, no snapshot is written and the raw file is untouched
-
-#### Scenario: Case-sensitive tags
-- **WHEN** `filters.include` lists `{"tag": "Chrome", "value": true}` and `{"tag": "chrome", "value": true}`
-- **THEN** the report is frozen with both entries unchanged, as distinct tags
-
-#### Scenario: Missing or non-array filter list
-- **WHEN** `filters` is present but has no `exclude` key, or its `include` is `null`, an object or a string
-- **THEN** the report is rejected with `unsupported_filter`, no snapshot is written and the raw file is untouched
-
-#### Scenario: Non-object filters
-- **WHEN** `filters` is present and is `null`, an array or a string
-- **THEN** the report is rejected with `unsupported_filter`, no snapshot is written and the raw file is untouched
+#### Scenario: Type violation is caught locally
+- **WHEN** a `test_finished` record has `duration_us: "12"`
+- **THEN** the report is rejected with `invalid_field` before a snapshot is frozen, rather than being frozen and rejected by the server
 
 ### Requirement: Reporting output preserves the existing output protocol
 Reporting SHALL emit structural collection/delivery status in both text and versioned JSON event modes. Existing job durations, statuses, dependency scheduling and summary semantics MUST remain unchanged. Raw timing records, response bodies, source contents and secrets MUST NOT be printed as diagnostics. Reporting events are best-effort: failing to write one MUST NOT change the check exit status, and the manifest SHALL be finalized before collection events are emitted.
@@ -330,3 +307,49 @@ For reports collected from an instance, `partition` SHALL be the instance index 
 #### Scenario: Tampered partition entries
 - **WHEN** a finalized manifest lists two entries for job `test` with the same partition index
 - **THEN** replay sends nothing and exits nonzero
+
+### Requirement: Contract violations map to stable structural codes
+Collection SHALL reject a report that breaks the contract with one stable code: `unsupported_format`, `unsupported_event`, `unsupported_field`, `missing_field`, `invalid_field`, `field_too_long`, `invalid_order`, `identity_mismatch`, `invalid_identifier`, `invalid_partition`, `invalid_partition_count`, `unsupported_filter`, `invalid_meta`, `unpaired_event`, `unfinished_mismatch`, `duplicate_key`, `nul_character`, `non_integer_number`, `integer_out_of_range`, `nested_too_deeply`, `malformed_record`, `invalid_utf8`, `empty_report` or `missing_suite_started`. A code that collection already returns for one of these failures SHALL keep that name. Size and count limits SHALL keep `too_large`, `record_limit` and `request_too_large`, which are outside this set. The code SHALL NOT include submitted values. A non-null `filters` that is not an object, lacks an `include` or `exclude` array, has a list over 256 entries, or holds an entry that is not an object or whose `tag` or `value` breaks the filter grammar SHALL be `unsupported_filter`, not `invalid_field`. An unknown key inside `filters` or inside a filter entry SHALL be `unsupported_field`, as for unknown keys in `counts` and `runner`, preserving the code collection already returns. An absent core key SHALL be `missing_field`. A second started event with an `execution_id` already in use for that kind SHALL be `unpaired_event`. Collection SHALL validate each record as its line is decoded, so a report with several faults SHALL get the code of the first faulty line in file order (and, within a record, of the first faulty key in the contract's table order), and the lines after it SHALL NOT be decoded.
+
+#### Scenario: Several faults
+- **WHEN** line 2 of a report has a 5,000-byte `name` and line 3 has a duplicate key
+- **THEN** the report is rejected with `field_too_long`, the code of line 2
+
+#### Scenario: Structured meta value
+- **WHEN** a record's `meta` holds an array value
+- **THEN** the report is rejected with `invalid_meta` and the raw file is untouched
+
+#### Scenario: Finish without start
+- **WHEN** a `group_finished` has no matching `group_started`
+- **THEN** the report is rejected with `unpaired_event`
+
+#### Scenario: Unfinished count disagrees
+- **WHEN** `suite_finished.unfinished_tests` differs from the number of unfinished tests in the report
+- **THEN** the report is rejected with `unfinished_mismatch`
+
+#### Scenario: Retired format in a new run
+- **WHEN** a producer writes a report whose `suite_started.format` is `exunit-timings`
+- **THEN** the report is rejected with `unsupported_format` and no snapshot is written
+
+#### Scenario: Missing core key
+- **WHEN** a `test_finished` record omits `duration_us`
+- **THEN** the report is rejected with `missing_field` and the raw file is untouched
+
+#### Scenario: Duplicate start
+- **WHEN** two `test_started` records share one `execution_id`
+- **THEN** the report is rejected with `unpaired_event`
+
+#### Scenario: Filter shape
+- **WHEN** a filter entry's value is not a boolean, its tag is outside the identifier grammar, or either list has 257 entries
+- **THEN** the report is rejected with `unsupported_filter`, no snapshot is written and the raw file is untouched
+
+#### Scenario: Unknown key in filters
+- **WHEN** `filters` is `{"include": [], "exclude": [], "x": 1}`, or a filter entry is `{"tag": "slow", "value": true, "note": "x"}`
+- **THEN** the report is rejected with `unsupported_field`, not `unsupported_filter`, and no snapshot is written
+
+### Requirement: Snapshots in retired formats are not replayed
+`goodflows reports upload` SHALL re-validate every saved snapshot against the current contract. A snapshot frozen in a retired format, such as `exunit-timings`, MUST NOT be sent: it SHALL be counted as `invalid_snapshot` and the command SHALL exit nonzero. Its file MUST remain intact.
+
+#### Scenario: Replaying a pre-upgrade run directory
+- **WHEN** a finalized manifest lists a pending `exunit-timings` snapshot
+- **THEN** replay sends nothing for it, reports `invalid_snapshot`, leaves the file in place and exits nonzero

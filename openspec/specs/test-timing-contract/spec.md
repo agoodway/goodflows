@@ -1,10 +1,10 @@
-# Spec Delta
+# test-timing-contract Specification
 
 ## Purpose
 
 Define the runner-neutral `test-timings/1` wire format that goodflows collects and the GoodFlows server stores, so that any test runner can publish per-test timings through one versioned contract.
 
-## ADDED Requirements
+## Requirements
 
 ### Requirement: The format names its contract version
 A report SHALL declare the format `test-timings/1` both in the request envelope's `format` and in its `suite_started` record's `format`, and the two MUST agree. A document with any other format, including the retired `exunit-timings`, MUST be rejected. A later incompatible contract SHALL use a new `test-timings/<n>` name instead of changing version 1.
@@ -222,6 +222,14 @@ A non-null `filters` SHALL be an object with exactly `include` and `exclude`, ea
 
 #### Scenario: Filters is not an object
 - **WHEN** `filters` is an array or a string
+- **THEN** the report is rejected
+
+#### Scenario: Unknown key in filters
+- **WHEN** `filters` is `{"include": [], "exclude": [], "x": 1}`
+- **THEN** the report is rejected
+
+#### Scenario: Unknown key in a filter entry
+- **WHEN** a filter entry is `{"tag": "slow", "value": true, "note": "x"}`
 - **THEN** the report is rejected
 
 ### Requirement: Documents are bounded and strictly encoded

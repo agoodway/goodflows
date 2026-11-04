@@ -817,9 +817,12 @@ queued work and emits a final summary.
 
 ## Test timing reports
 
-goodflows can publish per-test timing reports (the `exunit-timings` JSONL format)
-to GoodFlows. Reporting is opt-in: configs without a `[reporting]` block behave
-exactly as before, create no spool directory, and make no network requests.
+goodflows can publish per-test timing reports (the runner-neutral
+`test-timings/1` JSON Lines format) to GoodFlows. Reporting is opt-in: configs
+without a `[reporting]` block behave exactly as before, create no spool
+directory, and make no network requests. goodflows ships reporters for
+[ExUnit and Jest](#test-reporters); any other runner can produce the
+[format](#the-test-timings1-contract) directly.
 
 ```toml
 [reporting]
@@ -831,7 +834,7 @@ spool_dir = ".goodflows/reports" # Default; relative to this config file's direc
 [[jobs]]
 name = "test"
 command = "mix test.parallel"
-reports = ["exunit-timings"]
+reports = ["test-timings"]
 ```
 
 - `project` must be 1-64 bytes matching `[a-z0-9][a-z0-9_-]*`. It is the slug of a
@@ -849,9 +852,12 @@ reports = ["exunit-timings"]
 - `spool_dir` is resolved against the config file's directory, independent of
   `workdir` and of where goodflows is invoked. Add it to your project's
   `.gitignore` (for the default, `/.goodflows/`).
-- `reports` currently supports only `exunit-timings`. Unknown or duplicate formats,
-  `reports` without a `[reporting]` block, and reporting job names longer than 64
-  UTF-8 bytes or containing control characters are validation errors.
+- `reports` currently supports only `test-timings`, which names the format
+  family: reports are collected as the version this goodflows defines
+  (`test-timings/1`). Unknown or duplicate formats (including the retired
+  `exunit-timings`), `reports` without a `[reporting]` block, and reporting job
+  names longer than 64 UTF-8 bytes or containing control characters are
+  validation errors.
 - `GOODFLOWS_RUN_ID` and `GOODFLOWS_REPORT_DIR` are reserved: setting either in any
   job, step, or settings `env` is a validation error. `url_env` and `token_env` must
   differ and must not name a reserved variable (`GOODFLOWS_RUN_ID`,
@@ -949,18 +955,28 @@ so when the instances together exceed a cap the highest-numbered instances lose
 reports first: two instances with 130 reports each collect 130 and 126),
 100,000 records and 32 MiB encoded per report. Source files over 33 MiB are
 rejected (`request_too_large`) without being parsed, and each valid report is
-frozen as soon as it is built, so only one report body is held in memory. An invalid final unterminated line
-(for example a worker killed mid-write) is dropped and the report is sent with
-`truncated: true`; an invalid earlier line, a disallowed field, mismatched
-suite/report identities, an invalid partition, U+0000, an oversized field, a
-duplicate object key, nesting deeper than the server's 16-level body limit, a
-number with a fraction or exponent (or an integer above 2^53-1), a filter tag
-that is not an identifier (1 to 128 bytes of ASCII letters, digits, `.`, `_` or
-`-`, starting with a letter or digit), a non-boolean filter value, a `filters`
-that is not an object holding both `include` and `exclude` as arrays, either
-list longer than 256 entries, or a `report_id` reused by two reports in the same job (including
+frozen as soon as it is built, so only one report body is held in memory. An
+invalid final unterminated line (for example a worker killed mid-write) is
+dropped and the report is sent with `truncated: true`; an invalid earlier line
+rejects the report. Every record is then validated in full against the
+[contract](#the-test-timings1-contract) before anything is frozen, so a frozen
+snapshot is one the server accepts: unknown events or keys, missing core keys,
+wrong types, mismatched suite/report identities, an invalid partition, invalid
+`meta`, an unpaired or duplicated started/finished event, unfinished counts that
+disagree with the records, U+0000, an oversized field, a duplicate object key,
+nesting deeper than the 16-level body limit, a number with a fraction or
+exponent (or an integer beyond ±(2^53-1)), a filter that breaks the tag
+grammar, or a `report_id` reused by two reports in the same job (including
 across its instances, which rejects every copy as `duplicate_report_id`) rejects
-that report locally. A snapshot that cannot be written is counted as
+that report locally. The codes are `unsupported_format`, `unsupported_event`,
+`unsupported_field`, `missing_field`, `invalid_field`, `field_too_long`,
+`invalid_order`, `identity_mismatch`, `invalid_identifier`,
+`invalid_partition`, `invalid_partition_count`, `unsupported_filter`,
+`invalid_meta`, `unpaired_event`, `unfinished_mismatch`, `duplicate_key`,
+`nul_character`, `non_integer_number`, `integer_out_of_range`,
+`nested_too_deeply`, `malformed_record`, `invalid_utf8`, `empty_report` and
+`missing_suite_started`, plus `too_large`, `record_limit` and
+`request_too_large` for limits. A snapshot that cannot be written is counted as
 `snapshot_write_failed` (and, if it was also a duplicate, only as that). Each
 rejected file is counted under exactly one code, except that a rejected
 duplicate whose already-frozen snapshot cannot be removed is also counted as
@@ -968,18 +984,110 @@ duplicate whose already-frozen snapshot cannot be removed is also counted as
 file (it is never listed in the manifest or sent). Only regular files that were
 read count toward the 256-report limit. Rejections appear only as codes and
 counts in `reports_collected.rejected`; source files are never modified and
-record contents are never printed.
+record contents are never printed. A signal that arrives while reports are
+being collected stops collection between files (`collection_interrupted`).
 
-The field and event allowlists, the limits and the identifier grammar shared by
-suite ids, report ids and filter tags mirror the GoodFlows server contract and
-live in one versioned module (`src/reporting/contract.rs`), currently the
-GoodFlows change `2026-11-01-generalize-test-report-filters`. An older server
-accepts only five filter tags, so it permanently rejects (422) a report with
-any other tag. A report using vocabulary a newer server accepts but this goodflows does
-not know (for example a new event or field) is rejected locally and is not
-replayable; upgrade goodflows before producers emit new vocabulary. A signal
-that arrives while reports are being collected stops collection between files
-(`collection_interrupted`).
+### The `test-timings/1` contract
+
+goodflows owns the contract: the field tables, limits and identifier grammar
+live in one versioned module (`src/reporting/contract.rs`, contract version
+`generalize-test-timings`) and the
+[`test-timing-contract` spec](openspec/specs/test-timing-contract/spec.md),
+and the GoodFlows server mirrors them. In short:
+
+- A report is JSON Lines. Every record has `event`, `suite_id`, `report_id`
+  (identifiers: 1-128 bytes of `[A-Za-z0-9._-]`, starting with a letter or
+  digit, equal in every record) and `received_offset_us`, and may have `meta`.
+- Events are `suite_started` (first, and only first), `group_started`,
+  `group_finished`, `test_started`, `test_finished`, `interrupted`,
+  `max_failures_reached` and `suite_finished` (last, when present). Each event
+  carries all of its core keys (nullable ones as `null`) and nothing else.
+- `suite_started` has `format: "test-timings/1"`, `started_at`, `runner`
+  (`{name, version}`), `partition`, `partition_count`, `seed` and `filters`
+  (`null`, or boolean identifier tags in `include` and `exclude`).
+- A *group* is the runner's scheduling unit (an ExUnit module, a Jest file):
+  `group`, `file`, `execution_id`, `started_offset_us`, plus `duration_us`,
+  `outcome` and `counts` when finished. A *test* has `group`, `path` (describe
+  blocks, outermost first), `name`, `file`, `line`, `execution_id` and
+  `started_offset_us`, plus `duration_us` and `outcome` when finished. A
+  finished event repeats its started event's core values exactly.
+- Outcomes are `passed`, `failed`, `skipped` and `errored`. Times are integer
+  microseconds. `suite_finished` has `aborted`, `unfinished_tests`,
+  `unfinished_groups` (which must equal the started events left unfinished),
+  `counts` and `duration_us`.
+- `meta` holds runner-specific details: at most 32 identifier keys whose values
+  are null, booleans, safe integers or strings of at most 256 bytes. It never
+  holds logs, failure messages, assertion values or stack traces.
+
+### Test reporters
+
+goodflows maintains two zero-dependency reporters in `reporters/`, released in
+lockstep with the CLI (each reporter's version equals the goodflows version) and
+published on every release tag to read-only mirrors. The reporters ship starting
+with goodflows v0.6.0, the first release that contains them; earlier goodflows
+tags have no reporter tag. Pin the mirror tag equal to your goodflows version
+(v0.6.0 or later):
+
+- **ExUnit** (Elixir `~> 1.18`), from
+  [`agoodway/goodflows-exunit-reporter`](https://github.com/agoodway/goodflows-exunit-reporter):
+
+  ```elixir
+  # mix.exs
+  {:goodflows_exunit_reporter,
+   github: "agoodway/goodflows-exunit-reporter", tag: "v0.6.0", only: :test}
+  ```
+
+  ```elixir
+  # test/test_helper.exs
+  ExUnit.start()
+  Goodflows.ExUnitReporter.configure()
+  ```
+
+- **Jest** (Jest 29.6 or newer, Node.js 18 or newer), from
+  [`agoodway/goodflows-jest-reporter`](https://github.com/agoodway/goodflows-jest-reporter):
+
+  ```json
+  "devDependencies": {
+    "goodflows-jest-reporter": "github:agoodway/goodflows-jest-reporter#v0.6.0"
+  }
+  ```
+
+  ```js
+  // jest.config.js
+  module.exports = { reporters: ['default', 'goodflows-jest-reporter'] };
+  ```
+
+Both write each run to a new `<report_id>.jsonl` in `GOODFLOWS_REPORT_DIR` when
+goodflows runs them, take their partition from `GOODFLOWS_PARTITION` and
+`GOODFLOWS_PARTITION_COUNT` when both are valid (otherwise the runner's own
+partitioning, when it is complete, otherwise `null` and `1`), and take their
+suite id from the reporter's option, then `TEST_TIMING_SUITE_ID`, then
+`GOODFLOWS_RUN_ID` (so every report of one goodflows run shares it), then the
+report id. Each `suite_started.meta` names the reporter (`reporter`,
+`reporter_version`) and says whether the run was `filtered` by name, tag or
+path. A reporter's own directory option (`:test_timing_directory`,
+`outputDirectory`) wins over `GOODFLOWS_REPORT_DIR`; because goodflows then
+cannot collect the report, the reporter prints a warning when both are set and
+differ, so leave the option unset in goodflows jobs. See each reporter's README
+for its options, mapping and duration semantics. Changes go to this repository;
+CI (and every release, before publishing) runs both reporters over fixture
+suites with Jest at its minimum peer version and the latest, and fails if
+goodflows rejects any report they write, if a report is truncated, or if its
+outcomes and counts differ from the fixture's (`scripts/check-reporters.sh`).
+
+### Upgrading from `exunit-timings`
+
+- Change `reports = ["exunit-timings"]` to `reports = ["test-timings"]`, and
+  replace a copied `GC.TestTimingFormatter` with the ExUnit reporter (see [Test
+  reporters](#test-reporters); the suite option is now `:test_timing_suite_id`
+  and `TEST_TIMING_SUITE_ID`). Until you do, validation fails with "format
+  'exunit-timings' was retired", which links here.
+- The GoodFlows server must support `test-timings/1` before you upload with this
+  version. Until it does, uploads are rejected (`rejected_by_server`); delete the
+  matching `acks/NNN.rejected.json` files to resend them once it does.
+- Pending snapshots frozen in the old format are never sent: `reports upload`
+  counts each as `invalid_snapshot` and exits nonzero. Their raw JSONL stays on
+  disk.
 
 ### Spool layout and retention
 
@@ -1039,11 +1147,9 @@ different instances, is not sent at all: every copy is reported as
 Replay a run with the goodflows version that wrote it or a newer one: an older
 goodflows refuses a version 2 manifest with an unsupported-version error. The
 same rule covers snapshot contents, because every snapshot is re-validated
-against the replaying goodflows's contract before it is sent: an older goodflows
-refuses (`invalid_snapshot`) a snapshot with a filter tag outside its five-name
-list, and a newer one refuses a snapshot its rules no longer accept (for example
-one frozen without both `filters.include` and `filters.exclude`, or with a filter
-list over 256 entries). A refused
+against the replaying goodflows's contract before it is sent: a newer goodflows
+refuses (`invalid_snapshot`) a snapshot its rules no longer accept, such as one
+frozen in the retired `exunit-timings` format. A refused
 snapshot is never sent; its raw JSONL stays in `reports/`. Because the manifest chooses which of your
 environment variables become the endpoint and key, only replay run directories
 produced by your own invocations. It does
@@ -1477,11 +1583,119 @@ in a Debian 12 container so the binary runs on Ampcode orbs (glibc 2.36).
 Workflows use GitHub's documented
 [runner labels](https://docs.github.com/en/actions/reference/runners/github-hosted-runners).
 
-The Release workflow can be dispatched manually to build artifacts without publishing.
+The Release workflow can be dispatched manually to build artifacts without publishing
+(its `mirror-dry-run` job prints the reporter splits and pushes nothing).
 Pushing a `v<version>` tag matching `Cargo.toml` builds and publishes archives,
-individual SHA-256 checksums, and `SHA256SUMS`. Maintainers should bump the package
-version, update the lockfile, and review CI before pushing a release tag. No release
-is published merely by running `goodflows` or pushing a regular branch.
+individual SHA-256 checksums, and `SHA256SUMS`, and then pushes each bundled
+reporter to its read-only mirror with the same tag. No release is published merely
+by running `goodflows` or pushing a regular branch.
+
+On a tag push the jobs run in this order, and each stops the release if it fails:
+
+1. `verify-versions`: the CLI and both reporter versions, and the tag, agree.
+2. `mirror-check` (in the `reporter-mirrors` environment): both deploy keys are
+   set, the tag names a commit on `main`, and each mirror's `main` is an ancestor
+   of the new split (`scripts/mirror-reporters.sh <tag> --verify`). Nothing is
+   pushed. `reporters` runs the same reporter drift guard as CI, alongside.
+3. `build` and then `publish` create the GitHub release.
+4. `mirror-reporters` (in the `reporter-mirrors` environment) repeats the checks
+   and pushes each mirror's `main` and tag, only after the release is published,
+   so no mirror ever has a tag without a CLI release. If it fails after publish
+   (for example a network error), fix the cause and use **Re-run failed jobs**:
+   a mirror that was already pushed is up to date, so the re-run only pushes the
+   rest.
+
+Releases are tagged on `main` only. A tag on any other branch fails
+`mirror-check` before anything is built, because the mirrors' `main` could not
+fast-forward to it later. A fix for an older release ships as the next patch
+version from `main`; there are no maintenance-branch releases.
+
+To cut a release:
+
+1. Bump the version in `Cargo.toml` (and run `cargo update -p goodflows` to update
+   `Cargo.lock`), `reporters/exunit/mix.exs` (`@version`) and
+   `reporters/jest/package.json` together. The reporters are versioned in lockstep
+   with the CLI; CI's `release-scripts` job fails on every commit where the three
+   versions disagree, and the Release workflow's `verify-versions` job also fails
+   unless the tag agrees. Check locally with `scripts/verify-versions.sh v<version>`.
+2. Review CI on `main`, including the `reporters` and `release-scripts` jobs.
+3. Make sure the `reporter-mirrors` environment, both mirror deploy keys and the
+   `v*` tag ruleset are configured (below); a tag push fails before building when
+   either secret is missing.
+4. Push the `v<version>` tag from `main` (`git tag v<version> origin/main`, then
+   `git push origin v<version>`).
+
+`scripts/test-release-scripts.sh` (run in CI) tests `verify-versions.sh` and
+`mirror-reporters.sh` against local bare repositories: version drift, a tag
+that does not match, missing keys, first and fast-forward releases, `--verify`
+and `--dry-run`, a mirror edited directly, and tags off `main` or off `HEAD`.
+
+### Reporter mirror deploy keys
+
+The `mirror-reporters` job pushes `reporters/exunit` to
+`agoodway/goodflows-exunit-reporter` and `reporters/jest` to
+`agoodway/goodflows-jest-reporter` (`scripts/mirror-reporters.sh`), after
+`mirror-check` has fetched and checked both. Each mirror has
+its own write-enabled deploy key, whose private half is a secret of the
+`reporter-mirrors` environment in `agoodway/goodflows`. Only `v*` tags may deploy
+to that environment, so no branch, pull request or `workflow_dispatch` run can
+read the keys, and a tag ruleset limits who can create `v*` tags:
+
+| Environment secret | Deploy key on (with write access) |
+|---|---|
+| `EXUNIT_REPORTER_DEPLOY_KEY` | `agoodway/goodflows-exunit-reporter` |
+| `JEST_REPORTER_DEPLOY_KEY` | `agoodway/goodflows-jest-reporter` |
+
+One-time setup, by a repository admin:
+
+1. Create both mirror repositories empty, if they do not exist yet.
+2. Generate one key pair per mirror, without a passphrase:
+
+   ```bash
+   ssh-keygen -t ed25519 -N "" -C "goodflows release: goodflows-exunit-reporter" -f exunit_reporter_deploy_key
+   ssh-keygen -t ed25519 -N "" -C "goodflows release: goodflows-jest-reporter" -f jest_reporter_deploy_key
+   ```
+
+3. In each mirror, open **Settings → Deploy keys → Add deploy key**, paste that
+   mirror's `.pub` file and check **Allow write access**.
+4. In `agoodway/goodflows`, open **Settings → Environments → New environment**,
+   name it `reporter-mirrors` and, under **Deployment branches and tags**, choose
+   **Selected branches and tags** and add a rule with **Ref type: Tag** and name
+   pattern `v*`. Add no other branch or tag rule.
+5. In that environment, under **Environment secrets → Add environment secret**,
+   add each private key file's full contents under the secret name above (or
+   `gh secret set EXUNIT_REPORTER_DEPLOY_KEY --env reporter-mirrors -R
+   agoodway/goodflows < exunit_reporter_deploy_key`, and the same for Jest). If
+   either name exists as a repository secret (**Settings → Secrets and variables
+   → Actions → Repository secrets**), delete it (`gh secret delete
+   EXUNIT_REPORTER_DEPLOY_KEY -R agoodway/goodflows`), so the keys live only in
+   the environment.
+6. Delete the local key files.
+7. Protect release tags: open **Settings → Rules → Rulesets → New ruleset → New
+   tag ruleset**, name it `release tags`, set **Enforcement status** to
+   **Active**, add the target **Include by pattern** `v*`, and enable **Restrict
+   creations**, **Restrict updates**, **Restrict deletions** and **Block force
+   pushes**. Under **Bypass list**, add only the role allowed to cut releases
+   (for example **Repository admin**). Since a `v*` tag is what unlocks the
+   deploy keys, this keeps anyone else from creating one.
+8. Confirm the split without the keys: **Actions → Release → Run workflow** on
+   `main`. The `mirror-dry-run` log prints `source: ... is on origin/main`, each
+   mirror's split SHA and "secret ... is not set; skipping the mirror fetch"
+   (that job never gets the keys), and ends with "dry run: nothing pushed". The
+   keys themselves are checked by `mirror-check` on the first tag push, before
+   anything is built: a missing secret fails it with an error that names each
+   missing secret and links here, and a key without access fails with "cannot
+   reach".
+
+SSH trusts only GitHub's published host keys, pinned in the script. Mirrors are
+read-only: when a mirror's `main` has commits that are not in the new split, the
+release fails instead of overwriting them. To test the script without GitHub,
+point `MIRROR_URL_BASE` at a directory of bare repositories
+(`MIRROR_URL_BASE=/tmp/mirrors/` with
+`/tmp/mirrors/agoodway/goodflows-{exunit,jest}-reporter.git`), as
+`scripts/test-release-scripts.sh` does; `MIRROR_SOURCE_REMOTE` and
+`MIRROR_SOURCE_BRANCH` (default `origin` and `main`) name the branch a tag must be
+on.
 
 To exercise packaging locally, Linux targets need Docker and produce a Debian 12
 binary. macOS targets build natively:

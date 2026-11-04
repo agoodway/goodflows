@@ -29,9 +29,9 @@ Out of scope: goodflows_web (server validator, storage, purging stored rows) and
 
 ## Impact
 
-- Code: `src/reporting/contract.rs` (rewritten as the authoritative schema), `src/reporting/collect.rs` (validation and envelope), `src/config.rs` (`REPORT_FORMAT` and its error text), `src/reporting/replay.rs` (old snapshots are refused through validation).
+- Code: `src/reporting/contract.rs` (rewritten as the authoritative schema), `src/reporting/collect.rs` (validation and envelope), `src/config.rs` (`REPORT_FORMAT`, renamed `REPORT_FAMILY`, and its error text), `src/reporting/replay.rs` (old snapshots are refused through validation).
 - Tests: `tests/common/mod.rs` synthetic report, `tests/reporting.rs`, `tests/inspection.rs`, the unit tests in `collect.rs` and `contract.rs`.
 - New trees: `reporters/exunit/`, `reporters/jest/`, `reporters/fixtures/`.
-- CI: `.github/workflows/ci.yml` gains a reporters job (Elixir and Node). `.github/workflows/release.yml` gains subtree mirror pushes, using one deploy-key secret per mirror.
+- CI: a reusable `.github/workflows/reporters.yml` drift guard (Elixir and Node), called by `.github/workflows/ci.yml` (which also gains a `release-scripts` job) and by `.github/workflows/release.yml`. Release gains a pre-build mirror check and, after publishing, subtree mirror pushes, using one deploy-key secret per mirror held in a tag-only `reporter-mirrors` environment.
 - Docs: README "Test timing reports", plus a README in each reporter (each mirror's README states that it is read-only).
 - Downstream: goodflows_web must adopt `test-timings/1` before a release containing this change can publish successfully. goodcases must switch to the ExUnit mirror. Both are separate changes.

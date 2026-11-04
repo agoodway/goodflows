@@ -90,7 +90,11 @@ Collection SHALL enforce the 32 MiB request limit, 100,000-record report limit a
 ## ADDED Requirements
 
 ### Requirement: Contract violations map to stable structural codes
-Collection SHALL reject a report that breaks the contract with one stable code: `unsupported_format`, `unsupported_event`, `unsupported_field`, `missing_field`, `invalid_field`, `field_too_long`, `invalid_order`, `identity_mismatch`, `invalid_identifier`, `invalid_partition`, `invalid_partition_count`, `unsupported_filter`, `invalid_meta`, `unpaired_event`, `unfinished_mismatch`, `duplicate_key`, `nul_character`, `non_integer_number`, `integer_out_of_range`, `nested_too_deeply`, `malformed_record`, `invalid_utf8`, `empty_report` or `missing_suite_started`. A code that collection already returns for one of these failures SHALL keep that name. Size and count limits SHALL keep `too_large`, `record_limit` and `request_too_large`, which are outside this set. The code SHALL NOT include submitted values. A filter that breaks the filter grammar SHALL be `unsupported_filter`, not `invalid_field`. An absent core key SHALL be `missing_field`. A second started event with an `execution_id` already in use for that kind SHALL be `unpaired_event`.
+Collection SHALL reject a report that breaks the contract with one stable code: `unsupported_format`, `unsupported_event`, `unsupported_field`, `missing_field`, `invalid_field`, `field_too_long`, `invalid_order`, `identity_mismatch`, `invalid_identifier`, `invalid_partition`, `invalid_partition_count`, `unsupported_filter`, `invalid_meta`, `unpaired_event`, `unfinished_mismatch`, `duplicate_key`, `nul_character`, `non_integer_number`, `integer_out_of_range`, `nested_too_deeply`, `malformed_record`, `invalid_utf8`, `empty_report` or `missing_suite_started`. A code that collection already returns for one of these failures SHALL keep that name. Size and count limits SHALL keep `too_large`, `record_limit` and `request_too_large`, which are outside this set. The code SHALL NOT include submitted values. A non-null `filters` that is not an object, lacks an `include` or `exclude` array, has a list over 256 entries, or holds an entry that is not an object or whose `tag` or `value` breaks the filter grammar SHALL be `unsupported_filter`, not `invalid_field`. An unknown key inside `filters` or inside a filter entry SHALL be `unsupported_field`, as for unknown keys in `counts` and `runner`, preserving the code collection already returns. An absent core key SHALL be `missing_field`. A second started event with an `execution_id` already in use for that kind SHALL be `unpaired_event`. Collection SHALL validate each record as its line is decoded, so a report with several faults SHALL get the code of the first faulty line in file order (and, within a record, of the first faulty key in the contract's table order), and the lines after it SHALL NOT be decoded.
+
+#### Scenario: Several faults
+- **WHEN** line 2 of a report has a 5,000-byte `name` and line 3 has a duplicate key
+- **THEN** the report is rejected with `field_too_long`, the code of line 2
 
 #### Scenario: Structured meta value
 - **WHEN** a record's `meta` holds an array value
@@ -120,6 +124,10 @@ Collection SHALL reject a report that breaks the contract with one stable code: 
 - **WHEN** a filter entry's value is not a boolean, its tag is outside the identifier grammar, or either list has 257 entries
 - **THEN** the report is rejected with `unsupported_filter`, no snapshot is written and the raw file is untouched
 
+#### Scenario: Unknown key in filters
+- **WHEN** `filters` is `{"include": [], "exclude": [], "x": 1}`, or a filter entry is `{"tag": "slow", "value": true, "note": "x"}`
+- **THEN** the report is rejected with `unsupported_field`, not `unsupported_filter`, and no snapshot is written
+
 ### Requirement: Snapshots in retired formats are not replayed
 `goodflows reports upload` SHALL re-validate every saved snapshot against the current contract. A snapshot frozen in a retired format, such as `exunit-timings`, MUST NOT be sent: it SHALL be counted as `invalid_snapshot` and the command SHALL exit nonzero. Its file MUST remain intact.
 
@@ -131,4 +139,4 @@ Collection SHALL reject a report that breaks the contract with one stable code: 
 
 ### Requirement: Suite filter tags are boolean identifiers
 **Reason**: The filter grammar moves to `test-timing-contract`, where `filters` is a required nullable core field and `null` is accepted. Leaving this requirement in place would reject every Jest report.
-**Migration**: Enforce "Suite filters are boolean identifier tags" in `test-timing-contract`. A missing `filters` key is `missing_field`. A present value that breaks the grammar is `unsupported_filter`.
+**Migration**: Enforce "Suite filters are boolean identifier tags" in `test-timing-contract`. A missing `filters` key is `missing_field`. A present value that breaks the grammar is `unsupported_filter`, and an unknown key inside `filters` or a filter entry is `unsupported_field`.
