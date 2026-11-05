@@ -74,11 +74,11 @@ The report SHALL show counts of configured jobs by row status: passed, failed, t
 - **THEN** the counts read 2 passed, 1 failed and 1 skipped
 
 ### Requirement: Report details each failed instance
-When any instance failed or timed out, the report SHALL include a Failures section with one entry per such instance, in result order. Each entry SHALL name the instance as `<name>` or `<name> (<index>/<count>)` and show its failed or timed-out status. It SHALL identify the first step with a failed or timed-out `status` when one exists, and show the exit code, command and error only when present. Nonempty job-level stderr and stdout tails SHALL be shown with truncation markers when applicable; these tails MUST NOT be described as exclusively from the failing step. Cancelled and skipped instances MUST NOT get an entry.
+When any instance failed or timed out, the report SHALL include a Failures section with one entry per such instance, in result order. Each entry SHALL name the instance as `<name>` or `<name> (<index>/<count>)` and show its failed or timed-out status. It SHALL identify the first step with a failed or timed-out `status` when one exists, and show the exit code, command and error only when present. Stdout and stderr tails MUST NOT be shown, because text mode already streamed the full output live; they stay in JSON results. Cancelled and skipped instances MUST NOT get an entry.
 
 #### Scenario: Failed partition instances
 - **WHEN** instances 1 and 2 of `test` fail with distinct stderr output
-- **THEN** the Failures section has an entry for `test (1/2)` and one for `test (2/2)`, each with its own stderr tail
+- **THEN** the Failures section has an entry for `test (1/2)` and one for `test (2/2)`, neither repeating that output
 
 #### Scenario: Failed step
 - **WHEN** step `integration` of job `test` fails
@@ -90,7 +90,7 @@ When any instance failed or timed out, the report SHALL include a Failures secti
 
 #### Scenario: Timeout without an exit code
 - **WHEN** an instance times out and has no exit code
-- **THEN** its entry shows timed out and the available command, error and tails without a fabricated exit code
+- **THEN** its entry shows timed out and the available command and error without a fabricated exit code
 
 #### Scenario: Timed-out step
 - **WHEN** step `a` of job `test` passes and step `slow` times out
@@ -140,10 +140,10 @@ When the run used a log directory, the report SHALL show that run's log director
 - **THEN** the report has no history path
 
 ### Requirement: Job-provided text cannot rewrite the terminal
-In text mode, the report and the live failure and step error lines SHALL print control characters other than tab in commands, errors, skip reasons and output tails as visible escapes (for example `\u{1b}` or `\r`), keeping tail line breaks as separate lines. Job names containing control characters MUST fail validation; other job-name rules are unchanged.
+In text mode, the report and the live failure and step error lines SHALL print control characters other than tab in commands, errors and skip reasons as visible escapes (for example `\u{1b}` or `\r`). Job names containing control characters MUST fail validation; other job-name rules are unchanged.
 
-#### Scenario: Escape sequence in a tail
-- **WHEN** a failed job's stderr tail contains `ESC [2J` and a bare carriage return
+#### Scenario: Escape sequence in a command or error
+- **WHEN** a failed job's command contains `ESC [2J` and its error a bare carriage return
 - **THEN** the report shows them as `\u{1b}[2J` and `\r` and writes no raw control characters other than newlines
 
 #### Scenario: Control character in a job name
@@ -151,7 +151,7 @@ In text mode, the report and the live failure and step error lines SHALL print c
 - **THEN** validation fails with an error naming the job and its invalid control characters, while names with spaces or commas stay valid
 
 ### Requirement: Live failure lines stay short in text mode
-In text mode, a failed or timed-out `job_finished` line SHALL show the instance, status, duration, and exit code and error when available, only. The command and output tails MUST NOT be printed there, because the run report shows them. JSON `job_finished` events MUST keep their command and tail fields.
+In text mode, a failed or timed-out `job_finished` line SHALL show the instance, status, duration, and exit code and error when available, only. The command and output tails MUST NOT be printed there; the run report shows the command. JSON `job_finished` events MUST keep their command and tail fields.
 
 #### Scenario: Failure while the run continues
 - **WHEN** `test (1/2)` fails while other jobs are still running, in text mode
@@ -159,7 +159,7 @@ In text mode, a failed or timed-out `job_finished` line SHALL show the instance,
 
 #### Scenario: Timeout while the run continues
 - **WHEN** a job with `timeout_secs = 1` prints `out` and then sleeps past its timeout, in text mode
-- **THEN** its live finished line shows `TIMED OUT` without a command or tail block, and the report's entry shows `stdout tail:` with `out`
+- **THEN** its live finished line shows `TIMED OUT` without a command or tail block, and the report's entry shows no output tail
 
 ### Requirement: JSON summary carries run duration and log directory
 The JSON `summary` event SHALL include integer `duration_ms`, measured immediately before `runner::execute` until summary construction after reporting finishes, integer `execute_ms`, measured from the same start until `runner::execute` returns, and, when a log directory is in use, `log_dir` with that run's log directory as specified by `run-logs`, converted lossily when the path is not valid UTF-8. Without a log directory, `log_dir` MUST be absent. The event SHALL include the optimizer fields specified by `run-history`, including `history_file` only when a history file was written, as the resolved path the run wrote, converted lossily when the path is not valid UTF-8. Each `summary.results` entry SHALL additionally include boolean `started`, true if it entered `run_job` and false if skipped or cancelled before launch; this field MUST NOT be added to live `job_finished` events. Optimizer fields MUST NOT be added to live `job_finished` events. Every existing `summary` field MUST keep its name and meaning, including per-instance counts, except that `log_dir` names the per-run directory.

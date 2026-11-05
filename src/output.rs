@@ -218,7 +218,8 @@ fn render(json: bool, mut event: Value, out: &mut impl Write, err: &mut impl Wri
                 if let Some(error) = result["error"].as_str() {
                     writeln!(out, "  {}", visible(error))?;
                 }
-                // The command and output tails are in the run report's Failures section.
+                // The command is in the run report's Failures section; output
+                // tails are JSON-only, since the output already streamed live.
             }
             "summary" => report::report(&event, out)?,
             "config_valid" => {
