@@ -8,20 +8,18 @@ on:
 permissions:
   contents: read
 
-# Order on a tag push: verify-versions, then mirror-check (with the deploy
-# keys) and the reporters drift guard, then build, then publish, and only after
-# the release is published, mirror-reporters pushes the mirrors. Nothing is
-# published or pushed unless every check passed, and no mirror gets a tag
-# without a CLI release. A workflow_dispatch run builds and runs mirror-dry-run
-# instead, which never sees the deploy keys.
+# Releases the CLI. Order on a tag push: verify-versions, then the reporters
+# drift guard and build, then publish. Nothing is published unless every check
+# passed. A workflow_dispatch run builds without publishing. The reporters are
+# versioned on their own and released by Reporter release, not by this workflow.
 jobs:
-  # The CLI and both reporters ship in lockstep; a tag must name that version.
+  # A tag must name the CLI version in Cargo.toml.
   verify-versions:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v6
-      - name: Verify CLI, reporter and tag versions agree
+      - name: Verify the tag names the CLI version
         env:
           REF_NAME: ${{ github.ref_name }}
           REF_TYPE: ${{ github.ref_type }}
@@ -32,48 +30,14 @@ jobs:
             scripts/verify-versions.sh
           fi
 
-  # Before building anything, check that the mirrors can take this tag: both
-  # deploy keys are set (the error names each missing secret), the tag is on
-  # main, and each mirror's main is an ancestor of the new split. Nothing is
-  # pushed. The deploy keys are
-  # secrets of the reporter-mirrors environment, which only v* tags may deploy
-  # to, so no branch can read them.
-  mirror-check:
-    if: github.event_name == 'push' && github.ref_type == 'tag'
-    needs: verify-versions
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    environment: reporter-mirrors
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-      - name: Check reporter mirror deploy keys
-        env:
-          EXUNIT_REPORTER_DEPLOY_KEY: ${{ secrets.EXUNIT_REPORTER_DEPLOY_KEY }}
-          JEST_REPORTER_DEPLOY_KEY: ${{ secrets.JEST_REPORTER_DEPLOY_KEY }}
-          REF_NAME: ${{ github.ref_name }}
-        run: scripts/mirror-reporters.sh "$REF_NAME" --check-keys
-      - name: Verify the mirrors can take the tag
-        env:
-          EXUNIT_REPORTER_DEPLOY_KEY: ${{ secrets.EXUNIT_REPORTER_DEPLOY_KEY }}
-          JEST_REPORTER_DEPLOY_KEY: ${{ secrets.JEST_REPORTER_DEPLOY_KEY }}
-          REF_NAME: ${{ github.ref_name }}
-        run: scripts/mirror-reporters.sh "$REF_NAME" --verify
-
-  # The same reporter drift guard as CI, so a release never ships reporters
-  # whose output goodflows rejects.
+  # The same reporter drift guard as CI, so a release never ships a CLI that
+  # rejects the published reporters' output.
   reporters:
     needs: verify-versions
     uses: ./.github/workflows/reporters.yml
 
   build:
-    needs: [verify-versions, mirror-check]
-    # mirror-check is skipped on workflow_dispatch; build still needs it to
-    # have passed whenever it ran.
-    if: >-
-      !cancelled() && needs.verify-versions.result == 'success' &&
-      (needs.mirror-check.result == 'success' || needs.mirror-check.result == 'skipped')
+    needs: verify-versions
     strategy:
       fail-fast: false
       matrix:
@@ -119,30 +83,9 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
-  # A workflow_dispatch run is a dry run of the mirror split: it prints the
-  # split SHAs and the source check, and pushes nothing. It gets no deploy
-  # keys, so it does not fetch the mirrors; mirror-check does that on a tag.
-  mirror-dry-run:
-    # mirror-check, which build needs, is skipped on workflow_dispatch, and a
-    # bare `if` would skip this job along with it.
-    if: >-
-      !cancelled() && github.event_name != 'push' &&
-      needs.build.result == 'success' && needs.reporters.result == 'success'
-    needs: [build, reporters]
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-      - name: Split reporter mirrors (dry run)
-        run: |
-          tag="v$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')"
-          scripts/mirror-reporters.sh "$tag" --dry-run
-
   publish:
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-    needs: [build, reporters, mirror-check]
+    needs: [build, reporters]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -162,25 +105,3 @@ jobs:
           cat ./*.sha256 > SHA256SUMS
           sha256sum --check SHA256SUMS
           gh release create "$RELEASE_TAG" ./*.tar.gz ./*.sha256 SHA256SUMS --verify-tag --generate-notes --title "$RELEASE_TAG"
-
-  # Splits each reporter into its read-only mirror with the release tag, only
-  # after the CLI release is published. The script repeats every check before
-  # pushing anything, and main is never forced. SSH trusts only GitHub's pinned
-  # host keys. If this job fails after publish, fix the cause and re-run it
-  # (Re-run failed jobs); the push is idempotent for the same tag.
-  mirror-reporters:
-    if: github.event_name == 'push' && github.ref_type == 'tag'
-    needs: [build, reporters, publish]
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    environment: reporter-mirrors
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-      - name: Split and push reporter mirrors
-        env:
-          EXUNIT_REPORTER_DEPLOY_KEY: ${{ secrets.EXUNIT_REPORTER_DEPLOY_KEY }}
-          JEST_REPORTER_DEPLOY_KEY: ${{ secrets.JEST_REPORTER_DEPLOY_KEY }}
-          REF_NAME: ${{ github.ref_name }}
-        run: scripts/mirror-reporters.sh "$REF_NAME"

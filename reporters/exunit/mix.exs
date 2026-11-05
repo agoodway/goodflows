@@ -1,7 +1,8 @@
 defmodule Goodflows.ExUnitReporter.MixProject do
   use Mix.Project
 
-  # Kept in lockstep with the goodflows CLI version (Cargo.toml).
+  # Versioned on its own, apart from the goodflows CLI; released by tagging
+  # exunit-reporter-v<version> (see docs/releasing.md).
   @version "0.6.0"
 
   def project do

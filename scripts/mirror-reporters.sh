@@ -1,14 +1,18 @@
 #!/usr/bin/env bash
-# Publishes each bundled reporter to its read-only mirror for a release tag.
+# Publishes one bundled reporter to its read-only mirror for its release tag.
 #
 #   scripts/mirror-reporters.sh <tag> [--verify | --dry-run | --check-keys]
 #
-# For each reporter, `git subtree split` produces its history as a standalone
-# branch (deterministic for the same history, so releases fast-forward). Every
-# mirror is checked before anything is pushed: when its `main` exists it must be
-# an ancestor of the new split, so commits made directly in a mirror fail the
-# release instead of being overwritten. Then each mirror receives `main`
-# (never forced) and the tag.
+# The tag names the reporter and its version: `exunit-reporter-v<version>` or
+# `jest-reporter-v<version>`. Each reporter is versioned on its own, apart from
+# the CLI, and its mirror is tagged with the plain `v<version>`.
+#
+# `git subtree split` produces the reporter's history as a standalone branch
+# (deterministic for the same history, so releases fast-forward). The mirror is
+# checked before anything is pushed: when its `main` exists it must be an
+# ancestor of the new split, so commits made directly in the mirror fail the
+# release instead of being overwritten. Then the mirror receives `main` (never
+# forced) and the tag.
 #
 # Releases are cut from main only: the tag must name the checked-out commit,
 # and that commit must be on the source repository's main (fetched from
@@ -23,18 +27,18 @@
 #   --dry-run     print the split SHAs and ancestry results without pushing; a
 #                 mirror is only fetched when its key is set, and the source
 #                 checks only warn.
-#   --check-keys  only check that both deploy keys are set.
+#   --check-keys  only check that the reporter's deploy key is set.
 #
 # Deploy keys come from EXUNIT_REPORTER_DEPLOY_KEY and JEST_REPORTER_DEPLOY_KEY
 # (private keys with write access to one mirror each, stored as secrets of the
 # `reporter-mirrors` environment). A push or --verify fails before splitting
-# anything when either key is missing, naming the missing secrets.
+# anything when the released reporter's key is missing, naming the secret.
 #
 # SSH trusts only GitHub's published host keys (pinned below), never a key
 # learned on first use. MIRROR_URL_BASE (default git@github.com:) replaces the
 # remote prefix, for testing against local repositories, for example
-# MIRROR_URL_BASE=/tmp/mirrors/ with bare repositories at
-# /tmp/mirrors/agoodway/goodflows-{exunit,jest}-reporter.git; keys are then not
+# MIRROR_URL_BASE=/tmp/mirrors/ with a bare repository at
+# /tmp/mirrors/agoodway/goodflows-exunit-reporter.git; keys are then not
 # required. scripts/test-release-scripts.sh tests every mode that way.
 set -euo pipefail
 
@@ -55,11 +59,19 @@ base="${MIRROR_URL_BASE:-$github}"
 source_remote="${MIRROR_SOURCE_REMOTE:-origin}"
 source_branch="${MIRROR_SOURCE_BRANCH:-main}"
 
-# prefix|mirror|deploy key variable
-mirrors=(
-  "reporters/exunit|agoodway/goodflows-exunit-reporter|EXUNIT_REPORTER_DEPLOY_KEY"
-  "reporters/jest|agoodway/goodflows-jest-reporter|JEST_REPORTER_DEPLOY_KEY"
-)
+case "$tag" in
+  exunit-reporter-v[0-9]*)
+    prefix=reporters/exunit mirror=agoodway/goodflows-exunit-reporter var=EXUNIT_REPORTER_DEPLOY_KEY
+    ;;
+  jest-reporter-v[0-9]*)
+    prefix=reporters/jest mirror=agoodway/goodflows-jest-reporter var=JEST_REPORTER_DEPLOY_KEY
+    ;;
+  *)
+    echo "error: $tag is not a reporter release tag (exunit-reporter-v<version> or jest-reporter-v<version>)" >&2
+    exit 2
+    ;;
+esac
+mirror_tag="v${tag#*-reporter-v}"
 
 # Prints an error, as a workflow annotation too when running in GitHub Actions.
 # Inside a dry run's source check (warn_only set) it is a warning instead.
@@ -73,19 +85,12 @@ fail() {
   exit 1
 }
 
-# Pushing to GitHub needs every mirror's deploy key; name each missing secret.
+# Pushing to GitHub needs the mirror's deploy key.
 check_keys() {
-  local missing=() entry prefix mirror var
-  for entry in "${mirrors[@]}"; do
-    IFS='|' read -r prefix mirror var <<<"$entry"
-    [ -n "${!var:-}" ] || missing+=("$var (write access to $mirror)")
-  done
-  if [ "${#missing[@]}" -gt 0 ]; then
-    local list
-    list="$(printf '%s, ' "${missing[@]}")"
-    fail "missing secret(s): ${list%, }. Add a write-enabled deploy key to each mirror and its private half as that secret of the reporter-mirrors environment in agoodway/goodflows. Nothing was pushed."
+  if [ -z "${!var:-}" ]; then
+    fail "missing secret: $var (write access to $mirror). Add a write-enabled deploy key to the mirror and its private half as that secret of the reporter-mirrors environment in agoodway/goodflows. Nothing was pushed."
   fi
-  echo "deploy keys: all set"
+  echo "deploy key: $var is set"
 }
 
 if [ "$mode" = "--check-keys" ]; then
@@ -145,33 +150,28 @@ ssh_for() {
   fi
 }
 
-# Phase 1: split and check every mirror; push nothing yet.
-declare -A splits
-for entry in "${mirrors[@]}"; do
-  IFS='|' read -r prefix mirror var <<<"$entry"
-  name="${prefix##*/}"
-  branch="mirror-split-$name"
-  git branch -D "$branch" >/dev/null 2>&1 || true
-  git subtree split --quiet --prefix "$prefix" -b "$branch" >/dev/null
-  split="$(git rev-parse "$branch")"
-  splits[$name]="$split"
-  echo "$mirror: split $split"
-  ssh="$(ssh_for "$var")"
-  if [ -z "$ssh" ] && [ "$base" = "$github" ]; then
-    if $dry_run; then
-      echo "$mirror: secret $var is not set; skipping the mirror fetch"
-      continue
-    fi
-    fail "secret $var is not set in the reporter-mirrors environment"
+# Split and check the mirror; push nothing yet.
+branch="mirror-split-${prefix##*/}"
+git branch -D "$branch" >/dev/null 2>&1 || true
+git subtree split --quiet --prefix "$prefix" -b "$branch" >/dev/null
+split="$(git rev-parse "$branch")"
+echo "$mirror: split $split for $mirror_tag"
+ssh="$(ssh_for "$var")"
+url="$base$mirror.git"
+if [ -z "$ssh" ] && [ "$base" = "$github" ]; then
+  if $dry_run; then
+    echo "$mirror: secret $var is not set; skipping the mirror fetch"
+    echo "dry run: nothing pushed"
+    exit 0
   fi
-  url="$base$mirror.git"
-  if ! heads="$(GIT_SSH_COMMAND="${ssh:-ssh}" git ls-remote --heads "$url" main)"; then
-    fail "cannot reach $mirror; check that the deploy key in $var is added to that repository with write access"
-  fi
-  if [ -z "$heads" ]; then
-    echo "$mirror: no main yet (first release)"
-    continue
-  fi
+  fail "secret $var is not set in the reporter-mirrors environment"
+fi
+if ! heads="$(GIT_SSH_COMMAND="${ssh:-ssh}" git ls-remote --heads "$url" main)"; then
+  fail "cannot reach $mirror; check that the deploy key in $var is added to that repository with write access"
+fi
+if [ -z "$heads" ]; then
+  echo "$mirror: no main yet (first release)"
+else
   GIT_SSH_COMMAND="${ssh:-ssh}" git fetch --quiet "$url" main
   current="$(git rev-parse FETCH_HEAD)"
   if git merge-base --is-ancestor "$current" "$split"; then
@@ -179,23 +179,16 @@ for entry in "${mirrors[@]}"; do
   else
     fail "$mirror main $current is not an ancestor of the split; it was edited directly"
   fi
-done
+fi
 
 if $dry_run; then
   echo "dry run: nothing pushed"
   exit 0
 fi
 if [ "$mode" = "--verify" ]; then
-  echo "verified: every mirror can take $tag; nothing pushed"
+  echo "verified: $mirror can take $mirror_tag; nothing pushed"
   exit 0
 fi
 
-# Phase 2: every mirror passed its checks, so push.
-for entry in "${mirrors[@]}"; do
-  IFS='|' read -r prefix mirror var <<<"$entry"
-  name="${prefix##*/}"
-  ssh="$(ssh_for "$var")"
-  GIT_SSH_COMMAND="${ssh:-ssh}" git push "$base$mirror.git" \
-    "${splits[$name]}:refs/heads/main" "${splits[$name]}:refs/tags/$tag"
-  echo "$mirror: pushed main and $tag"
-done
+GIT_SSH_COMMAND="${ssh:-ssh}" git push "$url" "$split:refs/heads/main" "$split:refs/tags/$mirror_tag"
+echo "$mirror: pushed main and $mirror_tag"

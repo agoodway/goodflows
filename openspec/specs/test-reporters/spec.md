@@ -174,36 +174,32 @@ The ExUnit reporter SHALL depend only on Elixir's standard library. The Jest rep
 - **WHEN** a project installs the Jest reporter from its git mirror
 - **THEN** no other package is installed and no build script runs
 
-### Requirement: Reporters are distributed through read-only mirrors in lockstep with the CLI
-Each release tag SHALL publish `reporters/exunit` to `agoodway/goodflows-exunit-reporter` and `reporters/jest` to `agoodway/goodflows-jest-reporter`, each with its `main` branch and the same tag. The first release containing the reporters is `v0.6.0`; no earlier tag exists in either mirror. Both reporter package versions MUST equal the CLI version, so a release bumps all three together, and CI MUST fail on any commit where they differ. A release tag push MUST fail before building when either mirror's deploy-key secret is missing, with an error that names each missing secret and points to the setup documentation. The deploy keys SHALL be secrets of a GitHub environment that only `v*` tags may deploy to, and a dry run MUST NOT receive them. Pushes over SSH SHALL trust only GitHub's published host keys. When the workflow ref is a tag, that tag's version MUST equal those package versions, and the tag MUST name a commit on `main`. A mismatch, a tag off `main`, or a mirror whose `main` is not an ancestor of the new split, MUST fail the release before anything is built or pushed. A release SHALL run the reporter drift guard before publishing, and SHALL push the mirrors only after the CLI release is published.
+### Requirement: Reporters are distributed through read-only mirrors, versioned apart from the CLI
+Each reporter SHALL be versioned and released on its own, apart from the CLI and from the other reporter. Tag `exunit-reporter-v<version>` SHALL publish `reporters/exunit` to `agoodway/goodflows-exunit-reporter`, and tag `jest-reporter-v<version>` SHALL publish `reporters/jest` to `agoodway/goodflows-jest-reporter`, each with the mirror's `main` branch and the tag `v<version>`. A CLI release tag (`v<version>`) MUST NOT push either mirror, and a reporter release MUST NOT push the other reporter's mirror. The first release in each mirror is `v0.6.0`; no earlier tag exists in either mirror. A reporter release tag's version MUST equal that reporter's package version (`@version` in `reporters/exunit/mix.exs`, `version` in `reporters/jest/package.json`), and a CLI release tag's version MUST equal the `Cargo.toml` version; the three versions need not agree, and CI MUST fail on any commit where one is missing. A reporter release tag push MUST fail before pushing anything when that mirror's deploy-key secret is missing, with an error that names the missing secret. The deploy keys SHALL be secrets of a GitHub environment that only reporter release tags may deploy to, and a dry run MUST NOT receive them. Pushes over SSH SHALL trust only GitHub's published host keys. The reporter release tag MUST name a commit on `main`. A version mismatch, a tag off `main`, or a mirror whose `main` is not an ancestor of the new split, MUST fail the release before anything is pushed. A reporter release SHALL run the reporter drift guard before pushing, and a CLI release SHALL run it before publishing. Each reporter's README SHALL state the report format it writes and the goodflows versions that accept it, instead of pinning to a goodflows version.
 
-#### Scenario: Release v0.6.0
-- **WHEN** tag `v0.6.0` is pushed and every version is `0.6.0`
-- **THEN** both mirrors receive `main` and tag `v0.6.0` containing only their reporter's files
+#### Scenario: Reporter release
+- **WHEN** tag `jest-reporter-v0.6.1` is pushed and `reporters/jest/package.json` says `0.6.1`
+- **THEN** `agoodway/goodflows-jest-reporter` receives `main` and tag `v0.6.1` containing only the Jest reporter's files, and the ExUnit mirror is not pushed
 
-#### Scenario: Version drift
-- **WHEN** `reporters/jest/package.json` says `0.5.0` and the CLI says `0.6.0`
-- **THEN** the release fails and no mirror is pushed
+#### Scenario: CLI release
+- **WHEN** tag `v0.7.0` is pushed, `Cargo.toml` says `0.7.0` and both reporter packages say `0.6.0`
+- **THEN** the CLI is released and neither mirror is pushed
 
 #### Scenario: Tag does not match the version
-- **WHEN** the release ref is tag `v0.7.0` and the CLI and both reporter packages say `0.6.0`
+- **WHEN** tag `exunit-reporter-v0.7.0` is pushed and `reporters/exunit/mix.exs` says `0.6.0`
 - **THEN** the release fails and no mirror is pushed
 
 #### Scenario: Missing deploy key
-- **WHEN** tag `v0.6.0` is pushed and `JEST_REPORTER_DEPLOY_KEY` is not set
-- **THEN** the release fails before building, the error names `JEST_REPORTER_DEPLOY_KEY` and the README's deploy-key setup, and no mirror is pushed
+- **WHEN** tag `jest-reporter-v0.6.1` is pushed and `JEST_REPORTER_DEPLOY_KEY` is not set
+- **THEN** the release fails before pushing, the error names `JEST_REPORTER_DEPLOY_KEY`, and no mirror is pushed
 
 #### Scenario: Mirror was edited directly
 - **WHEN** a mirror's `main` contains a commit that is not in the new split
 - **THEN** the release fails instead of overwriting it
 
 #### Scenario: Tag not on main
-- **WHEN** tag `v0.6.1` is pushed on a commit that is not on `main`
-- **THEN** the release fails before building, and no mirror is pushed
-
-#### Scenario: Publishing fails
-- **WHEN** the GitHub release cannot be created for tag `v0.6.0`
-- **THEN** neither mirror receives `main` or tag `v0.6.0`
+- **WHEN** tag `jest-reporter-v0.6.1` is pushed on a commit that is not on `main`
+- **THEN** the release fails, and no mirror is pushed
 
 ### Requirement: CI rejects reporter output that fails collection
 CI SHALL run each reporter against a fixture suite that covers passing, failing, skipped and errored tests and nested paths, and, for Jest, separate fixture runs with retries across two projects that run the same files and with bail. CI SHALL collect the output with the CLI built from the same commit, and SHALL fail when any report is rejected, when a fixture does not produce exactly one report, when a report does not end with `suite_finished` with the fixture's expected `aborted`, zero unfinished tests and groups, and the fixture's expected suite counts and group outcomes and counts, or when a reporter prints a "stopped writing" warning. The fixture command's own exit status SHALL be ignored, because the suites fail on purpose. Every fixture SHALL be executed with Jest at its minimum peer version and at the latest version.

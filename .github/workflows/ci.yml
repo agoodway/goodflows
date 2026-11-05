@@ -45,7 +45,7 @@ jobs:
   reporters:
     uses: ./.github/workflows/reporters.yml
 
-  # The release scripts: the CLI and both reporter versions agree on every
+  # The release scripts: the CLI and both reporter versions are set on every
   # commit (no tag needed), and the version, key and mirror checks behave as
   # documented against local bare repositories.
   release-scripts:
@@ -55,7 +55,7 @@ jobs:
       - uses: actions/checkout@v6
       - name: Check script syntax
         run: for script in scripts/*.sh; do bash -n "$script"; done
-      - name: Verify CLI and reporter versions agree
+      - name: Verify CLI and reporter versions are set
         run: scripts/verify-versions.sh
       - name: Test release scripts
         run: scripts/test-release-scripts.sh
