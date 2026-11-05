@@ -1,0 +1,108 @@
+name: Reporter release
+
+on:
+  push:
+    tags: ["exunit-reporter-v[0-9]*", "jest-reporter-v[0-9]*"]
+  workflow_dispatch:
+    inputs:
+      reporter:
+        description: Reporter to dry-run the mirror split for
+        type: choice
+        options: [exunit, jest]
+        required: true
+
+permissions:
+  contents: read
+
+# Releases one reporter to its read-only mirror, apart from the CLI. Order on a
+# tag push: verify-versions, then mirror-check (with the deploy key) and the
+# reporters drift guard, then mirror-reporter pushes the mirror's main and its
+# v<version> tag. Nothing is pushed unless every check passed. A
+# workflow_dispatch run is a dry run of the split, which never sees the deploy
+# keys.
+jobs:
+  # exunit-reporter-v<version> must name reporters/exunit/mix.exs's version,
+  # and jest-reporter-v<version> reporters/jest/package.json's.
+  verify-versions:
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+      - name: Verify the tag names the reporter version
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: scripts/verify-versions.sh "$REF_NAME"
+
+  # Check that the mirror can take this tag: its deploy key is set, the tag is
+  # on main, and the mirror's main is an ancestor of the new split. Nothing is
+  # pushed. The deploy keys are secrets of the reporter-mirrors environment,
+  # which only reporter release tags may deploy to, so no branch can read them.
+  mirror-check:
+    needs: verify-versions
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment: reporter-mirrors
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Check the reporter mirror deploy key
+        env:
+          EXUNIT_REPORTER_DEPLOY_KEY: ${{ secrets.EXUNIT_REPORTER_DEPLOY_KEY }}
+          JEST_REPORTER_DEPLOY_KEY: ${{ secrets.JEST_REPORTER_DEPLOY_KEY }}
+          REF_NAME: ${{ github.ref_name }}
+        run: scripts/mirror-reporters.sh "$REF_NAME" --check-keys
+      - name: Verify the mirror can take the tag
+        env:
+          EXUNIT_REPORTER_DEPLOY_KEY: ${{ secrets.EXUNIT_REPORTER_DEPLOY_KEY }}
+          JEST_REPORTER_DEPLOY_KEY: ${{ secrets.JEST_REPORTER_DEPLOY_KEY }}
+          REF_NAME: ${{ github.ref_name }}
+        run: scripts/mirror-reporters.sh "$REF_NAME" --verify
+
+  # The same reporter drift guard as CI, so a release never ships a reporter
+  # whose output goodflows rejects.
+  reporters:
+    uses: ./.github/workflows/reporters.yml
+
+  # Splits the reporter into its read-only mirror. The script repeats every
+  # check before pushing anything, and main is never forced. SSH trusts only
+  # GitHub's pinned host keys. If this job fails, fix the cause and re-run it
+  # (Re-run failed jobs); the push is idempotent for the same tag.
+  mirror-reporter:
+    needs: [mirror-check, reporters]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment: reporter-mirrors
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Split and push the reporter mirror
+        env:
+          EXUNIT_REPORTER_DEPLOY_KEY: ${{ secrets.EXUNIT_REPORTER_DEPLOY_KEY }}
+          JEST_REPORTER_DEPLOY_KEY: ${{ secrets.JEST_REPORTER_DEPLOY_KEY }}
+          REF_NAME: ${{ github.ref_name }}
+        run: scripts/mirror-reporters.sh "$REF_NAME"
+
+  # A workflow_dispatch run prints the split SHA and the source check for the
+  # chosen reporter, and pushes nothing. It gets no deploy keys, so it does not
+  # fetch the mirror; mirror-check does that on a tag.
+  mirror-dry-run:
+    if: github.event_name == 'workflow_dispatch'
+    needs: reporters
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Split the reporter mirror (dry run)
+        env:
+          REPORTER: ${{ inputs.reporter }}
+        run: |
+          case "$REPORTER" in
+            exunit) version="$(sed -n 's/^  @version "\(.*\)"$/\1/p' reporters/exunit/mix.exs | head -n 1)" ;;
+            jest) version="$(node -p 'require("./reporters/jest/package.json").version')" ;;
+          esac
+          scripts/mirror-reporters.sh "$REPORTER-reporter-v$version" --dry-run

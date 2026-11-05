@@ -327,8 +327,8 @@ retry them:
 goodflows reports upload .goodflows/reports/<run-id>
 ```
 
-Reporters, versioned with goodflows (pin the tag to your goodflows version, v0.6.0
-or later):
+Reporters, versioned on their own (pin the latest tag; every release writes
+`test-timings/1`, which goodflows v0.6.0 and later accept):
 
 - **ExUnit** (Elixir ~> 1.18), from
   [`agoodway/goodflows-exunit-reporter`](https://github.com/agoodway/goodflows-exunit-reporter):
@@ -401,5 +401,5 @@ node --test tests/amp-plugin.test.mjs   # Node 22.18+, after cargo build
 ```
 
 Detailed behavior is specified in [`openspec/specs/`](openspec/specs/). The release
-process, including the version bump across the CLI and both reporters, is in
+processes for the CLI and for each reporter are in
 [docs/releasing.md](docs/releasing.md).

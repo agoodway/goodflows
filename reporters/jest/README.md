@@ -2,7 +2,7 @@
 
 > **Read-only mirror.** This repository is published automatically from
 > [`agoodway/goodflows`](https://github.com/agoodway/goodflows) (`reporters/jest`)
-> on every goodflows release. Do not open pull requests or push here: send
+> on every release of this reporter. Do not open pull requests or push here: send
 > changes to `agoodway/goodflows`. A release fails rather than overwrite commits
 > made directly in this mirror.
 
@@ -14,9 +14,11 @@ TypeScript declarations for its options. It needs Node.js 18 or newer and Jest
 
 ## Install
 
-The reporter is versioned in lockstep with the goodflows CLI and is available
-starting with goodflows v0.6.0, the first release that contains it (there is no
-earlier tag). Pin the tag equal to your goodflows version, v0.6.0 or later:
+The reporter is versioned on its own, apart from the goodflows CLI, and only
+gets a new tag when the reporter itself changes. Every release writes
+`test-timings/1`, which goodflows v0.6.0 and later accept, so any reporter tag
+works with any of those goodflows versions. Pin the latest tag (v0.6.0 is the
+first; there is no earlier tag):
 
 ```json
 {
