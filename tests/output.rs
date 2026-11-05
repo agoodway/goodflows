@@ -235,21 +235,12 @@ command = """printf 'EARLY'; head -c 10000 /dev/zero | tr '\\000' x; printf 'OUT
         &text[live..header].lines().nth(1).unwrap(),
         &"  exited with 7"
     );
-    for label in [
-        "  command: ",
-        "  stdout tail (truncated):\n",
-        "  stderr tail (truncated):\n",
-    ] {
-        assert!(!text[..header].contains(label), "{label}: {text}");
-        assert_eq!(
-            text[failures..].matches(label).count(),
-            1,
-            "{label}: {text}"
-        );
-    }
-    // Tail lines end the tail; the command also mentions these markers.
+    assert!(!text[..header].contains("  command: "), "{text}");
+    assert_eq!(text[failures..].matches("  command: ").count(), 1, "{text}");
+    // Output tails are JSON-only; the text report never repeats output.
+    assert!(!text[header..].contains(" tail"), "{text}");
     for tail in ["OUT-END\n", "ERR-END\n"] {
-        assert_eq!(text[failures..].matches(tail).count(), 1, "{text}");
+        assert!(!text[failures..].contains(tail), "{text}");
     }
 }
 
@@ -558,8 +549,8 @@ fn text_output_names_instances_and_the_summary_counts_them() {
         assert!(text.contains(line), "missing {line:?}: {text}");
     }
     let header = text.find("\ndefault  FAILED  in ").expect("report header");
-    // The live failure block has no tails; the report's Failures entry has them.
-    assert!(!text[..header].contains("stderr tail"), "{text}");
+    // Neither the live failure block nor the report repeats output tails.
+    assert!(!text.contains("stderr tail"), "{text}");
     let report = &text[header..];
     let rows: Vec<_> = report.lines().filter(|l| l.starts_with("  ")).collect();
     assert!(rows[0].starts_with("  FAIL  test "), "{report}");
@@ -570,7 +561,7 @@ fn text_output_names_instances_and_the_summary_counts_them() {
         entry.starts_with("\nFailures\n--- test (2/3)  FAILED  exit 3\n"),
         "{report}"
     );
-    assert!(entry.contains("  stderr tail:\n    boom-2\n"), "{report}");
+    assert!(!entry.contains("boom-2"), "{report}");
     assert!(!entry.contains("test (1/3)") && !entry.contains("test (3/3)"));
     // The report is the last stdout text and ends with the rerun hint.
     assert!(
@@ -901,7 +892,7 @@ fn non_utf8_log_dir_still_gets_a_summary() {
 }
 
 #[test]
-fn timeout_live_line_is_short_and_the_report_has_the_tail() {
+fn timeout_live_line_is_short_and_the_report_has_no_tail() {
     let p = Project::new("[[jobs]]\nname='slow'\ntimeout_secs=1\ncommand='echo out; sleep 5'\n");
     let output = p.run(&[]);
     assert_eq!(output.status.code(), Some(1));
@@ -913,7 +904,7 @@ fn timeout_live_line_is_short_and_the_report_has_the_tail() {
     }
     let report = &text[header..];
     let entry = &report[report.find("\n--- slow  TIMED OUT").expect("entry")..];
-    assert!(entry.contains("  stdout tail:\n    out\n"), "{text}");
+    assert!(!entry.contains("tail"), "{text}");
     assert!(
         text.ends_with("\nRerun failed: goodflows run default --jobs=slow\n"),
         "{text}"

@@ -254,7 +254,8 @@ pub(super) fn report(event: &Value, out: &mut impl Write) -> Result<()> {
     Ok(())
 }
 
-/// One Failures entry for a failed or timed-out instance.
+/// One Failures entry for a failed or timed-out instance. Output tails stay
+/// in JSON results only; text mode already streamed the full output live.
 fn failure(result: &Value, out: &mut impl Write) -> Result<()> {
     let status = if text(result, "status") == "timed_out" {
         "TIMED OUT"
@@ -279,21 +280,6 @@ fn failure(result: &Value, out: &mut impl Write) -> Result<()> {
     }
     if let Some(error) = result["error"].as_str() {
         writeln!(out, "  error: {}", visible(error))?;
-    }
-    // Job-level tails: they can include output from earlier steps.
-    for stream in ["stderr", "stdout"] {
-        let tail = text(result, &format!("{stream}_tail"));
-        if !tail.is_empty() {
-            let truncated = if result[format!("{stream}_truncated")] == true {
-                " (truncated)"
-            } else {
-                ""
-            };
-            writeln!(out, "  {stream} tail{truncated}:")?;
-            for line in tail.lines() {
-                writeln!(out, "    {}", visible(line))?;
-            }
-        }
     }
     Ok(())
 }
@@ -687,10 +673,11 @@ mod tests {
         ]);
         let failures = &report[report.find("\nFailures\n").unwrap()..];
         assert!(
-            failures.starts_with("\nFailures\n--- test (1/2)  FAILED  exit 1\n  command: cargo test\n  error: exited with 1\n  stderr tail:\n    boom-1\n\n--- test (2/2)  FAILED  exit 1\n  command: cargo test\n  error: exited with 1\n  stderr tail (truncated):\n    boom-2\n    more\n\n"),
+            failures.starts_with("\nFailures\n--- test (1/2)  FAILED  exit 1\n  command: cargo test\n  error: exited with 1\n\n--- test (2/2)  FAILED  exit 1\n  command: cargo test\n  error: exited with 1\n\n"),
             "{report}"
         );
-        assert!(!failures.contains("stdout tail"), "{report}");
+        assert!(!failures.contains("tail"), "{report}");
+        assert!(!failures.contains("boom"), "{report}");
         assert!(!failures.contains("other"), "{report}");
 
         // A failed step names the step; its command is the step's.
@@ -741,9 +728,11 @@ mod tests {
         let timeout = with(timeout, "stdout_tail", json!("before"));
         let report = report_of(vec![timeout]);
         assert!(
-            report.contains("--- slow  TIMED OUT\n  command: sleep 5\n  error: timed out after 1s\n  stdout tail:\n    before\n"),
+            report
+                .contains("--- slow  TIMED OUT\n  command: sleep 5\n  error: timed out after 1s\n"),
             "{report}"
         );
+        assert!(!report.contains("before"), "{report}");
         assert!(report.contains("  TIMEOUT  slow  1.0s"), "{report}");
 
         // A timed-out step is the failing step; no exit code is invented.
@@ -772,7 +761,6 @@ mod tests {
             json!("printf '\x1b[2J'"),
         );
         let r = with(r, "error", json!("oops\rhidden"));
-        let r = with(r, "stderr_tail", json!("a\x1b]0;title\x07b\r\nnext\tcol\n"));
         let skip = with(
             result("later", "skipped", true, 0),
             "error",
@@ -783,7 +771,6 @@ mod tests {
         for expected in [
             "  command: printf '\\u{1b}[2J'\n",
             "  error: oops\\rhidden\n",
-            "    a\\u{1b}]0;title\\u{7}b\n    next\tcol\n",
             "  SKIP  later  0ms  reason\\u{1b}[31m\n",
         ] {
             assert!(report.contains(expected), "{expected:?}: {report:?}");

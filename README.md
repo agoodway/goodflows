@@ -258,15 +258,15 @@ default  FAILED  in 207ms
 Failures
 --- test (1/2)  FAILED  exit 1
   command: ./run-tests
-  stderr tail:
-    boom-1
+  error: exited with 1
 ...
 Rerun failed: goodflows run default --jobs='test,deploy'
 ```
 
 For agents and scripts, `--json` prints JSON Lines on stdout. The final `summary`
 event includes `success`, counts per status, and per-job `results`. Failed jobs
-include stdout/stderr tails.
+include stdout/stderr tails, which the text report leaves out because the output
+already streamed live.
 
 ```bash
 goodflows --json > results.jsonl
