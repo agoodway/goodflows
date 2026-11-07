@@ -160,6 +160,7 @@ fn job(name: &str, command: &str, deps: &[&str]) -> Job {
     Job {
         name: name.into(),
         command: Some(command.into()),
+        workflow: None,
         condition: None,
         steps: Vec::new(),
         outputs: Default::default(),

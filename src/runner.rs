@@ -8,7 +8,9 @@ use anyhow::{bail, Context, Result};
 use serde::Serialize;
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, HashMap};
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -40,6 +42,12 @@ pub struct JobResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub partition: Option<Partition>,
     pub command: Option<String>,
+    /// A workflow-call job's target workflow, even when the call was skipped.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workflow: Option<String>,
+    /// The child invocation's run id, once the call activated one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub child_run_id: Option<String>,
     pub status: Status,
     pub duration_ms: u128,
     pub exit_code: Option<i32>,
@@ -62,8 +70,8 @@ pub struct JobResult {
     /// Projected only into the run summary, never into live events.
     #[serde(skip)]
     pub started: bool,
-    /// From the start of `execute` until every dependency passed, or until an
-    /// earlier skip or cancel. Summary and history only.
+    /// From the start of this invocation's `execute` until every dependency
+    /// passed, or until an earlier skip or cancel. Summary and history only.
     #[serde(skip)]
     pub blocked_ms: u64,
     /// After `blocked_ms`, the wait for a slot until launch, skip or cancel.
@@ -139,6 +147,8 @@ impl JobResult {
             name: job.name.clone(),
             partition,
             command: job.command.clone(),
+            workflow: job.workflow.clone(),
+            child_run_id: None,
             status,
             duration_ms: 0,
             exit_code: None,
@@ -216,8 +226,10 @@ impl CommandResult {
 type DependencyOutputs = BTreeMap<String, Map<String, Value>>;
 
 pub struct Options {
-    pub parallelism: usize,
-    pub fail_fast: bool,
+    /// This invocation's capacity and fail-fast scope in the run tree.
+    pub scope: Arc<Scope>,
+    /// Starts a call job's child invocation; `None` when no job calls a workflow.
+    pub calls: Option<Activate>,
     pub workdir: PathBuf,
     pub log_dir: Option<PathBuf>,
     pub output: Output,
@@ -282,6 +294,172 @@ impl ReportingEnv {
     }
 }
 
+/// A call job's request to run its target workflow as a child invocation.
+pub struct Activation {
+    pub target: String,
+    pub caller_job: String,
+    /// The caller's scope, under which the child's scope nests.
+    pub scope: Arc<Scope>,
+}
+
+/// How a child invocation ended, for its call job's result.
+pub struct ChildEnd {
+    /// Set once the child's identity was allocated.
+    pub run_id: Option<String>,
+    pub status: Status,
+    pub error: Option<String>,
+}
+
+/// Runs a child invocation to completion, including its reporting and summary.
+pub type Activate =
+    Arc<dyn Fn(Activation) -> Pin<Box<dyn Future<Output = ChildEnd> + Send>> + Send + Sync>;
+
+/// State shared by every invocation of one run: the lock that makes a launch
+/// check every containing limit at once, a counter bumped whenever capacity
+/// frees, and the one RSS sampler.
+pub struct Tree {
+    lock: Mutex<()>,
+    released: watch::Sender<u64>,
+    rss: Arc<RssMonitor>,
+    _rss_task: RssTask,
+}
+
+/// One invocation's place in the run tree: its parallelism limit over the
+/// command/step instances (and call-condition shells) executing in its
+/// subtree, and its fail-fast policy.
+pub struct Scope {
+    tree: Arc<Tree>,
+    parent: Option<Arc<Scope>>,
+    limit: usize,
+    fail_fast: bool,
+    /// Admitted units holding a slot in this subtree. A slot frees only
+    /// after the scheduler records the unit's result.
+    now: AtomicUsize,
+    /// Units executing in this subtree (inside `run_job`, or a call's shell
+    /// condition while it runs) and their high water mark, `max_in_flight`.
+    inside: AtomicUsize,
+    max: AtomicUsize,
+    /// A unit in this subtree failed or timed out.
+    failed: AtomicBool,
+}
+
+impl Scope {
+    /// The root invocation's scope, which starts the run's RSS sampler.
+    pub fn root(limit: usize, fail_fast: bool) -> Arc<Self> {
+        let (rss, rss_task) = RssMonitor::start();
+        let tree = Arc::new(Tree {
+            lock: Mutex::new(()),
+            released: watch::channel(0).0,
+            rss,
+            _rss_task: rss_task,
+        });
+        Arc::new(Self::new(tree, None, limit, fail_fast))
+    }
+
+    /// A child invocation's scope, nested in its caller's.
+    pub fn child(parent: &Arc<Self>, limit: usize, fail_fast: bool) -> Arc<Self> {
+        Arc::new(Self::new(
+            parent.tree.clone(),
+            Some(parent.clone()),
+            limit,
+            fail_fast,
+        ))
+    }
+
+    fn new(tree: Arc<Tree>, parent: Option<Arc<Self>>, limit: usize, fail_fast: bool) -> Self {
+        Self {
+            tree,
+            parent,
+            limit,
+            fail_fast,
+            now: AtomicUsize::new(0),
+            inside: AtomicUsize::new(0),
+            max: AtomicUsize::new(0),
+            failed: AtomicBool::new(false),
+        }
+    }
+
+    /// This scope and every containing scope up to the root.
+    fn chain(&self) -> impl Iterator<Item = &Self> {
+        std::iter::successors(Some(self), |scope| scope.parent.as_deref())
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.tree.lock.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Admit one executable unit if this scope and every containing scope
+    /// have a free slot. The slot is held until the returned guard drops.
+    fn try_acquire(self: &Arc<Self>) -> Option<Slot> {
+        let _lock = self.lock();
+        if self
+            .chain()
+            .any(|scope| scope.now.load(Ordering::SeqCst) >= scope.limit)
+        {
+            return None;
+        }
+        for scope in self.chain() {
+            scope.now.fetch_add(1, Ordering::SeqCst);
+        }
+        Some(Slot(self.clone()))
+    }
+
+    /// Count one executing unit in this scope and every containing scope
+    /// until the guard drops, even if the unit panics. Separate from the
+    /// slot, which outlives execution until the result is recorded.
+    fn enter(self: &Arc<Self>) -> Inside {
+        for scope in self.chain() {
+            let inside = scope.inside.fetch_add(1, Ordering::SeqCst) + 1;
+            scope.max.fetch_max(inside, Ordering::SeqCst);
+        }
+        Inside(self.clone())
+    }
+
+    /// Record a failure in this invocation and every containing one.
+    fn fail(&self) {
+        for scope in self.chain() {
+            scope.failed.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// Whether an enabled fail-fast policy of this or a containing
+    /// invocation stops new work here.
+    pub fn stopped(&self) -> bool {
+        self.chain()
+            .any(|scope| scope.fail_fast && scope.failed.load(Ordering::SeqCst))
+    }
+}
+
+/// One admitted executable unit. Dropping it frees the slot in every
+/// containing scope and wakes invocations waiting for capacity.
+struct Slot(Arc<Scope>);
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        let lock = self.0.lock();
+        for scope in self.0.chain() {
+            scope.now.fetch_sub(1, Ordering::SeqCst);
+        }
+        drop(lock);
+        self.0.tree.released.send_modify(|n| *n = n.wrapping_add(1));
+    }
+}
+
+/// One executing unit, counted for `max_in_flight` until dropped.
+struct Inside(Arc<Scope>);
+
+impl Drop for Inside {
+    fn drop(&mut self) {
+        for scope in self.0.chain() {
+            scope.inside.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+}
+
+fn failed(result: &JobResult) -> bool {
+    matches!(result.status, Status::Failed | Status::TimedOut)
+}
+
 /// Per-invocation state shared by every job task.
 struct Shared {
     workdir: PathBuf,
@@ -306,10 +484,34 @@ async fn record(
     Ok(())
 }
 
+/// Record a started unit's result. A failure stops this and every
+/// containing invocation whose fail-fast policy is enabled before the
+/// unit's slot frees, so an invocation waiting for that capacity sees the
+/// failure before it can launch. An invocation with free slots re-checks
+/// `Scope::stopped` before each launch, so only a launch racing that check
+/// can still start. Marking the failure here rather than in the unit's task
+/// keeps dependents of the failed unit on the dependency reason.
+async fn finish(
+    scope: &Scope,
+    results: &mut [Option<JobResult>],
+    index: usize,
+    result: JobResult,
+    slot: Option<Slot>,
+    output: &Output,
+) -> Result<()> {
+    if failed(&result) {
+        scope.fail();
+    }
+    record(results, index, result, output).await?;
+    drop(slot);
+    Ok(())
+}
+
 /// The scheduler's results plus run-level measurements.
 pub struct Execution {
     pub results: Vec<JobResult>,
-    /// The most units inside `run_job` at once.
+    /// The most executable units (command/step instances and call-condition
+    /// shells) at once in this invocation's subtree; waiting calls never count.
     pub max_in_flight: usize,
 }
 
@@ -352,16 +554,36 @@ pub async fn execute(
     for (index, unit) in units.iter().enumerate() {
         job_units[unit.job].push(index);
     }
+    // Jobs whose dependencies reach a workflow call, directly or through
+    // other jobs. Only these take a dependency skip before fail-fast
+    // regardless of listing order; other jobs keep the configuration-order
+    // behavior of configs without calls.
+    let mut reaches_call = vec![false; jobs.len()];
+    loop {
+        let mut changed = false;
+        for job in 0..jobs.len() {
+            if !reaches_call[job]
+                && deps[job]
+                    .iter()
+                    .any(|&d| jobs[d].workflow.is_some() || reaches_call[d])
+            {
+                reaches_call[job] = true;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
     let mut results: Vec<Option<JobResult>> = vec![None; units.len()];
     let mut started = vec![false; units.len()];
     // When each unit's dependencies were all satisfied, and its waits at launch.
     let mut ready_at: Vec<Option<Instant>> = vec![None; units.len()];
     let mut launch_waits = vec![(0, 0); units.len()];
-    let in_flight = Arc::new(InFlight::default());
     let mut running = JoinSet::new();
-    let mut failed = false;
-    // One sampler for the whole run; it stops when this guard drops.
-    let (rss, _rss_task) = RssMonitor::start();
+    let scope = &options.scope;
+    // Bumped whenever any invocation of the run frees a slot.
+    let mut released = scope.tree.released.subscribe();
     let shared = Arc::new(Shared {
         workdir: options.workdir.clone(),
         log_dir: options.log_dir.clone(),
@@ -369,16 +591,16 @@ pub async fn execute(
         reporting: options.reporting.clone(),
         environment: options.environment.clone(),
         settings_env: options.settings_env.clone(),
-        rss,
+        // One sampler serves the whole run tree.
+        rss: scope.tree.rss.clone(),
     });
 
     loop {
         // Consume completed jobs before deciding whether to launch queued work.
         while let Some(completed) = running.try_join_next() {
-            let (index, mut result): (usize, JobResult) = completed?;
+            let (index, mut result, slot): (usize, JobResult, Option<Slot>) = completed?;
             (result.blocked_ms, result.queued_ms) = launch_waits[index];
-            failed |= matches!(result.status, Status::Failed | Status::TimedOut);
-            record(&mut results, index, result, &options.output).await?;
+            finish(scope, &mut results, index, result, slot, &options.output).await?;
         }
         // Whether every dependency of each configured job passed. Only the
         // skips recorded below change results before the launch loop, and a
@@ -402,50 +624,89 @@ pub async fn execute(
                 ready_at[index] = Some(now);
             }
         }
-        let cancelled = cancel.borrow().is_some();
-        // Repeat so transitive skips propagate even when configs are not topologically ordered.
+        // Jobs that wait, directly or through unfinished jobs, on a started
+        // call without a result. A child failure stops this invocation before
+        // the call fails, so these keep the dependency reason once it does.
+        // Skips below never record a call, so one computation per pass serves.
+        let mut calling: Vec<bool> = vec![false; jobs.len()];
         loop {
             let mut changed = false;
-            for (index, unit) in units.iter().enumerate() {
-                if started[index] || results[index].is_some() {
+            for job in 0..jobs.len() {
+                if calling[job] {
                     continue;
                 }
-                let job = &jobs[unit.job];
-                let dependency = |d: usize| dependency_state(&results, &job_units[d]);
-                let blocked = deps[unit.job]
-                    .iter()
-                    .any(|&d| dependency(d) == Dependency::Blocked);
-                // A dependency job with a non-passing unit but unfinished siblings
-                // blocks only once they finish, so the dependency reason is stable.
-                let settling = deps[unit.job]
-                    .iter()
-                    .any(|&d| dependency(d) == Dependency::Settling);
-                let reason = if cancelled {
-                    Some((Status::Cancelled, "cancelled by signal"))
-                } else if blocked {
-                    Some((Status::Skipped, "dependency did not pass"))
-                } else if settling {
-                    None
-                } else if options.fail_fast && failed {
-                    Some((Status::Skipped, "fail_fast: previous job failed"))
-                } else {
-                    None
-                };
-                if let Some((status, error)) = reason {
-                    let mut result =
-                        JobResult::new(job, unit.partition, status, Some(error.into()));
-                    (result.blocked_ms, result.queued_ms) =
-                        waits(run_start, ready_at[index], Instant::now());
-                    record(&mut results, index, result, &options.output).await?;
-                    changed = true;
-                }
+                calling[job] = deps[job].iter().any(|&d| {
+                    let unfinished = job_units[d].iter().any(|&u| results[u].is_none());
+                    let running_call = jobs[d].workflow.is_some() && started[job_units[d][0]];
+                    unfinished && (running_call || calling[d])
+                });
+                changed |= calling[job];
             }
             if !changed {
                 break;
             }
         }
+        let cancelled = cancel.borrow().is_some();
+        // A failure anywhere in a containing invocation with fail-fast enabled.
+        let stopped = scope.stopped();
+        // Repeat so transitive skips propagate even when configs are not
+        // topologically ordered. The first phase holds back the fail-fast skip
+        // of jobs that reach a call, so a failed call's dependency skips reach
+        // them first; the second phase applies it to what remains.
+        for defer_calls in [true, false] {
+            loop {
+                let mut changed = false;
+                for (index, unit) in units.iter().enumerate() {
+                    if started[index] || results[index].is_some() {
+                        continue;
+                    }
+                    let job = &jobs[unit.job];
+                    let dependency = |d: usize| dependency_state(&results, &job_units[d]);
+                    let blocked = deps[unit.job]
+                        .iter()
+                        .any(|&d| dependency(d) == Dependency::Blocked);
+                    // A dependency job with a non-passing unit but unfinished siblings
+                    // blocks only once they finish, so the dependency reason is stable.
+                    let settling = deps[unit.job]
+                        .iter()
+                        .any(|&d| dependency(d) == Dependency::Settling);
+                    let reason = if cancelled {
+                        Some((Status::Cancelled, "cancelled by signal"))
+                    } else if blocked {
+                        Some((Status::Skipped, "dependency did not pass"))
+                    } else if settling || calling[unit.job] {
+                        None
+                    // Only call-reaching jobs are deferred. Other jobs keep the
+                    // configuration-order fail-fast skip on purpose, so configs
+                    // without calls behave exactly as before calls existed.
+                    } else if stopped && !(defer_calls && reaches_call[unit.job]) {
+                        Some((Status::Skipped, "fail_fast: previous job failed"))
+                    } else {
+                        None
+                    };
+                    if let Some((status, error)) = reason {
+                        let mut result =
+                            JobResult::new(job, unit.partition, status, Some(error.into()));
+                        (result.blocked_ms, result.queued_ms) =
+                            waits(run_start, ready_at[index], Instant::now());
+                        record(&mut results, index, result, &options.output).await?;
+                        changed = true;
+                    }
+                }
+                if !changed {
+                    break;
+                }
+            }
+        }
+        // Capacity freed after this point wakes the wait below.
+        released.borrow_and_update();
+        // Set once a ready unit found no free slot: later executable units
+        // wait behind it, keeping configuration and partition launch order.
+        let mut waiting = false;
         for (index, unit) in units.iter().copied().enumerate() {
-            if running.len() >= options.parallelism || cancel.borrow().is_some() {
+            // Another invocation can stop this one after the snapshot above;
+            // the next pass skips what remains.
+            if cancel.borrow().is_some() || scope.stopped() {
                 break;
             }
             if started[index] || results[index].is_some() {
@@ -454,16 +715,38 @@ pub async fn execute(
             if !deps_passed[unit.job] {
                 continue;
             }
+            let job = &jobs[unit.job];
+            // A waiting call holds no slot; only its own shell condition does,
+            // while that shell runs.
+            let needs_slot = job.workflow.is_none()
+                || matches!(
+                    job.condition,
+                    Some(Condition::LegacyShell(_) | Condition::Shell { .. })
+                );
+            let slot = if needs_slot {
+                if waiting {
+                    continue;
+                }
+                match scope.try_acquire() {
+                    Some(slot) => Some(slot),
+                    None => {
+                        waiting = true;
+                        continue;
+                    }
+                }
+            } else {
+                None
+            };
             started[index] = true;
             launch_waits[index] = waits(run_start, ready_at[index], Instant::now());
-            let job = jobs[unit.job].clone();
+            let job = job.clone();
             let shared = shared.clone();
             let cancel = cancel.clone();
-            // Validation forbids output references to partitioned jobs, so only
-            // single-unit dependencies publish outputs.
+            // Validation forbids output references to partitioned and call
+            // jobs, so only single-unit command and step dependencies publish outputs.
             let needs = deps[unit.job]
                 .iter()
-                .filter(|&&d| jobs[d].partitions.is_none())
+                .filter(|&&d| jobs[d].partitions.is_none() && jobs[d].workflow.is_none())
                 .map(|&d| {
                     let result = results[job_units[d][0]]
                         .as_ref()
@@ -471,19 +754,30 @@ pub async fn execute(
                     (result.name.clone(), result.outputs.clone())
                 })
                 .collect();
-            let in_flight = in_flight.clone();
+            let scope = scope.clone();
+            let calls = options.calls.clone();
             running.spawn(async move {
-                let _inside = in_flight.enter();
-                let result = run_job(unit.job, unit.partition, &job, &shared, cancel, needs).await;
-                (index, result)
+                // The slot returns with the result, so it frees only after
+                // the scheduler records the result and any failure.
+                let (result, slot) = if job.workflow.is_some() {
+                    run_call(unit.job, &job, &shared, cancel, needs, slot, calls, &scope).await
+                } else {
+                    let inside = scope.enter();
+                    let result =
+                        run_job(unit.job, unit.partition, &job, &shared, cancel, needs).await;
+                    drop(inside);
+                    (result, slot)
+                };
+                (index, result, slot)
             });
         }
         if results.iter().all(Option::is_some) {
             break;
         }
-        if running.is_empty() {
-            // Cancellation can arrive during the launch loop; classify pending work next iteration.
-            if cancel.borrow().is_some() {
+        if running.is_empty() && !waiting {
+            // Cancellation or another invocation's failure can arrive during
+            // the launch loop; classify pending work next iteration.
+            if cancel.borrow().is_some() || scope.stopped() {
                 continue;
             }
             anyhow::bail!("no runnable jobs remain");
@@ -491,43 +785,19 @@ pub async fn execute(
         tokio::select! {
             biased;
             changed = cancel.changed(), if !cancelled => { changed.context("signal monitor stopped")?; }
-            completed = running.join_next() => {
-                let (index, mut result) = completed.context("job scheduler stopped")??;
+            completed = running.join_next(), if !running.is_empty() => {
+                let (index, mut result, slot) = completed.context("job scheduler stopped")??;
                 (result.blocked_ms, result.queued_ms) = launch_waits[index];
-                failed |= matches!(result.status, Status::Failed | Status::TimedOut);
-                record(&mut results, index, result, &options.output).await?;
+                finish(scope, &mut results, index, result, slot, &options.output).await?;
             }
+            // Another invocation freed a slot (the sender lives as long as `scope`).
+            _ = released.changed(), if waiting => {}
         }
     }
     Ok(Execution {
         results: results.into_iter().flatten().collect(),
-        max_in_flight: in_flight.max.load(Ordering::SeqCst),
+        max_in_flight: scope.max.load(Ordering::SeqCst),
     })
-}
-
-/// Units currently inside `run_job` and their high water mark. A finished
-/// task the scheduler has not joined yet no longer counts.
-#[derive(Default)]
-struct InFlight {
-    now: AtomicUsize,
-    max: AtomicUsize,
-}
-
-impl InFlight {
-    /// Count one unit in until the guard drops, even if `run_job` panics.
-    fn enter(&self) -> InFlightGuard<'_> {
-        let now = self.now.fetch_add(1, Ordering::SeqCst) + 1;
-        self.max.fetch_max(now, Ordering::SeqCst);
-        InFlightGuard(self)
-    }
-}
-
-struct InFlightGuard<'a>(&'a InFlight);
-
-impl Drop for InFlightGuard<'_> {
-    fn drop(&mut self) {
-        self.0.now.fetch_sub(1, Ordering::SeqCst);
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -577,6 +847,157 @@ fn apply_profile(env: &mut HashMap<String, String>, name: Option<&str>) {
     }
 }
 
+/// The stdout and stderr log files of one unit, when logs are enabled.
+async fn open_logs(
+    log_dir: Option<&Path>,
+    index: usize,
+    job: &Job,
+    partition: Option<Partition>,
+) -> Result<[Option<tokio::fs::File>; 2]> {
+    let safe_name: String = job
+        .name
+        .chars()
+        .take(60)
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    // `index` is the job's position in the selected job list, so instance logs sort together.
+    let stem = match partition {
+        Some(partition) => format!("{:03}-{safe_name}.p{:02}", index + 1, partition.index),
+        None => format!("{:03}-{safe_name}", index + 1),
+    };
+    Ok([
+        open_log(log_dir, &format!("{stem}.stdout.log")).await?,
+        open_log(log_dir, &format!("{stem}.stderr.log")).await?,
+    ])
+}
+
+/// The environment a job's conditions and expressions see, before step env
+/// and reserved reporting values: the caller's environment, this
+/// invocation's settings env and job env, scrubbed, with partition and
+/// profile identity.
+fn job_env(shared: &Shared, job: &Job, partition: Option<Partition>) -> HashMap<String, String> {
+    // The caller's GOODFLOWS_OUTPUT belongs to an enclosing command; drop it so
+    // expressions never observe it. Commands get their own file (or none).
+    let mut env: HashMap<String, String> = std::env::vars_os()
+        .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
+        .filter(|(key, _)| key != config::OUTPUT_ENV)
+        .chain(shared.settings_env.clone())
+        .chain(job.env.clone())
+        .collect();
+    // Expressions read this map, so the token must be gone before any evaluation.
+    shared.reporting.scrub(&mut env);
+    // Partition identity is visible to conditions, expressions and every
+    // command; unpartitioned jobs never see values inherited by the CLI.
+    let [index_key, count_key] = config::PARTITION_ENV;
+    match partition {
+        Some(partition) => {
+            env.insert(index_key.into(), partition.index.to_string());
+            env.insert(count_key.into(), partition.count.to_string());
+        }
+        None => {
+            env.remove(index_key);
+            env.remove(count_key);
+        }
+    }
+    apply_profile(&mut env, shared.environment.as_deref());
+    env
+}
+
+/// A workflow-call job: its own condition (a shell condition holds `slot`
+/// only while it runs), then the child invocation, whose outcome becomes the
+/// call's status. `duration_ms` covers both, never the dependency wait. The
+/// slot is returned when the call ends without activating a child.
+#[allow(clippy::too_many_arguments)]
+async fn run_call(
+    index: usize,
+    job: &Job,
+    shared: &Shared,
+    cancel: watch::Receiver<Option<i32>>,
+    needs: DependencyOutputs,
+    mut slot: Option<Slot>,
+    calls: Option<Activate>,
+    scope: &Arc<Scope>,
+) -> (JobResult, Option<Slot>) {
+    let start = Instant::now();
+    let target = job.workflow.clone().expect("a call job names a workflow");
+    let mut result = JobResult::new(job, None, Status::Passed, None);
+    result.started = true;
+    let spawned = AtomicBool::new(false);
+    let commands = Mutex::new(Vec::new());
+    // Only a shell condition, which holds a slot, executes a unit.
+    let inside = slot.as_ref().map(|_| scope.enter());
+    let condition: Result<CommandResult> = async {
+        shared
+            .output
+            .emit(json!({"type":"job_started", "name":job.name}))
+            .await?;
+        // Only a shell condition spawns a process, so only it writes logs.
+        let logs = match slot {
+            Some(_) => open_logs(shared.log_dir.as_deref(), index, job, None).await?,
+            None => [None, None],
+        };
+        let env = job_env(shared, job, None);
+        let mut execution = JobExecution {
+            job,
+            workdir: &shared.workdir,
+            output: &shared.output,
+            cancel: cancel.clone(),
+            tails: Arc::new(Mutex::new(Tails::default())),
+            logs,
+            needs,
+            reporting: &shared.reporting,
+            partition: None,
+            environment: shared.environment.clone(),
+            spawned: &spawned,
+            commands: &commands,
+            deadline: None,
+            rss: shared.rss.clone(),
+        };
+        execution
+            .condition(job.condition.as_ref(), &env, &[], None)
+            .await
+    }
+    .await;
+    drop(inside);
+    result.commands = commands.into_inner().expect("command cost mutex poisoned");
+    match condition {
+        Err(error) => result.finish(CommandResult::failed(error)),
+        Ok(condition) if condition.status != Status::Passed => result.finish(condition),
+        Ok(_) if cancel.borrow().is_some() => result.finish(CommandResult::new(
+            Status::Cancelled,
+            Some("cancelled by signal".into()),
+        )),
+        // A failure elsewhere in an enclosing fail-fast invocation during
+        // the condition stops new work, so no child starts.
+        Ok(_) if scope.stopped() => result.finish(CommandResult::new(
+            Status::Skipped,
+            Some("fail_fast: previous job failed".into()),
+        )),
+        Ok(_) => {
+            let activate = calls.expect("call jobs run only when the root selection has calls");
+            // The condition shell's slot frees before the child starts.
+            drop(slot.take());
+            let end = activate(Activation {
+                target,
+                caller_job: job.name.clone(),
+                scope: scope.clone(),
+            })
+            .await;
+            result.child_run_id = end.run_id;
+            result.status = end.status;
+            result.error = end.error;
+        }
+    }
+    result.duration_ms = start.elapsed().as_millis();
+    (result, slot)
+}
+
 async fn run_job(
     index: usize,
     partition: Option<Partition>,
@@ -595,27 +1016,7 @@ async fn run_job(
     let spawned = AtomicBool::new(false);
     let commands = Mutex::new(Vec::new());
     let execution: Result<()> = async {
-        let safe_name: String = job
-            .name
-            .chars()
-            .take(60)
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect();
-        // `index` is the job's position in the selected job list, so instance logs sort together.
-        let stem = match partition {
-            Some(partition) => format!("{:03}-{safe_name}.p{:02}", index + 1, partition.index),
-            None => format!("{:03}-{safe_name}", index + 1),
-        };
-        let logs = [
-            open_log(log_dir, &format!("{stem}.stdout.log")).await?,
-            open_log(log_dir, &format!("{stem}.stderr.log")).await?,
-        ];
+        let logs = open_logs(log_dir, index, job, partition).await?;
         let mut execution = JobExecution {
             job,
             workdir,
@@ -640,30 +1041,7 @@ async fn run_job(
                 json!({"type":"job_started", "name":job.name}),
             ))
             .await?;
-        // The caller's GOODFLOWS_OUTPUT belongs to an enclosing command; drop it so
-        // expressions never observe it. Commands get their own file (or none).
-        let mut env: HashMap<String, String> = std::env::vars_os()
-            .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
-            .filter(|(key, _)| key != config::OUTPUT_ENV)
-            .chain(shared.settings_env.clone())
-            .chain(job.env.clone())
-            .collect();
-        // Expressions read this map, so the token must be gone before any evaluation.
-        reporting.scrub(&mut env);
-        // Partition identity is visible to conditions, expressions and every
-        // command; unpartitioned jobs never see values inherited by the CLI.
-        let [index_key, count_key] = config::PARTITION_ENV;
-        match partition {
-            Some(partition) => {
-                env.insert(index_key.into(), partition.index.to_string());
-                env.insert(count_key.into(), partition.count.to_string());
-            }
-            None => {
-                env.remove(index_key);
-                env.remove(count_key);
-            }
-        }
-        apply_profile(&mut env, shared.environment.as_deref());
+        let env = job_env(shared, job, partition);
         let condition = execution
             .condition(job.condition.as_ref(), &env, &[], None)
             .await?;
@@ -1559,17 +1937,66 @@ async fn drain<R: AsyncRead + Unpin>(
 mod tests {
     use super::*;
 
-    #[test]
-    fn in_flight_counts_only_units_inside_run_job() {
-        let in_flight = InFlight::default();
-        let first = in_flight.enter();
-        let second = in_flight.enter();
+    #[tokio::test]
+    async fn slots_count_only_admitted_units() {
+        let root = Scope::root(2, true);
+        let first = root.try_acquire().unwrap();
+        let second = root.try_acquire().unwrap();
+        assert!(root.try_acquire().is_none());
         drop(first);
-        // A finished unit no longer counts, even before it is joined.
-        let third = in_flight.enter();
-        assert_eq!(in_flight.max.load(Ordering::SeqCst), 2);
+        // A dropped slot no longer counts. The scheduler drops a unit's slot
+        // only after recording its result, so until then the unit counts.
+        let third = root.try_acquire().unwrap();
+        assert_eq!(root.now.load(Ordering::SeqCst), 2);
+        // Holding a slot is not executing: `max_in_flight` is unaffected.
+        assert_eq!(root.max.load(Ordering::SeqCst), 0);
         drop((second, third));
-        assert_eq!(in_flight.now.load(Ordering::SeqCst), 0);
+        assert_eq!(root.now.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn in_flight_counts_only_units_inside_run_job() {
+        let root = Scope::root(4, true);
+        let child = Scope::child(&root, 4, true);
+        let first = child.enter();
+        let second = root.enter();
+        drop(first);
+        // A unit that left `run_job` no longer counts, even before its
+        // result is recorded and its slot frees.
+        let third = child.enter();
+        assert_eq!(root.max.load(Ordering::SeqCst), 2);
+        assert_eq!(child.max.load(Ordering::SeqCst), 1);
+        drop((second, third));
+        assert_eq!(root.inside.load(Ordering::SeqCst), 0);
+        assert_eq!(child.inside.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn child_slots_count_against_every_containing_scope() {
+        let root = Scope::root(3, false);
+        let child = Scope::child(&root, 1, true);
+        let grandchild = Scope::child(&child, 4, false);
+        let a = grandchild.try_acquire().unwrap();
+        // The child's limit of one caps its whole subtree.
+        assert!(child.try_acquire().is_none());
+        assert!(grandchild.try_acquire().is_none());
+        // Siblings still share the root's remaining slots.
+        let b = root.try_acquire().unwrap();
+        let c = root.try_acquire().unwrap();
+        assert!(root.try_acquire().is_none());
+        assert_eq!(
+            [&root, &child, &grandchild].map(|s| s.now.load(Ordering::SeqCst)),
+            [3, 1, 1]
+        );
+        drop((a, b, c));
+        assert_eq!(root.now.load(Ordering::SeqCst), 0);
+        // Failures reach every containing scope; only enabled policies stop work.
+        grandchild.fail();
+        assert!(root.failed.load(Ordering::SeqCst));
+        assert!(grandchild.stopped() && child.stopped());
+        assert!(!root.stopped());
+        let sibling = Scope::child(&root, 1, true);
+        assert!(!sibling.stopped());
     }
 
     #[test]

@@ -88,6 +88,18 @@ struct GraphJob<'a> {
     shell: bool,
     condition: Option<GraphCondition<'a>>,
     steps: Vec<GraphStep<'a>>,
+    /// Workflow-call jobs only, after every existing field, so documents
+    /// without calls keep their bytes and hashes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    call: Option<GraphCall<'a>>,
+}
+
+/// A call's target and that workflow's complete canonical jobs under the
+/// selected profile, recursively.
+#[derive(Serialize)]
+struct GraphCall<'a> {
+    workflow: &'a str,
+    jobs: Vec<GraphJob<'a>>,
 }
 
 #[derive(Serialize)]
@@ -121,34 +133,44 @@ impl<'a> GraphCondition<'a> {
 }
 
 /// Lowercase hex SHA-256 of the canonical selected-job document. Covers only
-/// the graph shape and commands, never env values or paths.
-pub fn graph_sha256(jobs: &[Job]) -> String {
+/// the graph shape and commands, never env values, paths or run identities.
+/// `targets` resolves a called workflow to its complete jobs under the
+/// selected profile; it is never asked for a workflow nothing calls.
+pub fn graph_sha256<'a>(jobs: &'a [Job], targets: &dyn Fn(&str) -> &'a [Job]) -> String {
     let document = GraphDocument {
-        jobs: jobs
-            .iter()
-            .map(|job| GraphJob {
-                name: &job.name,
-                command: job.command.as_deref(),
-                depends_on: &job.depends_on,
-                partitions: job.partitions,
-                timeout_secs: job.timeout_secs,
-                shell: job.shell,
-                condition: GraphCondition::of(job.condition.as_ref()),
-                steps: job
-                    .steps
-                    .iter()
-                    .map(|step| GraphStep {
-                        id: &step.id,
-                        command: &step.command,
-                        shell: step.shell,
-                        condition: GraphCondition::of(step.condition.as_ref()),
-                    })
-                    .collect(),
-            })
-            .collect(),
+        jobs: graph_jobs(jobs, targets),
     };
     let bytes = serde_json::to_vec(&document).expect("graph document serializes");
     format!("{:x}", Sha256::digest(bytes))
+}
+
+fn graph_jobs<'a>(jobs: &'a [Job], targets: &dyn Fn(&str) -> &'a [Job]) -> Vec<GraphJob<'a>> {
+    jobs.iter()
+        .map(|job| GraphJob {
+            name: &job.name,
+            command: job.command.as_deref(),
+            depends_on: &job.depends_on,
+            partitions: job.partitions,
+            timeout_secs: job.timeout_secs,
+            shell: job.shell,
+            condition: GraphCondition::of(job.condition.as_ref()),
+            steps: job
+                .steps
+                .iter()
+                .map(|step| GraphStep {
+                    id: &step.id,
+                    command: &step.command,
+                    shell: step.shell,
+                    condition: GraphCondition::of(step.condition.as_ref()),
+                })
+                .collect(),
+            // A call's condition never removes its target from the graph.
+            call: job.workflow.as_deref().map(|workflow| GraphCall {
+                workflow,
+                jobs: graph_jobs(targets(workflow), targets),
+            }),
+        })
+        .collect()
 }
 
 /// Run-level fields shared by the history file and the `summary` event.
@@ -174,6 +196,11 @@ struct Record<'a> {
     #[serde(skip_serializing_if = "<[_]>::is_empty")]
     requested_jobs: &'a [String],
     run_id: &'a str,
+    /// A child invocation's parent run and the call job that started it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parent_run_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    caller_job: Option<&'a str>,
     started_at: &'a str,
     outcome: &'a str,
     duration_ms: u64,
@@ -211,6 +238,11 @@ struct Instance<'a> {
     name: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     partition: Option<Partition>,
+    /// A workflow-call job's target and, once activated, its child run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    workflow: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    child_run_id: Option<&'a str>,
     status: Status,
     exit_code: Option<i32>,
     command: Option<String>,
@@ -310,8 +342,11 @@ pub struct HistoryTarget<'a> {
     pub workflow: &'a str,
     /// The selected `--env` profile, if any.
     pub environment: Option<&'a str>,
-    /// `--jobs` as given; empty when every job was selected.
+    /// `--jobs` as given; empty when every job was selected and for a child
+    /// invocation, which always runs its complete workflow.
     pub requested_jobs: &'a [String],
+    /// A child invocation's parent run id and caller job.
+    pub parent: Option<(&'a str, &'a str)>,
     /// Source context captured before jobs ran.
     pub source: Option<&'a Source>,
     pub stem: &'a str,
@@ -343,6 +378,8 @@ pub fn write(
         environment: target.environment,
         requested_jobs: target.requested_jobs,
         run_id: &fields.run_id,
+        parent_run_id: target.parent.map(|(run_id, _)| run_id),
+        caller_job: target.parent.map(|(_, job)| job),
         started_at: &fields.started_at,
         outcome: fields.outcome,
         duration_ms,
@@ -356,6 +393,8 @@ pub fn write(
             .map(|result| Instance {
                 name: &result.name,
                 partition: result.partition,
+                workflow: result.workflow.as_deref(),
+                child_run_id: result.child_run_id.as_deref(),
                 status: result.status,
                 exit_code: result.exit_code,
                 command: result.command.as_deref().map(truncate),
@@ -487,7 +526,7 @@ mod tests {
     fn hash(source: &str) -> String {
         let mut config: crate::config::Config = toml::from_str(source).unwrap();
         config.validate().unwrap();
-        graph_sha256(&config.jobs)
+        graph_sha256(&config.jobs, &|_| unreachable!("no workflow calls"))
     }
 
     const GRAPH: &str = "[[jobs]]\nname = 'build'\ncommand = 'make'\nenv = { A = '1' }\n\
@@ -535,6 +574,7 @@ mod tests {
                 timeout_secs: None,
                 shell: true,
                 condition: None,
+                call: None,
                 steps: vec![GraphStep {
                     id: "s",
                     command: "c",
@@ -569,6 +609,43 @@ mod tests {
             assert_ne!(changed, GRAPH, "{from}");
             assert_ne!(hash(&changed), base, "{from} -> {to}");
         }
+    }
+
+    #[test]
+    fn a_call_appends_its_target_graph_after_the_existing_fields() {
+        let mut config: crate::config::Config = toml::from_str(
+            "[[workflows.ci.jobs]]\nname = 'call'\nworkflow = 'suite'\ndepends_on = ['prep']\n\
+             condition = { expression = 'true' }\n\
+             [[workflows.ci.jobs]]\nname = 'prep'\ncommand = 'make'\n\
+             [[workflows.suite.jobs]]\nname = 't'\ncommand = 'true'\n",
+        )
+        .unwrap();
+        config.validate().unwrap();
+        let (_, ci) = config.workflow(Some("ci"), None).unwrap();
+        let (_, suite) = config.workflow(Some("suite"), None).unwrap();
+        let targets = |_: &str| suite.jobs.as_slice();
+        let document = GraphDocument {
+            jobs: graph_jobs(&ci.jobs, &targets),
+        };
+        assert_eq!(
+            serde_json::to_string(&document).unwrap(),
+            r#"{"jobs":[{"name":"call","command":null,"depends_on":["prep"],"partitions":null,"timeout_secs":null,"shell":true,"condition":{"kind":"expression","text":"true"},"steps":[],"call":{"workflow":"suite","jobs":[{"name":"t","command":"true","depends_on":[],"partitions":null,"timeout_secs":null,"shell":true,"condition":null,"steps":[]}]}},{"name":"prep","command":"make","depends_on":[],"partitions":null,"timeout_secs":null,"shell":true,"condition":null,"steps":[]}]}"#
+        );
+        // Without the call object the bytes are the existing canonical form.
+        let plain = graph_sha256(&suite.jobs, &|_| unreachable!("no workflow calls"));
+        let document = GraphDocument {
+            jobs: graph_jobs(&suite.jobs, &|_| unreachable!("no workflow calls")),
+        };
+        assert_eq!(
+            plain,
+            format!(
+                "{:x}",
+                Sha256::digest(
+                    br#"{"jobs":[{"name":"t","command":"true","depends_on":[],"partitions":null,"timeout_secs":null,"shell":true,"condition":null,"steps":[]}]}"#
+                )
+            )
+        );
+        assert!(!serde_json::to_string(&document).unwrap().contains("call"));
     }
 
     #[test]
