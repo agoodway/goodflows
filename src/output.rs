@@ -18,11 +18,20 @@ struct Request {
     done: oneshot::Sender<std::result::Result<(), String>>,
 }
 
+/// The owning invocation of a run that calls workflows, and for a child
+/// invocation its parent run and caller job.
+#[derive(Clone)]
+struct Invocation {
+    id: String,
+    parent: Option<(String, String)>,
+}
+
 #[derive(Clone)]
 pub struct Output {
     pub json: bool,
     workflow: Option<String>,
     environment: Option<String>,
+    invocation: Option<Invocation>,
     sender: mpsc::Sender<Request>,
     cancel: watch::Receiver<Option<i32>>,
     suppressed: Arc<AtomicBool>,
@@ -52,6 +61,7 @@ impl Output {
             json,
             workflow: None,
             environment: None,
+            invocation: None,
             sender,
             cancel,
             suppressed: Arc::new(AtomicBool::new(false)),
@@ -61,6 +71,17 @@ impl Output {
     pub fn with_workflow(&self, name: &str) -> Self {
         let mut output = self.clone();
         output.workflow = Some(name.into());
+        output
+    }
+
+    /// Tag every event with its owning invocation. Used only when the run
+    /// calls workflows, so runs without calls keep their event shapes.
+    pub fn with_invocation(&self, id: &str, parent: Option<(&str, &str)>) -> Self {
+        let mut output = self.clone();
+        output.invocation = Some(Invocation {
+            id: id.into(),
+            parent: parent.map(|(run_id, job)| (run_id.into(), job.into())),
+        });
         output
     }
 
@@ -94,6 +115,13 @@ impl Output {
         }
         if let Some(environment) = &self.environment {
             event["environment"] = json!(environment);
+        }
+        if let Some(invocation) = &self.invocation {
+            event["invocation_id"] = json!(invocation.id);
+            if let Some((run_id, job)) = &invocation.parent {
+                event["parent_run_id"] = json!(run_id);
+                event["caller_job"] = json!(job);
+            }
         }
         if self.suppressed.load(Ordering::Relaxed) {
             return Ok(());
@@ -161,21 +189,27 @@ fn render(json: bool, mut event: Value, out: &mut impl Write, err: &mut impl Wri
         match event["type"].as_str().unwrap_or_default() {
             "run_started" => writeln!(
                 out,
-                "goodflows  parallelism={}  fail_fast={}  jobs={}\nworkflow: {}\nworkdir: {}",
+                "goodflows  parallelism={}  fail_fast={}  jobs={}\nworkflow: {}{}\nworkdir: {}",
                 event["parallelism"],
                 event["fail_fast"],
                 event["jobs"],
-                text(&event, "workflow"),
+                invocation_label(&event),
+                caller(&event),
                 text(&event, "workdir")
             )?,
-            "job_started" => writeln!(out, "→ {}", instance(&event).cyan())?,
-            "step_started" => writeln!(out, "  → {}/{}", instance(&event), text(&event, "step"))?,
+            "job_started" => writeln!(out, "→ {}", label(&event, &event).cyan())?,
+            "step_started" => writeln!(
+                out,
+                "  → {}/{}",
+                label(&event, &event),
+                text(&event, "step")
+            )?,
             "step_finished" => {
                 let result = &event["result"];
                 writeln!(
                     out,
                     "  {}/{} {}  {}ms",
-                    instance(&event),
+                    label(&event, &event),
                     text(result, "id"),
                     text(result, "status").to_uppercase(),
                     result["duration_ms"]
@@ -187,8 +221,8 @@ fn render(json: bool, mut event: Value, out: &mut impl Write, err: &mut impl Wri
             "job_output" => {
                 let data = text(&event, "data");
                 let name = match event["step"].as_str() {
-                    Some(step) => format!("{}/{step}", instance(&event)),
-                    None => instance(&event),
+                    Some(step) => format!("{}/{step}", label(&event, &event)),
+                    None => label(&event, &event),
                 };
                 write!(out, "[{} {}] {}", name, text(&event, "stream"), data)?;
                 if !data.ends_with('\n') {
@@ -197,7 +231,7 @@ fn render(json: bool, mut event: Value, out: &mut impl Write, err: &mut impl Wri
             }
             "job_finished" => {
                 let result = &event["result"];
-                let label = match text(result, "status") {
+                let status = match text(result, "status") {
                     "passed" => "PASSED".green(),
                     "skipped" => "SKIPPED".yellow(),
                     "cancelled" => "CANCELLED".yellow(),
@@ -207,8 +241,8 @@ fn render(json: bool, mut event: Value, out: &mut impl Write, err: &mut impl Wri
                 write!(
                     out,
                     "{} {}  {}ms",
-                    instance(result),
-                    label,
+                    label(&event, result),
+                    status,
                     result["duration_ms"]
                 )?;
                 if let Some(code) = result["exit_code"].as_i64() {
@@ -257,6 +291,14 @@ fn render(json: bool, mut event: Value, out: &mut impl Write, err: &mut impl Wri
                     }
                 )?;
                 writeln!(out, "  selected: {}", names(&event["selected_jobs"]))?;
+                for call in event["calls"].as_array().into_iter().flatten() {
+                    writeln!(
+                        out,
+                        "  call: {} -> workflow {}",
+                        visible(text(call, "job")),
+                        visible(text(call, "workflow"))
+                    )?;
+                }
             }
             "jobs" => {
                 writeln!(out, "Workflow: {}", text(&event, "workflow"))?;
@@ -297,7 +339,10 @@ fn render(json: bool, mut event: Value, out: &mut impl Write, err: &mut impl Wri
                         } else {
                             deps.join(", ")
                         },
-                        text(job, "command")
+                        match job["workflow"].as_str() {
+                            Some(target) => format!("workflow: {}", visible(target)),
+                            None => text(job, "command").to_owned(),
+                        }
                     )?;
                     let timeout = job["timeout_secs"]
                         .as_u64()
@@ -465,6 +510,46 @@ fn names(value: &Value) -> String {
         .filter_map(Value::as_str)
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// A short distinguisher for an invocation id: its first 8 hex digits.
+fn short_id(id: &str) -> &str {
+    id.get(..8).unwrap_or(id)
+}
+
+/// The event's workflow, with a short invocation distinguisher when the run
+/// calls workflows.
+fn invocation_label(event: &Value) -> String {
+    let workflow = visible(text(event, "workflow")).into_owned();
+    match event["invocation_id"].as_str() {
+        Some(id) => format!("{workflow} [{}]", visible(short_id(id))),
+        None => workflow,
+    }
+}
+
+/// `  called by <job> in run <id>` for a child invocation's event.
+fn caller(event: &Value) -> String {
+    match (
+        event["caller_job"].as_str(),
+        event["parent_run_id"].as_str(),
+    ) {
+        (Some(job), Some(run)) => format!(
+            "  called by {} in run {}",
+            visible(job),
+            visible(short_id(run))
+        ),
+        _ => String::new(),
+    }
+}
+
+/// A live line's job label: the [`instance`] of `value`, prefixed with the
+/// owning workflow and invocation when the run calls workflows, so the same
+/// job in two invocations stays distinguishable.
+fn label(event: &Value, value: &Value) -> String {
+    match event["invocation_id"].as_str() {
+        Some(_) => format!("{} {}", invocation_label(event), instance(value)),
+        None => instance(value),
+    }
 }
 
 /// A job's display name: `name`, or `name (i/N)` for a partition instance.

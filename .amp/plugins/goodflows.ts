@@ -7,12 +7,20 @@ type Event = Record<string, unknown>
 type Execution = {
   exitCode: number | null
   summary?: Event
+  // Bounded copies of the non-passing jobs of called workflow runs, whose
+  // summaries carry `parent_run_id`, and how many more were dropped.
+  called: { run: Event, job: Event }[]
+  calledOmitted: number
   workflows?: Event
   error: string
 }
 
 const diagnosticLimit = 60_000
 const lineLimit = 1_048_576
+// Called-run failures retained, and the characters kept of each field, so many
+// large child summaries cannot grow memory beyond what diagnostics can send.
+const calledLimit = 200
+const fieldLimit = 4096
 
 function bounded(text: string, limit = diagnosticLimit): string {
   return text.length <= limit ? text : `${text.slice(0, limit)}\n[diagnostics truncated]`
@@ -23,12 +31,13 @@ function quote(value: string): string {
 }
 
 // Ignore streamed job output: GoodFlows's summary already contains bounded failure
-// tails. Retain at most one summary/discovery event and a small error excerpt.
+// tails. Retain at most one root summary/discovery event, bounded failures of called
+// workflow runs, and a small error excerpt.
 function execute(args: string[], cwd: string, signal: AbortSignal): Promise<Execution> {
   return new Promise((resolve, reject) => {
     signal.throwIfAborted()
     const child = spawn('goodflows', args, { cwd, stdio: ['ignore', 'pipe', 'pipe'] })
-    const result: Execution = { exitCode: null, error: '' }
+    const result: Execution = { exitCode: null, called: [], calledOmitted: 0, error: '' }
     let pending = ''
     let dropping = false
     let stderr = ''
@@ -39,6 +48,15 @@ function execute(args: string[], cwd: string, signal: AbortSignal): Promise<Exec
         const event = JSON.parse(line)
         if (!event || event.schema_version !== 1 || typeof event.type !== 'string') {
           error('Unsupported or invalid GoodFlows JSON event.')
+        } else if (event.type === 'summary' && event.parent_run_id !== undefined) {
+          // A called workflow run's own summary; the root summary has no parent and comes last.
+          const run = Object.fromEntries(['workflow', 'run_id', 'caller_job', 'parent_run_id']
+            .map((key) => [key, scalar(event[key])]))
+          for (const job of Array.isArray(event.results) ? event.results : []) {
+            if (!job || typeof job !== 'object' || job.status === 'passed') continue
+            if (result.called.length < calledLimit) result.called.push({ run, job: project(job) })
+            else result.calledOmitted++
+          }
         } else if (event.type === 'summary' || event.type === 'workflows') {
           if (result[event.type as 'summary' | 'workflows']) error(`Duplicate ${event.type} event.`)
           result[event.type as 'summary' | 'workflows'] = event
@@ -85,6 +103,26 @@ function execute(args: string[], cwd: string, signal: AbortSignal): Promise<Exec
   })
 }
 
+// A bounded string, a number, or null: objects, arrays and other values become null.
+function scalar(value: unknown, keep = (text: string) => text.slice(0, fieldLimit)): string | number | null {
+  if (typeof value === 'string') return keep(value)
+  return typeof value === 'number' ? value : null
+}
+
+// Only the fields `diagnostics` reads, each bounded; trimmed tails stay marked truncated.
+function project(job: Event): Event {
+  const head = (value: unknown) => scalar(value)
+  const tail = (value: unknown) => scalar(value, (text) => text.slice(-fieldLimit))
+  const trimmed = (value: unknown) => typeof value === 'string' && value.length > fieldLimit
+  return {
+    name: head(job.name), status: head(job.status), exit_code: head(job.exit_code),
+    command: head(job.command), error: head(job.error),
+    stdout_tail: tail(job.stdout_tail), stderr_tail: tail(job.stderr_tail),
+    stdout_truncated: Boolean(job.stdout_truncated) || trimmed(job.stdout_tail),
+    stderr_truncated: Boolean(job.stderr_truncated) || trimmed(job.stderr_tail),
+  }
+}
+
 function check(result: Execution): void {
   if (result.exitCode !== 0 || result.error) {
     throw new Error(`GoodFlows exited ${result.exitCode ?? 'without an exit code'}.${result.error}`)
@@ -93,9 +131,15 @@ function check(result: Execution): void {
 
 function diagnostics(summary: Event, result: Execution): string {
   const { results, ...counts } = summary
-  const failures = (results as Event[]).filter((job) => job.status !== 'passed')
+  // Non-passing jobs of the root run, then of each called workflow run, labelled
+  // with that run so the agent can see which called job failed.
+  const failures = [
+    ...(results as Event[]).filter((job) => job.status !== 'passed').map((job) => ({ job, run: undefined as Event | undefined })),
+    ...result.called,
+  ]
   // Reserve metadata before logs so an early noisy job cannot hide later failures.
-  const metadata = failures.map((job) => ({
+  const metadata = failures.map(({ job, run }) => ({
+    ...(run ? { called_run: run } : {}),
     name: job.name, status: job.status, exit_code: job.exit_code,
     command: bounded(String(job.command ?? ''), 2048),
     error: job.error == null ? null : bounded(String(job.error), 1024),
@@ -108,10 +152,11 @@ function diagnostics(summary: Event, result: Execution): string {
     while (start < text.length && JSON.stringify(text.slice(start)).length > streamBudget) start++
     return text.slice(start)
   }
-  const logs = failures.map((job) => {
+  const logs = failures.map(({ job, run }) => {
     const stdout = tail(job.stdout_tail)
     const stderr = tail(job.stderr_tail)
     return {
+      ...(run ? { called_run: run } : {}),
       name: job.name,
       stdout_tail: stdout, stderr_tail: stderr,
       excerpts_truncated: Boolean(job.stdout_truncated || job.stderr_truncated ||
@@ -120,7 +165,11 @@ function diagnostics(summary: Event, result: Execution): string {
     }
   })
   return [
-    bounded(JSON.stringify({ ...counts, exit_code: result.exitCode, error: result.error, results: metadata }, null, 2), 30_000),
+    bounded(JSON.stringify({
+      ...counts, exit_code: result.exitCode, error: result.error,
+      ...(result.calledOmitted ? { called_failures_omitted: result.calledOmitted } : {}),
+      results: metadata,
+    }, null, 2), 30_000),
     'Failure log excerpts (JSON):',
     bounded(JSON.stringify(logs, null, 2), 28_000),
   ].join('\n\n')

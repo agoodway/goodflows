@@ -1056,6 +1056,85 @@ fn a_ready_job_skipped_by_fail_fast_keeps_its_queue_wait() {
 }
 
 #[test]
+fn a_plain_chain_listed_before_its_prerequisites_keeps_the_fail_fast_reason() {
+    // Without workflow calls, skips follow configuration order: `p3` is
+    // visited while `p2` is still pending, so fail-fast skips it first.
+    let p = Project::new(
+        "[settings]\nparallelism = 1\nfail_fast = true\n\
+         [[jobs]]\nname='p3'\ncommand='touch p3'\ndepends_on=['p2']\n\
+         [[jobs]]\nname='a'\ncommand='exit 1'\n\
+         [[jobs]]\nname='p1'\ncommand='touch p1'\ndepends_on=['a']\n\
+         [[jobs]]\nname='p2'\ncommand='touch p2'\ndepends_on=['p1']\n",
+    );
+    let output = p.run(&["--json", "--no-history"]);
+    assert_eq!(output.status.code(), Some(1));
+    let summary = summary_of(&output);
+    let reasons: Vec<_> = summary["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| (r["name"].as_str().unwrap(), r["error"].as_str().unwrap()))
+        .collect();
+    assert_eq!(
+        reasons,
+        [
+            ("p3", "fail_fast: previous job failed"),
+            ("a", "exited with 1"),
+            ("p1", "dependency did not pass"),
+            ("p2", "dependency did not pass"),
+        ],
+        "{summary}"
+    );
+    let output = p.run(&["--no-history"]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        stdout(&output).ends_with("Rerun failed: goodflows run default --jobs='a,p1,p2'\n"),
+        "{}",
+        stdout(&output)
+    );
+    for absent in ["p1", "p2", "p3"] {
+        assert!(!p.dir.join(absent).exists(), "{absent}");
+    }
+}
+
+#[test]
+fn a_dependent_of_a_failed_job_keeps_the_dependency_reason_under_fail_fast() {
+    // The failure must not stop the dependent before the failed result is
+    // recorded. The window is narrow, so repeat it on concurrent threads.
+    let config = "[settings]\nparallelism = 1\nfail_fast = true\n\
+         [[jobs]]\nname='a'\ncommand='exit 1'\n\
+         [[jobs]]\nname='b'\ncommand='touch b'\ndepends_on=['a']\n\
+         [[jobs]]\nname='c'\ncommand='touch c'\n";
+    let threads: Vec<_> = (0..8)
+        .map(|_| {
+            std::thread::spawn(move || {
+                let p = Project::new(config);
+                for _ in 0..30 {
+                    let output = p.run(&["--json", "--no-history"]);
+                    assert_eq!(output.status.code(), Some(1));
+                    let summary = summary_of(&output);
+                    let reason = |name: &str| {
+                        summary["results"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .find(|r| r["name"] == name)
+                            .unwrap()["error"]
+                            .clone()
+                    };
+                    assert_eq!(reason("b"), "dependency did not pass", "{summary}");
+                    assert_eq!(reason("c"), "fail_fast: previous job failed", "{summary}");
+                }
+                assert!(!p.dir.join("b").exists() && !p.dir.join("c").exists());
+            })
+        })
+        .collect();
+    for thread in threads {
+        thread.join().unwrap();
+    }
+}
+
+#[test]
 fn workflow_log_runs_isolate_workflows() {
     let p = Project::new(
         "[workflows.ci.settings]\nlog_runs = 2\n\
@@ -1099,4 +1178,536 @@ fn a_log_prune_failure_warns_and_keeps_the_exit_code() {
     assert!(old.exists());
     assert_eq!(run_dirs(&p.dir.join("logs")).len(), 2);
     assert!(summary_of(&output)["log_dir"].is_string());
+}
+
+// ---- workflow-call capacity and failure policy ----
+
+/// A command that records its start and end in `trace` around `sleep`.
+fn traced(label: &str, sleep: &str) -> String {
+    format!("echo + {label} >> trace; sleep {sleep}; echo - {label} >> trace")
+}
+
+/// The most traced commands running at once whose label starts with `prefix`.
+fn peak(p: &Project, prefix: &str) -> usize {
+    let (mut now, mut max) = (0usize, 0);
+    for line in p.read("trace").lines() {
+        let (sign, label) = line.split_once(' ').unwrap();
+        if !label.starts_with(prefix) {
+            continue;
+        }
+        if sign == "+" {
+            now += 1;
+            max = max.max(now);
+        } else {
+            now -= 1;
+        }
+    }
+    max
+}
+
+fn summaries(output: &std::process::Output) -> Vec<serde_json::Value> {
+    events(output)
+        .into_iter()
+        .filter(|e| e["type"] == "summary")
+        .collect()
+}
+
+#[test]
+fn nested_calls_complete_with_a_single_slot() {
+    let p = Project::new(&format!(
+        r#"
+[settings]
+parallelism = 1
+[[workflows.ci.jobs]]
+name = "call"
+workflow = "suite"
+[[workflows.ci.jobs]]
+name = "root"
+command = "{}"
+[[workflows.suite.jobs]]
+name = "nested"
+workflow = "leaf"
+[[workflows.suite.jobs]]
+name = "cmd"
+command = "{}"
+[[workflows.leaf.jobs]]
+name = "cmd"
+command = "{}"
+"#,
+        traced("root", "0.05"),
+        traced("suite", "0.05"),
+        traced("leaf", "0.05")
+    ));
+    let output = p.run(&["run", "ci", "--json"]);
+    success(&output);
+    assert_eq!(peak(&p, ""), 1);
+    assert_eq!(p.read("trace").lines().count(), 6);
+    // Waiting calls never count: every invocation saw one unit at most.
+    for summary in summaries(&output) {
+        assert_eq!(summary["max_in_flight"], 1, "{summary}");
+    }
+}
+
+#[test]
+fn sibling_calls_share_the_root_ceiling() {
+    let suite: String = (0..3)
+        .map(|i| {
+            format!(
+                "[[workflows.suite.jobs]]\nname='s{i}'\ncommand='{}'\n",
+                traced("s", "0.2")
+            )
+        })
+        .collect();
+    let p = Project::new(&format!(
+        "[settings]\nparallelism = 3\n\
+         [[workflows.ci.jobs]]\nname='a'\nworkflow='suite'\n\
+         [[workflows.ci.jobs]]\nname='b'\nworkflow='suite'\n\
+         [[workflows.ci.jobs]]\nname='root'\ncommand='{}'\n{suite}",
+        traced("r", "0.2")
+    ));
+    let output = p.run(&["run", "ci", "--json"]);
+    success(&output);
+    assert_eq!(peak(&p, ""), 3);
+    let summaries = summaries(&output);
+    assert_eq!(summaries.last().unwrap()["max_in_flight"], 3);
+    assert!(summaries
+        .iter()
+        .all(|s| s["max_in_flight"].as_u64().unwrap() <= 3));
+}
+
+#[test]
+fn a_lower_child_limit_caps_its_subtree_only() {
+    let suite: String = (0..3)
+        .map(|i| {
+            format!(
+                "[[workflows.suite.jobs]]\nname='s{i}'\ncommand='{}'\n",
+                traced("child", "0.15")
+            )
+        })
+        .collect();
+    let root: String = (0..3)
+        .map(|i| {
+            format!(
+                "[[workflows.ci.jobs]]\nname='r{i}'\ncommand='{}'\n",
+                traced("root", "0.3")
+            )
+        })
+        .collect();
+    let p = Project::new(&format!(
+        "[workflows.ci.settings]\nparallelism = 4\n[workflows.suite.settings]\nparallelism = 1\n\
+         [[workflows.ci.jobs]]\nname='call'\nworkflow='suite'\n{root}{suite}"
+    ));
+    let output = p.run(&["run", "ci", "--json"]);
+    success(&output);
+    assert_eq!(peak(&p, "child"), 1);
+    // Root work used the remaining slots alongside the child.
+    assert_eq!(peak(&p, ""), 4);
+    let summaries = summaries(&output);
+    assert_eq!(summaries[0]["workflow"], "suite");
+    assert_eq!(summaries[0]["max_in_flight"], 1);
+    assert_eq!(summaries[1]["max_in_flight"], 4);
+}
+
+#[test]
+fn child_partitions_take_one_slot_each() {
+    let p = Project::new(&format!(
+        "[settings]\nparallelism = 2\n\
+         [[workflows.ci.jobs]]\nname='call'\nworkflow='suite'\n\
+         [[workflows.suite.jobs]]\nname='test'\npartitions=4\ncommand='{}'\n",
+        traced("p", "0.15")
+    ));
+    let output = p.run(&["run", "ci", "--json"]);
+    success(&output);
+    assert_eq!(peak(&p, ""), 2);
+    assert_eq!(p.read("trace").lines().count(), 8);
+    let summaries = summaries(&output);
+    assert_eq!(summaries[0]["results"].as_array().unwrap().len(), 4);
+    // The root counts its one call, which held no slot itself.
+    assert_eq!(summaries[1]["results"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn a_stepped_child_job_and_a_call_condition_shell_hold_one_slot() {
+    let p = Project::new(
+        r#"
+[settings]
+parallelism = 1
+[[workflows.ci.jobs]]
+name = "root"
+command = "mkdir exclusive && sleep 0.05 && rmdir exclusive"
+[[workflows.ci.jobs]]
+name = "call"
+workflow = "suite"
+condition = { shell = "mkdir exclusive && sleep 0.05 && rmdir exclusive" }
+[[workflows.suite.jobs]]
+name = "stepped"
+[[workflows.suite.jobs.steps]]
+id = "acquire"
+command = "mkdir exclusive && sleep 0.05"
+[[workflows.suite.jobs.steps]]
+id = "release"
+command = "rmdir exclusive"
+[[workflows.suite.jobs]]
+name = "other"
+command = "mkdir exclusive && sleep 0.05 && rmdir exclusive"
+"#,
+    );
+    let output = p.run(&["run", "ci", "--json"]);
+    success(&output);
+    let summaries = summaries(&output);
+    let (child, root) = (&summaries[0], &summaries[1]);
+    assert_eq!(root["max_in_flight"], 1);
+    assert_eq!(child["max_in_flight"], 1);
+    // The call's own cost is its condition shell; child commands stay in the child.
+    let call = &root["results"][1];
+    let commands = call["commands"].as_array().unwrap();
+    assert_eq!(commands.len(), 1);
+    assert_eq!(commands[0]["kind"], "condition");
+    assert_eq!(child["results"][0]["commands"].as_array().unwrap().len(), 2);
+    assert_eq!(child["results"][1]["commands"][0]["kind"], "command");
+}
+
+/// A failing child job and a long-running sibling under nested fail-fast
+/// policies; `bad-done` is the barrier the other jobs wait on.
+fn policy_config(root_fail_fast: bool, child_fail_fast: bool) -> String {
+    let wait = "i=0; while [ $i -lt 500 ] && ! test -f bad-done; do sleep 0.01; i=$((i+1)); done";
+    format!(
+        r#"
+[workflows.ci.settings]
+parallelism = 6
+fail_fast = {root_fail_fast}
+[[workflows.ci.jobs]]
+name = "call"
+workflow = "suite"
+[[workflows.ci.jobs]]
+name = "root-slow"
+command = "{wait}; sleep 0.3"
+[[workflows.ci.jobs]]
+name = "root-later"
+command = "touch root-later"
+depends_on = ["root-slow"]
+[[workflows.ci.jobs]]
+name = "sibling"
+workflow = "independent"
+depends_on = ["root-slow"]
+[workflows.suite.settings]
+fail_fast = {child_fail_fast}
+[[workflows.suite.jobs]]
+name = "running"
+command = "{wait}; sleep 0.3; touch settled"
+[[workflows.suite.jobs]]
+name = "bad"
+command = "touch bad-done; exit 1"
+[[workflows.suite.jobs]]
+name = "after-bad"
+command = "touch after-bad"
+depends_on = ["bad"]
+[[workflows.suite.jobs]]
+name = "later"
+command = "touch later"
+depends_on = ["running"]
+[workflows.independent.settings]
+fail_fast = true
+[[workflows.independent.jobs]]
+name = "work"
+command = "touch sibling-work"
+"#
+    )
+}
+
+fn status(summary: &serde_json::Value, name: &str) -> (String, String) {
+    let result = summary["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["name"] == name)
+        .unwrap();
+    (
+        result["status"].as_str().unwrap().to_owned(),
+        result["error"].as_str().unwrap_or_default().to_owned(),
+    )
+}
+
+fn workflow<'a>(summaries: &'a [serde_json::Value], name: &str) -> &'a serde_json::Value {
+    summaries.iter().find(|s| s["workflow"] == name).unwrap()
+}
+
+fn pair(status: &str, error: &str) -> (String, String) {
+    (status.to_owned(), error.to_owned())
+}
+
+#[test]
+fn a_child_cannot_bypass_an_enabled_root_fail_fast() {
+    let p = Project::new(&policy_config(true, false));
+    let output = p.run(&["run", "ci", "--json"]);
+    assert_eq!(output.status.code(), Some(1));
+    let summaries = summaries(&output);
+    let (child, root) = (workflow(&summaries, "suite"), summaries.last().unwrap());
+    // Running jobs settle; nothing new starts anywhere in the tree.
+    assert!(p.dir.join("settled").exists());
+    assert_eq!(status(child, "running"), pair("passed", ""));
+    assert_eq!(
+        status(child, "after-bad"),
+        pair("skipped", "dependency did not pass")
+    );
+    assert_eq!(
+        status(child, "later"),
+        pair("skipped", "fail_fast: previous job failed")
+    );
+    assert_eq!(status(root, "root-slow"), pair("passed", ""));
+    assert_eq!(
+        status(root, "root-later"),
+        pair("skipped", "fail_fast: previous job failed")
+    );
+    assert_eq!(
+        status(root, "sibling"),
+        pair("skipped", "fail_fast: previous job failed")
+    );
+    assert_eq!(
+        status(root, "call"),
+        pair("failed", "workflow 'suite' failed")
+    );
+    for absent in ["later", "after-bad", "root-later", "sibling-work"] {
+        assert!(!p.dir.join(absent).exists(), "{absent}");
+    }
+    assert_eq!(summaries.len(), 2, "no sibling child started");
+}
+
+#[test]
+fn a_child_fail_fast_does_not_stop_independent_root_work() {
+    let p = Project::new(&policy_config(false, true));
+    let output = p.run(&["run", "ci", "--json"]);
+    assert_eq!(output.status.code(), Some(1));
+    let summaries = summaries(&output);
+    let (child, root) = (workflow(&summaries, "suite"), summaries.last().unwrap());
+    assert_eq!(root["workflow"], "ci");
+    assert_eq!(status(child, "running"), pair("passed", ""));
+    assert_eq!(
+        status(child, "later"),
+        pair("skipped", "fail_fast: previous job failed")
+    );
+    assert_eq!(
+        status(child, "after-bad"),
+        pair("skipped", "dependency did not pass")
+    );
+    // Independent root work and another child with fail-fast enabled continue.
+    assert_eq!(status(root, "root-later"), pair("passed", ""));
+    assert_eq!(status(root, "sibling"), pair("passed", ""));
+    assert!(p.dir.join("root-later").exists() && p.dir.join("sibling-work").exists());
+    assert!(!p.dir.join("later").exists());
+    // With every policy disabled, the child's independent work continues too.
+    let p = Project::new(&policy_config(false, false));
+    let output = p.run(&["run", "ci", "--json"]);
+    assert_eq!(output.status.code(), Some(1));
+    let summaries = self::summaries(&output);
+    assert_eq!(
+        status(workflow(&summaries, "suite"), "later"),
+        pair("passed", "")
+    );
+    assert!(p.dir.join("later").exists());
+}
+
+#[test]
+fn a_root_waiting_for_capacity_keeps_the_dependency_reason_after_a_child_fails() {
+    // `prepare` is first, so its shell condition takes the only slot and
+    // holds it until the child is waiting; the child's `test` gets it next.
+    // `prepare`'s own child needs no slot (its only job is a skipped call),
+    // so `other` becomes ready while `test` runs and waits for capacity
+    // until `test` fails. `announce` depends on the call only through
+    // `publish`, and the chain `p4` -> `p3` -> `p2` -> `p1` -> call is listed
+    // in reverse dependency order.
+    let p = Project::new(
+        r#"
+[workflows.ci.settings]
+parallelism = 1
+fail_fast = true
+[[workflows.ci.jobs]]
+name = "prepare"
+workflow = "noop"
+condition = "sleep 0.3"
+[[workflows.ci.jobs]]
+name = "other"
+command = "touch other"
+depends_on = ["prepare"]
+[[workflows.ci.jobs]]
+name = "integration"
+workflow = "suite"
+[[workflows.ci.jobs]]
+name = "publish"
+command = "touch published"
+depends_on = ["integration"]
+[[workflows.ci.jobs]]
+name = "announce"
+command = "touch announced"
+depends_on = ["publish"]
+[[workflows.ci.jobs]]
+name = "p4"
+command = "touch p4"
+depends_on = ["p3"]
+[[workflows.ci.jobs]]
+name = "p3"
+command = "touch p3"
+depends_on = ["p2"]
+[[workflows.ci.jobs]]
+name = "p2"
+command = "touch p2"
+depends_on = ["p1"]
+[[workflows.ci.jobs]]
+name = "p1"
+command = "touch p1"
+depends_on = ["integration"]
+[[workflows.suite.jobs]]
+name = "test"
+command = "sleep 0.5; exit 1"
+[[workflows.noop.jobs]]
+name = "never"
+workflow = "suite"
+condition = { expression = "false" }
+"#,
+    );
+    let output = p.run(&["run", "ci", "--json", "--no-history"]);
+    assert_eq!(output.status.code(), Some(1));
+    let summaries = summaries(&output);
+    let root = summaries.last().unwrap();
+    assert_eq!(root["workflow"], "ci");
+    assert_eq!(status(root, "prepare"), pair("passed", ""));
+    assert_eq!(
+        status(root, "integration"),
+        pair("failed", "workflow 'suite' failed")
+    );
+    for dependent in ["publish", "announce", "p4", "p3", "p2", "p1"] {
+        assert_eq!(
+            status(root, dependent),
+            pair("skipped", "dependency did not pass"),
+            "{dependent}"
+        );
+    }
+    // Fail-fast still reaches the root and stops its unrelated pending work.
+    assert_eq!(
+        status(root, "other"),
+        pair("skipped", "fail_fast: previous job failed")
+    );
+    for absent in ["published", "announced", "other", "p4", "p3", "p2", "p1"] {
+        assert!(!p.dir.join(absent).exists(), "{absent}");
+    }
+
+    let output = p.run(&["run", "ci", "--no-history"]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        stdout(&output).ends_with(
+            "Rerun failed: goodflows run ci --jobs='integration,publish,announce,p4,p3,p2,p1'\n"
+        ),
+        "{}",
+        stdout(&output)
+    );
+}
+
+#[test]
+fn a_root_failure_during_a_call_condition_activates_no_child() {
+    // The call's shell condition passes only once `boom-done` exists. The
+    // test creates it when it reads `boom`'s `job_finished` event, which the
+    // scheduler emits only after recording the failure, so the root is
+    // stopped by the time the condition passes.
+    let p = Project::new(
+        r#"
+[workflows.ci.settings]
+parallelism = 2
+fail_fast = true
+[[workflows.ci.jobs]]
+name = "boom"
+command = "exit 1"
+[[workflows.ci.jobs]]
+name = "integration"
+workflow = "suite"
+condition = "i=0; while [ $i -lt 500 ] && ! test -f boom-done; do sleep 0.01; i=$((i+1)); done; test -f boom-done"
+[[workflows.suite.jobs]]
+name = "test"
+command = "touch ran"
+"#,
+    );
+    let mut child = p
+        .command()
+        .args(["run", "ci", "--json", "--no-history"])
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut events = Vec::new();
+    for line in std::io::BufRead::lines(std::io::BufReader::new(child.stdout.take().unwrap())) {
+        let parsed = line
+            .map_err(|e| e.to_string())
+            .and_then(|line| serde_json::from_str(&line).map_err(|e| format!("{e}: {line}")));
+        let event: serde_json::Value = match parsed {
+            Ok(event) => event,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("bad event line: {error}");
+            }
+        };
+        if event["type"] == "job_finished" && event["result"]["name"] == "boom" {
+            std::fs::write(p.dir.join("boom-done"), "").unwrap();
+        }
+        events.push(event);
+    }
+    assert_eq!(child.wait().unwrap().code(), Some(1));
+    // No child run started: no child events, summary, or job.
+    assert!(events.iter().all(|e| e["workflow"] == "ci"), "{events:?}");
+    let summaries: Vec<_> = events.iter().filter(|e| e["type"] == "summary").collect();
+    assert_eq!(summaries.len(), 1);
+    let root = summaries[0];
+    assert_eq!(status(root, "boom"), pair("failed", "exited with 1"));
+    assert_eq!(
+        status(root, "integration"),
+        pair("skipped", "fail_fast: previous job failed")
+    );
+    let call = root["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["name"] == "integration")
+        .unwrap();
+    assert!(call.get("child_run_id").is_none(), "{call}");
+    assert!(!p.dir.join("ran").exists());
+}
+
+#[test]
+fn a_root_failure_mid_child_skips_its_remaining_jobs_and_the_child_passes() {
+    // `boom` fails while the child's `first` runs. The child's remaining
+    // work stops with the fail-fast reason; no child job failed, so the
+    // child and its call pass, while the root fails.
+    let p = Project::new(
+        r#"
+[workflows.ci.settings]
+parallelism = 4
+fail_fast = true
+[[workflows.ci.jobs]]
+name = "integration"
+workflow = "suite"
+[[workflows.ci.jobs]]
+name = "boom"
+command = "i=0; while [ $i -lt 500 ] && ! test -f first-started; do sleep 0.01; i=$((i+1)); done; exit 1"
+[[workflows.suite.jobs]]
+name = "first"
+command = "touch first-started; sleep 0.4"
+[[workflows.suite.jobs]]
+name = "second"
+command = "touch second"
+depends_on = ["first"]
+"#,
+    );
+    let output = p.run(&["run", "ci", "--json", "--no-history"]);
+    assert_eq!(output.status.code(), Some(1));
+    let summaries = summaries(&output);
+    let (child, root) = (workflow(&summaries, "suite"), summaries.last().unwrap());
+    assert_eq!(root["workflow"], "ci");
+    assert_eq!(status(child, "first"), pair("passed", ""));
+    assert_eq!(
+        status(child, "second"),
+        pair("skipped", "fail_fast: previous job failed")
+    );
+    assert_eq!(child["outcome"], "passed");
+    assert_eq!(status(root, "integration"), pair("passed", ""));
+    assert_eq!(status(root, "boom"), pair("failed", "exited with 1"));
+    assert_eq!(root["outcome"], "failed");
+    assert!(!p.dir.join("second").exists());
 }

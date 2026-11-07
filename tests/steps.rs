@@ -380,3 +380,75 @@ command = "touch consumed"
     assert_eq!(results[4]["name"], "consume");
     assert_eq!(results[4]["status"], "passed");
 }
+
+#[test]
+fn a_call_job_cannot_also_define_steps() {
+    let p = Project::new(
+        "[[jobs]]\nname='marker'\ncommand='touch marker'\n\
+         [[workflows.ci.jobs]]\nname='call'\nworkflow='default'\n[[workflows.ci.jobs.steps]]\nid='s'\ncommand='touch step'\n",
+    );
+    let output = p.run(&["run", "ci", "--json"]);
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(
+        events(&output).last().unwrap()["message"],
+        "workflow 'ci': job 'call': define exactly one of a command, nonempty steps, or a workflow"
+    );
+    assert!(!p.dir.join("marker").exists() && !p.dir.join("step").exists());
+}
+
+#[test]
+fn stepped_jobs_run_in_children_and_step_outputs_gate_calls() {
+    let p = Project::new(
+        r#"
+[workflows.ci.settings.env]
+MODE = "caller"
+[[workflows.ci.jobs]]
+name = "detect"
+outputs = { run = "steps.scan.outputs.run" }
+[[workflows.ci.jobs.steps]]
+id = "scan"
+command = "printf '{\"run\":true}' > \"$GOODFLOWS_OUTPUT\""
+[[workflows.ci.jobs]]
+name = "call"
+workflow = "suite"
+depends_on = ["detect"]
+condition = { expression = 'needs.detect.outputs.run && env.MODE == "caller"' }
+[workflows.suite.settings.env]
+MODE = "child"
+[[workflows.suite.jobs]]
+name = "build"
+outputs = { mode = "steps.first.outputs.mode" }
+[[workflows.suite.jobs.steps]]
+id = "first"
+command = "printf '{\"mode\":\"%s\"}' \"$MODE\" > \"$GOODFLOWS_OUTPUT\""
+[[workflows.suite.jobs.steps]]
+id = "second"
+condition = { expression = 'steps.first.outputs.mode == "child"' }
+command = "echo \"$MODE\" > mode"
+"#,
+    );
+    let output = p.run(&["run", "ci", "--json"]);
+    success(&output);
+    assert_eq!(p.read("mode"), "child\n");
+    let events = events(&output);
+    let child = events
+        .iter()
+        .find(|e| e["type"] == "summary" && e["workflow"] == "suite")
+        .unwrap();
+    assert_eq!(child["results"][0]["outputs"], json!({"mode": "child"}));
+    assert_eq!(child["results"][0]["steps"][1]["status"], "passed");
+    let steps: Vec<_> = events
+        .iter()
+        .filter(|e| e["type"] == "step_finished")
+        .map(|e| {
+            (
+                e["workflow"].as_str().unwrap(),
+                e["result"]["id"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        steps,
+        [("ci", "scan"), ("suite", "first"), ("suite", "second")]
+    );
+}

@@ -81,6 +81,51 @@ test('conditional skips in a named workflow do not request repairs', async (t) =
   await assert.rejects(readFile(join(h.cwd, 'ran')), { code: 'ENOENT' })
 })
 
+const calls = (command) => `[[workflows.ci.jobs]]
+name = "integration"
+workflow = "suite"
+[[workflows.suite.jobs]]
+name = "unit"
+command = "${command}"
+`
+
+test('a workflow that calls another passes on its root summary', async (t) => {
+  const h = await host(t, calls('true'), { selection: 'ci' })
+  await h.run()
+  assert.equal(h.messages.length, 1)
+  assert.match(h.messages[0].content, /checks passed/i)
+  assert.doesNotMatch(h.messages[0].content, /Duplicate/)
+})
+
+test('a failing called workflow identifies the called job in the repair handoff', async (t) => {
+  const h = await host(t, calls('echo child-detail >&2; exit 7'), { selection: 'ci' })
+  await h.run()
+  const message = h.messages[0].content
+  assert.match(message, /checks failed/i)
+  assert.doesNotMatch(message, /Duplicate/)
+  assert.match(message, /"name": "integration"/)
+  assert.match(message, /"caller_job": "integration"/)
+  assert.match(message, /"name": "unit"/)
+  assert.match(message, /exit_code.*7/)
+  assert.match(message, /child-detail/)
+})
+
+test('bounds retained called-run failures however many child summaries arrive', async (t) => {
+  const discovery = '{"schema_version":1,"type":"workflows","workflows":[{"name":"ci","jobs":1,"settings":{}}],"default_workflow":"ci"}'
+  const failure = (name) => ({ name, status: 'failed', exit_code: 1, command: 'exit 1', error: 'exited with 1', stdout_tail: 'x'.repeat(20_000), stderr_tail: `${'y'.repeat(20_000)}tail-end`, stdout_truncated: false, stderr_truncated: false })
+  const child = (i) => JSON.stringify({ schema_version: 1, type: 'summary', workflow: 'suite', run_id: `child-${i}`, parent_run_id: 'root', caller_job: `call-${i}`, success: false, results: [failure('unit')] })
+  const root = JSON.stringify({ schema_version: 1, type: 'summary', workflow: 'ci', run_id: 'root', success: false, results: [failure('call-0')] })
+  const lines = [...Array.from({ length: 250 }, (_, i) => child(i)), root].join('\n')
+  const h = await host(t, undefined, { fake: `case "$1" in list) printf '%s\\n' '${discovery}';; *) cat <<'EOF'\n${lines}\nEOF\nexit 1;; esac` })
+  await h.run()
+  const message = h.messages[0].content
+  assert.match(message, /checks failed/i)
+  assert.match(message, /"called_failures_omitted": 50/)
+  assert.match(message, /"caller_job": "call-0"/)
+  assert.match(message, /tail-end/)
+  assert.ok(message.length < 70000)
+})
+
 test('step failures identify the failed step and its command in the repair handoff', async (t) => {
   const h = await host(t, `[[jobs]]
 name = "checks"
@@ -197,6 +242,8 @@ for (const [name, output, exit] of [
   ['invalid JSON', 'not JSON', 0],
   ['unsupported schema', '{"schema_version":99,"type":"summary","success":true,"results":[]}', 0],
   ['nonzero exit despite passing summary', '{"schema_version":1,"type":"summary","success":true,"results":[]}', 3],
+  ['child summary without root', '{"schema_version":1,"type":"summary","success":true,"parent_run_id":"r","caller_job":"c","results":[]}', 0],
+  ['duplicate root summary', '{"schema_version":1,"type":"summary","success":true,"results":[]}\n{"schema_version":1,"type":"summary","success":true,"results":[]}', 0],
 ]) {
   test(`${name} never reports passing checks`, async (t) => {
     const discovery = '{"schema_version":1,"type":"workflows","workflows":[{"name":"default","jobs":1,"settings":{}}],"default_workflow":"default"}'

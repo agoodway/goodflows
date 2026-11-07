@@ -3306,3 +3306,173 @@ fn a_signal_after_the_last_job_cancels_the_json_outcome() {
             .unwrap();
     assert_eq!(record["outcome"], "cancelled");
 }
+
+// ---- workflow-call jobs ----
+
+/// A root that calls `suite` twice; each child has a partitioned reporting job.
+fn called_reporting(extra: &str) -> Project {
+    project(&format!(
+        "[settings]\nparallelism = 4\n\
+         [[workflows.ci.jobs]]\nname = \"one\"\nworkflow = \"suite\"\n\
+         [[workflows.ci.jobs]]\nname = \"two\"\nworkflow = \"suite\"\n{extra}\
+         [[workflows.suite.jobs]]\nname = \"test\"\npartitions = 2\n\
+         command = 'cp fixtures/r$GOODFLOWS_PARTITION.jsonl \"$GOODFLOWS_REPORT_DIR/r$GOODFLOWS_PARTITION.jsonl\"; echo \"${{GOODFLOWS_API_KEY-scrubbed}}\" > key.$GOODFLOWS_PARTITION.$$'\n\
+         reports = [\"test-timings\"]\n"
+    ))
+}
+
+#[test]
+fn each_child_invocation_collects_and_uploads_only_its_own_reports() {
+    let mock = Mock::store();
+    let p = called_reporting("");
+    let output = run_with(&p, &["run", "ci", "--json"], Some(&mock.url));
+    success(&output);
+    assert_no_secret(&p, &output);
+    let events = events(&output);
+    let root = events.last().unwrap();
+    let children: Vec<_> = ["one", "two"]
+        .iter()
+        .map(|call| {
+            root["results"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["name"] == *call)
+                .unwrap()["child_run_id"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        })
+        .collect();
+    assert_ne!(children[0], children[1]);
+    // One spool run directory per child, named by its own identity.
+    let runs = run_dirs(&p);
+    assert_eq!(runs.len(), 2);
+    for run in &runs {
+        let manifest = manifest(run);
+        let id = manifest["workflow_run_id"].as_str().unwrap();
+        assert!(children.iter().any(|c| c == id), "{id}");
+        assert_eq!(manifest["workflow"], "suite");
+        assert_eq!(manifest["jobs"].as_array().unwrap().len(), 2);
+    }
+    // Each child's collection is attributed to it and holds only its reports.
+    for child in &children {
+        let collected: Vec<_> = by_type(&events, "reports_collected")
+            .into_iter()
+            .filter(|e| e["invocation_id"] == child.as_str())
+            .collect();
+        assert_eq!(collected.len(), 2);
+        for event in &collected {
+            assert_eq!(event["run_id"], child.as_str());
+            assert_eq!(event["reports"], 1);
+        }
+    }
+    // Upload envelopes keep the existing wire contract: no parent metadata.
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 4);
+    for request in &requests {
+        let body = request.json();
+        let mut keys: Vec<_> = body.as_object().unwrap().keys().cloned().collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            [
+                "environment",
+                "format",
+                "job",
+                "job_status",
+                "report",
+                "source",
+                "workflow",
+                "workflow_run_id"
+            ],
+            "{body}"
+        );
+        assert_eq!(body["workflow"], "suite");
+        assert!(children
+            .iter()
+            .any(|c| body["workflow_run_id"] == c.as_str()));
+    }
+    // The credential never reached a child command.
+    for file in std::fs::read_dir(&p.dir).unwrap() {
+        let path = file.unwrap().path();
+        if path
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("key.")
+        {
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "scrubbed\n");
+        }
+    }
+}
+
+#[test]
+fn delayed_child_reporting_does_not_stall_unrelated_root_work() {
+    let mock = Mock::start(|_, _| Reply::Hang(Duration::from_millis(1500)));
+    // `free` becomes ready only once both children produced their reports,
+    // while their publishing hangs; it must start before the calls finish.
+    let p = called_reporting(
+        "[[workflows.ci.jobs]]\nname = \"gate\"\n\
+         command = 'i=0; while [ $i -lt 500 ] && [ $(ls key.* 2>/dev/null | wc -l) -lt 4 ]; do sleep 0.01; i=$((i+1)); done; sleep 0.2'\n\
+         [[workflows.ci.jobs]]\nname = \"free\"\ncommand = \"touch free\"\ndepends_on = [\"gate\"]\n",
+    );
+    let output = run_with(&p, &["run", "ci", "--json"], Some(&mock.url));
+    success(&output);
+    let events = events(&output);
+    let finished = |name: &str| {
+        events
+            .iter()
+            .position(|e| {
+                e["type"] == "job_finished" && e["workflow"] == "ci" && e["result"]["name"] == name
+            })
+            .unwrap()
+    };
+    assert!(finished("free") < finished("one"), "{}", stdout(&output));
+    assert!(finished("free") < finished("two"), "{}", stdout(&output));
+    assert!(!mock.requests().is_empty());
+}
+
+#[test]
+fn a_signal_after_child_jobs_passed_cancels_the_call() {
+    let mock = Mock::start(|_, _| Reply::Hang(Duration::from_secs(20)));
+    let p = project(&format!(
+        "[[workflows.ci.jobs]]\nname = \"call\"\nworkflow = \"suite\"\n\
+         [[workflows.ci.jobs]]\nname = \"after\"\ncommand = \"touch after\"\ndepends_on = [\"call\"]\n\
+         [[workflows.suite.jobs]]\nname = \"test\"\ncommand = '{}'\nreports = [\"test-timings\"]\n",
+        copy(&["r1"])
+    ));
+    let child = p
+        .command()
+        .args(["run", "ci", "--json"])
+        .env("GOODFLOWS_URL", &mock.url)
+        .env("GOODFLOWS_API_KEY", SECRET)
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let start = Instant::now();
+    while mock.requests().is_empty() {
+        assert!(start.elapsed() < Duration::from_secs(10));
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // SAFETY: the child PID identifies the CLI spawned above.
+    assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGTERM) }, 0);
+    let output = child.wait_with_output().unwrap();
+    assert!(start.elapsed() < Duration::from_secs(8));
+    assert_eq!(output.status.code(), Some(143));
+    let events = events(&output);
+    let summaries = by_type(&events, "summary");
+    assert_eq!(summaries.len(), 2);
+    let (suite, root) = (&summaries[0], &summaries[1]);
+    assert_eq!(suite["results"][0]["status"], "passed");
+    assert_eq!(suite["outcome"], "cancelled");
+    assert_eq!(root["results"][0]["status"], "cancelled");
+    assert_eq!(
+        root["results"][0]["error"],
+        "workflow 'suite' was cancelled"
+    );
+    assert_eq!(root["results"][1]["status"], "cancelled");
+    assert_eq!(root["outcome"], "cancelled");
+    assert!(!p.dir.join("after").exists());
+}
