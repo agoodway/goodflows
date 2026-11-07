@@ -216,7 +216,7 @@ Each workflow directory SHALL keep at most `history_runs` matching files, defaul
 - **THEN** the settings show history off, directory `/work/goodflows-history`, `log_runs` 10, `history_runs` 1000, and `history_bytes` 10485760
 
 ### Requirement: Graph hash includes the called workflow
-A workflow-call job SHALL keep the existing canonical fields and order, including null command and empty steps, and add one trailing object omitted for ordinary jobs. That object contains the target name and the target's complete canonical jobs under the same selected profile, recursively. It MUST NOT precede an existing field or replace `command`. A false call condition SHALL still include the resolved target. Root filtering determines reachability.
+A workflow-call job SHALL keep the existing canonical fields and order and add one trailing object, omitted for ordinary jobs, after them. That object contains the target name and `graph_sha256`, the target's own graph hash under the same selected profile. Each reachable workflow SHALL be hashed once per invocation and reused for every call path. A false call condition SHALL still include the target. Root filtering determines reachability.
 
 #### Scenario: Called command change
 - **WHEN** a command in a reachable called workflow changes, including a grandchild workflow
@@ -225,6 +225,10 @@ A workflow-call job SHALL keep the existing canonical fields and order, includin
 #### Scenario: False call condition still fingerprints the target
 - **WHEN** a selected call's condition is false and a command in its target workflow changes
 - **THEN** the root graph hash changes, and no child invocation is created
+
+#### Scenario: Repeated nested calls
+- **WHEN** each of 40 nesting levels calls the next level twice, behind a false root call condition
+- **THEN** the root graph hash is computed without expanding every call path, and a command change in the deepest workflow still changes it
 
 ### Requirement: History links workflow-call invocations
 A child's history record SHALL add `parent_run_id` and `caller_job`. Each activated call's parent instance record SHALL add its target `workflow` and `child_run_id`. Other instance records SHALL retain their existing field allowlist. These additions keep schema version 1. Each invocation SHALL independently obey effective history and retention settings. Linkage SHALL contain identities only, not resolved paths, output, or environment values.

@@ -9,6 +9,7 @@ use crate::runner::{JobResult, Scheduling, Status};
 use anyhow::{Context, Result};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
@@ -94,12 +95,13 @@ struct GraphJob<'a> {
     call: Option<GraphCall<'a>>,
 }
 
-/// A call's target and that workflow's complete canonical jobs under the
-/// selected profile, recursively.
+/// A call's target and the `graph_sha256` of that workflow's complete jobs
+/// under the selected profile, so each workflow is hashed once however many
+/// call paths reach it.
 #[derive(Serialize)]
 struct GraphCall<'a> {
     workflow: &'a str,
-    jobs: Vec<GraphJob<'a>>,
+    graph_sha256: String,
 }
 
 #[derive(Serialize)]
@@ -137,14 +139,27 @@ impl<'a> GraphCondition<'a> {
 /// `targets` resolves a called workflow to its complete jobs under the
 /// selected profile; it is never asked for a workflow nothing calls.
 pub fn graph_sha256<'a>(jobs: &'a [Job], targets: &dyn Fn(&str) -> &'a [Job]) -> String {
+    document_sha256(jobs, targets, &mut HashMap::new())
+}
+
+/// `graph_sha256`, reusing the hashes of workflows already hashed.
+fn document_sha256<'a>(
+    jobs: &'a [Job],
+    targets: &dyn Fn(&str) -> &'a [Job],
+    hashed: &mut HashMap<&'a str, String>,
+) -> String {
     let document = GraphDocument {
-        jobs: graph_jobs(jobs, targets),
+        jobs: graph_jobs(jobs, targets, hashed),
     };
     let bytes = serde_json::to_vec(&document).expect("graph document serializes");
     format!("{:x}", Sha256::digest(bytes))
 }
 
-fn graph_jobs<'a>(jobs: &'a [Job], targets: &dyn Fn(&str) -> &'a [Job]) -> Vec<GraphJob<'a>> {
+fn graph_jobs<'a>(
+    jobs: &'a [Job],
+    targets: &dyn Fn(&str) -> &'a [Job],
+    hashed: &mut HashMap<&'a str, String>,
+) -> Vec<GraphJob<'a>> {
     jobs.iter()
         .map(|job| GraphJob {
             name: &job.name,
@@ -165,9 +180,19 @@ fn graph_jobs<'a>(jobs: &'a [Job], targets: &dyn Fn(&str) -> &'a [Job]) -> Vec<G
                 })
                 .collect(),
             // A call's condition never removes its target from the graph.
-            call: job.workflow.as_deref().map(|workflow| GraphCall {
-                workflow,
-                jobs: graph_jobs(targets(workflow), targets),
+            call: job.workflow.as_deref().map(|workflow| {
+                let graph_sha256 = match hashed.get(workflow) {
+                    Some(hash) => hash.clone(),
+                    None => {
+                        let hash = document_sha256(targets(workflow), targets, hashed);
+                        hashed.insert(workflow, hash.clone());
+                        hash
+                    }
+                };
+                GraphCall {
+                    workflow,
+                    graph_sha256,
+                }
             }),
         })
         .collect()
@@ -612,7 +637,7 @@ mod tests {
     }
 
     #[test]
-    fn a_call_appends_its_target_graph_after_the_existing_fields() {
+    fn a_call_appends_its_target_hash_after_the_existing_fields() {
         let mut config: crate::config::Config = toml::from_str(
             "[[workflows.ci.jobs]]\nname = 'call'\nworkflow = 'suite'\ndepends_on = ['prep']\n\
              condition = { expression = 'true' }\n\
@@ -623,21 +648,11 @@ mod tests {
         config.validate().unwrap();
         let (_, ci) = config.workflow(Some("ci"), None).unwrap();
         let (_, suite) = config.workflow(Some("suite"), None).unwrap();
-        let targets = |_: &str| suite.jobs.as_slice();
-        let document = GraphDocument {
-            jobs: graph_jobs(&ci.jobs, &targets),
-        };
+        // The target's hash is its own graph hash, which is what a child
+        // invocation of it reports.
+        let suite_hash = graph_sha256(&suite.jobs, &|_| unreachable!("no workflow calls"));
         assert_eq!(
-            serde_json::to_string(&document).unwrap(),
-            r#"{"jobs":[{"name":"call","command":null,"depends_on":["prep"],"partitions":null,"timeout_secs":null,"shell":true,"condition":{"kind":"expression","text":"true"},"steps":[],"call":{"workflow":"suite","jobs":[{"name":"t","command":"true","depends_on":[],"partitions":null,"timeout_secs":null,"shell":true,"condition":null,"steps":[]}]}},{"name":"prep","command":"make","depends_on":[],"partitions":null,"timeout_secs":null,"shell":true,"condition":null,"steps":[]}]}"#
-        );
-        // Without the call object the bytes are the existing canonical form.
-        let plain = graph_sha256(&suite.jobs, &|_| unreachable!("no workflow calls"));
-        let document = GraphDocument {
-            jobs: graph_jobs(&suite.jobs, &|_| unreachable!("no workflow calls")),
-        };
-        assert_eq!(
-            plain,
+            suite_hash,
             format!(
                 "{:x}",
                 Sha256::digest(
@@ -645,7 +660,16 @@ mod tests {
                 )
             )
         );
-        assert!(!serde_json::to_string(&document).unwrap().contains("call"));
+        let targets = |_: &str| suite.jobs.as_slice();
+        let document = GraphDocument {
+            jobs: graph_jobs(&ci.jobs, &targets, &mut HashMap::new()),
+        };
+        assert_eq!(
+            serde_json::to_string(&document).unwrap(),
+            format!(
+                r#"{{"jobs":[{{"name":"call","command":null,"depends_on":["prep"],"partitions":null,"timeout_secs":null,"shell":true,"condition":{{"kind":"expression","text":"true"}},"steps":[],"call":{{"workflow":"suite","graph_sha256":"{suite_hash}"}}}},{{"name":"prep","command":"make","depends_on":[],"partitions":null,"timeout_secs":null,"shell":true,"condition":null,"steps":[]}}]}}"#
+            )
+        );
     }
 
     #[test]

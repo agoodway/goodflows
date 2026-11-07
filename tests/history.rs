@@ -858,3 +858,40 @@ test = 3
     );
     assert_eq!(hash(&unrelated, &[]), root);
 }
+
+#[test]
+fn repeated_nested_calls_hash_each_workflow_once() {
+    // Each level calls the next twice: 2^40 call paths from 82 written jobs.
+    // Expanding every path would never finish; hashing each workflow once does.
+    let config = |leaf: &str| {
+        let mut config = String::from(
+            "[[workflows.ci.jobs]]\nname = 'call'\nworkflow = 'l0'\n\
+             condition = { expression = 'false' }\n",
+        );
+        for level in 0..40 {
+            for name in ["a", "b"] {
+                config.push_str(&format!(
+                    "[[workflows.l{level}.jobs]]\nname = '{name}'\nworkflow = 'l{}'\n",
+                    level + 1
+                ));
+            }
+        }
+        config.push_str(&format!(
+            "[[workflows.l40.jobs]]\nname = 'leaf'\ncommand = '{leaf}'\n"
+        ));
+        config
+    };
+    let hash = |config: &str| {
+        let p = Project::new(config);
+        let output = p.run(&["run", "ci", "--json"]);
+        success(&output);
+        summary_of(&output)["graph_sha256"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let root = hash(&config("true"));
+    assert_eq!(hash(&config("true")), root);
+    // The deepest command still reaches the root hash.
+    assert_ne!(hash(&config("false")), root);
+}
