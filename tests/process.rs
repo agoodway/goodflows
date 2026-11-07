@@ -358,3 +358,89 @@ fn timeout_and_signal_cleanup_work_when_stdout_is_not_consumed() {
     );
     assert!(exited, "SIGTERM did not stop CLI while stdout was blocked");
 }
+
+#[test]
+fn signals_cancel_and_reap_nested_workflow_calls() {
+    for (signal, code) in [(libc::SIGINT, 130), (libc::SIGTERM, 143)] {
+        let p = Project::new(
+            r#"
+[settings]
+parallelism = 4
+[[workflows.ci.jobs]]
+name = "outer"
+workflow = "suite"
+[[workflows.ci.jobs]]
+name = "after"
+workflow = "late"
+depends_on = ["outer"]
+[[workflows.suite.jobs]]
+name = "inner"
+workflow = "leaf"
+[[workflows.suite.jobs]]
+name = "queued"
+command = "touch queued"
+depends_on = ["inner"]
+[[workflows.leaf.jobs]]
+name = "running"
+command = "(touch started; while ! test -f release; do sleep 0.01; done; touch escaped) >/dev/null 2>&1 & wait"
+[[workflows.late.jobs]]
+name = "never"
+command = "touch never"
+"#,
+        );
+        let mut child = p
+            .command()
+            .args(["run", "ci", "--json"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let start = Instant::now();
+        while !p.dir.join("started").exists() {
+            if start.elapsed() > Duration::from_secs(5) {
+                let _ = child.kill();
+                panic!("grandchild did not start");
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // SAFETY: the child PID identifies the CLI spawned above.
+        assert_eq!(unsafe { libc::kill(child.id() as i32, signal) }, 0);
+        let output = child.wait_with_output().unwrap();
+        assert_eq!(output.status.code(), Some(code));
+        let events: Vec<serde_json::Value> = stdout(&output)
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let summaries: Vec<_> = events.iter().filter(|e| e["type"] == "summary").collect();
+        // Innermost first, root last; no call started a new child.
+        let workflows: Vec<_> = summaries
+            .iter()
+            .map(|s| s["workflow"].as_str().unwrap())
+            .collect();
+        assert_eq!(workflows, ["leaf", "suite", "ci"]);
+        assert!(!events.iter().any(|e| e["workflow"] == "late"));
+        for summary in &summaries {
+            assert_eq!(summary["outcome"], "cancelled", "{summary}");
+        }
+        let status = |summary: &serde_json::Value, index: usize| {
+            summary["results"][index]["status"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        };
+        assert_eq!(status(summaries[0], 0), "cancelled");
+        assert_eq!(status(summaries[1], 0), "cancelled");
+        assert_eq!(summaries[1]["results"][1]["error"], "cancelled by signal");
+        assert_eq!(status(summaries[2], 0), "cancelled");
+        assert_eq!(summaries[2]["results"][1]["error"], "cancelled by signal");
+        assert!(summaries[2]["results"][1].get("child_run_id").is_none());
+        std::fs::write(p.dir.join("release"), "").unwrap();
+        std::thread::sleep(Duration::from_millis(600));
+        for absent in ["escaped", "queued", "never"] {
+            assert!(
+                !p.dir.join(absent).exists(),
+                "{absent} after signal {signal}"
+            );
+        }
+    }
+}

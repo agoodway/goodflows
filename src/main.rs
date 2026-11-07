@@ -15,8 +15,10 @@ use config::Config;
 use output::Output;
 use runner::{Options, Status};
 use serde_json::json;
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Arc;
 use tokio::sync::watch;
 
 #[derive(Parser)]
@@ -324,14 +326,24 @@ async fn run(cli: &Cli, output: &mut Output, cancel: watch::Receiver<Option<i32>
     *output = output.with_workflow(&name);
     let total_defined_jobs = config.jobs.len();
     config.select(&cli.jobs)?;
+    // Called workflows run their complete graphs; the selected profile must
+    // resolve for each one before anything runs.
+    let targets = document.called_workflows(&config.jobs, profile)?;
     let settings = config
         .settings
         .resolve(cli.parallelism, fail_fast_override, &history_cli)?;
+    let calls: Vec<_> = config
+        .jobs
+        .iter()
+        .filter_map(|job| Some(json!({"job":job.name, "workflow":job.workflow.as_ref()?})))
+        .collect();
     match cli.command.as_ref() {
         Some(Commands::Validate { .. }) => {
-            output
-                .emit(json!({"type":"config_valid", "jobs":config.jobs.len(), "total_defined_jobs":total_defined_jobs, "requested_jobs":cli.jobs, "selected_jobs":config.jobs.iter().map(|j| &j.name).collect::<Vec<_>>(), "settings":settings}))
-                .await?;
+            let mut event = json!({"type":"config_valid", "jobs":config.jobs.len(), "total_defined_jobs":total_defined_jobs, "requested_jobs":cli.jobs, "selected_jobs":config.jobs.iter().map(|j| &j.name).collect::<Vec<_>>(), "settings":settings});
+            if !calls.is_empty() {
+                event["calls"] = json!(calls);
+            }
+            output.emit(event).await?;
             return Ok(0);
         }
         Some(Commands::List { .. }) => {
@@ -345,20 +357,213 @@ async fn run(cli: &Cli, output: &mut Output, cancel: watch::Receiver<Option<i32>
         }
         _ => {}
     }
+    let run = Arc::new(Run {
+        calls: !calls.is_empty(),
+        root: config,
+        targets,
+        profile: cli.env.clone(),
+        parallelism: cli.parallelism,
+        fail_fast: fail_fast_override,
+        history: history_cli,
+        requested_jobs: cli.jobs.clone(),
+        log_dir: cli.log_dir.clone(),
+        legacy_default,
+        config_path: cli
+            .config
+            .as_ref()
+            .map(|path| path.to_string_lossy().into_owned()),
+        output: output.clone(),
+        cancel,
+    });
+    let (_, finished) = invoke(run, name, None).await;
+    let finished = finished?.expect("only a called run stops before it starts");
+    Ok(finished
+        .signal
+        .map(|s| (128 + s) as u8)
+        .unwrap_or(if finished.success { 0 } else { 1 }))
+}
+
+/// What every invocation of one `goodflows run` shares: the root selection,
+/// the workflows its calls reach, and the CLI overrides that apply to each.
+struct Run {
+    root: Config,
+    /// Every workflow reachable through calls, with its complete jobs under
+    /// the selected profile.
+    targets: BTreeMap<String, Config>,
+    /// The root selection contains a workflow call, so events carry
+    /// invocation identities.
+    calls: bool,
+    profile: Option<String>,
+    parallelism: Option<usize>,
+    fail_fast: Option<bool>,
+    history: config::HistoryOverrides,
+    /// `--jobs`, which selects only in the root workflow.
+    requested_jobs: Vec<String>,
+    log_dir: Option<PathBuf>,
+    legacy_default: bool,
+    /// The explicit `--config` path, for the root rerun hint.
+    config_path: Option<String>,
+    output: Output,
+    cancel: watch::Receiver<Option<i32>>,
+}
+
+/// The invocation that activated a child, and the call job that did it.
+struct Parent {
+    run_id: String,
+    caller_job: String,
+    scope: Arc<runner::Scope>,
+}
+
+/// How one invocation ended, after its reporting, history and summary.
+struct Finished {
+    outcome: &'static str,
+    success: bool,
+    signal: Option<i32>,
+    /// The outcome is passed, but a local job or call was skipped by
+    /// fail-fast: only an enclosing invocation's failure can do that.
+    interrupted: bool,
+}
+
+/// Run one invocation, the root (`parent` is `None`) or a called workflow,
+/// through its whole lifecycle in this process. Returns its run id, which
+/// exists even when setup then failed, and `None` when a called run was
+/// stopped by fail-fast before it started.
+async fn invoke(
+    run: Arc<Run>,
+    name: String,
+    parent: Option<Parent>,
+) -> (String, Result<Option<Finished>>) {
+    // One identity names the log run directory, the history file and the
+    // reporting workflow_run_id.
+    let identity = retention::RunIdentity::new();
+    let id = identity.id.clone();
+    (id, invocation(&run, &name, parent, identity).await)
+}
+
+/// The activation callback for the call jobs of the invocation `run_id`.
+fn activator(run: Arc<Run>, run_id: String) -> runner::Activate {
+    Arc::new(move |activation: runner::Activation| {
+        let parent = Parent {
+            run_id: run_id.clone(),
+            caller_job: activation.caller_job,
+            scope: activation.scope,
+        };
+        let (run, target) = (run.clone(), activation.target);
+        Box::pin(async move {
+            let (run_id, finished) = invoke(run, target.clone(), Some(parent)).await;
+            child_end(&target, run_id, finished)
+        })
+    })
+}
+
+/// Whether an invocation with `outcome`, whose local results carry the given
+/// `fail_fast_skip` flags, was cut short by an enclosing fail-fast: it passed
+/// by the existing rule, yet a job or call was skipped by fail-fast. Failed
+/// and cancelled outcomes take precedence.
+fn interrupted(outcome: &str, fail_fast_skips: impl IntoIterator<Item = bool>) -> bool {
+    outcome == "passed" && fail_fast_skips.into_iter().any(|skip| skip)
+}
+
+/// The call result for a child invocation of `target` that ended with
+/// `finished`.
+fn child_end(target: &str, run_id: String, finished: Result<Option<Finished>>) -> runner::ChildEnd {
+    let (status, error, fail_fast_skip) = match finished {
+        // Stopped before its first effect: the same skip as the call's
+        // own check, with no child identity.
+        Ok(None) => {
+            return runner::ChildEnd {
+                run_id: None,
+                status: Status::Skipped,
+                error: Some(runner::FAIL_FAST_SKIP.into()),
+                fail_fast_skip: true,
+            }
+        }
+        // The child's outcome, from its own signal snapshot.
+        Ok(Some(finished)) => match finished.outcome {
+            // Cut short by an enclosing fail-fast: skipped like the work it
+            // stopped, though the child's own outcome stays passed.
+            "passed" if finished.interrupted => {
+                (Status::Skipped, Some(runner::FAIL_FAST_SKIP.into()), true)
+            }
+            "passed" => (Status::Passed, None, false),
+            "failed" => (
+                Status::Failed,
+                Some(format!("workflow '{target}' failed")),
+                false,
+            ),
+            "cancelled" => (
+                Status::Cancelled,
+                Some(format!("workflow '{target}' was cancelled")),
+                false,
+            ),
+            other => (
+                Status::Failed,
+                Some(format!(
+                    "workflow '{target}' ended with unknown outcome '{other}'"
+                )),
+                false,
+            ),
+        },
+        Err(error) => (
+            Status::Failed,
+            Some(format!("workflow '{target}': {error:#}")),
+            false,
+        ),
+    };
+    runner::ChildEnd {
+        run_id: Some(run_id),
+        status,
+        error,
+        fail_fast_skip,
+    }
+}
+
+async fn invocation(
+    run: &Arc<Run>,
+    name: &str,
+    parent: Option<Parent>,
+    identity: retention::RunIdentity,
+) -> Result<Option<Finished>> {
+    let config = match &parent {
+        Some(_) => &run.targets[name],
+        None => &run.root,
+    };
+    let settings = config
+        .settings
+        .resolve(run.parallelism, run.fail_fast, &run.history)?;
+    let mut output = run.output.with_workflow(name);
+    if run.calls {
+        output = output.with_invocation(
+            &identity.id,
+            parent
+                .as_ref()
+                .map(|p| (p.run_id.as_str(), p.caller_job.as_str())),
+        );
+    }
+    let output = &output;
+    let cancel = run.cancel.clone();
+    let profile = run.profile.as_deref();
     let parallelism = settings.parallelism;
     let fail_fast = settings.fail_fast;
-    // One identity names the log run directory, the history file and the
-    // reporting workflow_run_id. The host is sampled at run start too.
-    let identity = retention::RunIdentity::new();
+    let scope = match &parent {
+        Some(parent) => runner::Scope::child(&parent.scope, parallelism, fail_fast),
+        None => runner::Scope::root(parallelism, fail_fast),
+    };
+    // The host is sampled at run start too.
     let host = history::Host::current();
-    let graph_sha256 = history::graph_sha256(&config.jobs);
+    let graph_sha256 = history::graph_sha256(&config.jobs, &|target| &run.targets[target].jobs);
+    // An enclosing fail-fast stop can land after the call's own check; re-check
+    // right before the first observable effect (reporting, events, logs).
+    if parent.as_ref().is_some_and(|parent| parent.scope.stopped()) {
+        return Ok(None);
+    }
     let mut session = match &config.reporting {
         Some(reporting) => Some(
             reporting::Session::start(
                 reporting,
                 &identity.id,
-                &name,
-                cli.env.as_deref(),
+                name,
+                profile,
                 &config.jobs,
                 &settings.workdir,
             )
@@ -382,16 +587,20 @@ async fn run(cli: &Cli, output: &mut Output, cancel: watch::Receiver<Option<i32>
     } else {
         None
     };
-    let log_base = cli.log_dir.as_ref().map(|dir| {
-        if legacy_default && name == "default" {
+    // Legacy root jobs log flat; every named workflow and every called
+    // workflow, `default` included, logs under its own namespace.
+    let log_base = run.log_dir.as_ref().map(|dir| {
+        if parent.is_none() && run.legacy_default && name == "default" {
             dir.clone()
         } else {
-            dir.join(config::path_component(&name))
+            dir.join(config::path_component(name))
         }
     });
     let mut options = Options {
-        parallelism,
-        fail_fast,
+        scope: scope.clone(),
+        calls: run
+            .calls
+            .then(|| activator(run.clone(), identity.id.clone())),
         workdir: settings.workdir,
         log_dir: None,
         output: output.clone(),
@@ -399,7 +608,7 @@ async fn run(cli: &Cli, output: &mut Output, cancel: watch::Receiver<Option<i32>
             .as_ref()
             .map(reporting::Session::runner_env)
             .unwrap_or_default(),
-        environment: cli.env.clone(),
+        environment: run.profile.clone(),
         settings_env: settings.env,
     };
     output.emit(json!({"type":"run_started", "parallelism":parallelism, "fail_fast":fail_fast, "jobs":config.jobs.iter().map(config::Job::instances).sum::<usize>(), "workdir":options.workdir})).await?;
@@ -458,7 +667,7 @@ async fn run(cli: &Cli, output: &mut Output, cancel: watch::Receiver<Option<i32>
     summary["duration_ms"] = json!(run_start.elapsed().as_millis() as u64);
     summary["execute_ms"] = json!(execute_ms);
     // One snapshot decides the outcome in the history file and the summary,
-    // the report header and the exit code.
+    // the report header, the exit code and a calling job's status.
     let signal = *cancel.borrow();
     let fields = history::RunFields {
         run_id: identity.id.clone(),
@@ -478,9 +687,16 @@ async fn run(cli: &Cli, output: &mut Output, cancel: watch::Receiver<Option<i32>
         let target = history::HistoryTarget {
             dir: &settings.history_dir,
             // Legacy top-level jobs record under `default`, which is their workflow name.
-            workflow: &name,
-            environment: cli.env.as_deref(),
-            requested_jobs: &cli.jobs,
+            workflow: name,
+            environment: profile,
+            // A child always runs its complete workflow.
+            requested_jobs: match &parent {
+                Some(_) => &[],
+                None => &run.requested_jobs,
+            },
+            parent: parent
+                .as_ref()
+                .map(|p| (p.run_id.as_str(), p.caller_job.as_str())),
             source: source.as_ref(),
             stem: &identity.stem,
             runs: settings.history_runs,
@@ -500,13 +716,20 @@ async fn run(cli: &Cli, output: &mut Output, cancel: watch::Receiver<Option<i32>
             Err(error) => eprintln!("goodflows: warning: run history: {error:#}"),
         }
     }
-    let config_path = cli.config.as_ref().map(|path| path.to_string_lossy());
+    // Only the root report offers a rerun, which keeps the calling context.
+    let config_path = match &parent {
+        Some(_) => None,
+        None => run.config_path.as_deref(),
+    };
     output
-        .emit_summary(summary, config_path.as_deref(), signal.is_some())
+        .emit_summary(summary, config_path, signal.is_some())
         .await?;
-    Ok(signal
-        .map(|s| (128 + s) as u8)
-        .unwrap_or(if success { 0 } else { 1 }))
+    Ok(Some(Finished {
+        outcome: fields.outcome,
+        success,
+        signal,
+        interrupted: interrupted(fields.outcome, results.iter().map(|r| r.fail_fast_skip)),
+    }))
 }
 
 type Cancellation = (watch::Sender<Option<i32>>, watch::Receiver<Option<i32>>);
@@ -538,6 +761,68 @@ fn cancellation() -> Result<Cancellation> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn child_end_maps_how_the_child_invocation_ended() {
+        let end = |finished| child_end("suite", "child".into(), finished);
+        let ended = |outcome, interrupted| {
+            Ok(Some(Finished {
+                outcome,
+                success: outcome == "passed",
+                signal: None,
+                interrupted,
+            }))
+        };
+        // Stopped by fail-fast before it started: skipped, with no identity.
+        let skipped = end(Ok(None));
+        assert_eq!(skipped.status, Status::Skipped);
+        assert_eq!(
+            skipped.error.as_deref(),
+            Some("fail_fast: previous job failed")
+        );
+        assert!(skipped.run_id.is_none() && skipped.fail_fast_skip);
+        // That skip interrupts the invocation that owns the call in turn.
+        assert!(interrupted("passed", [skipped.fail_fast_skip]));
+        let passed = end(ended("passed", false));
+        assert_eq!(
+            (passed.status, passed.error, passed.run_id.as_deref()),
+            (Status::Passed, None, Some("child"))
+        );
+        assert!(!passed.fail_fast_skip);
+        let failed = end(ended("failed", false));
+        assert_eq!(
+            (
+                failed.status,
+                failed.error.as_deref(),
+                failed.run_id.as_deref()
+            ),
+            (
+                Status::Failed,
+                Some("workflow 'suite' failed"),
+                Some("child")
+            )
+        );
+        // Cut short by an enclosing fail-fast: skipped, keeping the identity.
+        let cut = end(ended("passed", true));
+        assert_eq!(
+            (cut.status, cut.error.as_deref(), cut.run_id.as_deref()),
+            (Status::Skipped, Some(runner::FAIL_FAST_SKIP), Some("child"))
+        );
+        assert!(cut.fail_fast_skip && !failed.fail_fast_skip);
+        assert!(interrupted("passed", [cut.fail_fast_skip]));
+    }
+
+    #[test]
+    fn only_a_passed_child_with_fail_fast_skips_is_interrupted() {
+        // Passed jobs and skips by a false condition or a dependency carry no
+        // fail-fast flag, so they leave the child passed.
+        let (fail_fast, other) = (true, false);
+        assert!(!interrupted("passed", [other, other, other]));
+        assert!(interrupted("passed", [other, fail_fast]));
+        // A failed or cancelled outcome takes precedence.
+        assert!(!interrupted("failed", [fail_fast]));
+        assert!(!interrupted("cancelled", [fail_fast]));
+    }
 
     fn parse(args: &[&str]) -> std::result::Result<Cli, clap::Error> {
         Cli::try_parse_from(std::iter::once("goodflows").chain(args.iter().copied()))

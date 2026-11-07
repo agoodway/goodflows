@@ -936,3 +936,983 @@ fn readme_profile_partition_examples_validate() {
         .unwrap();
     assert!(!profiles.contains("cannot change a partition count"));
 }
+
+// ---- workflow-call jobs ----
+
+/// Every summary event, in output order.
+fn summaries(events: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    events
+        .iter()
+        .filter(|e| e["type"] == "summary")
+        .cloned()
+        .collect()
+}
+
+/// The summary of the invocation of `workflow` (the first, if repeated).
+fn summary_for(events: &[serde_json::Value], workflow: &str) -> serde_json::Value {
+    summaries(events)
+        .into_iter()
+        .find(|s| s["workflow"] == workflow)
+        .unwrap_or_else(|| panic!("no summary for {workflow}"))
+}
+
+fn result_of(summary: &serde_json::Value, name: &str) -> serde_json::Value {
+    summary["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["name"] == name)
+        .unwrap_or_else(|| panic!("no result {name}: {summary}"))
+        .clone()
+}
+
+fn error_of(output: &std::process::Output) -> String {
+    assert_eq!(output.status.code(), Some(1), "{}", stdout(output));
+    let event: serde_json::Value = serde_json::from_str(stdout(output).lines().last().unwrap())
+        .unwrap_or_else(|_| panic!("{}", stdout(output)));
+    assert_eq!(event["type"], "error", "{event}");
+    event["message"].as_str().unwrap().to_owned()
+}
+
+const SUITE: &str = "[[workflows.suite.jobs]]\nname='t'\ncommand='echo suite >> order'\n";
+
+#[test]
+fn call_jobs_accept_the_workflow_form_with_harmless_defaults() {
+    let p = Project::new(&format!(
+        "[[workflows.ci.jobs]]\nname='marker'\ncommand='touch marker'\n\
+         [[workflows.ci.jobs]]\nname='call'\nworkflow='suite'\ndepends_on=['marker']\n\
+         condition={{ expression = 'true' }}\nenv={{}}\noutputs={{}}\nreports=[]\nshell=true\nsteps=[]\n{SUITE}"
+    ));
+    success(&p.run(&["validate", "ci"]));
+    assert!(!p.dir.join("marker").exists());
+    let output = p.run(&["run", "ci", "--json"]);
+    success(&output);
+    assert_eq!(p.read("order"), "suite\n");
+    let events = events(&output);
+    let call = result_of(&summary_for(&events, "ci"), "call");
+    assert_eq!(call["status"], "passed");
+    assert_eq!(call["workflow"], "suite");
+    assert!(call["command"].is_null() && call["exit_code"].is_null());
+    assert_eq!(call["outputs"], serde_json::json!({}));
+}
+
+#[test]
+fn call_jobs_reject_other_forms_modifiers_and_output_references_before_running() {
+    let base = "[[workflows.ci.jobs]]\nname='marker'\ncommand='touch marker'\n";
+    let call = "[[workflows.ci.jobs]]\nname='call'\nworkflow='suite'\n";
+    for (extra, message) in [
+        (
+            "command='true'\n",
+            "job 'call': define exactly one of a command, nonempty steps, or a workflow",
+        ),
+        (
+            "[[workflows.ci.jobs.steps]]\nid='s'\ncommand='true'\n",
+            "job 'call': define exactly one of a command, nonempty steps, or a workflow",
+        ),
+        (
+            "timeout_secs=5\n",
+            "job 'call': workflow-call jobs do not support timeout_secs",
+        ),
+        (
+            "partitions=2\n",
+            "job 'call': workflow-call jobs do not support partitions",
+        ),
+        (
+            "env={ A = '1' }\n",
+            "job 'call': workflow-call jobs do not support env",
+        ),
+        (
+            "outputs={ x = 'needs.marker.outputs.x' }\n",
+            "job 'call': workflow-call jobs do not support outputs",
+        ),
+        (
+            "reports=['test-timings']\n",
+            "job 'call': workflow-call jobs do not support reports",
+        ),
+        (
+            "shell=false\n",
+            "job 'call': workflow-call jobs do not support shell = false",
+        ),
+    ] {
+        let p = Project::new(&format!("{base}{call}{extra}{SUITE}"));
+        for args in [&["validate", "--json"][..], &["run", "ci", "--json"]] {
+            let error = error_of(&p.run(args));
+            assert_eq!(error, format!("workflow 'ci': {message}"), "{extra}");
+        }
+        assert!(!p.dir.join("marker").exists(), "{extra}");
+    }
+    let p = Project::new(&format!(
+        "{base}[[workflows.ci.jobs]]\nname='call'\nworkflow=''\n{SUITE}"
+    ));
+    for args in [&["validate", "--json"][..], &["run", "ci", "--json"]] {
+        assert_eq!(
+            error_of(&p.run(args)),
+            "workflow 'ci': job 'call': workflow-call target must be a nonempty workflow name"
+        );
+    }
+    assert!(!p.dir.join("marker").exists());
+    // A call publishes no outputs, to conditions or to output mappings.
+    for dependent in [
+        "[[workflows.ci.jobs]]\nname='after'\ndepends_on=['call']\ncondition={ expression = 'needs.call.outputs.x' }\ncommand='true'\n",
+        "[[workflows.ci.jobs]]\nname='after'\ndepends_on=['call']\noutputs={ v = 'needs.call.outputs.x' }\n[[workflows.ci.jobs.steps]]\nid='s'\ncommand='true'\n",
+    ] {
+        let p = Project::new(&format!("{base}{call}{dependent}{SUITE}"));
+        let error = error_of(&p.run(&["run", "ci", "--json"]));
+        assert!(
+            error.starts_with("workflow 'ci': job 'after': ")
+                && error.ends_with("workflow-call job 'call' publishes no outputs"),
+            "{error}"
+        );
+        assert!(!p.dir.join("marker").exists());
+    }
+}
+
+#[test]
+fn call_targets_and_cycles_are_validated_across_the_whole_document() {
+    let marker = "[[workflows.ci.jobs]]\nname='marker'\ncommand='touch marker'\n";
+    for (config, message) in [
+        (
+            // An unselected workflow's unknown target still fails.
+            format!("{marker}[[workflows.other.jobs]]\nname='c'\nworkflow='missing'\n"),
+            "workflow 'other': job 'c': unknown workflow 'missing' (available: ci, other)".to_owned(),
+        ),
+        (
+            format!("{marker}[[workflows.ci.jobs]]\nname='again'\nworkflow='ci'\n"),
+            "workflow call cycle detected: workflow 'ci' job 'again' -> workflow 'ci'".to_owned(),
+        ),
+        (
+            // Direct, behind a false condition and outside the selection.
+            format!(
+                "{marker}[[workflows.a.jobs]]\nname='to-b'\nworkflow='b'\ncondition={{ expression = 'false' }}\n\
+                 [[workflows.b.jobs]]\nname='to-a'\nworkflow='a'\n"
+            ),
+            "workflow call cycle detected: workflow 'a' job 'to-b' -> workflow 'b' job 'to-a' -> workflow 'a'"
+                .to_owned(),
+        ),
+        (
+            format!(
+                "{marker}[[workflows.a.jobs]]\nname='x'\nworkflow='b'\n[[workflows.b.jobs]]\nname='y'\nworkflow='c'\n\
+                 [[workflows.c.jobs]]\nname='z'\nworkflow='a'\n"
+            ),
+            "workflow call cycle detected: workflow 'a' job 'x' -> workflow 'b' job 'y' -> workflow 'c' job 'z' -> workflow 'a'"
+                .to_owned(),
+        ),
+    ] {
+        let p = Project::new(&config);
+        for args in [&["validate", "--json"][..], &["run", "ci", "--json"], &["list", "ci", "--json"]] {
+            assert_eq!(error_of(&p.run(args)), message, "{args:?}");
+        }
+        assert!(!p.dir.join("marker").exists());
+    }
+}
+
+#[test]
+fn legacy_default_repeated_and_deep_targets_are_valid() {
+    // A named workflow may call the root jobs' `default` workflow.
+    let p = Project::new(
+        "[[jobs]]\nname='root'\ncommand='echo root >> order'\n\
+         [[workflows.ci.jobs]]\nname='legacy'\nworkflow='default'\n",
+    );
+    success(&p.run(&["run", "ci"]));
+    assert_eq!(p.read("order"), "root\n");
+    // Diamond and repeated targets are acyclic; each call runs separately.
+    let p = Project::new(
+        "[[workflows.ci.jobs]]\nname='b'\nworkflow='b'\n[[workflows.ci.jobs]]\nname='c'\nworkflow='c'\n\
+         [[workflows.ci.jobs]]\nname='d'\nworkflow='d'\n\
+         [[workflows.b.jobs]]\nname='d'\nworkflow='d'\n[[workflows.c.jobs]]\nname='d'\nworkflow='d'\n\
+         [[workflows.d.jobs]]\nname='t'\ncommand='echo d >> order'\n",
+    );
+    success(&p.run(&["run", "ci"]));
+    assert_eq!(p.read("order"), "d\nd\nd\n");
+    // No nesting-depth limit: a long call chain validates and runs.
+    let mut config = String::new();
+    for i in 0..300 {
+        config.push_str(&format!(
+            "[[workflows.w{i}.jobs]]\nname='next'\nworkflow='w{}'\n",
+            i + 1
+        ));
+    }
+    config.push_str("[[workflows.w300.jobs]]\nname='leaf'\ncommand='touch leaf'\n");
+    let p = Project::new(&config);
+    success(&p.run(&["validate"]));
+    let mut short = String::new();
+    for i in 0..20 {
+        short.push_str(&format!(
+            "[[workflows.w{i}.jobs]]\nname='next'\nworkflow='w{}'\n",
+            i + 1
+        ));
+    }
+    short.push_str("[[workflows.w20.jobs]]\nname='leaf'\ncommand='touch leaf'\n");
+    let p = Project::new(&short);
+    success(&p.run(&["run", "w0", "--parallelism", "1"]));
+    assert!(p.dir.join("leaf").exists());
+}
+
+const SELECT: &str = r#"
+[[workflows.ci.jobs]]
+name = "prepare"
+command = "echo prepare >> order"
+[[workflows.ci.jobs]]
+name = "checks"
+workflow = "suite"
+depends_on = ["prepare"]
+[[workflows.ci.jobs]]
+name = "publish"
+command = "echo publish >> order"
+depends_on = ["checks"]
+[[workflows.ci.jobs]]
+name = "other"
+command = "echo other >> order"
+[[workflows.suite.jobs]]
+name = "setup"
+command = "echo setup >> order"
+[[workflows.suite.jobs]]
+name = "unit"
+command = "echo unit >> order"
+[[workflows.suite.jobs]]
+name = "test"
+command = "echo test >> order"
+depends_on = ["setup"]
+"#;
+
+#[test]
+fn root_selection_is_local_and_children_run_their_complete_graph() {
+    let p = Project::new(SELECT);
+    let output = p.run(&["run", "ci", "--jobs", "publish", "--json"]);
+    success(&output);
+    let order = p.read("order");
+    let lines: Vec<_> = order.lines().collect();
+    assert_eq!(lines.first(), Some(&"prepare"));
+    assert_eq!(lines.last(), Some(&"publish"));
+    let mut child: Vec<_> = lines[1..lines.len() - 1].to_vec();
+    child.sort();
+    assert_eq!(child, ["setup", "test", "unit"], "{order}");
+    let events = events(&output);
+    let root = summary_for(&events, "ci");
+    // Local counts: three selected root jobs, the call counted once.
+    assert_eq!(
+        (
+            root["passed"].as_u64(),
+            root["results"].as_array().unwrap().len()
+        ),
+        (Some(3), 3)
+    );
+    assert_eq!(summary_for(&events, "suite")["passed"], 3);
+    // Selecting the call itself does not filter the child.
+    std::fs::remove_file(p.dir.join("order")).unwrap();
+    success(&p.run(&["run", "ci", "--jobs", "checks"]));
+    let mut order: Vec<_> = p.read("order").lines().map(str::to_owned).collect();
+    order.sort();
+    assert_eq!(order, ["prepare", "setup", "test", "unit"]);
+}
+
+#[test]
+fn list_and_validate_show_call_targets_without_running() {
+    let p = Project::new(SELECT);
+    let validated = event(&p.run(&["validate", "ci", "--jobs", "publish", "--json"]));
+    assert_eq!(
+        validated["selected_jobs"],
+        serde_json::json!(["prepare", "checks", "publish"])
+    );
+    assert_eq!(validated["jobs"], 3);
+    assert_eq!(validated["total_defined_jobs"], 4);
+    assert_eq!(
+        validated["calls"],
+        serde_json::json!([{"job":"checks", "workflow":"suite"}])
+    );
+    let text = p.run(&["validate", "ci"]);
+    success(&text);
+    assert!(
+        stdout(&text).contains("  call: checks -> workflow suite\n"),
+        "{}",
+        stdout(&text)
+    );
+    let listed = event(&p.run(&["list", "ci", "--json"]));
+    let checks = &listed["jobs"][1];
+    assert_eq!(checks["name"], "checks");
+    assert_eq!(checks["workflow"], "suite");
+    assert!(checks["command"].is_null());
+    assert!(listed["jobs"][0].get("workflow").is_none());
+    let text = stdout(&p.run(&["list", "ci"]));
+    assert!(
+        text.contains("  checks  depends_on: prepare\n    workflow: suite\n"),
+        "{text}"
+    );
+    // Discovery and aggregate validation keep local per-workflow counts.
+    let workflows = event(&p.run(&["list", "--workflows", "--json"]));
+    assert_eq!(workflows["workflows"][0]["jobs"], 4);
+    assert_eq!(workflows["workflows"][1]["jobs"], 3);
+    assert_eq!(
+        event(&p.run(&["validate", "--json"]))["total_defined_jobs"],
+        7
+    );
+    assert!(!p.dir.join("order").exists());
+}
+
+#[test]
+fn child_settings_merge_shared_settings_per_key_without_caller_overrides() {
+    std::fs::create_dir_all(std::env::temp_dir()).unwrap();
+    let p = Project::new(
+        r#"
+[settings]
+parallelism = 4
+fail_fast = false
+[settings.env]
+KEEP = "shared"
+X = "shared"
+[workflows.ci.settings]
+parallelism = 1
+workdir = "caller"
+[workflows.ci.settings.env]
+X = "caller"
+ONLY = "caller"
+[[workflows.ci.jobs]]
+name = "here"
+command = "pwd > where; echo \"$KEEP:$X:${ONLY-unset}:${GOODFLOWS_ENVIRONMENT-none}\" > env"
+[[workflows.ci.jobs]]
+name = "call"
+workflow = "suite"
+[workflows.suite.settings]
+workdir = "child"
+[workflows.suite.settings.env]
+X = "child"
+[[workflows.suite.jobs]]
+name = "here"
+command = "pwd > where; echo \"$KEEP:$X:${ONLY-unset}:${GOODFLOWS_ENVIRONMENT-none}\" > env"
+[environments.p.settings.env]
+KEEP = "profile"
+"#,
+    );
+    for dir in ["caller", "child"] {
+        std::fs::create_dir_all(p.dir.join(dir)).unwrap();
+    }
+    let output = p.run(&["run", "ci", "--json"]);
+    success(&output);
+    for (dir, env) in [
+        ("caller", "shared:caller:caller:none"),
+        ("child", "shared:child:unset:none"),
+    ] {
+        assert_eq!(
+            p.read(&format!("{dir}/where")).trim(),
+            p.dir.join(dir).to_str().unwrap()
+        );
+        assert_eq!(p.read(&format!("{dir}/env")).trim(), env);
+    }
+    let events = events(&output);
+    let started: Vec<_> = events
+        .iter()
+        .filter(|e| e["type"] == "run_started")
+        .collect();
+    // The omitted child parallelism inherits shared 4, not the caller's 1.
+    assert_eq!(
+        (
+            started[0]["workflow"].as_str(),
+            started[0]["parallelism"].as_u64()
+        ),
+        (Some("ci"), Some(1))
+    );
+    assert_eq!(
+        (
+            started[1]["workflow"].as_str(),
+            started[1]["parallelism"].as_u64()
+        ),
+        (Some("suite"), Some(4))
+    );
+    // The selected profile and CLI flags reach every invocation.
+    let output = p.run(&["run", "ci", "--env", "p", "--parallelism", "2", "--json"]);
+    success(&output);
+    assert_eq!(p.read("caller/env").trim(), "profile:caller:caller:p");
+    assert_eq!(p.read("child/env").trim(), "profile:child:unset:p");
+    assert!(common::events(&output)
+        .iter()
+        .filter(|e| e["type"] == "run_started")
+        .all(|e| e["parallelism"] == 2));
+}
+
+#[test]
+fn profile_partitions_are_shared_by_job_name_across_reachable_workflows() {
+    let config = |condition: &str| {
+        format!(
+            r#"
+[[workflows.ci.jobs]]
+name = "marker"
+command = "touch marker"
+[[workflows.ci.jobs]]
+name = "test"
+partitions = 2
+command = "echo ci-$GOODFLOWS_ENVIRONMENT-$GOODFLOWS_PARTITION_COUNT >> counts"
+[[workflows.ci.jobs]]
+name = "call"
+workflow = "suite"
+[[workflows.suite.jobs]]
+name = "test"
+partitions = 2
+command = "echo suite-$GOODFLOWS_ENVIRONMENT-$GOODFLOWS_PARTITION_COUNT >> counts"
+[[workflows.suite.jobs]]
+name = "maybe"
+workflow = "plain"
+condition = {{ expression = '{condition}' }}
+[[workflows.plain.jobs]]
+name = "test"
+command = "true"
+[[workflows.release.jobs]]
+name = "call"
+workflow = "suite"
+[environments.local.partitions]
+test = 3
+"#
+        )
+    };
+    // The reachable unpartitioned `test` fails the profile before any root
+    // job runs, even behind a false call condition.
+    let p = Project::new(&config("false"));
+    for args in [
+        &["run", "ci", "--env", "local", "--json"][..],
+        &["list", "ci", "--env", "local", "--json"],
+        &["validate", "ci", "--env", "local", "--json"],
+        &["validate", "--json"],
+    ] {
+        assert_eq!(
+            error_of(&p.run(args)),
+            "environment 'local': workflow 'plain': job 'test' is not partitioned",
+            "{args:?}"
+        );
+    }
+    assert!(!p.dir.join("marker").exists() && !p.dir.join("counts").exists());
+    // Without the profile the same graph runs, and the false call is skipped.
+    success(&p.run(&["run", "ci"]));
+    let mut counts: Vec<_> = p.read("counts").lines().map(str::to_owned).collect();
+    counts.sort();
+    assert_eq!(counts, ["ci--2", "ci--2", "suite--2", "suite--2"]);
+    // Without the incompatible workflow, one profile count covers both jobs.
+    let p = Project::new(&config("false").replace(
+        "[[workflows.plain.jobs]]\nname = \"test\"\ncommand = \"true\"\n",
+        "[[workflows.plain.jobs]]\nname = \"unrelated\"\ncommand = \"true\"\n",
+    ));
+    success(&p.run(&["run", "ci", "--env", "local"]));
+    let mut counts: Vec<_> = p.read("counts").lines().map(str::to_owned).collect();
+    counts.sort();
+    let mut expected = vec!["ci-local-3"; 3];
+    expected.extend(["suite-local-3"; 3]);
+    assert_eq!(counts, expected);
+}
+
+#[test]
+fn calls_order_preparation_nesting_and_repeated_executions() {
+    let p = Project::new(
+        r#"
+[settings]
+parallelism = 4
+[[workflows.ci.jobs]]
+name = "init"
+command = "echo v1 > state; echo init >> order"
+[[workflows.ci.jobs]]
+name = "before"
+workflow = "checks"
+depends_on = ["init"]
+[[workflows.ci.jobs]]
+name = "mutate"
+command = "echo v2 > state; echo mutate >> order"
+depends_on = ["before"]
+[[workflows.ci.jobs]]
+name = "after"
+workflow = "checks"
+depends_on = ["mutate"]
+[[workflows.ci.jobs]]
+name = "publish"
+command = "echo publish >> order"
+depends_on = ["after"]
+[[workflows.checks.jobs]]
+name = "read"
+command = "cat state >> seen; echo checks >> order"
+[[workflows.checks.jobs]]
+name = "nested"
+workflow = "leaf"
+depends_on = ["read"]
+[[workflows.leaf.jobs]]
+name = "leaf"
+command = "echo leaf >> order"
+"#,
+    );
+    let output = p.run(&["run", "ci", "--json"]);
+    success(&output);
+    assert_eq!(
+        p.read("order"),
+        "init\nchecks\nleaf\nmutate\nchecks\nleaf\npublish\n"
+    );
+    // The second execution observes the workspace change.
+    assert_eq!(p.read("seen"), "v1\nv2\n");
+    let events = events(&output);
+    let root = summary_for(&events, "ci");
+    let before = result_of(&root, "before")["child_run_id"].clone();
+    let after = result_of(&root, "after")["child_run_id"].clone();
+    assert!(before.is_string() && after.is_string() && before != after);
+    let children: Vec<_> = summaries(&events)
+        .into_iter()
+        .filter(|s| s["workflow"] == "checks")
+        .collect();
+    assert_eq!(children.len(), 2);
+    assert_eq!(children[0]["run_id"], before);
+    assert_eq!(children[0]["caller_job"], "before");
+    assert_eq!(children[1]["run_id"], after);
+    assert_eq!(
+        summaries(&events)
+            .iter()
+            .filter(|s| s["workflow"] == "leaf")
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn independent_jobs_are_not_gated_by_a_call_listed_first() {
+    let p = Project::new(
+        r#"
+[settings]
+parallelism = 4
+[[workflows.ci.jobs]]
+name = "call"
+workflow = "slow"
+[[workflows.ci.jobs]]
+name = "free"
+command = "touch free"
+[[workflows.slow.jobs]]
+name = "wait"
+command = "i=0; while [ $i -lt 500 ] && ! test -f free; do sleep 0.01; i=$((i+1)); done; test -f free"
+"#,
+    );
+    success(&p.run(&["run", "ci"]));
+}
+
+#[test]
+fn a_false_call_condition_creates_no_child_state() {
+    let p = Project::new(
+        r#"
+[[workflows.ci.jobs]]
+name = "detect"
+outputs = { run = "steps.scan.outputs.run" }
+[[workflows.ci.jobs.steps]]
+id = "scan"
+command = "printf '{\"run\":false}' > \"$GOODFLOWS_OUTPUT\""
+[[workflows.ci.jobs]]
+name = "call"
+workflow = "suite"
+depends_on = ["detect"]
+condition = { expression = "needs.detect.outputs.run" }
+[[workflows.ci.jobs]]
+name = "after"
+command = "touch after"
+depends_on = ["call"]
+[[workflows.suite.jobs]]
+name = "t"
+command = "touch ran"
+"#,
+    );
+    let output = p.run(&["run", "ci", "--json", "--history", "--log-dir", "logs"]);
+    success(&output);
+    let events = events(&output);
+    assert!(
+        events.iter().all(|e| e["workflow"] == "ci"),
+        "{}",
+        stdout(&output)
+    );
+    assert_eq!(summaries(&events).len(), 1);
+    let root = summary_for(&events, "ci");
+    let call = result_of(&root, "call");
+    assert_eq!(call["status"], "skipped");
+    assert_eq!(call["error"], "condition expression was false");
+    assert_eq!(call["workflow"], "suite");
+    assert!(call.get("child_run_id").is_none());
+    assert_eq!(
+        result_of(&root, "after")["error"],
+        "dependency did not pass"
+    );
+    assert!(!p.dir.join("ran").exists() && !p.dir.join("after").exists());
+    assert!(!p.dir.join("logs/suite").exists());
+    assert!(!p.dir.join("goodflows-history/suite").exists());
+    // A true output activates the child.
+    let p = Project::new(&p.read("goodflows.toml").replace("false", "true"));
+    success(&p.run(&["run", "ci"]));
+    assert!(p.dir.join("ran").exists() && p.dir.join("after").exists());
+}
+
+#[test]
+fn calls_complete_with_the_child_outcome() {
+    let p = Project::new(
+        r#"
+[settings]
+fail_fast = false
+[[workflows.ci.jobs]]
+name = "integration"
+workflow = "suite"
+[[workflows.ci.jobs]]
+name = "publish"
+command = "touch published"
+depends_on = ["integration"]
+[[workflows.ci.jobs]]
+name = "optional"
+workflow = "optional"
+[[workflows.ci.jobs]]
+name = "after-optional"
+command = "touch after-optional"
+depends_on = ["optional"]
+[[workflows.suite.jobs]]
+name = "test"
+command = "exit 1"
+[[workflows.optional.jobs]]
+name = "ok"
+command = "true"
+[[workflows.optional.jobs]]
+name = "never"
+condition = { expression = "false" }
+command = "touch never"
+[[workflows.optional.jobs]]
+name = "blocked"
+depends_on = ["never"]
+command = "touch blocked"
+"#,
+    );
+    let output = p.run(&["run", "ci", "--json"]);
+    assert_eq!(output.status.code(), Some(1));
+    let events = events(&output);
+    let root = summary_for(&events, "ci");
+    let integration = result_of(&root, "integration");
+    assert_eq!(integration["status"], "failed");
+    assert_eq!(integration["error"], "workflow 'suite' failed");
+    assert!(integration["exit_code"].is_null() && integration["command"].is_null());
+    assert!(integration["duration_ms"].is_u64());
+    assert!(integration.get("commands").is_none());
+    assert_eq!(
+        result_of(&root, "publish")["error"],
+        "dependency did not pass"
+    );
+    // Conditional skips in the child do not fail the call.
+    assert_eq!(result_of(&root, "optional")["status"], "passed");
+    assert!(p.dir.join("after-optional").exists());
+    assert!(!p.dir.join("published").exists());
+    assert_eq!(
+        (
+            root["passed"].as_u64(),
+            root["failed"].as_u64(),
+            root["skipped"].as_u64()
+        ),
+        (Some(2), Some(1), Some(1))
+    );
+    assert_eq!(root["outcome"], "failed");
+    assert_eq!(summary_for(&events, "optional")["skipped"], 2);
+    // The root summary is last, after every child summary.
+    assert_eq!(events.last().unwrap()["type"], "summary");
+    assert_eq!(events.last().unwrap()["workflow"], "ci");
+    // Without any failure in the run, the child's skips still pass the call.
+    let output = p.run(&["run", "ci", "--json", "--jobs", "after-optional"]);
+    let events = common::events(&output);
+    assert_eq!(output.status.code(), Some(0), "{events:?}");
+    let root = summary_for(&events, "ci");
+    assert_eq!(result_of(&root, "optional")["status"], "passed");
+    assert_eq!(result_of(&root, "after-optional")["status"], "passed");
+    assert_eq!(root["outcome"], "passed");
+    assert_eq!(summary_for(&events, "optional")["skipped"], 2);
+}
+
+#[test]
+fn child_setup_failure_fails_the_call_with_context_and_keeps_the_root_summary() {
+    let p = Project::new(
+        "[[workflows.ci.jobs]]\nname='call'\nworkflow='suite'\n\
+         [[workflows.ci.jobs]]\nname='after'\ncommand='touch after'\ndepends_on=['call']\n\
+         [[workflows.suite.jobs]]\nname='t'\ncommand='touch ran'\n",
+    );
+    std::fs::create_dir_all(p.dir.join("logs")).unwrap();
+    // A file where the child's log namespace must be created.
+    std::fs::write(p.dir.join("logs/suite"), "").unwrap();
+    let output = p.run(&["run", "ci", "--json", "--log-dir", "logs"]);
+    assert_eq!(output.status.code(), Some(1));
+    let events = events(&output);
+    let root = events.last().unwrap();
+    assert_eq!(
+        (root["type"].as_str(), root["workflow"].as_str()),
+        (Some("summary"), Some("ci"))
+    );
+    let call = result_of(root, "call");
+    assert_eq!(call["status"], "failed");
+    let error = call["error"].as_str().unwrap();
+    assert!(
+        error.starts_with("workflow 'suite': failed to create log directory"),
+        "{error}"
+    );
+    // The child identity was allocated, though it never ran a job. As
+    // documented, its run started but it has no summary.
+    let child = call["child_run_id"].as_str().unwrap();
+    let kinds: Vec<_> = events
+        .iter()
+        .filter(|e| e["invocation_id"] == child)
+        .map(|e| e["type"].as_str().unwrap())
+        .collect();
+    assert_eq!(kinds, ["run_started"], "{events:?}");
+    assert_eq!(result_of(root, "after")["error"], "dependency did not pass");
+    assert!(!p.dir.join("ran").exists());
+    let text = p.run(&["run", "ci", "--log-dir", "logs"]);
+    assert_eq!(text.status.code(), Some(1));
+    assert!(stdout(&text).contains("Rerun failed: goodflows run ci --jobs='call,after'"));
+}
+
+#[test]
+fn child_wait_metrics_use_the_child_invocation_clock() {
+    let p = Project::new(
+        r#"
+[workflows.ci.settings]
+parallelism = 2
+[[workflows.ci.jobs]]
+name = "prepare"
+command = "sleep 0.3"
+[[workflows.ci.jobs]]
+name = "call"
+workflow = "suite"
+depends_on = ["prepare"]
+[[workflows.ci.jobs]]
+name = "hog"
+command = "sleep 0.7"
+depends_on = ["prepare"]
+[[workflows.suite.jobs]]
+name = "first"
+command = "sleep 0.2"
+[[workflows.suite.jobs]]
+name = "other"
+command = "sleep 0.6"
+[[workflows.suite.jobs]]
+name = "second"
+command = "true"
+depends_on = ["first"]
+"#,
+    );
+    let output = p.run(&["run", "ci", "--json"]);
+    success(&output);
+    let events = events(&output);
+    let root = summary_for(&events, "ci");
+    let child = summary_for(&events, "suite");
+    let ms = |result: &serde_json::Value, key: &str| result[key].as_u64().unwrap();
+    // The parent call waited for preparation on the parent's clock.
+    let call = result_of(&root, "call");
+    assert!(ms(&call, "blocked_ms") >= 250, "{call}");
+    // An immediately ready child job excludes the parent's preparation.
+    let first = result_of(&child, "first");
+    assert!(ms(&first, "blocked_ms") < 150, "{first}");
+    // Local dependency wait and the later shared-capacity wait are separate.
+    let second = result_of(&child, "second");
+    let (blocked, queued) = (ms(&second, "blocked_ms"), ms(&second, "queued_ms"));
+    assert!((150..450).contains(&blocked), "{second}");
+    assert!(queued >= 250, "{second}");
+    assert!(
+        blocked + queued < ms(&call, "duration_ms") + 50,
+        "{second} {call}"
+    );
+}
+
+#[test]
+fn call_aware_events_identify_owners_targets_and_repeated_children() {
+    let p = Project::new(
+        r#"
+[settings]
+parallelism = 4
+[[workflows.ci.jobs]]
+name = "one"
+workflow = "suite"
+[[workflows.ci.jobs]]
+name = "two"
+workflow = "suite"
+[[workflows.suite.jobs]]
+name = "test"
+command = "echo hi; touch started.$$; i=0; while [ $i -lt 300 ] && [ $(ls started.* | wc -l) -lt 2 ]; do sleep 0.01; i=$((i+1)); done"
+"#,
+    );
+    let output = p.run(&["run", "ci", "--json"]);
+    success(&output);
+    let events = events(&output);
+    let root = events.last().unwrap();
+    assert_eq!(root["workflow"], "ci");
+    let root_id = root["run_id"].as_str().unwrap();
+    let mut children = Vec::new();
+    for call in ["one", "two"] {
+        let result = result_of(root, call);
+        // The result names the target; the event's workflow is the owner.
+        assert_eq!(result["workflow"], "suite");
+        let child = result["child_run_id"].as_str().unwrap().to_owned();
+        let owned: Vec<_> = events
+            .iter()
+            .filter(|e| e["invocation_id"] == child.as_str())
+            .collect();
+        assert!(owned.len() >= 5, "{owned:?}");
+        for event in &owned {
+            assert_eq!(event["workflow"], "suite");
+            assert_eq!(event["parent_run_id"], root_id);
+            assert_eq!(event["caller_job"], call);
+        }
+        let summary = owned.last().unwrap();
+        assert_eq!(
+            (summary["type"].as_str(), summary["run_id"].as_str()),
+            (Some("summary"), Some(child.as_str()))
+        );
+        assert_eq!(summary["passed"], 1);
+        children.push(child);
+    }
+    assert_ne!(children[0], children[1]);
+    // Root events carry the root identity only.
+    for event in events.iter().filter(|e| e["workflow"] == "ci") {
+        assert_eq!(event["invocation_id"], root_id, "{event}");
+        assert!(event.get("parent_run_id").is_none() && event.get("caller_job").is_none());
+    }
+    assert_eq!(
+        (
+            root["passed"].as_u64(),
+            root["results"].as_array().unwrap().len()
+        ),
+        (Some(2), 2)
+    );
+
+    // Text lines name the owning workflow and a short invocation id.
+    let text = p.run(&["run", "ci"]);
+    success(&text);
+    let text = stdout(&text);
+    let labels: std::collections::BTreeSet<_> = text
+        .lines()
+        .filter_map(|line| line.strip_prefix("[suite ["))
+        .filter_map(|rest| rest.strip_suffix("] test stdout] hi"))
+        .collect();
+    assert_eq!(labels.len(), 2, "{text}");
+    assert!(labels.iter().all(|id| id.len() == 8), "{labels:?}");
+    for id in &labels {
+        assert!(text.contains(&format!("→ suite [{id}] test\n")), "{text}");
+        assert!(
+            text.contains(&format!("suite [{id}] test PASSED")),
+            "{text}"
+        );
+    }
+    let last_report = text.rfind("\nci [").unwrap();
+    assert!(text[last_report..].contains("  PASS  one"), "{text}");
+    // No child line or report follows the root report.
+    assert!(!text[last_report..].contains("\nsuite ["), "{text}");
+}
+
+#[test]
+fn root_rerun_hint_reruns_preparation_before_the_failed_child() {
+    let config = |name: &str| {
+        format!(
+            r#"
+[[workflows."{name}".jobs]]
+name = "prepare"
+command = "echo prepare >> order"
+[[workflows."{name}".jobs]]
+name = "integ ration"
+workflow = "suite"
+depends_on = ["prepare"]
+[[workflows."{name}".jobs]]
+name = "publish"
+command = "echo publish >> order"
+depends_on = ["integ ration"]
+[[workflows.suite.jobs]]
+name = "test"
+command = "echo test >> order; test -f second || {{ touch second; exit 1; }}"
+"#
+        )
+    };
+    let p = Project::new(&config("my ci"));
+    let output = p.run(&["run", "my ci"]);
+    assert_eq!(output.status.code(), Some(1));
+    let text = stdout(&output);
+    let hint = text.lines().last().unwrap();
+    assert_eq!(
+        hint,
+        "Rerun failed: goodflows run 'my ci' --jobs='integ ration,publish'"
+    );
+    // Only the root report offers a rerun.
+    assert_eq!(text.matches("Rerun").count(), 1, "{text}");
+    let command = hint.strip_prefix("Rerun failed: goodflows ").unwrap();
+    let rerun = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!("\"$GOODFLOWS\" {command}"))
+        .env("GOODFLOWS", env!("CARGO_BIN_EXE_goodflows"))
+        .current_dir(&p.dir)
+        .output()
+        .unwrap();
+    success(&rerun);
+    assert_eq!(p.read("order"), "prepare\ntest\nprepare\ntest\npublish\n");
+
+    // A comma in a call name falls back to the whole root workflow.
+    let p = Project::new(&config("ci").replace("integ ration", "in,tegration"));
+    let output = p.run(&["run", "ci"]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        stdout(&output).ends_with("Selective rerun unavailable: job 'in,tegration' contains a comma, which --jobs cannot select.\nRerun workflow: goodflows run ci\n"),
+        "{}",
+        stdout(&output)
+    );
+}
+
+#[test]
+fn repeated_target_logs_are_isolated_and_wrappers_write_none() {
+    let p = Project::new(
+        r#"
+[settings]
+parallelism = 4
+[[workflows.ci.jobs]]
+name = "one"
+workflow = "suite"
+[[workflows.ci.jobs]]
+name = "two"
+workflow = "suite"
+condition = { shell = "echo condition" }
+[[workflows.suite.jobs]]
+name = "test"
+command = "echo $$ > pid.$$; touch started.$$; i=0; while [ $i -lt 300 ] && [ $(ls started.* | wc -l) -lt 2 ]; do sleep 0.01; i=$((i+1)); done; echo out-$$"
+"#,
+    );
+    // Concurrent children with a cap of one: neither live directory is pruned.
+    let output = p.run(&[
+        "run",
+        "ci",
+        "--json",
+        "--log-dir",
+        "logs",
+        "--log-runs",
+        "1",
+    ]);
+    success(&output);
+    let events = events(&output);
+    let mut outputs = Vec::new();
+    for summary in summaries(&events)
+        .iter()
+        .filter(|s| s["workflow"] == "suite")
+    {
+        let dir = p.dir.join(summary["log_dir"].as_str().unwrap());
+        assert!(
+            dir.starts_with(p.dir.join("logs/suite")),
+            "{}",
+            dir.display()
+        );
+        let log = std::fs::read_to_string(dir.join("001-test.stdout.log")).unwrap();
+        assert!(log.starts_with("out-"), "{log}");
+        outputs.push(log);
+    }
+    assert_eq!(outputs.len(), 2);
+    assert_ne!(outputs[0], outputs[1]);
+    // The root run directory holds only the shell condition's ordinary logs.
+    let root = p
+        .dir
+        .join(events.last().unwrap()["log_dir"].as_str().unwrap());
+    let mut names: Vec<_> = std::fs::read_dir(&root)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        [
+            ".goodflows.lock",
+            "002-two.stderr.log",
+            "002-two.stdout.log"
+        ]
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("002-two.stdout.log")).unwrap(),
+        "condition\n"
+    );
+}

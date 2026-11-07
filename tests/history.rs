@@ -669,3 +669,192 @@ fn non_utf8_history_dir_is_reported_lossily() {
     assert_eq!(reported, files[0].to_string_lossy());
     assert!(reported.contains("hist\u{fffd}/default/"), "{reported}");
 }
+
+// ---- workflow-call jobs ----
+
+const CALLS: &str = r#"
+[settings.env]
+SECRET_VALUE = "history-secret-9d1e"
+[workflows.ci.settings]
+history = false
+[[workflows.ci.jobs]]
+name = "prepare"
+command = "true"
+[[workflows.ci.jobs]]
+name = "call"
+workflow = "suite"
+depends_on = ["prepare"]
+[workflows.suite.settings]
+history = true
+[[workflows.suite.jobs]]
+name = "a"
+command = "true"
+[[workflows.suite.jobs]]
+name = "b"
+command = "test -n \"$SECRET_VALUE\""
+"#;
+
+#[test]
+fn child_history_links_its_parent_and_caller_only() {
+    let p = Project::new(CALLS);
+    let output = p.run(&["run", "ci", "--jobs", "call", "--json", "--log-dir", "logs"]);
+    success(&output);
+    let events = events(&output);
+    let root = events.last().unwrap();
+    assert!(root.get("history_file").is_none());
+    assert!(!p.dir.join("goodflows-history/ci").exists());
+    let files = history_files(&p.dir.join("goodflows-history/suite"));
+    assert_eq!(files.len(), 1);
+    let child = record(&files[0]);
+    assert_eq!(child["parent_run_id"], root["run_id"]);
+    assert_eq!(child["caller_job"], "call");
+    // The child ran its complete workflow; the root --jobs list is not copied.
+    assert!(child.get("requested_jobs").is_none());
+    let mut keys: Vec<_> = child
+        .as_object()
+        .unwrap()
+        .keys()
+        .filter(|k| *k != "source")
+        .cloned()
+        .collect();
+    keys.sort();
+    let mut expected = vec![
+        "schema_version",
+        "workflow",
+        "run_id",
+        "parent_run_id",
+        "caller_job",
+        "started_at",
+        "outcome",
+        "duration_ms",
+        "parallelism",
+        "graph_sha256",
+        "max_in_flight",
+        "host",
+        "results",
+    ];
+    expected.sort();
+    assert_eq!(keys, expected);
+    assert_eq!(child["schema_version"], 1);
+    // Child command measurements stay in the child record.
+    for result in child["results"].as_array().unwrap() {
+        assert_eq!(result["commands"][0]["kind"], "command");
+        assert!(result.get("workflow").is_none() && result.get("child_run_id").is_none());
+    }
+    let text = std::fs::read_to_string(&files[0]).unwrap();
+    for leaked in ["history-secret-9d1e", p.dir.to_str().unwrap(), "logs/"] {
+        assert!(!text.contains(leaked), "{leaked}: {text}");
+    }
+    // --no-history disables every invocation.
+    let output = p.run(&["run", "ci", "--no-history", "--json"]);
+    success(&output);
+    assert_eq!(
+        history_files(&p.dir.join("goodflows-history/suite")).len(),
+        1
+    );
+    assert!(common::events(&output)
+        .iter()
+        .all(|e| e.get("history_file").is_none()));
+}
+
+#[test]
+fn call_instances_record_their_target_child_and_no_synthetic_cost() {
+    let p = Project::new(&CALLS.replace("history = false", "history = true"));
+    let output = p.run(&["run", "ci", "--json", "--parallelism", "1"]);
+    success(&output);
+    let events = events(&output);
+    let root = events.last().unwrap();
+    let parent = record(Path::new(root["history_file"].as_str().unwrap()));
+    assert!(parent.get("parent_run_id").is_none() && parent.get("caller_job").is_none());
+    let call = &parent["results"][1];
+    let mut keys: Vec<_> = call.as_object().unwrap().keys().cloned().collect();
+    keys.sort();
+    let mut expected = vec![
+        "name",
+        "workflow",
+        "child_run_id",
+        "status",
+        "started",
+        "exit_code",
+        "command",
+        "error",
+        "blocked_ms",
+        "queued_ms",
+        "duration_ms",
+    ];
+    expected.sort();
+    assert_eq!(keys, expected, "{call}");
+    assert_eq!(call["workflow"], "suite");
+    assert!(call["duration_ms"].is_u64() && call["command"].is_null());
+    let child = record(&history_files(&p.dir.join("goodflows-history/suite"))[0]);
+    assert_eq!(call["child_run_id"], child["run_id"]);
+    // A waiting call takes no slot: one command at a time, not two.
+    assert_eq!(parent["max_in_flight"], 1);
+    assert_eq!(child["max_in_flight"], 1);
+    assert_eq!(parent["results"][0].get("workflow"), None);
+}
+
+#[test]
+fn reachable_called_graphs_change_the_root_hash() {
+    let base = r#"
+[settings.env]
+A = "1"
+[[workflows.ci.jobs]]
+name = "call"
+workflow = "suite"
+condition = { expression = 'env.A == "2"' }
+[[workflows.suite.jobs]]
+name = "test"
+command = "true"
+partitions = 2
+[[workflows.suite.jobs]]
+name = "nested"
+workflow = "leaf"
+[[workflows.leaf.jobs]]
+name = "deep"
+command = "true"
+[[workflows.unrelated.jobs]]
+name = "x"
+command = "true"
+[environments.wide.partitions]
+test = 3
+"#;
+    let hash = |config: &str, args: &[&str]| {
+        let p = Project::new(config);
+        let output = p.run(&[&["run", "ci", "--json"], args].concat());
+        success(&output);
+        // The call condition is false, so no child runs, yet the target counts.
+        let events = events(&output);
+        assert_eq!(events.iter().filter(|e| e["type"] == "summary").count(), 1);
+        summary_of(&output)["graph_sha256"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let root = hash(base, &[]);
+    assert_eq!(hash(base, &[]), root);
+    for (from, to) in [
+        // Child command and grandchild command.
+        (
+            "name = \"test\"\ncommand = \"true\"",
+            "name = \"test\"\ncommand = \"false\"",
+        ),
+        (
+            "name = \"deep\"\ncommand = \"true\"",
+            "name = \"deep\"\ncommand = \"false\"",
+        ),
+        ("partitions = 2", "partitions = 4"),
+    ] {
+        let changed = base.replace(from, to);
+        assert_ne!(changed, base, "{from}");
+        assert_ne!(hash(&changed, &[]), root, "{from}");
+    }
+    assert_ne!(hash(base, &["--env", "wide"]), root);
+    // Env values and unreachable workflows do not change the hash.
+    assert_eq!(hash(&base.replace("A = \"1\"", "A = \"3\""), &[]), root);
+    let unrelated = base.replace(
+        "name = \"x\"\ncommand = \"true\"",
+        "name = \"x\"\ncommand = \"false\"",
+    );
+    assert_eq!(hash(&unrelated, &[]), root);
+}

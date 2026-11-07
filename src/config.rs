@@ -285,6 +285,10 @@ fn resolve_history_dir(base: &Path, dir: &Path) -> Result<PathBuf> {
 pub struct Job {
     pub name: String,
     pub command: Option<String>,
+    /// Workflow in the same config that this job invokes, instead of a
+    /// command or steps. Omitted for command and step jobs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow: Option<String>,
     pub condition: Option<Condition>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub steps: Vec<Step>,
@@ -713,6 +717,7 @@ impl Config {
                 .with_context(|| format!("workflow '{name}'"))?;
             store_partitions(&mut workflow.jobs, partitions);
         }
+        self.validate_calls()?;
         for name in self.environments.keys() {
             validate_name(name, "environment")?;
         }
@@ -744,6 +749,88 @@ impl Config {
                 }
                 if !partitioned.contains(job.as_str()) {
                     bail!("environment '{profile}': job '{job}' is not partitioned");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Every workflow's authored jobs by name, including root jobs as `default`.
+    fn workflow_jobs(&self) -> BTreeMap<&str, &[Job]> {
+        let mut workflows: BTreeMap<&str, &[Job]> = self
+            .workflows
+            .iter()
+            .map(|(name, workflow)| (name.as_str(), workflow.jobs.as_slice()))
+            .collect();
+        if !self.jobs.is_empty() {
+            workflows.insert("default", &self.jobs);
+        }
+        workflows
+    }
+
+    /// Check every workflow-call target and reject direct and indirect call
+    /// cycles across the whole document, whether or not a call is selected or
+    /// its condition would pass.
+    fn validate_calls(&self) -> Result<()> {
+        let workflows = self.workflow_jobs();
+        let names: Vec<&str> = workflows.keys().copied().collect();
+        let index: HashMap<&str, usize> = names.iter().enumerate().map(|(i, n)| (*n, i)).collect();
+        // Each workflow's call edges in job order: (target index, call job name).
+        let mut edges: Vec<Vec<(usize, &str)>> = vec![Vec::new(); names.len()];
+        for (from, jobs) in workflows.values().enumerate() {
+            for job in jobs.iter() {
+                let Some(target) = &job.workflow else {
+                    continue;
+                };
+                let &to = index.get(target.as_str()).with_context(|| {
+                    format!(
+                        "workflow '{}': job '{}': unknown workflow '{}' (available: {})",
+                        names[from],
+                        job.name,
+                        target.escape_debug(),
+                        self.workflow_names().join(", ")
+                    )
+                })?;
+                edges[from].push((to, &job.name));
+            }
+        }
+        // Iterative DFS, like `cycle_path`, so deep call chains need no depth limit.
+        let mut state = vec![0u8; names.len()];
+        for root in 0..names.len() {
+            if state[root] != 0 {
+                continue;
+            }
+            let mut stack = vec![(root, 0usize)];
+            state[root] = 1;
+            while let Some(&(node, next)) = stack.last() {
+                if next == edges[node].len() {
+                    state[node] = 2;
+                    stack.pop();
+                    continue;
+                }
+                stack.last_mut().expect("stack is not empty").1 += 1;
+                let (to, _) = edges[node][next];
+                if state[to] == 1 {
+                    let start = stack
+                        .iter()
+                        .position(|&(index, _)| index == to)
+                        .expect("active workflow is on stack");
+                    let mut path: Vec<_> = stack[start..]
+                        .iter()
+                        .map(|&(index, next)| {
+                            format!(
+                                "workflow '{}' job '{}'",
+                                names[index],
+                                edges[index][next - 1].1
+                            )
+                        })
+                        .collect();
+                    path.push(format!("workflow '{}'", names[to]));
+                    bail!("workflow call cycle detected: {}", path.join(" -> "));
+                }
+                if state[to] == 0 {
+                    state[to] = 1;
+                    stack.push((to, 0));
                 }
             }
         }
@@ -849,6 +936,28 @@ impl Config {
         ))
     }
 
+    /// Every workflow reachable through calls from `jobs`, each resolved with
+    /// its complete job list under the selected profile. Resolving checks the
+    /// profile against each reachable workflow, whether or not a call's
+    /// condition would pass. Validation already rejected call cycles.
+    pub fn called_workflows(
+        &self,
+        jobs: &[Job],
+        profile: Option<&str>,
+    ) -> Result<BTreeMap<String, Config>> {
+        let mut targets = BTreeMap::new();
+        let mut pending: Vec<String> = jobs.iter().filter_map(|j| j.workflow.clone()).collect();
+        while let Some(name) = pending.pop() {
+            if targets.contains_key(&name) {
+                continue;
+            }
+            let (_, config) = self.workflow(Some(&name), profile)?;
+            pending.extend(config.jobs.iter().filter_map(|j| j.workflow.clone()));
+            targets.insert(name, config);
+        }
+        Ok(targets)
+    }
+
     pub fn select(&mut self, selected: &[String]) -> Result<()> {
         if selected.is_empty() {
             return Ok(());
@@ -907,10 +1016,18 @@ fn validate_jobs(jobs: &[Job], reporting: Option<&Reporting>) -> Result<Vec<Opti
     if jobs.is_empty() {
         bail!("no jobs defined");
     }
-    let partitioned: HashSet<&str> = jobs
+    let no_outputs: NoOutputs = jobs
         .iter()
-        .filter(|job| job.partitions_input.is_some())
-        .map(|job| job.name.as_str())
+        .filter_map(|job| {
+            let kind = if job.workflow.is_some() {
+                "workflow-call"
+            } else if job.partitions_input.is_some() {
+                "partitioned"
+            } else {
+                return None;
+            };
+            Some((job.name.as_str(), kind))
+        })
         .collect();
     let mut names = HashMap::new();
     let mut partitions = Vec::with_capacity(jobs.len());
@@ -922,7 +1039,7 @@ fn validate_jobs(jobs: &[Job], reporting: Option<&Reporting>) -> Result<Vec<Opti
             bail!("duplicate job name '{}'", job.name);
         }
         partitions.push(
-            validate_job(job, reporting, &partitioned)
+            validate_job(job, reporting, &no_outputs)
                 .with_context(|| format!("job '{}'", job.name))?,
         );
         if job.timeout_secs == Some(0) {
@@ -1027,14 +1144,15 @@ fn validate_settings_env(
     validate_env(env, reporting)
 }
 
-/// Names of the partitioned jobs in one workflow; they publish no job outputs.
-type Partitioned<'a> = HashSet<&'a str>;
+/// Jobs in one workflow that publish no job outputs, with their kind:
+/// partitioned jobs and workflow-call jobs.
+type NoOutputs<'a> = HashMap<&'a str, &'static str>;
 
 fn validate_expression(
     source: &str,
     needs: &[String],
     steps: &[String],
-    partitioned: &Partitioned,
+    no_outputs: &NoOutputs,
 ) -> Result<()> {
     let expression = Expression::parse(source)?;
     for reference in expression.references() {
@@ -1042,8 +1160,11 @@ fn validate_expression(
             Reference::Needs { job, .. } if !needs.contains(job) => {
                 bail!("output reference requires declared dependency '{job}'");
             }
-            Reference::Needs { job, .. } if partitioned.contains(job.as_str()) => {
-                bail!("partitioned job '{job}' publishes no outputs");
+            Reference::Needs { job, .. } if no_outputs.contains_key(job.as_str()) => {
+                bail!(
+                    "{} job '{job}' publishes no outputs",
+                    no_outputs[job.as_str()]
+                );
             }
             Reference::Step { step, .. } if !steps.contains(step) => {
                 bail!("output reference requires an earlier step '{step}'");
@@ -1058,11 +1179,11 @@ fn validate_condition(
     condition: Option<&Condition>,
     needs: &[String],
     steps: &[String],
-    partitioned: &Partitioned,
+    no_outputs: &NoOutputs,
 ) -> Result<()> {
     match condition {
         Some(Condition::Expression { expression }) => {
-            validate_expression(expression, needs, steps, partitioned)
+            validate_expression(expression, needs, steps, no_outputs)
                 .context("invalid condition expression")?;
         }
         Some(Condition::LegacyShell(shell) | Condition::Shell { shell })
@@ -1129,8 +1250,13 @@ fn validate_partitions(job: &Job) -> Result<Option<Partitions>> {
 fn validate_job(
     job: &Job,
     reporting: Option<&Reporting>,
-    partitioned: &Partitioned,
+    no_outputs: &NoOutputs,
 ) -> Result<Option<Partitions>> {
+    if job.workflow.is_some() {
+        validate_call(job)?;
+        validate_condition(job.condition.as_ref(), &job.depends_on, &[], no_outputs)?;
+        return Ok(None);
+    }
     let partitions = validate_partitions(job)?;
     validate_reports(job, reporting.is_some())?;
     match (&job.command, job.steps.is_empty()) {
@@ -1144,7 +1270,7 @@ fn validate_job(
         _ => bail!("define either a command or nonempty steps, never both"),
     }
     validate_env(&job.env, reporting)?;
-    validate_condition(job.condition.as_ref(), &job.depends_on, &[], partitioned)?;
+    validate_condition(job.condition.as_ref(), &job.depends_on, &[], no_outputs)?;
     let mut steps = Vec::new();
     for step in &job.steps {
         (|| {
@@ -1154,22 +1280,42 @@ fn validate_job(
             }
             validate_command(&step.command, step.shell.unwrap_or(job.shell))?;
             validate_env(&step.env, reporting)?;
-            validate_condition(
-                step.condition.as_ref(),
-                &job.depends_on,
-                &steps,
-                partitioned,
-            )
+            validate_condition(step.condition.as_ref(), &job.depends_on, &steps, no_outputs)
         })()
         .with_context(|| format!("step '{}'", step.id))?;
         steps.push(step.id.clone());
     }
     for (key, source) in &job.outputs {
         validate_name(key, "output")?;
-        validate_expression(source, &job.depends_on, &steps, partitioned)
+        validate_expression(source, &job.depends_on, &steps, no_outputs)
             .with_context(|| format!("output '{key}'"))?;
     }
     Ok(partitions)
+}
+
+/// A workflow-call job has no other execution form and none of the
+/// execution-only modifiers; defaults and empty collections are harmless.
+/// Its target is checked against the whole document by `validate_calls`.
+fn validate_call(job: &Job) -> Result<()> {
+    if job.command.is_some() || !job.steps.is_empty() {
+        bail!("define exactly one of a command, nonempty steps, or a workflow");
+    }
+    if job.workflow.as_deref() == Some("") {
+        bail!("workflow-call target must be a nonempty workflow name");
+    }
+    for (set, field) in [
+        (job.timeout_secs.is_some(), "timeout_secs"),
+        (job.partitions_input.is_some(), "partitions"),
+        (!job.env.is_empty(), "env"),
+        (!job.outputs.is_empty(), "outputs"),
+        (!job.reports.is_empty(), "reports"),
+        (!job.shell, "shell = false"),
+    ] {
+        if set {
+            bail!("workflow-call jobs do not support {field}");
+        }
+    }
+    Ok(())
 }
 
 fn cycle_path(jobs: &[Job], names: &HashMap<&str, usize>) -> String {

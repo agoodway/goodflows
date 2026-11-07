@@ -127,6 +127,104 @@ Top-level `[[jobs]]` form the `default` workflow. Without a default, `goodflows`
 `goodflows list` ask you to name a workflow. Job names and dependencies are scoped
 to their workflow. Workflow settings override `[settings]` field by field.
 
+## Workflow calls
+
+A job can run another workflow from the same file instead of a command or steps:
+
+```toml
+[[workflows.release.jobs]]
+name = "prepare"
+command = "cargo build --release --locked"
+
+[[workflows.release.jobs]]
+name = "checks"
+workflow = "ci"              # Runs every job in the ci workflow
+depends_on = ["prepare"]
+
+[[workflows.release.jobs]]
+name = "publish"
+command = "./scripts/publish.sh"
+depends_on = ["checks"]
+```
+
+- A job has exactly one of `command`, `steps`, or `workflow`. A call job supports
+  `name`, `depends_on`, and `condition`. It rejects `timeout_secs`, `partitions`,
+  `env`, `outputs`, `reports`, and `shell = false`, and it publishes no outputs, so
+  `needs.checks.outputs...` is rejected.
+- Only `depends_on` orders a call. File order adds no ordering, so a job with no
+  dependency path to a call can run alongside it.
+- A call waits for its workflow to finish, including that workflow's reporting.
+  It passes when the workflow passes (jobs skipped by conditions or dependencies
+  inside it are fine). It fails when any job inside fails or times out, and it is
+  cancelled by a signal. It is skipped with `fail_fast: previous job failed` when a
+  caller's fail-fast cut the workflow short (see Failures and signals). A failed or
+  skipped call skips its dependents like any other job. A false call condition
+  skips the call without running the workflow.
+- Every call is a separate run. Calling the same workflow twice runs it twice, and
+  each run sees the workspace as it is then. Nothing is cached, deduplicated, or
+  isolated. Called workflows share the filesystem the way concurrent jobs do, so
+  order calls with `depends_on` when their side effects must not overlap.
+- `--jobs` selects only in the workflow you run. `goodflows run release --jobs
+  publish` runs `prepare`, `checks`, and `publish`, and `checks` still runs all of
+  `ci`.
+- Targets and call cycles are checked across the whole file before anything runs,
+  including unselected workflows and calls behind false conditions. A workflow
+  that calls itself is a cycle. A named workflow may call `default`, the root jobs.
+  There is no nesting limit beyond rejecting cycles.
+
+**Settings.** A called workflow resolves its own settings exactly as
+`goodflows run <workflow>` would: `[settings]`, then its own workflow settings, then
+the `--env` profile and CLI flags, merged per key. A setting the called workflow
+omits comes from `[settings]`, never from the caller's workflow settings. Its
+workdir and env are its own. Profile `partitions` entries are global by job name:
+`test = 6` applies to every reachable workflow that partitions a job named `test`.
+A reachable workflow with an unpartitioned `test` makes that profile fail before
+anything runs, even behind a false call condition.
+
+**Parallelism.** The root workflow's parallelism caps running command and step jobs
+across every workflow it calls. A called workflow's own (lower) parallelism caps its
+part of the run too. A call waiting for its workflow holds no slot, so nested calls
+finish even with `--parallelism 1`. A call's shell condition takes a slot only while
+it runs. Partition instances take one slot each, and a stepped job takes one.
+
+**Failures and signals.** A failure stops new work in every enclosing workflow that
+has `fail_fast` enabled, including work inside its other calls. Running jobs
+finish. A called workflow with `fail_fast = false` does not override an enabled
+caller. A called workflow with `fail_fast = true` stops only its own remaining work
+when the caller's is disabled. A called workflow cut short by a caller's fail-fast
+shows its unstarted jobs as skipped with `fail_fast: previous job failed`. None of
+its own jobs failed, so its own summary and history still report passed, but its
+call is skipped with `fail_fast: previous job failed` and keeps its
+`child_run_id`. Jobs that depend on that call are skipped with `dependency did not
+pass`, and the root run fails and exits 1. This carries up through nested calls.
+Like any job skipped by fail-fast, the interrupted call is not in the rerun hint,
+which reruns the failure and its dependency-skipped jobs; rerun the interrupted
+workflow by selecting the call, such as `goodflows run ci --jobs integration`. A
+workflow that finished before the failure, even with jobs skipped by conditions or
+dependencies, still passes its call. A call whose shell condition
+finishes after such a stop is skipped with the same reason and starts no workflow.
+SIGINT and SIGTERM cancel every running job at every level, start no new calls, and
+exit 130 or 143.
+
+**Output.** Each called workflow run gets its own run id, summary, log directory
+(`<log-dir>/<workflow>/<run>`), history file, and reporting run. In JSON mode,
+every event of a run that calls workflows carries `invocation_id`, the run id of
+the workflow run it belongs to. Events from a called run also carry
+`parent_run_id` and `caller_job`. A called run that fails during setup, for
+example because its log directory cannot be created, has a `run_started` event but
+no summary. Its call fails with the error and records the called run's
+`child_run_id`. Text lines show the workflow and the first 8
+characters of the run id, such as `→ ci [3f2a9c1e] test`. Each called run prints its
+own report naming its caller. The root report comes last, and it is the only one
+with a rerun hint. A call is one row in its caller's results and counts, with
+`workflow` (the target) and `child_run_id` once started. The rerun hint reruns the
+failed call through the root workflow, so its prerequisites run again first.
+History records add `parent_run_id` and `caller_job` to a called run, and
+`workflow` and `child_run_id` to the call. A called run's record never copies the
+root `--jobs`. A call's own costs are only its shell condition. Each run's
+`max_in_flight` counts command and step jobs, and call shell conditions while they
+run, in that run and the workflows it calls.
+
 ## Conditional jobs
 
 ```toml

@@ -1,6 +1,6 @@
 //! The closing text run report, rendered from the `summary` event alone.
 
-use super::{instance, text, visible};
+use super::{instance, invocation_label, short_id, text, visible};
 use anyhow::Result;
 use colored::Colorize;
 use serde_json::Value;
@@ -55,6 +55,17 @@ fn rows(results: &[Value]) -> Vec<Row<'_>> {
             .filter_map(|r| r["duration_ms"].as_u64())
             .max();
         let mut notes = Vec::new();
+        // A workflow-call job is one row; its child invocation has its own report.
+        if let Some(target) = first["workflow"].as_str() {
+            notes.push(match first["child_run_id"].as_str() {
+                Some(child) => format!(
+                    "workflow {} [{}]",
+                    visible(target),
+                    visible(short_id(child))
+                ),
+                None => format!("workflow {}", visible(target)),
+            });
+        }
         let partitioned = group.iter().any(|r| r["partition"].is_object());
         let all_passed = group.iter().all(|r| text(r, "status") == "passed");
         if partitioned && !all_passed {
@@ -126,11 +137,21 @@ pub(super) fn report(event: &Value, out: &mut impl Write) -> Result<()> {
     } else {
         ("PASSED".green(), false)
     };
-    write!(out, "\n{}  {}", text(event, "workflow"), outcome.bold())?;
+    write!(out, "\n{}  {}", invocation_label(event), outcome.bold())?;
     if let Some(ms) = event["duration_ms"].as_u64() {
         write!(out, "  in {}", duration(ms))?;
     }
     writeln!(out)?;
+    // A child invocation's report names the call that started it.
+    let child = event["parent_run_id"].as_str();
+    if let Some(parent) = child {
+        writeln!(
+            out,
+            "called by {} in run {}",
+            visible(text(event, "caller_job")),
+            visible(parent)
+        )?;
+    }
 
     let rows = rows(results);
     // Alignment counts chars, so it assumes narrow (single-column) characters;
@@ -217,10 +238,14 @@ pub(super) fn report(event: &Value, out: &mut impl Write) -> Result<()> {
         .any(|r| matches!(r.status, "failed" | "timed_out"));
     // Failed jobs plus dependents skipped because a dependency did not pass;
     // `--jobs` adds each selected job's prerequisites.
+    // Only the root report offers a rerun: rerunning a child directly would
+    // skip the preparation its caller runs first.
     let rerun_jobs: Vec<&str> = rows
         .iter()
         .filter(|r| {
-            failed_rows && (matches!(r.status, "failed" | "timed_out") || r.dependency_skipped)
+            child.is_none()
+                && failed_rows
+                && (matches!(r.status, "failed" | "timed_out") || r.dependency_skipped)
         })
         .map(|r| r.name)
         .collect();
@@ -274,6 +299,13 @@ fn failure(result: &Value, out: &mut impl Write) -> Result<()> {
         .find(|step| matches!(text(step, "status"), "failed" | "timed_out"));
     if let Some(step) = step {
         writeln!(out, "  step: {}", text(step, "id"))?;
+    }
+    // A failed call points to its child, whose report details the failed jobs.
+    if let Some(target) = result["workflow"].as_str() {
+        writeln!(out, "  workflow: {}", visible(target))?;
+        if let Some(child) = result["child_run_id"].as_str() {
+            writeln!(out, "  child run: {}", visible(child))?;
+        }
     }
     if let Some(command) = result["command"].as_str() {
         writeln!(out, "  command: {}", visible(command))?;
@@ -917,6 +949,93 @@ mod tests {
         );
         assert!(rendered(event)
             .ends_with("\nRerun workflow: goodflows run ci --config='my config.toml'\n"));
+    }
+
+    #[test]
+    fn call_rows_and_child_reports_link_invocations() {
+        colored::control::set_override(false);
+        let child = "0123456789abcdef-0000-0000-0000-000000000000";
+        let call = |status, ms| {
+            let r = with(
+                result("integration", status, true, ms),
+                "workflow",
+                json!("suite"),
+            );
+            with(r, "child_run_id", json!(child))
+        };
+        let failed = with(call("failed", 0), "error", json!("workflow 'suite' failed"));
+        let skipped = with(
+            with(
+                result("again", "skipped", false, 0),
+                "workflow",
+                json!("suite"),
+            ),
+            "error",
+            json!(DEPENDENCY_SKIP),
+        );
+        let mut event = summary(vec![
+            result("prepare", "passed", true, 5),
+            failed,
+            skipped,
+            with(
+                result("publish", "skipped", false, 0),
+                "error",
+                json!(DEPENDENCY_SKIP),
+            ),
+        ]);
+        event["invocation_id"] = json!("feedbeef-0000-0000-0000-000000000000");
+        let report = rendered(event.clone());
+        assert!(
+            report.starts_with("\nci [feedbeef]  FAILED  in 710ms\n"),
+            "{report}"
+        );
+        // A started call shows its integer duration (0ms included) and child.
+        assert_eq!(
+            row(&report, "integration"),
+            "FAIL integration 0ms workflow suite [01234567]"
+        );
+        // A call skipped before activation has no duration or child.
+        assert_eq!(
+            row(&report, "again"),
+            "SKIP again workflow suite dependency did not pass"
+        );
+        assert!(
+            report.contains("1 passed, 1 failed, 2 skipped\n"),
+            "{report}"
+        );
+        assert!(
+            report.contains(&format!(
+                "--- integration  FAILED\n  workflow: suite\n  child run: {child}\n  error: workflow 'suite' failed\n"
+            )),
+            "{report}"
+        );
+        assert!(
+            !report.contains("command:") && !report.contains("exit"),
+            "{report}"
+        );
+        assert!(
+            report
+                .ends_with("\nRerun failed: goodflows run ci --jobs='integration,again,publish'\n"),
+            "{report}"
+        );
+
+        // A child report names its caller and parent and offers no rerun.
+        let mut child_event = summary(vec![with(
+            result("test", "failed", true, 3),
+            "error",
+            json!("exited with 1"),
+        )]);
+        child_event["workflow"] = json!("suite");
+        child_event["invocation_id"] = json!(child);
+        child_event["parent_run_id"] = json!("feedbeef-0000-0000-0000-000000000000");
+        child_event["caller_job"] = json!("integ\x1bration");
+        let report = rendered(child_event);
+        assert!(
+            report.starts_with("\nsuite [01234567]  FAILED  in 710ms\ncalled by integ\\u{1b}ration in run feedbeef-0000-0000-0000-000000000000\n"),
+            "{report}"
+        );
+        assert!(report.contains("--- test  FAILED\n"), "{report}");
+        assert!(!report.contains("Rerun"), "{report}");
     }
 
     #[test]

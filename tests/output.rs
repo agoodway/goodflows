@@ -941,3 +941,71 @@ fn rerun_hint_keeps_an_explicit_config_and_skipped_dependents() {
         "{text}"
     );
 }
+
+#[test]
+fn call_aware_events_add_only_invocation_identity() {
+    let p = Project::new(
+        "[[workflows.ci.jobs]]\nname='compile'\ncommand='echo hi'\n\
+         [[workflows.ci.jobs]]\nname='call'\nworkflow='suite'\n\
+         [[workflows.suite.jobs]]\nname='compile'\ncommand='echo hi'\n",
+    );
+    let output = p.run(&["run", "ci", "--json"]);
+    success(&output);
+    let events: Vec<serde_json::Value> = stdout(&output)
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let keys = |kind: &str, workflow: &str| {
+        let event = events
+            .iter()
+            .find(|e| e["type"] == kind && e["workflow"] == workflow)
+            .unwrap_or_else(|| panic!("no {kind} in {workflow}"));
+        event
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        keys("job_started", "ci"),
+        [
+            "invocation_id",
+            "name",
+            "schema_version",
+            "type",
+            "workflow"
+        ]
+    );
+    assert_eq!(
+        keys("job_started", "suite"),
+        [
+            "caller_job",
+            "invocation_id",
+            "name",
+            "parent_run_id",
+            "schema_version",
+            "type",
+            "workflow"
+        ]
+    );
+    assert_eq!(
+        keys("job_output", "suite"),
+        [
+            "caller_job",
+            "data",
+            "invocation_id",
+            "name",
+            "parent_run_id",
+            "schema_version",
+            "stream",
+            "type",
+            "workflow"
+        ]
+    );
+    // Each summary's run_id is its invocation_id; the root summary is last.
+    for summary in events.iter().filter(|e| e["type"] == "summary") {
+        assert_eq!(summary["run_id"], summary["invocation_id"]);
+    }
+    assert_eq!(events.last().unwrap()["workflow"], "ci");
+}
