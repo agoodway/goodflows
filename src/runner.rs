@@ -80,6 +80,10 @@ pub struct JobResult {
     /// One entry per spawned condition, command or step. Summary and history only.
     #[serde(skip)]
     pub commands: Vec<CommandCost>,
+    /// Skipped because an enabled fail-fast policy stopped new work, with
+    /// `FAIL_FAST_SKIP` as its error. Never serialized.
+    #[serde(skip)]
+    pub fail_fast_skip: bool,
 }
 
 /// What a spawned process was for.
@@ -180,6 +184,7 @@ impl JobResult {
             blocked_ms: 0,
             queued_ms: 0,
             commands: Vec::new(),
+            fail_fast_skip: false,
         }
     }
 
@@ -308,6 +313,9 @@ pub struct ChildEnd {
     pub run_id: Option<String>,
     pub status: Status,
     pub error: Option<String>,
+    /// The call is skipped because a fail-fast stop prevented or cut short
+    /// the child.
+    pub fail_fast_skip: bool,
 }
 
 /// Runs a child invocation to completion, including its reporting and summary.
@@ -455,6 +463,10 @@ impl Drop for Inside {
         }
     }
 }
+
+/// The reason a unit, or a call, is skipped because an enabled fail-fast
+/// policy stopped new work.
+pub const FAIL_FAST_SKIP: &str = "fail_fast: previous job failed";
 
 fn failed(result: &JobResult) -> bool {
     matches!(result.status, Status::Failed | Status::TimedOut)
@@ -671,22 +683,23 @@ pub async fn execute(
                         .iter()
                         .any(|&d| dependency(d) == Dependency::Settling);
                     let reason = if cancelled {
-                        Some((Status::Cancelled, "cancelled by signal"))
+                        Some((Status::Cancelled, "cancelled by signal", false))
                     } else if blocked {
-                        Some((Status::Skipped, "dependency did not pass"))
+                        Some((Status::Skipped, "dependency did not pass", false))
                     } else if settling || calling[unit.job] {
                         None
                     // Only call-reaching jobs are deferred. Other jobs keep the
                     // configuration-order fail-fast skip on purpose, so configs
                     // without calls behave exactly as before calls existed.
                     } else if stopped && !(defer_calls && reaches_call[unit.job]) {
-                        Some((Status::Skipped, "fail_fast: previous job failed"))
+                        Some((Status::Skipped, FAIL_FAST_SKIP, true))
                     } else {
                         None
                     };
-                    if let Some((status, error)) = reason {
+                    if let Some((status, error, fail_fast_skip)) = reason {
                         let mut result =
                             JobResult::new(job, unit.partition, status, Some(error.into()));
+                        result.fail_fast_skip = fail_fast_skip;
                         (result.blocked_ms, result.queued_ms) =
                             waits(run_start, ready_at[index], Instant::now());
                         record(&mut results, index, result, &options.output).await?;
@@ -975,10 +988,13 @@ async fn run_call(
         )),
         // A failure elsewhere in an enclosing fail-fast invocation during
         // the condition stops new work, so no child starts.
-        Ok(_) if scope.stopped() => result.finish(CommandResult::new(
-            Status::Skipped,
-            Some("fail_fast: previous job failed".into()),
-        )),
+        Ok(_) if scope.stopped() => {
+            result.finish(CommandResult::new(
+                Status::Skipped,
+                Some(FAIL_FAST_SKIP.into()),
+            ));
+            result.fail_fast_skip = true;
+        }
         Ok(_) => {
             let activate = calls.expect("call jobs run only when the root selection has calls");
             // The condition shell's slot frees before the child starts.
@@ -992,6 +1008,7 @@ async fn run_call(
             result.child_run_id = end.run_id;
             result.status = end.status;
             result.error = end.error;
+            result.fail_fast_skip = end.fail_fast_skip;
         }
     }
     result.duration_ms = start.elapsed().as_millis();

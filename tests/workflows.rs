@@ -1603,6 +1603,15 @@ command = "touch blocked"
     // The root summary is last, after every child summary.
     assert_eq!(events.last().unwrap()["type"], "summary");
     assert_eq!(events.last().unwrap()["workflow"], "ci");
+    // Without any failure in the run, the child's skips still pass the call.
+    let output = p.run(&["run", "ci", "--json", "--jobs", "after-optional"]);
+    let events = common::events(&output);
+    assert_eq!(output.status.code(), Some(0), "{events:?}");
+    let root = summary_for(&events, "ci");
+    assert_eq!(result_of(&root, "optional")["status"], "passed");
+    assert_eq!(result_of(&root, "after-optional")["status"], "passed");
+    assert_eq!(root["outcome"], "passed");
+    assert_eq!(summary_for(&events, "optional")["skipped"], 2);
 }
 
 #[test]

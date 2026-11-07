@@ -419,6 +419,9 @@ struct Finished {
     outcome: &'static str,
     success: bool,
     signal: Option<i32>,
+    /// The outcome is passed, but a local job or call was skipped by
+    /// fail-fast: only an enclosing invocation's failure can do that.
+    interrupted: bool,
 }
 
 /// Run one invocation, the root (`parent` is `None`) or a called workflow,
@@ -453,43 +456,65 @@ fn activator(run: Arc<Run>, run_id: String) -> runner::Activate {
     })
 }
 
+/// Whether an invocation with `outcome`, whose local results carry the given
+/// `fail_fast_skip` flags, was cut short by an enclosing fail-fast: it passed
+/// by the existing rule, yet a job or call was skipped by fail-fast. Failed
+/// and cancelled outcomes take precedence.
+fn interrupted(outcome: &str, fail_fast_skips: impl IntoIterator<Item = bool>) -> bool {
+    outcome == "passed" && fail_fast_skips.into_iter().any(|skip| skip)
+}
+
 /// The call result for a child invocation of `target` that ended with
 /// `finished`.
 fn child_end(target: &str, run_id: String, finished: Result<Option<Finished>>) -> runner::ChildEnd {
-    let (status, error) = match finished {
+    let (status, error, fail_fast_skip) = match finished {
         // Stopped before its first effect: the same skip as the call's
         // own check, with no child identity.
         Ok(None) => {
             return runner::ChildEnd {
                 run_id: None,
                 status: Status::Skipped,
-                error: Some("fail_fast: previous job failed".into()),
+                error: Some(runner::FAIL_FAST_SKIP.into()),
+                fail_fast_skip: true,
             }
         }
         // The child's outcome, from its own signal snapshot.
         Ok(Some(finished)) => match finished.outcome {
-            "passed" => (Status::Passed, None),
-            "failed" => (Status::Failed, Some(format!("workflow '{target}' failed"))),
+            // Cut short by an enclosing fail-fast: skipped like the work it
+            // stopped, though the child's own outcome stays passed.
+            "passed" if finished.interrupted => {
+                (Status::Skipped, Some(runner::FAIL_FAST_SKIP.into()), true)
+            }
+            "passed" => (Status::Passed, None, false),
+            "failed" => (
+                Status::Failed,
+                Some(format!("workflow '{target}' failed")),
+                false,
+            ),
             "cancelled" => (
                 Status::Cancelled,
                 Some(format!("workflow '{target}' was cancelled")),
+                false,
             ),
             other => (
                 Status::Failed,
                 Some(format!(
                     "workflow '{target}' ended with unknown outcome '{other}'"
                 )),
+                false,
             ),
         },
         Err(error) => (
             Status::Failed,
             Some(format!("workflow '{target}': {error:#}")),
+            false,
         ),
     };
     runner::ChildEnd {
         run_id: Some(run_id),
         status,
         error,
+        fail_fast_skip,
     }
 }
 
@@ -703,6 +728,7 @@ async fn invocation(
         outcome: fields.outcome,
         success,
         signal,
+        interrupted: interrupted(fields.outcome, results.iter().map(|r| r.fail_fast_skip)),
     }))
 }
 
@@ -739,11 +765,12 @@ mod tests {
     #[test]
     fn child_end_maps_how_the_child_invocation_ended() {
         let end = |finished| child_end("suite", "child".into(), finished);
-        let ended = |outcome| {
+        let ended = |outcome, interrupted| {
             Ok(Some(Finished {
                 outcome,
                 success: outcome == "passed",
                 signal: None,
+                interrupted,
             }))
         };
         // Stopped by fail-fast before it started: skipped, with no identity.
@@ -753,13 +780,16 @@ mod tests {
             skipped.error.as_deref(),
             Some("fail_fast: previous job failed")
         );
-        assert!(skipped.run_id.is_none());
-        let passed = end(ended("passed"));
+        assert!(skipped.run_id.is_none() && skipped.fail_fast_skip);
+        // That skip interrupts the invocation that owns the call in turn.
+        assert!(interrupted("passed", [skipped.fail_fast_skip]));
+        let passed = end(ended("passed", false));
         assert_eq!(
             (passed.status, passed.error, passed.run_id.as_deref()),
             (Status::Passed, None, Some("child"))
         );
-        let failed = end(ended("failed"));
+        assert!(!passed.fail_fast_skip);
+        let failed = end(ended("failed", false));
         assert_eq!(
             (
                 failed.status,
@@ -772,6 +802,26 @@ mod tests {
                 Some("child")
             )
         );
+        // Cut short by an enclosing fail-fast: skipped, keeping the identity.
+        let cut = end(ended("passed", true));
+        assert_eq!(
+            (cut.status, cut.error.as_deref(), cut.run_id.as_deref()),
+            (Status::Skipped, Some(runner::FAIL_FAST_SKIP), Some("child"))
+        );
+        assert!(cut.fail_fast_skip && !failed.fail_fast_skip);
+        assert!(interrupted("passed", [cut.fail_fast_skip]));
+    }
+
+    #[test]
+    fn only_a_passed_child_with_fail_fast_skips_is_interrupted() {
+        // Passed jobs and skips by a false condition or a dependency carry no
+        // fail-fast flag, so they leave the child passed.
+        let (fail_fast, other) = (true, false);
+        assert!(!interrupted("passed", [other, other, other]));
+        assert!(interrupted("passed", [other, fail_fast]));
+        // A failed or cancelled outcome takes precedence.
+        assert!(!interrupted("failed", [fail_fast]));
+        assert!(!interrupted("cancelled", [fail_fast]));
     }
 
     fn parse(args: &[&str]) -> std::result::Result<Cli, clap::Error> {

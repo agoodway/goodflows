@@ -109,7 +109,7 @@ The root's effective parallelism SHALL cap executing command/step job instances 
 - **THEN** the stepped job occupies one slot, the finished call-condition shell occupies none, and RSS peaks are recorded only for the invocation that spawned each process
 
 ### Requirement: A call completes with its child outcome
-A call SHALL stay active until its child finishes execution and reporting finalization. Its status SHALL be the child's workflow outcome, using the existing failed, timed-out, cancelled, and signal-snapshot rule. A false call condition SHALL skip the call without creating a child. Non-passing calls SHALL block local dependents under existing dependency rules. `duration_ms` SHALL be integer milliseconds of the call's own condition and the child lifecycle, excluding dependency wait.
+A call SHALL stay active until its child finishes execution and reporting. Its status SHALL be the child's outcome under the existing failed, timed-out, cancelled, and signal-snapshot rule, unless the child was interrupted. A false call condition SHALL skip the call without creating a child. Non-passing calls SHALL block local dependents under existing dependency rules. `duration_ms` SHALL be integer milliseconds of the call's own condition and the child lifecycle, excluding dependency wait.
 
 #### Scenario: Child failure blocks publication
 - **WHEN** a child command fails and `publish` depends on the call
@@ -126,6 +126,21 @@ A call SHALL stay active until its child finishes execution and reporting finali
 #### Scenario: Child setup fails
 - **WHEN** child activation fails before execution, such as failing to create its required log directory
 - **THEN** the call fails with contextual diagnostics and the root still produces its normal failure summary
+
+### Requirement: A child interrupted by an ancestor's fail-fast skips its call
+A child SHALL be interrupted when the existing outcome rule gives passed but at least one of its local job instances or calls was skipped with the fail-fast reason; only an enclosing invocation's failure can cause that. Its call SHALL be skipped with the fail-fast reason and keep its target `workflow`, `child_run_id`, and `duration_ms`. The child's own summary and history outcome SHALL remain passed. A call skipped this way SHALL interrupt its own invocation in turn.
+
+#### Scenario: Ancestor fail-fast interrupts a child
+- **WHEN** root fail-fast is enabled, a root job fails while a child job runs, and the child's remaining jobs are skipped with the fail-fast reason without any child job failing
+- **THEN** the child's outcome is passed, the call is skipped with the fail-fast reason and keeps its `child_run_id`, the call's dependents are skipped with the dependency reason, and the root exits with failure
+
+#### Scenario: Interruption propagates through nested calls
+- **WHEN** root `ci` calls `mid`, `mid` calls `leaf`, and a root failure interrupts `leaf`
+- **THEN** `mid`'s call to `leaf` and `ci`'s call to `mid` are both skipped with the fail-fast reason
+
+#### Scenario: Child completed before the stop
+- **WHEN** a child finishes all its jobs, including jobs skipped by conditions or their dependencies, before a root job fails under root fail-fast
+- **THEN** the child is not interrupted and the call passes
 
 ### Requirement: Failure and cancellation policies span active calls
 A failure SHALL stop new work within every containing invocation whose effective fail-fast policy is enabled, including descendant work, without cancelling already executing jobs. A child with fail-fast disabled MUST NOT bypass an enabled ancestor policy. With all containing policies disabled, independent work SHALL continue. SIGINT and SIGTERM SHALL cancel active descendants, reap their process groups, prevent new calls, and preserve the root signal exit code.

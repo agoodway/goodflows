@@ -154,10 +154,12 @@ depends_on = ["checks"]
 - Only `depends_on` orders a call. File order adds no ordering, so a job with no
   dependency path to a call can run alongside it.
 - A call waits for its workflow to finish, including that workflow's reporting.
-  It passes when the workflow passes (skipped jobs inside it are fine). It fails
-  when any job inside fails or times out, and it is cancelled by a signal. A failed
-  call skips its dependents like any failed job. A false call condition skips the
-  call without running the workflow.
+  It passes when the workflow passes (jobs skipped by conditions or dependencies
+  inside it are fine). It fails when any job inside fails or times out, and it is
+  cancelled by a signal. It is skipped with `fail_fast: previous job failed` when a
+  caller's fail-fast cut the workflow short (see Failures and signals). A failed or
+  skipped call skips its dependents like any other job. A false call condition
+  skips the call without running the workflow.
 - Every call is a separate run. Calling the same workflow twice runs it twice, and
   each run sees the workspace as it is then. Nothing is cached, deduplicated, or
   isolated. Called workflows share the filesystem the way concurrent jobs do, so
@@ -191,8 +193,15 @@ finish. A called workflow with `fail_fast = false` does not override an enabled
 caller. A called workflow with `fail_fast = true` stops only its own remaining work
 when the caller's is disabled. A called workflow cut short by a caller's fail-fast
 shows its unstarted jobs as skipped with `fail_fast: previous job failed`. None of
-its own jobs failed, so it and its call report passed, while the run whose job
-failed reports failed and the root run exits 1. A call whose shell condition
+its own jobs failed, so its own summary and history still report passed, but its
+call is skipped with `fail_fast: previous job failed` and keeps its
+`child_run_id`. Jobs that depend on that call are skipped with `dependency did not
+pass`, and the root run fails and exits 1. This carries up through nested calls.
+Like any job skipped by fail-fast, the interrupted call is not in the rerun hint,
+which reruns the failure and its dependency-skipped jobs; rerun the interrupted
+workflow by selecting the call, such as `goodflows run ci --jobs integration`. A
+workflow that finished before the failure, even with jobs skipped by conditions or
+dependencies, still passes its call. A call whose shell condition
 finishes after such a stop is skipped with the same reason and starts no workflow.
 SIGINT and SIGTERM cancel every running job at every level, start no new calls, and
 exit 130 or 143.
