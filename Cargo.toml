@@ -15,6 +15,7 @@ path = "src/main.rs"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 colored = "2"
+flate2 = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "rustls-tls-native-roots"] }
 # Direct dependency only to recognize TLS failures in reqwest error chains; reqwest selects the ring provider.
 rustls = { version = "0.23", default-features = false }
@@ -22,6 +23,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 shell-words = "1"
+tar = { version = "0.4", default-features = false }
 tempfile = "3"
 tokio = { version = "1", features = ["full"] }
 toml = "0.8"
@@ -29,3 +31,8 @@ uuid = { version = "1", features = ["v4", "serde"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+# Debug builds hash the (large) debug executable when they provision a Sprite
+# runner; an unoptimized SHA-256 makes every Sprite test spend seconds on it.
+[profile.dev.package.sha2]
+opt-level = 3

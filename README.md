@@ -461,6 +461,18 @@ copied `GC.TestTimingFormatter` with the ExUnit reporter. The suite option is no
 `:test_timing_suite_id` / `TEST_TIMING_SUITE_ID`. The server must support
 `test-timings/1`. Pending snapshots in the old format are never resent.
 
+## Sprites
+
+`goodflows run [workflow] --sprite <identity>` runs a whole workflow on a
+retained [Sprite](https://sprites.dev) owned by that caller identity, from a
+verified snapshot of your working tree. It needs `[settings] sprite_prefix` and
+explicit `[sprite] setup` and `resume` commands (no scripts are discovered),
+forwards only variables listed in `[sprite] pass_env`, and keeps Sprite and
+publisher credentials on the controller. `--env` still selects a profile.
+`goodflows sprite status|logs|collect|cancel|destroy` recover, cancel and
+explicitly destroy environments. Runs without `--sprite` stay local. See
+[docs/sprites.md](docs/sprites.md).
+
 ## Ampcode orbs
 
 1. Commit `goodflows.toml` at the repository root.

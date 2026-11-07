@@ -91,6 +91,7 @@ pub async fn generate(
         workflows: Default::default(),
         environments: Default::default(),
         reporting: None,
+        sprite: None,
     };
     if let Some(name) = workflow {
         config.workflows.insert(

@@ -8,6 +8,8 @@ use std::io::Write;
 
 /// Text-only summary key: the `--config` path the user passed explicitly.
 pub(super) const CONFIG: &str = "rerun_config";
+/// Text-only summary key: the caller's Sprite identity of a remote run.
+pub(super) const SPRITE: &str = "rerun_sprite";
 /// Text-only summary key: true when a signal arrived before the summary.
 pub(super) const INTERRUPTED: &str = "interrupted";
 
@@ -263,6 +265,7 @@ pub(super) fn report(event: &Value, out: &mut impl Write) -> Result<()> {
             workflow: text(event, "workflow"),
             environment: event["environment"].as_str(),
             config: event[CONFIG].as_str(),
+            sprite: event[SPRITE].as_str(),
         };
         match rerun_jobs.iter().find(|name| name.contains(',')) {
             Some(name) => {
@@ -322,6 +325,8 @@ struct Rerun<'a> {
     environment: Option<&'a str>,
     /// Only when the original run passed `--config` explicitly.
     config: Option<&'a str>,
+    /// Only for a remote run: its original caller-supplied identity.
+    sprite: Option<&'a str>,
 }
 
 impl Rerun<'_> {
@@ -340,6 +345,9 @@ impl Rerun<'_> {
         if let Some(environment) = self.environment {
             words.push(format!("--env={}", shell_quote(environment)));
         }
+        if let Some(sprite) = self.sprite {
+            words.push(format!("--sprite={}", shell_quote(sprite)));
+        }
         if let Some(jobs) = jobs {
             words.push(format!("--jobs={}", shell_quote(&jobs.join(","))));
         }
@@ -353,7 +361,7 @@ impl Rerun<'_> {
 
 /// POSIX shell quoting: plain tokens stay bare, anything else is single-quoted
 /// with each embedded apostrophe written as `'"'"'`.
-fn shell_quote(value: &str) -> String {
+pub(super) fn shell_quote(value: &str) -> String {
     if !value.is_empty()
         && value
             .chars()
@@ -1048,6 +1056,7 @@ mod tests {
                 workflow,
                 environment,
                 config,
+                sprite: None,
             }
             .command(Some(jobs))
         };
@@ -1063,5 +1072,51 @@ mod tests {
             rerun("ci", Some("prod"), Some("-my dir/it's.toml"), &["t"]),
             r#"goodflows run ci --config='-my dir/it'"'"'s.toml' --env=prod --jobs=t"#
         );
+    }
+
+    #[test]
+    fn remote_rerun_hints_keep_the_sprite_identity() {
+        // Selective rerun keeps identity, profile and the controller config spelling.
+        let event = with(
+            with(
+                with(
+                    summary(vec![result("t", "failed", true, 1)]),
+                    CONFIG,
+                    json!("custom.toml"),
+                ),
+                SPRITE,
+                json!("T-example"),
+            ),
+            "environment",
+            json!("test"),
+        );
+        assert!(
+            rendered(event).ends_with(
+                "\nRerun failed: goodflows run ci --config=custom.toml --env=test --sprite=T-example --jobs=t\n"
+            )
+        );
+        // Comma fallback: identity before the final `-- -wf`, no --jobs.
+        let mut event = with(
+            with(
+                summary(vec![result("test,unit", "failed", true, 1)]),
+                SPRITE,
+                json!("T-example"),
+            ),
+            "environment",
+            json!("prod"),
+        );
+        event["workflow"] = json!("-wf");
+        assert!(rendered(event)
+            .ends_with("\nRerun workflow: goodflows run --env=prod --sprite=T-example -- -wf\n"));
+        // Identities are shell-quoted like every other value.
+        let event = with(
+            summary(vec![result("t", "failed", true, 1)]),
+            SPRITE,
+            json!("thread 'x'"),
+        );
+        assert!(rendered(event).ends_with(
+            r#" --sprite='thread '"'"'x'"'"'' --jobs=t
+"#
+        ));
     }
 }

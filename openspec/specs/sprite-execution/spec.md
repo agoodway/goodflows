@@ -1,10 +1,10 @@
-# Spec Delta
+# sprite-execution Specification
 
 ## Purpose
 
 Runs an existing GoodFlows workflow from a verified working-tree snapshot on its owned Sprite, with durable status and recoverable execution results independent of the controller connection.
 
-## ADDED Requirements
+## Requirements
 
 ### Requirement: Source reflects the current working tree
 Remote runs SHALL snapshot the Git repository containing the selected config, using current tracked file contents and nonignored untracked files rather than cloning a commit. Deleted files SHALL be absent. Git metadata, GoodFlows controller state, and documented credential files SHALL be excluded with a visible exclusion summary. A required config or hook excluded from the snapshot SHALL fail preflight. Non-Git roots SHALL fail with an explicit limitation.
@@ -62,7 +62,7 @@ The complete selected graph SHALL execute on the Sprite using a compatible match
 - **THEN** workflow jobs run without those elevated capabilities, including inherited bounding/ambient capabilities, or fail before launch if the restriction cannot be established
 
 ### Requirement: Run identity and timings are coherent
-A remote invocation SHALL have one canonical run UUID shared by its control record, workflow summary, requested history, and reporting spool. Lifecycle status SHALL expose preparation/transfer/collection timing separately from native workflow `execute_ms` and `duration_ms`. Transport overhead SHALL NOT be added to those existing metrics. Controller-captured source provenance SHALL be identified separately from native remote Git context when `.git` is absent.
+A remote invocation SHALL have one canonical root run UUID shared by its control record, root summary, requested history, and reporting spool; called workflows keep their own. Lifecycle status SHALL expose preparation/transfer/collection timing separately from native workflow `execute_ms` and `duration_ms`. Transport overhead SHALL NOT be added to those existing metrics. Controller-captured source provenance SHALL be identified separately from native remote Git context when `.git` is absent.
 
 #### Scenario: Provisioning takes longer than jobs
 - **WHEN** creation and setup take 30 seconds and workflow execution takes 2 seconds
@@ -86,6 +86,7 @@ After durable acceptance, a Sprite-managed service supervisor SHALL own progress
 #### Scenario: Worker is gone after cold process loss
 - **WHEN** recovery proves the accepted supervisor/process generation no longer exists without a terminal workflow result
 - **THEN** status records interruption with partial results, does not synthesize success, and does not automatically restart the workflow
+- **AND** recovery after an actual cold boot with a changed boot identity is not verified and is not claimed as supported
 
 #### Scenario: Disconnected completion releases its last hold
 - **WHEN** work finishes without a controller connection
@@ -126,7 +127,7 @@ Status SHALL report preparation, active/latest UUID, phase, and terminal state w
 - **THEN** it does not signal the newer run or its preparation hook
 
 ### Requirement: Output protocol distinguishes lifecycle from workflow results
-Remote operations SHALL provide text and versioned JSON modes. JSON stdout SHALL contain only versioned events, never raw hook output or transport diagnostics. Existing workflow fields and saved native summaries SHALL remain unchanged. Controller collection/publication diagnostics SHALL use separate lifecycle events before the one final rendered workflow summary, when one exists. Transport failure SHALL NOT fabricate a job failure or terminal summary.
+Remote operations SHALL provide text and versioned JSON modes. JSON stdout SHALL contain only versioned events, never raw hook output or transport diagnostics. Existing workflow fields and saved native summaries SHALL remain unchanged. Controller collection/publication diagnostics SHALL use separate lifecycle events before the one final rendered root workflow summary, when one exists; child summaries precede it. Transport failure SHALL NOT fabricate a job failure or terminal summary.
 
 #### Scenario: Setup prints plain output
 - **WHEN** a JSON-mode remote run's setup prints text to stdout and stderr

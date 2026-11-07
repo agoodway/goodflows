@@ -1,0 +1,268 @@
+#!/usr/bin/env bash
+# Fake Sprite CLI for GoodFlows integration tests. Each "Sprite" is a local
+# directory under $FAKE_SPRITE_ROOT; `exec` runs the command locally with that
+# directory as HOME and a minimal environment. Never contacts any network.
+#
+# Fault injection (controller environment):
+#   FAKE_SPRITE_UNREACHABLE=1        every call fails as if the API were down
+#   FAKE_SPRITE_LOSE_CREATE_ACK=1    create succeeds but reports an error
+#   FAKE_SPRITE_LIST_NO_ID=1         `list --json` omits resource ids
+#   FAKE_SPRITE_LIST_DUP=1           `list --json` reports every Sprite twice
+#   FAKE_SPRITE_LIST_LAG=N           a newly created Sprite is missing from its
+#                                    first N listings (eventual consistency)
+#   FAKE_SPRITE_REPORTED_ORG=name    `list --json` reports this platform org
+#                                    (default: the `-o` value), as the real CLI
+#                                    does when its token belongs to another org
+#   FAKE_SPRITE_ENTRY_ORG=name       listed Sprites report this organization
+#                                    (default: the reported org)
+#   FAKE_SPRITE_LIST_NO_ORG=1        `list --json` omits every org field
+#   FAKE_SPRITE_DESTROY=lose-ack     destroy deletes but reports an error
+#   FAKE_SPRITE_DESTROY=replace      destroy deletes, a new same-name Sprite
+#                                    appears, and the call reports an error
+#   FAKE_SPRITE_DESTROY=fail         destroy deletes nothing and the API refuses
+#                                    it (status 409)
+#   FAKE_SPRITE_DESTROY=fail-unknown destroy deletes nothing and reports a
+#                                    server error (status 502): outcome unknown
+#   FAKE_SPRITE_DESTROY=accept-linger destroy succeeds at once, but the Sprite
+#                                    stays listed (an asynchronous delete) until
+#                                    $FAKE_SPRITE_ROOT/finish-delete exists
+#   FAKE_SPRITE_FAIL_OPS=a,b         exec calls with an argument a or b fail
+#                                    without reaching the Sprite
+#   FAKE_SPRITE_LOSE_ACK_OPS=a,b     such exec calls run but their reply is lost
+#   FAKE_SPRITE_TRUNCATE_STDIN=N     `exec --stdin` delivers only N bytes
+#   FAKE_SPRITE_BROKEN_RUNNER=id     the runner installed as <id> cannot run on
+#                                    the Sprite (as with a glibc mismatch)
+#   FAKE_SPRITE_IGNORE_SKIP=1        exec drops `--skip N` arguments, as a runner
+#                                    from before that option ignores them
+#   FAKE_SPRITE_CPUS=list            in-Sprite commands run pinned to these CPUs
+#                                    (a "machine" that differs from the controller)
+# File toggles (a test can flip them while a command runs):
+#   $FAKE_SPRITE_ROOT/fail-list      while it exists, `list` fails
+#   $FAKE_SPRITE_ROOT/fail-ops       while it exists, exec calls with an
+#                                    argument in its comma list fail
+#   $FAKE_SPRITE_ROOT/fail-once-ops  the first exec call with an argument in
+#                                    its comma list fails (the file is removed)
+#   $FAKE_SPRITE_ROOT/cut-summary    the next `follow` exec (the file is removed)
+#                                    relays its stream up to the native
+#                                    `summary` line, writes only the first half
+#                                    of that line (no newline) and fails
+#   $FAKE_SPRITE_ROOT/inject-summaries  while it exists, `follow` execs relay
+#                                    its lines (with @ROOT@ replaced by the
+#                                    root run id) just before the root native
+#                                    `summary` line (forged remote events);
+#                                    lines of inject-after-summary follow it
+#   $FAKE_SPRITE_ROOT/hang-ops       while it exists, exec calls with an
+#                                    argument in its comma list hang without
+#                                    reaching the Sprite (a stalled session)
+#   $FAKE_SPRITE_ROOT/flap-ops       while it exists, exec calls with an
+#                                    argument in its comma list run for at
+#                                    most 1 s, then fail (a session cut)
+set -u
+root="${FAKE_SPRITE_ROOT:?FAKE_SPRITE_ROOT is required}"
+mkdir -p "$root/names"
+printf '%s\n' "$*" >> "$root/argv.log"
+if [ -n "${FAKE_SPRITE_UNREACHABLE:-}" ]; then
+  echo "Error: dial tcp: connection refused" >&2
+  exit 1
+fi
+has_op() { # has_op <comma list> <args...>
+  local list=",$1," a
+  shift
+  for a in "$@"; do
+    case "$list" in *",$a,"*) return 0 ;; esac
+  done
+  return 1
+}
+home_of() { printf '%s/s/%s' "$root" "${1: -8}"; }
+cmd="${1:-}"
+[ $# -gt 0 ] && shift
+case "$cmd" in
+  org)
+    echo "Organizations:"
+    echo "  testorg (current)"
+    ;;
+  list)
+    if [ -e "$root/fail-list" ]; then
+      echo "Error: failed to list sprites: context deadline exceeded" >&2
+      exit 1
+    fi
+    # The verified real shape: {"org":{"name":...},"sprites":[{...,"organization":...}]}.
+    prefix="" org=""
+    while [ $# -gt 0 ]; do
+      case "$1" in --prefix) prefix="$2"; shift 2 ;; -o|--org) org="$2"; shift 2 ;; *) shift ;; esac
+    done
+    reported="${FAKE_SPRITE_REPORTED_ORG:-$org}"
+    entry_org="${FAKE_SPRITE_ENTRY_ORG:-$reported}"
+    if [ -n "${FAKE_SPRITE_LIST_NO_ORG:-}" ]; then
+      printf '{"sprites":['
+      eo=""
+    else
+      printf '{"org":{"name":"%s","running":0,"warm":0,"cold":0},"sprites":[' "$reported"
+      eo=",\"organization\":\"$entry_org\""
+    fi
+    sep=""
+    for d in "$root"/names/*; do
+      [ -e "$d" ] || continue
+      n="$(basename "$d")"
+      lag="$root/lag/$n"
+      if [ -s "$lag" ]; then
+        left=$(cat "$lag")
+        if [ "$left" -gt 0 ]; then echo $((left - 1)) > "$lag"; continue; fi
+      fi
+      case "$n" in "$prefix"*)
+        if [ -n "${FAKE_SPRITE_LIST_NO_ID:-}" ]; then
+          printf '%s{"name":"%s"%s}' "$sep" "$n" "$eo"
+        else
+          printf '%s{"name":"%s","id":"%s"%s}' "$sep" "$n" "$(cat "$d")" "$eo"
+        fi
+        [ -n "${FAKE_SPRITE_LIST_DUP:-}" ] && printf ',{"name":"%s","id":"other-%s"%s}' "$n" "$(cat "$d")" "$eo"
+        sep="," ;;
+      esac
+    done
+    printf ']}\n'
+    ;;
+  create)
+    name="${*: -1}"
+    if [ -n "${FAKE_SPRITE_LOSE_CREATE_ACK:-}" ]; then
+      ( set -o noclobber; echo "id-$name-$$" > "$root/names/$name" ) 2>/dev/null && mkdir -p "$(home_of "$name")"
+      echo "Error: connection reset" >&2
+      exit 1
+    fi
+    if ( set -o noclobber; echo "id-$name-$$" > "$root/names/$name" ) 2>/dev/null; then
+      mkdir -p "$(home_of "$name")"
+      if [ -n "${FAKE_SPRITE_LIST_LAG:-}" ]; then
+        mkdir -p "$root/lag" && echo "$FAKE_SPRITE_LIST_LAG" > "$root/lag/$name"
+      fi
+    else
+      echo "Error creating sprite: API error (status 400)" >&2
+      exit 1
+    fi
+    ;;
+  destroy)
+    name="${*: -1}"
+    if [ "${FAKE_SPRITE_DESTROY:-}" = fail ]; then
+      echo "Error: failed to destroy sprite: API error (status 409)" >&2
+      exit 1
+    fi
+    if [ "${FAKE_SPRITE_DESTROY:-}" = fail-unknown ]; then
+      echo "Error: failed to destroy sprite: API error (status 502)" >&2
+      exit 1
+    fi
+    h="$(home_of "$name")"
+    if [ "${FAKE_SPRITE_DESTROY:-}" = accept-linger ]; then
+      (
+        while [ ! -e "$root/finish-delete" ]; do sleep 0.1; done
+        for f in "$h"/.service-*.pid; do
+          [ -e "$f" ] && kill -KILL -- "-$(cat "$f")" 2>/dev/null
+        done
+        rm -rf "$h" "$root/names/$name"
+      ) </dev/null >/dev/null 2>&1 &
+      exit 0
+    fi
+    for f in "$h"/.service-*.pid; do
+      [ -e "$f" ] && kill -KILL -- "-$(cat "$f")" 2>/dev/null
+    done
+    rm -rf "$h" "$root/names/$name"
+    case "${FAKE_SPRITE_DESTROY:-}" in
+      lose-ack) echo "Error: connection reset" >&2; exit 1 ;;
+      replace)
+        echo "id-$name-replacement-$$" > "$root/names/$name"
+        mkdir -p "$h"
+        echo "replacement" > "$h/replacement-marker"
+        echo "Error: connection reset" >&2
+        exit 1
+        ;;
+    esac
+    ;;
+  exec)
+    name="" stdin=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        -o) shift 2 ;;
+        -s) name="$2"; shift 2 ;;
+        --stdin) stdin=1; shift ;;
+        --no-stdin|--no-port-forward) shift ;;
+        --) shift; break ;;
+        *) echo "fake sprite: unsupported exec flag $1" >&2; exit 2 ;;
+      esac
+    done
+    [ -e "$root/names/$name" ] || { echo "Error: sprite not found" >&2; exit 1; }
+    if [ -n "${FAKE_SPRITE_IGNORE_SKIP:-}" ]; then
+      kept=()
+      while [ $# -gt 0 ]; do
+        if [ "$1" = --skip ]; then shift 2; continue; fi
+        kept+=("$1"); shift
+      done
+      set -- "${kept[@]}"
+    fi
+    if [ -n "${FAKE_SPRITE_FAIL_OPS:-}" ] && has_op "$FAKE_SPRITE_FAIL_OPS" "$@"; then
+      echo "Error: websocket: close 1006 (abnormal closure)" >&2
+      exit 1
+    fi
+    if [ -e "$root/hang-ops" ] && has_op "$(cat "$root/hang-ops")" "$@"; then
+      exec sleep 3600
+    fi
+    if [ -e "$root/fail-ops" ] && has_op "$(cat "$root/fail-ops")" "$@"; then
+      echo "Error: websocket: close 1006 (abnormal closure)" >&2
+      exit 1
+    fi
+    if [ -e "$root/fail-once-ops" ] && has_op "$(cat "$root/fail-once-ops")" "$@" \
+      && rm "$root/fail-once-ops" 2>/dev/null; then
+      echo "Error: websocket: close 1006 (abnormal closure)" >&2
+      exit 1
+    fi
+    if [ -n "${FAKE_SPRITE_BROKEN_RUNNER:-}" ] && has_op goodflows-agent "$@" \
+      && has_op "$FAKE_SPRITE_BROKEN_RUNNER" "$@"; then
+      echo "goodflows: /lib/x86_64-linux-gnu/libc.so.6: version \`GLIBC_2.99' not found" >&2
+      exit 1
+    fi
+    h="$(home_of "$name")"
+    cd "$h" || exit 1
+    if [ -z "$stdin" ]; then exec </dev/null; fi
+    run=()
+    [ -n "${FAKE_SPRITE_CPUS:-}" ] && run+=(taskset -c "$FAKE_SPRITE_CPUS")
+    run+=(env -i HOME="$h" USER="${USER:-sprite}" LANG=C.UTF-8
+      PATH="$root/bin:/usr/local/bin:/usr/bin:/bin"
+      GOODFLOWS_SPRITE_API_SOCKET="${FAKE_SPRITE_API_SOCKET:-$root/api.sock}")
+    # Test-only pause points travel like any in-Sprite setting.
+    [ -n "${GOODFLOWS_TEST_PAUSE_DIR:-}" ] && run+=(GOODFLOWS_TEST_PAUSE_DIR="$GOODFLOWS_TEST_PAUSE_DIR")
+    if [ -e "$root/flap-ops" ] && has_op "$(cat "$root/flap-ops")" "$@"; then
+      timeout -s KILL 1 "${run[@]}" "$@"
+      echo "Error: websocket: close 1006 (abnormal closure)" >&2
+      exit 1
+    fi
+    if [ -n "${FAKE_SPRITE_LOSE_ACK_OPS:-}" ] && has_op "$FAKE_SPRITE_LOSE_ACK_OPS" "$@"; then
+      "${run[@]}" "$@" >/dev/null 2>&1
+      echo "Error: websocket: close 1006 (abnormal closure)" >&2
+      exit 1
+    fi
+    if [ -n "$stdin" ] && [ -n "${FAKE_SPRITE_TRUNCATE_STDIN:-}" ]; then
+      head -c "$FAKE_SPRITE_TRUNCATE_STDIN" | "${run[@]}" "$@"
+      exit $?
+    fi
+    if [ -e "$root/cut-summary" ] && has_op follow "$@" && rm "$root/cut-summary" 2>/dev/null; then
+      "${run[@]}" "$@" | awk '/"type":"summary"/ { printf "%s", substr($0, 1, int(length($0) / 2)); fflush(); exit } { print; fflush() }'
+      echo "Error: websocket: close 1006 (abnormal closure)" >&2
+      exit 1
+    fi
+    if [ -e "$root/inject-summaries" ] && has_op follow "$@"; then
+      "${run[@]}" "$@" | awk -v f="$root/inject-summaries" -v a="$root/inject-after-summary" '
+        /"type":"summary"/ && !/"parent_run_id"/ && !done {
+          match($0, /"run_id":"[^"]*"/)
+          id = substr($0, RSTART + 10, RLENGTH - 11)
+          while ((getline l < f) > 0) { gsub(/@ROOT@/, id, l); print l }
+          done = 1
+          print
+          while ((getline l < a) > 0) { gsub(/@ROOT@/, id, l); print l }
+          fflush(); next
+        }
+        { print; fflush() }'
+      exit "${PIPESTATUS[0]}"
+    fi
+    exec "${run[@]}" "$@"
+    ;;
+  *)
+    echo "fake sprite: unsupported command $cmd" >&2
+    exit 2
+    ;;
+esac

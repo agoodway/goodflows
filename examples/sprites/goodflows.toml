@@ -1,0 +1,36 @@
+# Dogfood: run GoodFlows' own checks on a Sprite.
+#   goodflows run --config examples/sprites/goodflows.toml --sprite "$THREAD_ID"
+# The toolchain and Cargo caches live in $GOODFLOWS_SPRITE_STATE_DIR (see
+# scripts/sprite-setup.sh); each run gets a fresh source tree. The same graph
+# also runs locally (`goodflows run --config examples/sprites/goodflows.toml`),
+# where the state directory is unset and the installed toolchain is used.
+
+[settings]
+sprite_prefix = "goodflows"
+workdir = "../.."
+parallelism = 4
+fail_fast = true
+
+[sprite]
+setup = "bash scripts/sprite-setup.sh"
+resume = "bash scripts/sprite-resume.sh"
+pass_env = []
+
+[[jobs]]
+name = "fmt"
+command = 'if [ -n "${GOODFLOWS_SPRITE_STATE_DIR-}" ]; then . "$GOODFLOWS_SPRITE_STATE_DIR/rust-env.sh" || exit 1; fi; cargo fmt --check'
+
+[[jobs]]
+name = "clippy"
+command = 'if [ -n "${GOODFLOWS_SPRITE_STATE_DIR-}" ]; then . "$GOODFLOWS_SPRITE_STATE_DIR/rust-env.sh" || exit 1; fi; cargo clippy --locked --all-targets -- -D warnings'
+depends_on = ["fmt"]
+
+[[jobs]]
+name = "test"
+command = 'if [ -n "${GOODFLOWS_SPRITE_STATE_DIR-}" ]; then . "$GOODFLOWS_SPRITE_STATE_DIR/rust-env.sh" || exit 1; fi; cargo test --locked --all'
+depends_on = ["fmt"]
+
+[[jobs]]
+name = "doc"
+command = 'if [ -n "${GOODFLOWS_SPRITE_STATE_DIR-}" ]; then . "$GOODFLOWS_SPRITE_STATE_DIR/rust-env.sh" || exit 1; fi; cargo doc --locked --no-deps'
+depends_on = ["fmt"]

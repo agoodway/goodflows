@@ -563,3 +563,41 @@ fn inspection_applies_history_overrides_like_parallelism() {
     let output = p.run(&["list", "--history", "--no-history"]);
     assert_eq!(output.status.code(), Some(2));
 }
+
+#[test]
+fn sprite_configuration_is_inspectable_offline_without_values() {
+    let p = Project::new(
+        r#"
+[settings]
+sprite_prefix = "goodflows"
+[sprite]
+setup = "bash scripts/sprite-setup.sh"
+resume = "true"
+pass_env = ["GF_TEST_UNSET_ALLOWLISTED"]
+[[jobs]]
+name = "test"
+command = "true"
+"#,
+    );
+    // No Sprite CLI on PATH and the allowlisted variable unset: still valid.
+    let run = |args: &[&str]| {
+        p.command()
+            .args(args)
+            .env("PATH", "/usr/bin:/bin")
+            .env_remove("GF_TEST_UNSET_ALLOWLISTED")
+            .env_remove("SPRITE_TOKEN")
+            .env_remove("SPRITES_TOKEN")
+            .output()
+            .unwrap()
+    };
+    let output = run(&["validate", "--json"]);
+    success(&output);
+    let output = run(&["list", "--json"]);
+    success(&output);
+    let event: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(event["settings"]["workdir"], p.dir.to_str().unwrap());
+    // A local run ignores the Sprite settings and runs no hook.
+    let output = run(&["run", "--json"]);
+    success(&output);
+    assert!(!p.dir.join("scripts").exists());
+}
