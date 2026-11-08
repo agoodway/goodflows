@@ -1663,18 +1663,19 @@ fn child_wait_metrics_use_the_child_invocation_clock() {
 parallelism = 2
 [[workflows.ci.jobs]]
 name = "prepare"
-command = "sleep 0.3"
+command = "i=0; while [ $i -lt 3000 ] && ! test -f hog; do sleep 0.01; i=$((i+1)); done; sleep 0.3"
 [[workflows.ci.jobs]]
 name = "call"
 workflow = "suite"
 depends_on = ["prepare"]
+# Holds the second slot from before the child starts until well after
+# `second` is ready, however the invocations' threads are scheduled.
 [[workflows.ci.jobs]]
 name = "hog"
-command = "sleep 0.7"
-depends_on = ["prepare"]
+command = "touch hog; i=0; while [ $i -lt 3000 ] && ! test -f first; do sleep 0.01; i=$((i+1)); done; sleep 0.5"
 [[workflows.suite.jobs]]
 name = "first"
-command = "sleep 0.2"
+command = "sleep 0.2; touch first"
 [[workflows.suite.jobs]]
 name = "other"
 command = "sleep 0.6"
