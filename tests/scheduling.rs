@@ -333,19 +333,24 @@ command = "true"
 
 #[test]
 fn a_failed_instance_skips_dependents_only_after_its_siblings_finish() {
+    use std::io::{BufRead, BufReader};
+    use std::process::Stdio;
     for fail_fast in [true, false] {
         let args = if fail_fast {
             vec!["--json"]
         } else {
             vec!["--json", "--no-fail-fast"]
         };
+        // Siblings wait for `release` instead of sleeping, so a slow runner cannot
+        // finish them before instance 2's failure is handled. The poll is bounded
+        // so a scheduling regression fails the assertions below rather than hangs.
         let p = Project::new(
             r#"
 [settings]
 parallelism = 4
 [[jobs]]
 name = "test"
-command = "if [ $GOODFLOWS_PARTITION = 2 ]; then exit 1; fi; sleep 0.3; touch done.$GOODFLOWS_PARTITION"
+command = "if [ $GOODFLOWS_PARTITION = 2 ]; then exit 1; fi; i=0; while [ $i -lt 3000 ] && ! test -f release; do sleep 0.01; i=$((i+1)); done; touch done.$GOODFLOWS_PARTITION"
 partitions = 3
 [[jobs]]
 name = "after"
@@ -357,11 +362,35 @@ command = "touch leaf"
 depends_on = ["after"]
 "#,
         );
-        let output = p.run(&args);
-        assert_eq!(output.status.code(), Some(1));
+        let release = Release(p.dir.join("release"));
+        let mut child = p
+            .command()
+            .args(&args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        // With fail-fast, release the siblings once `leaf` has been skipped;
+        // without it, once instance 2 has failed, since `after` and `leaf`
+        // cannot finish until the siblings do.
+        let mut events = Vec::new();
+        for line in BufReader::new(child.stdout.take().unwrap()).lines() {
+            let event: serde_json::Value = serde_json::from_str(&line.unwrap()).unwrap();
+            let trigger = event["type"] == "job_finished"
+                && if fail_fast {
+                    event["result"]["name"] == "leaf"
+                } else {
+                    event["result"]["partition"]["index"] == 2
+                };
+            events.push(event);
+            if trigger {
+                std::fs::write(&release.0, "").unwrap();
+            }
+        }
+        assert_eq!(child.wait().unwrap().code(), Some(1));
+        drop(release);
         assert!(!p.dir.join("after").exists() && !p.dir.join("leaf").exists());
         assert!(p.dir.join("done.1").exists() && p.dir.join("done.3").exists());
-        let events = events(&output);
         let order = finished(&events);
         // The direct dependent is skipped only after every instance finished.
         let position = |name: &str| order.iter().position(|(n, _)| n == name).unwrap();
