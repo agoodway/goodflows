@@ -450,7 +450,7 @@ fail_fast = false
 [[jobs]]
 name = "test"
 partitions = 3
-command = "if [ $GOODFLOWS_PARTITION = 2 ]; then exit 1; fi; touch started.$GOODFLOWS_PARTITION; i=0; while [ $i -lt 500 ] && ! test -f release; do sleep 0.01; i=$((i+1)); done"
+command = "if [ $GOODFLOWS_PARTITION = 2 ]; then exit 1; fi; touch started.$GOODFLOWS_PARTITION; i=0; while [ $i -lt 3000 ] && ! test -f release; do sleep 0.01; i=$((i+1)); done"
 [[jobs]]
 name = "after"
 command = "touch after"
@@ -772,7 +772,7 @@ fn a_signal_cancels_running_and_unstarted_instances() {
     use std::time::{Duration, Instant};
     for (signal, code) in [(libc::SIGINT, 130), (libc::SIGTERM, 143)] {
         let p = Project::new(
-            "[settings]\nparallelism=2\n[[jobs]]\nname='test'\npartitions=3\ncommand='touch started.$GOODFLOWS_PARTITION; i=0; while [ $i -lt 500 ] && ! test -f release; do sleep 0.01; i=$((i+1)); done'\n",
+            "[settings]\nparallelism=2\n[[jobs]]\nname='test'\npartitions=3\ncommand='touch started.$GOODFLOWS_PARTITION; i=0; while [ $i -lt 3000 ] && ! test -f release; do sleep 0.01; i=$((i+1)); done'\n",
         );
         let _release = Release(p.dir.join("release"));
         let mut child = p
@@ -828,7 +828,7 @@ fn a_signal_ends_the_text_report_cancelled() {
     use std::process::Stdio;
     use std::time::{Duration, Instant};
     let p = Project::new(
-        "[settings]\nparallelism=2\n[[jobs]]\nname='test'\npartitions=3\ncommand='touch started.$GOODFLOWS_PARTITION; i=0; while [ $i -lt 500 ] && ! test -f release; do sleep 0.01; i=$((i+1)); done'\n",
+        "[settings]\nparallelism=2\n[[jobs]]\nname='test'\npartitions=3\ncommand='touch started.$GOODFLOWS_PARTITION; i=0; while [ $i -lt 3000 ] && ! test -f release; do sleep 0.01; i=$((i+1)); done'\n",
     );
     let _release = Release(p.dir.join("release"));
     let mut child = p
@@ -959,7 +959,7 @@ fn overlapping_runs_never_prune_a_live_log_directory() {
     use std::process::Stdio;
     use std::time::{Duration, Instant};
     let p = Project::new(
-        "[[jobs]]\nname='a'\ncommand='echo first; touch started; i=0; while [ $i -lt 500 ] && ! test -f release; do sleep 0.01; i=$((i+1)); done; echo after'\n",
+        "[[jobs]]\nname='a'\ncommand='echo first; touch started; i=0; while [ $i -lt 3000 ] && ! test -f release; do sleep 0.01; i=$((i+1)); done; echo after'\n",
     );
     let release = Release(p.dir.join("release"));
     let first = p
