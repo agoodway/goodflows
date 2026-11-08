@@ -2,7 +2,7 @@
 
 ## Context
 
-See `proposal.md` for motivation and the delta specs for behavior. This is a planning change, not an implemented remote backend.
+See `proposal.md` for motivation and the delta specs for behavior. The remote backend described here is implemented in `src/sprite`; `tasks.md` records its verification and `docs/sprites.md` its documented limits.
 
 ### Existing execution boundary
 
@@ -35,7 +35,7 @@ The original UUID-only lock admitted different runs with 7.002 seconds of overla
 
 Add a focused `src/sprite` module for scope, transport, snapshots, remote supervision, and recovery. Keep `runner::execute` local to whichever machine executes the graph. Extract only the invocation/finalization boundary from `main.rs` needed to supply a preallocated run identity and managed paths; do not build a second scheduler or a general backend trait hierarchy.
 
-Use installed `sprite` commands with explicit organization and Sprite arguments, non-TTY WebSocket stdin, and `--no-port-forward`. Never call `sprite use`, change global/local active context, expose public URLs, or auto-forward job ports. Resolve organization once from the Sprite CLI's authenticated context and persist it in the local invocation reference; subsequent calls use that resolved organization. Do not assume a token belongs to this repository. Missing tools/authentication fail remote preflight without exposing values.
+Use installed `sprite` commands with explicit organization and Sprite arguments, non-TTY WebSocket stdin, and `--no-port-forward`. Never call `sprite use`, change global/local active context, expose public URLs, or auto-forward job ports. Resolve organization once from the Sprite CLI's authenticated context and persist it in the local invocation reference; subsequent calls use that resolved organization. Do not assume a token belongs to this repository. Tokens embed their organization and the API lists that organization's Sprites even when `-o`/`SPRITE_ORG` names another, so do not trust the requested organization: before any receipt, create, exec, read, or destroy, verify that `sprite list --json` reports it as the top-level organization and on every listed Sprite, and fail closed when either is missing or differs. Missing tools/authentication fail remote preflight without exposing values.
 
 Alternative: invoke Spry recipes. Rejected because GoodFlows would then split ownership of preparation, locks, status, and recovery across two CLIs. Sprite CLI remains the controller transport; the in-Sprite supervisor uses the local Tasks API for wake holds. Plain attached exec is not the execution owner: the measured disconnect cutoff cannot satisfy the contract. Fail closed if the installed service/hold mechanism cannot satisfy the integrated acceptance gates.
 
@@ -162,7 +162,7 @@ Never destroy after success/failure, controller loss, or cancellation. `destroy`
 ## Migration Plan
 
 1. Implement the opt-in surface and protocol behind explicit `--sprite`; leave existing configurations/local execution unchanged. Keep unknown-field validation strict with the new fields intentionally recognized.
-2. Translate the bounded service/hold and identity-lock evidence into integrated fault-injection gates before treating remote execution as supported. Require supported cold-wake verification or leave that support gate unresolved explicitly. Use only specifically authorized disposable Sprites, not retained benchmark resources.
+2. Translate the bounded service/hold and identity-lock evidence into integrated fault-injection gates before treating remote execution as supported. Require supported cold-wake verification or leave that support gate unresolved explicitly. By owner decision the gate stays unresolved: recovery after an actual cold boot with a changed boot identity is unverified and unsupported, a documented limitation pending future validation; unchanged-boot service restarts, suspend/resume, and checkpoint/restore do not count as cold boot. Use only specifically authorized disposable Sprites, not retained benchmark resources.
 3. Dogfood GoodFlows' existing graph with explicit Sprite setup/resume scripts, persistent script-managed caches, both first-use and subsequent runs, and controller recovery. Compare graph/test counts and native metrics to the local run, not only command exit codes.
 4. Document installation, prefix ownership, source exclusions/limitations, credential policy, result layout, cold-loss behavior, and explicit cleanup. No automatic migration of Spry recipes or existing Sprites.
 5. Roll back adoption by omitting `--sprite`; existing remote data remains recoverable by a compatible CLI. Destruction remains a separate explicit action. Future incompatible remote metadata/protocol versions fail clearly rather than being rewritten automatically.
@@ -172,4 +172,4 @@ Never destroy after success/failure, controller loss, or cancellation. `destroy`
 - What finite default count/byte budgets best fit collected raw logs and reporting spools? Pick and document them with oversize/partial-bundle acceptance tests; do not weaken existing report-size limits.
 - What progress frequency is useful for lifecycle timing/output without excessive noise? This affects presentation only, not lock ownership or liveness.
 
-Service-owned supervision plus renewable holds is the selected mechanism, supported by bounded live evidence rather than an attached-exec lifetime assumption. Integrated crash-window and cold-wake acceptance gates remain fail-closed, not permission to weaken recovery. User decisions on identity, prefix, exclusive runs, hooks, source inclusion, caches, and allowlisted environment are settled by this proposal.
+Service-owned supervision plus renewable holds is the selected mechanism, supported by bounded live evidence rather than an attached-exec lifetime assumption. Integrated crash-window gates and the owner-accepted, unverified cold-wake limitation remain fail-closed, not permission to weaken recovery. User decisions on identity, prefix, exclusive runs, hooks, source inclusion, caches, and allowlisted environment are settled by this proposal.

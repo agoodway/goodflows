@@ -85,6 +85,17 @@ impl Output {
         output
     }
 
+    /// A copy that adds no workflow, environment or invocation context, for
+    /// events that already carry their own (a remote run's native events,
+    /// including those of called workflows).
+    pub fn relay(&self) -> Self {
+        let mut output = self.clone();
+        output.workflow = None;
+        output.environment = None;
+        output.invocation = None;
+        output
+    }
+
     pub fn with_environment(&self, name: &str) -> Self {
         let mut output = self.clone();
         output.environment = Some(name.into());
@@ -92,17 +103,21 @@ impl Output {
     }
 
     /// Emits the run `summary`. Text mode alone also receives the explicit
-    /// `--config` path for the rerun hint and whether a signal arrived; neither
-    /// is part of the JSON event.
+    /// `--config` path and any Sprite identity for the rerun hint and whether
+    /// a signal arrived; none of them is part of the JSON event.
     pub async fn emit_summary(
         &self,
         mut event: Value,
         config: Option<&str>,
+        sprite: Option<&str>,
         interrupted: bool,
     ) -> Result<()> {
         if !self.json {
             if let Some(config) = config {
                 event[report::CONFIG] = json!(config);
+            }
+            if let Some(sprite) = sprite {
+                event[report::SPRITE] = json!(sprite);
             }
             event[report::INTERRUPTED] = json!(interrupted);
         }
@@ -155,6 +170,11 @@ impl Output {
             }
         }
     }
+}
+
+/// POSIX shell quoting as used by rerun hints.
+pub(crate) fn shell_word(value: &str) -> String {
+    report::shell_quote(value)
 }
 
 #[cfg(unix)]
@@ -480,6 +500,24 @@ fn render(json: bool, mut event: Value, out: &mut impl Write, err: &mut impl Wri
             )?,
             "error" => {
                 writeln!(err, "Error: {}", text(&event, "message"))?;
+            }
+            "sprite_hook_output" => {
+                let data = text(&event, "data");
+                write!(
+                    out,
+                    "[{} {}] {}",
+                    text(&event, "hook"),
+                    text(&event, "stream"),
+                    data
+                )?;
+                if !data.ends_with('\n') {
+                    writeln!(out)?;
+                }
+            }
+            kind if kind.starts_with("sprite_") => {
+                if let Some(message) = event["message"].as_str() {
+                    writeln!(out, "{}", visible(message))?;
+                }
             }
             _ => {}
         }

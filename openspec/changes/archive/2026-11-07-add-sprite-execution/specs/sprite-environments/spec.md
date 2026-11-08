@@ -36,6 +36,10 @@ Remote operations SHALL require project-wide `[settings] sprite_prefix`. Within 
 - **WHEN** a Sprite has the computed name but lacks matching ownership metadata
 - **THEN** the operation fails without adopting it, running hooks, replacing source, or destroying it
 
+#### Scenario: Platform-reported organization is missing or differs
+- **WHEN** a run, `sprite status`, `logs`, `collect`, `cancel`, or `destroy` finds the platform-reported organization, or any listed Sprite's organization, missing or different from the requested organization
+- **THEN** the command fails before saving a receipt or creating, executing in, reading from, or destroying any Sprite
+
 #### Scenario: Invalid or missing configuration
 - **WHEN** remote execution lacks a prefix or a workflow/profile attempts to override it
 - **THEN** preflight fails before creating a Sprite

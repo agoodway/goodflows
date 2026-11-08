@@ -7,6 +7,7 @@ mod output;
 mod reporting;
 mod retention;
 mod runner;
+mod sprite;
 mod tail;
 
 use anyhow::Result;
@@ -77,7 +78,12 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Run checks (default)
-    Run { workflow: Option<String> },
+    Run {
+        workflow: Option<String>,
+        /// Run the whole workflow on this caller identity's owned Sprite (see docs/sprites.md)
+        #[arg(long, value_name = "IDENTITY", value_parser = sprite::naming::parse_identity)]
+        sprite: Option<String>,
+    },
     /// Validate config and selections without executing commands
     Validate { workflow: Option<String> },
     /// List jobs and dependencies
@@ -105,6 +111,17 @@ enum Commands {
         #[command(subcommand)]
         command: ReportsCommand,
     },
+    /// Inspect, recover, cancel or destroy a caller identity's Sprite
+    Sprite {
+        #[command(subcommand)]
+        command: sprite::Command,
+    },
+    /// Internal: the remote runner protocol used on a Sprite
+    #[command(name = "__sprite-agent", hide = true)]
+    SpriteAgent {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -119,7 +136,46 @@ enum ReportsCommand {
     },
 }
 
+/// Global flags that only `run` uses; `sprite` commands reject them.
+const RUN_ONLY_FLAGS: [&str; 12] = [
+    "env",
+    "parallelism",
+    "fail_fast",
+    "no_fail_fast",
+    "jobs",
+    "log_dir",
+    "history",
+    "no_history",
+    "history_dir",
+    "log_runs",
+    "history_runs",
+    "history_bytes",
+];
+
 impl Cli {
+    /// The parser, with run-only global flags hidden from `sprite` help.
+    /// They still parse there, so passing one is rejected with a clear error
+    /// rather than silently ignored.
+    fn parser() -> clap::Command {
+        let mut command = <Self as clap::CommandFactory>::command();
+        // Globals reach subcommands only when the command is built.
+        command.build();
+        let hide = |command: clap::Command| {
+            command.mut_args(|arg| {
+                let hidden = RUN_ONLY_FLAGS.contains(&arg.get_id().as_str()) || arg.is_hide_set();
+                arg.hide(hidden)
+            })
+        };
+        command.mut_subcommand("sprite", |sprite| hide(sprite).mut_subcommands(hide))
+    }
+
+    fn parse_from(
+        args: impl IntoIterator<Item = impl Into<std::ffi::OsString> + Clone>,
+    ) -> std::result::Result<Self, clap::Error> {
+        let matches = Self::parser().try_get_matches_from(args)?;
+        <Self as clap::FromArgMatches>::from_arg_matches(&matches)
+    }
+
     /// History and retention flags. `--history-dir` resolves from the
     /// invocation directory, like `--log-dir`.
     fn history_overrides(&self) -> Result<config::HistoryOverrides> {
@@ -145,12 +201,15 @@ impl Cli {
     fn workflow(&self) -> Option<&str> {
         match &self.command {
             Some(
-                Commands::Run { workflow }
+                Commands::Run { workflow, .. }
                 | Commands::List { workflow, .. }
                 | Commands::Validate { workflow }
                 | Commands::Init { workflow, .. },
             ) => workflow.as_deref(),
-            Some(Commands::Reports { .. }) | None => None,
+            Some(
+                Commands::Reports { .. } | Commands::Sprite { .. } | Commands::SpriteAgent { .. },
+            )
+            | None => None,
         }
     }
 }
@@ -159,7 +218,7 @@ impl Cli {
 async fn main() -> ExitCode {
     let raw_args: Vec<_> = std::env::args_os().collect();
     let json_requested = raw_args.iter().any(|arg| arg == "--json");
-    let cli = match Cli::try_parse_from(raw_args) {
+    let cli = match Cli::parse_from(raw_args) {
         Ok(cli) => cli,
         Err(error) => {
             if matches!(
@@ -178,9 +237,12 @@ async fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    if let Some(Commands::SpriteAgent { args }) = &cli.command {
+        return ExitCode::from(sprite::agent::main(args).await);
+    }
     let (_signal_sender, cancel) = match if matches!(
         cli.command,
-        None | Some(Commands::Run { .. } | Commands::Reports { .. })
+        None | Some(Commands::Run { .. } | Commands::Reports { .. } | Commands::Sprite { .. })
     ) {
         cancellation()
     } else {
@@ -271,7 +333,10 @@ async fn run(cli: &Cli, output: &mut Output, cancel: watch::Receiver<Option<i32>
         let budget = budget.map(std::time::Duration::from_secs);
         return reporting::replay::upload(run_directory, output, cancel, budget).await;
     }
-    let (document, _) = Config::load(cli.config.as_deref())?;
+    if let Some(Commands::Sprite { command }) = &cli.command {
+        return sprite::command(cli, command, output, cancel).await;
+    }
+    let (document, config_file) = Config::load(cli.config.as_deref())?;
     let history_cli = cli.history_overrides()?;
     let profile = cli.env.as_deref();
     // Report an unknown --env before the --jobs check for all-workflow commands;
@@ -357,7 +422,43 @@ async fn run(cli: &Cli, output: &mut Output, cancel: watch::Receiver<Option<i32>
         }
         _ => {}
     }
-    let run = Arc::new(Run {
+    if let Some(Commands::Run {
+        sprite: Some(identity),
+        ..
+    }) = &cli.command
+    {
+        let request = sprite::control::Request {
+            workflow: cli.workflow().map(str::to_owned),
+            environment: cli.env.clone(),
+            jobs: cli.jobs.clone(),
+            parallelism: cli.parallelism,
+            fail_fast: fail_fast_override,
+            logs: cli.log_dir.is_some(),
+            history: history_cli.history,
+            log_runs: cli.log_runs,
+            history_runs: cli.history_runs,
+            history_bytes: cli.history_bytes,
+        };
+        return sprite::run(
+            sprite::RunInput {
+                document,
+                config_file,
+                name,
+                selected: config,
+                targets,
+                identity: identity.clone(),
+                request,
+                rerun_config: cli
+                    .config
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().into_owned()),
+            },
+            output,
+            cancel,
+        )
+        .await;
+    }
+    let run = Run {
         calls: !calls.is_empty(),
         root: config,
         targets,
@@ -374,8 +475,21 @@ async fn run(cli: &Cli, output: &mut Output, cancel: watch::Receiver<Option<i32>
             .map(|path| path.to_string_lossy().into_owned()),
         output: output.clone(),
         cancel,
-    });
-    let (_, finished) = invoke(run, name, None).await;
+        sprite_state: None,
+    };
+    execute(run, name, retention::RunIdentity::new()).await
+}
+
+/// Run a whole invocation tree: the root workflow `name` with `identity`
+/// and every child its calls activate. Local runs and the remote Sprite
+/// runner (which preallocates the root identity) share this path. Returns
+/// the root's exit code.
+pub(crate) async fn execute(
+    run: Run,
+    name: String,
+    identity: retention::RunIdentity,
+) -> Result<u8> {
+    let (_, finished) = invoke(Arc::new(run), name, None, identity).await;
     let finished = finished?.expect("only a called run stops before it starts");
     Ok(finished
         .signal
@@ -385,26 +499,29 @@ async fn run(cli: &Cli, output: &mut Output, cancel: watch::Receiver<Option<i32>
 
 /// What every invocation of one `goodflows run` shares: the root selection,
 /// the workflows its calls reach, and the CLI overrides that apply to each.
-struct Run {
-    root: Config,
+pub(crate) struct Run {
+    pub root: Config,
     /// Every workflow reachable through calls, with its complete jobs under
     /// the selected profile.
-    targets: BTreeMap<String, Config>,
+    pub targets: BTreeMap<String, Config>,
     /// The root selection contains a workflow call, so events carry
     /// invocation identities.
-    calls: bool,
-    profile: Option<String>,
-    parallelism: Option<usize>,
-    fail_fast: Option<bool>,
-    history: config::HistoryOverrides,
+    pub calls: bool,
+    pub profile: Option<String>,
+    pub parallelism: Option<usize>,
+    pub fail_fast: Option<bool>,
+    pub history: config::HistoryOverrides,
     /// `--jobs`, which selects only in the root workflow.
-    requested_jobs: Vec<String>,
-    log_dir: Option<PathBuf>,
-    legacy_default: bool,
+    pub requested_jobs: Vec<String>,
+    pub log_dir: Option<PathBuf>,
+    pub legacy_default: bool,
     /// The explicit `--config` path, for the root rerun hint.
-    config_path: Option<String>,
-    output: Output,
-    cancel: watch::Receiver<Option<i32>>,
+    pub config_path: Option<String>,
+    pub output: Output,
+    pub cancel: watch::Receiver<Option<i32>>,
+    /// `GOODFLOWS_SPRITE_STATE_DIR` for every invocation of a remote Sprite
+    /// run; `None` locally.
+    pub sprite_state: Option<String>,
 }
 
 /// The invocation that activated a child, and the call job that did it.
@@ -427,15 +544,14 @@ struct Finished {
 /// Run one invocation, the root (`parent` is `None`) or a called workflow,
 /// through its whole lifecycle in this process. Returns its run id, which
 /// exists even when setup then failed, and `None` when a called run was
-/// stopped by fail-fast before it started.
+/// stopped by fail-fast before it started. One identity names the log run
+/// directory, the history file and the reporting workflow_run_id.
 async fn invoke(
     run: Arc<Run>,
     name: String,
     parent: Option<Parent>,
+    identity: retention::RunIdentity,
 ) -> (String, Result<Option<Finished>>) {
-    // One identity names the log run directory, the history file and the
-    // reporting workflow_run_id.
-    let identity = retention::RunIdentity::new();
     let id = identity.id.clone();
     (id, invocation(&run, &name, parent, identity).await)
 }
@@ -450,7 +566,13 @@ fn activator(run: Arc<Run>, run_id: String) -> runner::Activate {
         };
         let (run, target) = (run.clone(), activation.target);
         Box::pin(async move {
-            let (run_id, finished) = invoke(run, target.clone(), Some(parent)).await;
+            let (run_id, finished) = invoke(
+                run,
+                target.clone(),
+                Some(parent),
+                retention::RunIdentity::new(),
+            )
+            .await;
             child_end(&target, run_id, finished)
         })
     })
@@ -610,6 +732,7 @@ async fn invocation(
             .unwrap_or_default(),
         environment: run.profile.clone(),
         settings_env: settings.env,
+        sprite_state: run.sprite_state.clone(),
     };
     output.emit(json!({"type":"run_started", "parallelism":parallelism, "fail_fast":fail_fast, "jobs":config.jobs.iter().map(config::Job::instances).sum::<usize>(), "workdir":options.workdir})).await?;
     if let Some(session) = &session {
@@ -722,7 +845,7 @@ async fn invocation(
         None => run.config_path.as_deref(),
     };
     output
-        .emit_summary(summary, config_path, signal.is_some())
+        .emit_summary(summary, config_path, None, signal.is_some())
         .await?;
     Ok(Some(Finished {
         outcome: fields.outcome,
@@ -734,7 +857,7 @@ async fn invocation(
 
 type Cancellation = (watch::Sender<Option<i32>>, watch::Receiver<Option<i32>>);
 
-fn cancellation() -> Result<Cancellation> {
+pub(crate) fn cancellation() -> Result<Cancellation> {
     let (sender, receiver) = watch::channel(None);
     let notify = sender.clone();
     #[cfg(unix)]
@@ -825,7 +948,7 @@ mod tests {
     }
 
     fn parse(args: &[&str]) -> std::result::Result<Cli, clap::Error> {
-        Cli::try_parse_from(std::iter::once("goodflows").chain(args.iter().copied()))
+        Cli::parse_from(std::iter::once("goodflows").chain(args.iter().copied()))
     }
 
     fn overrides(args: &[&str]) -> config::HistoryOverrides {

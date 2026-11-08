@@ -244,6 +244,9 @@ pub struct Options {
     /// Resolved settings env defaults, layered over the caller's environment
     /// and under job and step env.
     pub settings_env: BTreeMap<String, String>,
+    /// `GOODFLOWS_SPRITE_STATE_DIR` for a remote Sprite run. `None` for local
+    /// runs, which never inherit an ambient value.
+    pub sprite_state: Option<String>,
 }
 
 /// Environment adjustments for reporting. Applied after job/step overrides.
@@ -480,6 +483,7 @@ struct Shared {
     reporting: Arc<ReportingEnv>,
     environment: Option<String>,
     settings_env: BTreeMap<String, String>,
+    sprite_state: Option<String>,
     rss: Arc<RssMonitor>,
 }
 
@@ -603,6 +607,7 @@ pub async fn execute(
         reporting: options.reporting.clone(),
         environment: options.environment.clone(),
         settings_env: options.settings_env.clone(),
+        sprite_state: options.sprite_state.clone(),
         // One sampler serves the whole run tree.
         rss: scope.tree.rss.clone(),
     });
@@ -899,10 +904,14 @@ fn job_env(shared: &Shared, job: &Job, partition: Option<Partition>) -> HashMap<
     // expressions never observe it. Commands get their own file (or none).
     let mut env: HashMap<String, String> = std::env::vars_os()
         .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
-        .filter(|(key, _)| key != config::OUTPUT_ENV)
+        .filter(|(key, _)| key != config::OUTPUT_ENV && key != config::SPRITE_STATE_ENV)
         .chain(shared.settings_env.clone())
         .chain(job.env.clone())
         .collect();
+    // Runner-owned: only a remote Sprite run exposes its state directory.
+    if let Some(state) = &shared.sprite_state {
+        env.insert(config::SPRITE_STATE_ENV.into(), state.clone());
+    }
     // Expressions read this map, so the token must be gone before any evaluation.
     shared.reporting.scrub(&mut env);
     // Partition identity is visible to conditions, expressions and every
@@ -1390,6 +1399,10 @@ impl JobExecution<'_> {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         std::os::unix::process::CommandExt::process_group(&mut command, 0);
+        // A local run never passes on an inherited remote state directory.
+        if !env.contains_key(config::SPRITE_STATE_ENV) {
+            command.env_remove(config::SPRITE_STATE_ENV);
+        }
         // .envs() only adds to the inherited CLI environment, so the token and any
         // inherited reserved values (from an enclosing goodflows run) must be removed.
         if let Some(token) = &self.reporting.scrub {

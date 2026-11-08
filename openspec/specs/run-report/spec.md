@@ -101,7 +101,7 @@ When any instance failed or timed out, the report SHALL include a Failures secti
 - **THEN** the entry for `test` shows timed out, names step `slow` and shows no exit code
 
 ### Requirement: Report points at logs and a rerun command
-When the run used a log directory, the report SHALL show that run's log directory. When a history file was written, the report SHALL show that file's path, after the log directory line when both are shown. When any job's row status is failed or timed out, the report SHALL end with a rerun command `goodflows run <workflow> [--config=<path>] [--env=<env>] --jobs=<names>` that lists, once each and in configuration order, every job whose row is failed or timed out and every skipped job with the skip reason `dependency did not pass`, and keeps the workflow and any `--env` selection of the original run. `--config` SHALL be included, with the path as given, only when the original run passed `--config` explicitly; this path MUST NOT be added to the JSON `summary` event. Values SHALL be POSIX shell-quoted with embedded apostrophes escaped. Option values SHALL use equals form; a workflow beginning with `-` SHALL appear last after `--`. If any job selected for the rerun has a name containing a comma, the report SHALL instead explain that selective rerun is unavailable and end with a full-workflow rerun command preserving workflow, config and environment but omitting `--jobs`.
+When the run used a log directory, the report SHALL show that run's log directory. When a history file was written, the report SHALL show that file's path, after the log directory line when both are shown. When any job's row status is failed or timed out, the report SHALL end with a rerun command `goodflows run <workflow> [--config=<path>] [--env=<env>] [--sprite=<identity>] --jobs=<names>` that lists, once each and in configuration order, every job whose row is failed or timed out and every skipped job with the skip reason `dependency did not pass`, and keeps the workflow and any `--env` selection of the original run. A remote run SHALL preserve its original caller-supplied Sprite identity using `--sprite=<identity>`; a local run SHALL omit this flag. `--config` SHALL be included, with the path as given, only when the original run passed `--config` explicitly; this path MUST NOT be added to the JSON `summary` event. Values SHALL be POSIX shell-quoted with embedded apostrophes escaped. Option values SHALL use equals form; a workflow beginning with `-` SHALL appear last after `--`. If any job selected for the rerun has a name containing a comma, the report SHALL instead explain that selective rerun is unavailable and end with a full-workflow rerun command preserving workflow, config, environment and any Sprite identity but omitting `--jobs`.
 
 #### Scenario: Rerun hint for a partitioned failure
 - **WHEN** `lint` precedes `test` in configuration order, and two instances of `test` and the job `lint` fail
@@ -142,6 +142,14 @@ When the run used a log directory, the report SHALL show that run's log director
 #### Scenario: History disabled
 - **WHEN** history is off
 - **THEN** the report has no history path
+
+#### Scenario: Remote selective rerun
+- **WHEN** a run with `--sprite T-example --env test --config custom.toml` has a failed job
+- **THEN** the rerun command preserves that identity, profile, and original controller config path rather than pointing at the remote staged config
+
+#### Scenario: Remote comma fallback
+- **WHEN** a remote run with workflow `-wf`, `--env prod`, and `--sprite T-example` has a failed job named `test,unit`
+- **THEN** the full-workflow hint preserves `--sprite=T-example` before the final `-- -wf` and omits `--jobs`
 
 ### Requirement: Job-provided text cannot rewrite the terminal
 In text mode, the report and the live failure and step error lines SHALL print control characters other than tab in commands, errors and skip reasons as visible escapes (for example `\u{1b}` or `\r`). Job names containing control characters MUST fail validation; other job-name rules are unchanged.

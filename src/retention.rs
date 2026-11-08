@@ -31,6 +31,15 @@ impl RunIdentity {
         Self::at(secs, uuid::Uuid::new_v4().hyphenated().to_string())
     }
 
+    /// A run identity with a preallocated id (a Sprite run's canonical UUID).
+    pub fn with_id(id: String) -> Self {
+        let secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or_default();
+        Self::at(secs, id)
+    }
+
     fn at(secs: u64, id: String) -> Self {
         let (year, month, day) = civil_from_days((secs / 86_400) as i64);
         let rem = secs % 86_400;

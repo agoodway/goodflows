@@ -18,6 +18,69 @@ pub struct Config {
     pub environments: BTreeMap<String, Environment>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reporting: Option<Reporting>,
+    /// Explicit Sprite preparation hooks and environment allowlist. Used only
+    /// by `run --sprite`; local runs ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sprite: Option<SpriteConfig>,
+}
+
+/// Directory exposed to remote hooks and jobs for script-managed persistent
+/// state. Reserved: never configurable, forwarded, or inherited by local runs.
+pub const SPRITE_STATE_ENV: &str = "GOODFLOWS_SPRITE_STATE_DIR";
+
+/// `[sprite]`: top-level only. `setup` and `resume` are required for remote
+/// runs (use `true` for a deliberate no-op); partial configurations remain
+/// valid for inspection.
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+#[serde(deny_unknown_fields)]
+pub struct SpriteConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub setup: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume: Option<String>,
+    /// Names of caller variables forwarded to remote hooks and jobs.
+    #[serde(default)]
+    pub pass_env: Vec<String>,
+}
+
+impl SpriteConfig {
+    fn validate(&self) -> Result<()> {
+        for (field, command) in [("setup", &self.setup), ("resume", &self.resume)] {
+            if let Some(command) = command {
+                if command.trim().is_empty() {
+                    bail!("{field} must be a nonempty shell command (use `true` for a no-op)");
+                }
+                if command.contains('\0') {
+                    bail!("{field} contains invalid control characters");
+                }
+            }
+        }
+        let mut seen = HashSet::new();
+        for name in &self.pass_env {
+            if !valid_env_name(name) {
+                bail!(
+                    "pass_env entry '{}' must be an environment variable name matching [A-Za-z_][A-Za-z0-9_]*",
+                    name.escape_debug()
+                );
+            }
+            if !seen.insert(name) {
+                bail!("pass_env lists '{name}' more than once");
+            }
+        }
+        Ok(())
+    }
+}
+
+/// `settings.sprite_prefix`: 1-20 lowercase ASCII letters, digits or hyphens,
+/// starting with a letter or digit.
+pub fn valid_sprite_prefix(prefix: &str) -> bool {
+    let bytes = prefix.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= 20
+        && (bytes[0].is_ascii_lowercase() || bytes[0].is_ascii_digit())
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-')
 }
 
 /// The report family a job requests in `reports`. The wire version it is
@@ -166,6 +229,9 @@ pub struct Settings {
     pub history_runs: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub history_bytes: Option<u64>,
+    /// Project-wide Sprite name prefix; only valid in the top-level `[settings]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sprite_prefix: Option<String>,
 }
 
 impl Default for Settings {
@@ -180,6 +246,7 @@ impl Default for Settings {
             log_runs: None,
             history_runs: None,
             history_bytes: None,
+            sprite_prefix: None,
         }
     }
 }
@@ -507,11 +574,17 @@ pub struct SettingsOverrides {
     pub history_runs: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub history_bytes: Option<u64>,
+    // Present only to reject a workflow/profile prefix override with a clear message.
+    #[serde(default, skip_serializing)]
+    sprite_prefix: Option<toml::Value>,
 }
 
 impl SettingsOverrides {
     /// Reject a zero retention cap in workflow or profile settings.
     fn validate_history(&self) -> Result<()> {
+        if self.sprite_prefix.is_some() {
+            bail!("sprite_prefix is project-wide; set it only in the top-level [settings]");
+        }
         validate_caps(self.log_runs, self.history_runs, self.history_bytes)
     }
 
@@ -545,6 +618,7 @@ impl SettingsOverrides {
             log_runs: self.log_runs.or(shared.log_runs),
             history_runs: self.history_runs.or(shared.history_runs),
             history_bytes: self.history_bytes.or(shared.history_bytes),
+            sprite_prefix: shared.sprite_prefix.clone(),
         }
     }
 }
@@ -682,6 +756,14 @@ impl Config {
         }
         if let Some(reporting) = &self.reporting {
             reporting.validate().context("reporting")?;
+        }
+        if let Some(prefix) = &self.settings.sprite_prefix {
+            if !valid_sprite_prefix(prefix) {
+                bail!("settings sprite_prefix must be 1-20 bytes of lowercase ASCII letters, digits or hyphens, starting with a letter or digit");
+            }
+        }
+        if let Some(sprite) = &self.sprite {
+            sprite.validate().context("sprite")?;
         }
         let reporting = self.reporting.as_ref();
         // Validate every authored settings map, including unselected workflows and
@@ -932,6 +1014,7 @@ impl Config {
                 workflows: BTreeMap::new(),
                 environments: BTreeMap::new(),
                 reporting: self.reporting.clone(),
+                sprite: self.sprite.clone(),
             },
         ))
     }
@@ -1120,6 +1203,7 @@ fn validate_env<'a>(
         if RESERVED_ENV.contains(&key.as_str())
             || PARTITION_ENV.contains(&key.as_str())
             || key == ENVIRONMENT_ENV
+            || key == SPRITE_STATE_ENV
         {
             bail!("env must not set reserved variable {key}; goodflows sets it itself");
         }
@@ -1705,6 +1789,82 @@ mod tests {
                 "{scope} {entry}: {error}"
             );
             assert!(!error.contains("secret-value"), "{scope} {entry}: {error}");
+        }
+    }
+
+    #[test]
+    fn sprite_configuration_is_validated_strictly() {
+        // Partial configurations stay valid for inspection.
+        for partial in [
+            "[settings]\nsprite_prefix = 'goodflows'\n",
+            "[sprite]\nsetup = 'true'\n",
+            "[sprite]\npass_env = ['A', '_B1']\n",
+            "[settings]\nsprite_prefix = 'a'\n[sprite]\nsetup = 'bash s.sh'\nresume = 'true'\npass_env = []\n",
+        ] {
+            let config = validate(&format!("{partial}{JOB}")).unwrap();
+            // The prefix applies to every resolved workflow.
+            if partial.contains("sprite_prefix") {
+                let (_, ci) = config.workflow(Some("ci"), None).unwrap();
+                assert!(ci.settings.sprite_prefix.is_some());
+            }
+        }
+        for (source, message) in [
+            ("[sprite]\nunknown = 1\n", "unknown field"),
+            (
+                "[settings]\nsprite_prefix = ''\n",
+                "sprite_prefix must be 1-20",
+            ),
+            (
+                "[settings]\nsprite_prefix = 'Upper'\n",
+                "sprite_prefix must be 1-20",
+            ),
+            (
+                "[settings]\nsprite_prefix = '-lead'\n",
+                "sprite_prefix must be 1-20",
+            ),
+            (
+                "[settings]\nsprite_prefix = 'has_underscore'\n",
+                "sprite_prefix must be 1-20",
+            ),
+            (
+                "[settings]\nsprite_prefix = 'abcdefghijklmnopqrstu'\n",
+                "sprite_prefix must be 1-20",
+            ),
+            ("[sprite]\nsetup = '  '\n", "setup must be a nonempty"),
+            ("[sprite]\nresume = ''\n", "resume must be a nonempty"),
+            ("[sprite]\npass_env = ['1BAD']\n", "pass_env entry '1BAD'"),
+            ("[sprite]\npass_env = ['A=B']\n", "pass_env entry"),
+            (
+                "[sprite]\npass_env = ['A', 'A']\n",
+                "pass_env lists 'A' more than once",
+            ),
+            (
+                "[workflows.ci.settings]\nsprite_prefix = 'x'\n",
+                "sprite_prefix is project-wide",
+            ),
+            (
+                "[environments.e.settings]\nsprite_prefix = 'x'\n",
+                "sprite_prefix is project-wide",
+            ),
+            ("[workflows.ci.sprite]\nsetup = 'true'\n", "unknown field"),
+        ] {
+            let error = validate(&format!("{source}{JOB}")).unwrap_err();
+            assert!(error.contains(message), "{source}: {error}");
+        }
+    }
+
+    #[test]
+    fn sprite_state_dir_is_reserved_in_every_env_layer() {
+        for entry in [
+            "[settings.env]\nGOODFLOWS_SPRITE_STATE_DIR = 'x'\n",
+            "[environments.e.settings.env]\nGOODFLOWS_SPRITE_STATE_DIR = 'x'\n",
+            "[[workflows.third.jobs]]\nname = 'j'\ncommand = 'true'\nenv = { GOODFLOWS_SPRITE_STATE_DIR = 'x' }\n",
+        ] {
+            let error = validate(&format!("{JOB}{entry}")).unwrap_err();
+            assert!(
+                error.contains("reserved variable GOODFLOWS_SPRITE_STATE_DIR"),
+                "{entry}: {error}"
+            );
         }
     }
 
