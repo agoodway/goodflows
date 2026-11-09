@@ -673,7 +673,8 @@ async fn invocation(
     };
     // The host is sampled at run start too.
     let host = history::Host::current();
-    let graph_sha256 = history::graph_sha256(&config.jobs, &|target| &run.targets[target].jobs);
+    let (graph_sha256, _) =
+        history::graph_sha256(&config.jobs, &|target| &run.targets[target].jobs);
     // An enclosing fail-fast stop can land after the call's own check; re-check
     // right before the first observable effect (reporting, events, logs).
     if parent.as_ref().is_some_and(|parent| parent.scope.stopped()) {

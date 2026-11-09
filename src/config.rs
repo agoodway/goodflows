@@ -118,6 +118,14 @@ pub struct Reporting {
     pub token_env: String,
     /// Resolved to an absolute path by `Config::load`.
     pub spool_dir: Option<PathBuf>,
+    /// Upload each invocation's run record. Controls upload only: local
+    /// history files keep their own settings and flags.
+    #[serde(
+        default,
+        deserialize_with = "history_flag",
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    pub history: bool,
     // Present only to reject credentials written inline with a clear message.
     #[serde(default, skip_serializing)]
     token: Option<toml::Value>,
@@ -125,6 +133,12 @@ pub struct Reporting {
     api_key: Option<toml::Value>,
     #[serde(default, skip_serializing)]
     url: Option<toml::Value>,
+}
+
+/// A boolean whose error names the key, which serde's type error does not.
+fn history_flag<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<bool, D::Error> {
+    bool::deserialize(deserializer)
+        .map_err(|_| serde::de::Error::custom("reporting.history must be a boolean"))
 }
 
 fn default_url_env() -> String {
@@ -1622,6 +1636,31 @@ mod tests {
         );
         let error = validate(&config("['test-timings', 'test-timings']")).unwrap_err();
         assert!(error.contains("duplicate format"), "{error}");
+    }
+
+    #[test]
+    fn reporting_history_is_an_optional_boolean() {
+        let config = |extra: &str| {
+            format!("[reporting]\nproject = 'goodcases'\n{extra}[[jobs]]\nname = 'test'\ncommand = 'true'\n")
+        };
+        let history = |extra: &str| validate(&config(extra)).unwrap().reporting.unwrap().history;
+        assert!(!history(""));
+        assert!(!history("history = false\n"));
+        assert!(history("history = true\n"));
+        for value in ["'yes'", "'true'", "1", "[true]", "{ upload = true }"] {
+            let error = validate(&config(&format!("history = {value}\n"))).unwrap_err();
+            assert!(
+                error.contains("reporting.history must be a boolean"),
+                "{value}: {error}"
+            );
+        }
+        // The upload setting never turns on the local history file.
+        assert!(
+            !validate(&config("history = true\n"))
+                .unwrap()
+                .settings
+                .history
+        );
     }
 
     #[test]
