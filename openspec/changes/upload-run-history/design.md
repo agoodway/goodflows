@@ -159,6 +159,110 @@ What a remote record contains:
 
 *Alternative considered:* the controller builds the run record from the collected events. Rejected: it would duplicate the builder, and it could not reproduce the remote `max_in_flight`, host and graph exactly.
 
+## Contract alignment
+
+Checked against `src/history.rs` on `main` at `87da18e` (`git diff main -- src Cargo.toml Cargo.lock` is empty on this branch) and against two history files produced by a binary built from that tree. `goodflows 0.6.0`, compiled with `rustc 1.88.0`, ran `goodflows run --history --json` in a clean git checkout whose only file was `fixtures/goodflows.toml`: a `default` workflow with job `prepare` (`echo prepare`) and job `call-suite` (`workflow = "suite"`, `depends_on = ["prepare"]`), and workflow `suite` with job `work` (`echo work`). The command exited 0. The bytes it wrote are `fixtures/parent-default.json` (sha256 `885e038c0f9b987034b408e021199f81da87b707b7f19d97781cc9a1ff79b6dc`) and `fixtures/child-suite.json` (sha256 `72e944d953fea14064d52c743e85c247f1bbdcaacbf5a054def8053bab0020b1`). They are compact JSON with one trailing LF. Do not reformat them.
+
+`schema_version` stayed 1 when the call fields were added. `history::write` still sets `schema_version: 1`. `git blame` shows that field, and the assignment, coming from `2b19a0a4` (2026-11-04, `feat: record run history`). Commit `999f80ec27c7b9b61c9fb85f374800effe30a317` (2026-11-07, `feat: add workflow-call jobs`) added `parent_run_id` and `caller_job` on `Record` and `workflow` and `child_run_id` on `Instance` in `src/history.rs`, and the requirement "History links workflow-call invocations" in `openspec/specs/run-history/spec.md`. That requirement says the additions keep schema version 1. Both golden files are `"schema_version": 1` and contain those fields: the parent result `call-suite` has `workflow` `suite` and `child_run_id` `0e54fb55-a115-4ac7-80fe-8fde26e76afb`, and the child file's `run_id` is that same id, with `parent_run_id` `fb7d2711-6b67-4f5a-9104-492032a9e1e5` and `caller_job` `call-suite`.
+
+Presence comes from serde on the writer. A field with no `skip_serializing_if` is always present, and an `Option` there is JSON `null`. `skip_serializing_if = "Option::is_none"` omits the field, so it is never `null`. `skip_serializing_if = "<[_]>::is_empty"` omits an empty array, so the field is never `null` and never `[]`. Types below are the JSON types in these files and in that serializer.
+
+### Document
+
+| Field | JSON type | Presence | Null |
+|---|---|---|---|
+| `schema_version` | integer, value 1 | always | never |
+| `workflow` | string | always | never |
+| `environment` | string | omitted when no `--env` profile was selected | never |
+| `requested_jobs` | array of strings | omitted when `--jobs` was empty, which includes every child invocation | never |
+| `run_id` | string, lowercase UUID | always | never |
+| `parent_run_id` | string, lowercase UUID | present on a child, omitted on a root | never |
+| `caller_job` | string | present on a child together with `parent_run_id`, omitted on a root | never |
+| `started_at` | string `YYYY-MM-DDTHH:MM:SSZ` | always | never |
+| `outcome` | string `passed`, `failed`, or `cancelled` | always | never |
+| `duration_ms` | integer | always | never |
+| `parallelism` | integer | always | never |
+| `graph_sha256` | string, 64 lowercase hex digits | always | never |
+| `max_in_flight` | integer | always | never |
+| `host` | object | always | never |
+| `source` | object | omitted when no commit was captured | never |
+| `results` | array of result objects | always | never |
+
+The golden parent omits `environment`, `requested_jobs`, `parent_run_id`, and `caller_job`. The golden child omits `environment` and `requested_jobs` and includes `parent_run_id` and `caller_job`. Both include `source`.
+
+### `host`
+
+| Field | JSON type | Presence | Null |
+|---|---|---|---|
+| `os` | string | always | never |
+| `arch` | string | always | never |
+| `logical_cpus` | integer | always | never |
+| `mem_total_bytes` | integer | omitted, together with `mem_available_bytes`, when the platform does not report both | never |
+| `mem_available_bytes` | integer | same as `mem_total_bytes` | never |
+
+Both golden files include both memory fields (`linux`, `x86_64`).
+
+### `source`
+
+| Field | JSON type | Presence | Null |
+|---|---|---|---|
+| `commit` | string, 40 or 64 hex digits | always when `source` is present | never |
+| `dirty` | boolean | omitted when git status was unavailable; otherwise `true` or `false` | never |
+
+History does not write `source.branch`. Both golden files have `source.commit` and `"dirty": false`.
+
+### `results` entries
+
+| Field | JSON type | Presence | Null |
+|---|---|---|---|
+| `name` | string | always | never |
+| `partition` | object | omitted for an unpartitioned instance | never |
+| `workflow` | string | omitted unless the job is a workflow call | never |
+| `child_run_id` | string, lowercase UUID | omitted unless that call activated a child | never |
+| `status` | string `passed`, `failed`, `skipped`, `timed_out`, or `cancelled` | always | never |
+| `exit_code` | integer, or null | always | null when the instance has no exit code |
+| `command` | string, or null | always | null when the job has no command |
+| `error` | string, or null | always | null when there is no error |
+| `duration_ms` | integer | always | never |
+| `started` | boolean | always | never |
+| `blocked_ms` | integer | always | never |
+| `queued_ms` | integer | always | never |
+| `commands` | array | omitted when the instance spawned nothing | never |
+
+In the golden parent, `prepare` has `exit_code` 0, `command` `"echo prepare"`, and `error` null, and it omits `partition`, `workflow`, and `child_run_id`. `call-suite` has `workflow`, `child_run_id`, `exit_code` null, `command` null, and `error` null, and it omits `partition` and `commands`. Every result in both files has `"error": null`.
+
+### `partition`, when present
+
+| Field | JSON type | Presence | Null |
+|---|---|---|---|
+| `index` | integer | always | never |
+| `count` | integer | always | never |
+
+Neither golden file has a partition. The object is what `config::Partition` serializes.
+
+### `commands` entries, when present
+
+| Field | JSON type | Presence | Null |
+|---|---|---|---|
+| `kind` | string `condition` or `command` | always | never |
+| `step` | string | omitted for a job command or a job shell condition; the step id when the process belongs to a step | never |
+| `wall_ms` | integer | always | never |
+| `cpu_user_ms` | integer | omitted when the measurement is unavailable | never |
+| `cpu_system_ms` | integer | omitted when the measurement is unavailable | never |
+| `peak_rss_bytes` | integer | omitted when no sample saw a live process with resident memory | never |
+
+The golden commands are `kind` `command` with `wall_ms`, `cpu_user_ms`, and `cpu_system_ms`. They omit `step` and `peak_rss_bytes`. These processes were short enough that the sampler recorded no resident set.
+
+The history file does not contain the graph document. `graph_sha256` is the hash of that document, and a workflow-call job adds a trailing `call` object (`workflow`, `graph_sha256`) to the hashed document only. That object is not in either golden file.
+
+### Server allowlist
+
+`agoodway/goodflows_web` is not visible to the GitHub credentials on this run (`gh` and the GitHub API both return 404), so this pass did not re-read PR #7's `specs/workflow-run-storage/spec.md` or `design.md`. The accepted and rejected keys are therefore not relisted here as if they had been read again. The comparison already recorded in "Server contract changes needed" stands as that earlier reading: the result allowlist has `partition` and `commands` beyond the required keys, and the document allowlist has no `parent_run_id` or `caller_job`. Under that reading, `fixtures/parent-default.json` is rejected for `results[1].workflow` and `results[1].child_run_id`, and `fixtures/child-suite.json` is rejected for `parent_run_id` and `caller_job`. Both are `schema_version` 1.
+
+The same files show a second check the server reading has to get right. `command`, `exit_code`, and `error` are always present, and they are JSON `null` when the instance has no command, no exit code, or no error. A rule that says "optional keys are omitted rather than null" fits these three fields only when they are required and nullable. Treating them as omit-only would reject every golden result on `error`, and the call result on `command` and `exit_code`, before the four new keys matter.
+
+**Recommendation:** keep `schema_version` 1 and ask the server to accept `parent_run_id`, `caller_job`, `results[].workflow`, and `results[].child_run_id` as optional keys on that version. The writer and `openspec/specs/run-history` already emit them as version 1, and both golden files are version 1 with those keys set. Bumping the version would describe a document this CLI does not write. `command`, `exit_code`, and `error` stay required and nullable, matching every history file since `2b19a0a4`. Open question 1 is the confirmation, because the merged allowlist could not be opened here.
+
 ## Server contract changes needed
 
 These are the differences between goodci `main` (checked again at `87da18e`, after the sprite-execution merge, which did not change `history.rs` or the graph) and goodflows_web `add-workflow-run-storage`. They come from comparing that change's `specs/workflow-run-storage/spec.md` and `design.md` with `src/history.rs`, `src/runner.rs` and `src/main.rs`. Without them, any run that uses workflow calls gets a `422`. goodci keeps those records pending (D7), so they can be replayed once the server accepts them.
@@ -195,5 +299,29 @@ Items 1, 3, 4 and 5 are required. Items 2, 6, 7, 8 and 9 are clarifications.
 
 ## Open Questions
 
-- Whether to fall back to `GITHUB_HEAD_REF` (pull requests) or `GITHUB_REF_NAME` (when `GITHUB_REF_TYPE=branch`) when git reports no branch. This would make the run's branch differ from its test reports' `source.branch`, so it is deferred until analytics shows a need. It can be added later without changing the contract.
-- Whether Sprite run records should carry the controller's commit and branch. Today the sprite-execution spec keeps controller provenance out of native `source` fields. A later change could allow it for the upload only, perhaps under a separate key, which would also need a server contract change.
+1. **Stay on `schema_version` 1 if the merged server allowlist still rejects the call fields?** (major)
+   - **Why it matters.** The golden files are version 1 and contain `parent_run_id`, `caller_job`, `results[].workflow`, and `results[].child_run_id`. A server that rejects those keys answers 422, and the upload stays pending, for every workflow-call run. They also contain JSON `null` for `error` on every result, and for `command` and `exit_code` on a call. This pass could not re-read goodflows_web PR #7, so the merged allowlist is the reading in "Server contract changes needed", not a fresh copy of the spec.
+   - **Options.**
+     1. Keep `schema_version` 1 and ask the server to allow the four keys as optional on that version, with `command`, `exit_code`, and `error` required and nullable.
+     2. Bump new history files to `schema_version` 2 and ask the server to accept version 2.
+     3. Keep the local file at version 1 and omit the four keys from the uploaded copy until the server allows them.
+     4. Stop writing the four keys in the local file as well, until the server allows them.
+   - **Recommended default:** option 1. The writer and `openspec/specs/run-history` have emitted these keys as version 1 since `999f80e`.
+
+2. **Fill `source.branch` from GitHub Actions ref variables when git has no branch?** (minor)
+   - **Why it matters.** A `pull_request` checkout is detached at `refs/pull/<n>/merge`, so `git symbolic-ref` fails and the uploaded record usually has no `source.branch`. List filters on `branch` then miss those runs. Test-report `source.branch` is captured the same way.
+   - **Options.**
+     1. Leave `source.branch` absent when git reports none.
+     2. Use `GITHUB_HEAD_REF` for pull requests.
+     3. Use `GITHUB_REF_NAME` when `GITHUB_REF_TYPE=branch`.
+     4. Try `GITHUB_HEAD_REF`, then `GITHUB_REF_NAME`.
+   - **Recommended default:** option 1. The run's branch then stays the same value test reports already store, and the fallback can be added later without a contract change.
+
+3. **Put the controller's commit and branch on a Sprite run record?** (major)
+   - **Why it matters.** A remote record has no `source`, because the archive has no `.git`. `commit` and `branch` filters never match those runs. Copying the controller's HEAD would put controller provenance into a record the sprite-execution spec currently leaves without `source`.
+   - **Options.**
+     1. Keep omitting `source` when native capture finds none.
+     2. Copy the controller's commit and branch into `source` before the controller uploads.
+     3. Add a separate provenance key, which needs a server contract change.
+     4. Record the controller commit only, and leave branch absent.
+   - **Recommended default:** option 1. The sprite-execution spec keeps controller provenance out of native `source`, and the server already accepts a missing `source`.

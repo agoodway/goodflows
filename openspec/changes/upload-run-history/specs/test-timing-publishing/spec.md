@@ -165,6 +165,10 @@ A 200 or 201 response SHALL mark a run record uploaded only if its `data` has a 
 - **WHEN** the server responds 422
 - **THEN** the record is not retried in this attempt, no rejection marker is written, and `run_upload_pending` has reason `rejected` and HTTP status 422 without `terminal`
 
+#### Scenario: Auth, project, and size failures leave the run's exit code
+- **WHEN** the server responds 401, 403, 404, or 413 during the run upload
+- **THEN** text output names `unauthorized (HTTP 401)`, `forbidden (HTTP 403)`, `project not found (HTTP 404)`, or `request too large (HTTP 413)`, the record stays pending, and the run's exit code is unchanged
+
 #### Scenario: Request timeout
 - **WHEN** the server responds 408 and then 201 within the budget
 - **THEN** the record is marked uploaded

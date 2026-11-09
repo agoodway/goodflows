@@ -20,6 +20,7 @@ Prerequisite: the goodci change `validate-job-names` (another thread, branch `t3
   - `ci` without `provider`, with `attempt` 0, an `http` URL, or an unknown key.
   - A graph with an unknown job key, `strategy` `hash`, a duplicate name, an unknown dependency, a two-job cycle, or a result outside the graph.
   - `call` with a bad hash; `parent_run_id` without `caller_job`; `child_run_id` without `workflow`.
+  - The captured documents in `fixtures/parent-default.json` and `fixtures/child-suite.json` pass once the call fields are accepted, including JSON `null` for `error` on every result and for `command` and `exit_code` on the call result.
   - U+0000 in a string, depth 9, a 4,194,305-byte body, and integers above 2^53-1.
   
   Unknown-key errors must name the enclosing path only.
@@ -98,3 +99,7 @@ Prerequisite: the goodci change `validate-job-names` (another thread, branch `t3
 
 - Send the "Server contract changes needed" list in design.md to the goodflows_web `add-workflow-run-storage` thread before that change is archived.
 - Archive this change after `validate-job-names` has landed and the server accepts the call fields.
+
+## Size
+
+8 task groups, about 24–40 agent-hours. The risky parts are the local validator (it has to accept the golden files' null `command`, `exit_code`, and `error`, and the four call fields, and still reject what the server rejects), manifest version 3 next to existing version 1 and 2 spools, and Sprite publication that freezes a record without a key and refuses it unless the trusted config opted in. The end-to-end smoke test stays red until the server allowlist accepts those call fields.
