@@ -19,7 +19,7 @@ Prerequisite: the goodci change `validate-job-names` (another thread, branch `t3
   - The four outcome cases, and `source.branch` at 257 bytes.
   - `ci` without `provider`, with `attempt` 0, an `http` URL, or an unknown key.
   - A graph with an unknown job key, `strategy` `hash`, a duplicate name, an unknown dependency, a two-job cycle, or a result outside the graph.
-  - `call` with a bad hash; `parent_run_id` without `caller_job`; `child_run_id` without `workflow`.
+  - `call` with a bad hash; `parent_run_id` without `caller_job`; `caller_job` without `parent_run_id`; either of those keys set to null; `child_run_id` without `workflow`; `child_run_id` or `workflow` set to null. `workflow` without `child_run_id` is valid.
   - The captured documents in `fixtures/parent-default.json` and `fixtures/child-suite.json` pass once the call fields are accepted, including JSON `null` for `error` on every result and for `command` and `exit_code` on the call result.
   - U+0000 in a string, depth 9, a 4,194,305-byte body, and integers above 2^53-1.
   
@@ -66,6 +66,7 @@ Prerequisite: the goodci change `validate-job-names` (another thread, branch `t3
   - A spool listing a run record under a trusted config without `history` is refused and nothing is posted.
   - `pass_env` forwarding of the `GITHUB_*` variables yields `ci`, and without it there is no `ci`.
   - A detached run's collected spool replays the record through `reports upload`.
+- [ ] 5.3 Pending confirmation of design open question 3. Do not start this task before that. When confirmed, capture `commit`, `branch`, and archive-derived `dirty` inside `snapshot::take`, send them on `Header.provenance`, and make `exec-workflow` apply that triple as history and test-report `source` for the root and every child. Replace the "no source" assertion in task 5.2 and the "Remote record provenance" scenario. Verify a clean tree (`dirty` false, branch present), a tracked edit (`dirty` true), a nonignored untracked file (`dirty` true), a detached HEAD (no `branch`), and that `pass_env` is not required for `source`.
 
 ## 6. History read commands
 
@@ -102,4 +103,4 @@ Prerequisite: the goodci change `validate-job-names` (another thread, branch `t3
 
 ## Size
 
-8 task groups, about 24–40 agent-hours. The risky parts are the local validator (it has to accept the golden files' null `command`, `exit_code`, and `error`, and the four call fields, and still reject what the server rejects), manifest version 3 next to existing version 1 and 2 spools, and Sprite publication that freezes a record without a key and refuses it unless the trusted config opted in. The end-to-end smoke test stays red until the server allowlist accepts those call fields.
+8 task groups, about 27–45 agent-hours if open question 3 is confirmed, and about 24–40 without task 5.3. Confirming Q3 adds about 3–5 hours inside group 5: snapshot-time provenance, the remote runner applying `header.provenance`, and the sprite-execution spec change. The group count stays 8. The risky parts are the local validator (null `command`, `exit_code`, and `error`, the four call fields, and the pairing rules), manifest version 3 next to version 1 and 2 spools, Sprite publication that freezes a record without a key, and, if Q3 is confirmed, setting `dirty` from the shipped archive rather than from `git status --untracked-files=no`. The smoke test stays red until the history-file allowlist accepts the call fields. The upload envelope (`graph`, `ci`, `source.branch`) waits on a separate goodflows_web change.

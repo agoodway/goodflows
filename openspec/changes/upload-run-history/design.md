@@ -67,6 +67,7 @@ Otherwise `ci` is absent. Variables that are empty, malformed or too long are dr
 
 New module `reporting::run_contract` validates the serialized `serde_json::Value`, not the Rust structs, so it checks exactly what is sent and what a replay reads back. It implements every rule in the server spec, with the additions from "Server contract changes needed":
 - The top-level, `host`, `source`, `ci`, `graph`, graph job, `partitions`, step, condition, result, `partition` and command allowlists, with optional keys absent rather than null.
+- Pairing: `parent_run_id` and `caller_job` are both present or both absent, and neither value is null. `child_run_id` is present only on a result that also has `workflow`, and neither value is null. A call that never activated has `workflow` and no `child_run_id`.
 - The name rule: 1–64 bytes, no control characters, not only whitespace. Text is at most 1,024 bytes. `run_id` is a lowercase canonical UUID. `started_at` matches `YYYY-MM-DDTHH:MM:SSZ` exactly.
 - Integer kinds and bounds (nonnegative, positive, `exit_code` i32, at most 2^53−1). `requested_jobs` and `commands` have 1–1,024 entries. `graph.jobs` has 1–1,024 entries, and `depends_on` and `steps` have at most 1,024 each. Partitions satisfy `1 ≤ index ≤ count ≤ 64`.
 - The outcome and status agreement rule.
@@ -153,7 +154,7 @@ A remote Sprite invocation (`Run::sprite_state` is set) has no publisher key by 
 The controller needs no new publication path. After collection it already walks the root's and each bound child's spool, checks it with `trusted_spool`, and calls `replay::upload`, which (D8) now sends the run record after the reports. `trusted_spool` gains one check: a manifest that lists `run_record` is refused unless the controller's trusted configuration has `[reporting] history = true`. A remote config that turned upload on cannot make the controller send command text the caller did not opt into. Replay's own checks cover the rest: re-validation and matching `run_id`, `workflow` and `environment` against the manifest, which `trusted_spool` has already bound to this invocation. As today, delivery never changes the run's exit code. A detached run's record waits in the collected bundle for `reports upload`.
 
 What a remote record contains:
-- **No `source`.** The archive excludes `.git`, so native capture finds no commit, and the sprite-execution spec forbids injecting the controller's HEAD, branch or dirty state. The record is still valid, because `source` is optional on the server, but analytics cannot place these runs on a commit. Adding controller provenance would need a sprite-execution spec change and is left as an open question.
+- **No `source` in the current code.** The archive excludes `.git`, so native capture finds no commit, and the sprite-execution spec keeps controller provenance out of native history and report `source` fields. Open question 3 proposes sending the snapshot's commit, branch, and dirty state with the run. That proposal is recommended and is waiting on Thomas. Until he confirms it, this design still ships remote records without `source`.
 - **`ci` only through `pass_env`.** The remote runner's environment is `base_env()` plus forwarded values, so `ci` appears only when `[sprite] pass_env` lists `GITHUB_ACTIONS` and the other D3 variables. Forwarded values also reach hooks and jobs, which the README must point out. None of these names is denied by sprite preflight.
 - **`host`** is the Sprite's, and `duration_ms` is the remote invocation's, matching the existing rule that transport and collection time are not added to native metrics.
 
@@ -261,7 +262,7 @@ The history file does not contain the graph document. `graph_sha256` is the hash
 
 The same files show a second check the server reading has to get right. `command`, `exit_code`, and `error` are always present, and they are JSON `null` when the instance has no command, no exit code, or no error. A rule that says "optional keys are omitted rather than null" fits these three fields only when they are required and nullable. Treating them as omit-only would reject every golden result on `error`, and the call result on `command` and `exit_code`, before the four new keys matter.
 
-**Recommendation:** keep `schema_version` 1 and ask the server to accept `parent_run_id`, `caller_job`, `results[].workflow`, and `results[].child_run_id` as optional keys on that version. The writer and `openspec/specs/run-history` already emit them as version 1, and both golden files are version 1 with those keys set. Bumping the version would describe a document this CLI does not write. `command`, `exit_code`, and `error` stay required and nullable, matching every history file since `2b19a0a4`. Open question 1 is the confirmation, because the merged allowlist could not be opened here.
+**Decision (open question 1, resolved):** keep `schema_version` 1 and widen the goodflows_web history-file allowlist. Thomas chose this. The writer and `openspec/specs/run-history` already emit `parent_run_id`, `caller_job`, `results[].workflow`, and `results[].child_run_id` as version 1, and both golden files are version 1 with those keys set. `command`, `exit_code`, and `error` stay required and nullable, matching every history file since `2b19a0a4`. The upload envelope (`graph`, `ci`, `source.branch`) is a separate server change; see Follow-up.
 
 ## Server contract changes needed
 
@@ -280,6 +281,20 @@ These are the differences between goodci `main` (checked again at `87da18e`, aft
 
 Items 1, 3, 4 and 5 are required. Items 2, 6, 7, 8 and 9 are clarifications.
 
+## Follow-up: upload envelope
+
+Thomas's decision on open question 1 widens the goodflows_web allowlist for the history file the CLI already writes: `schema_version` stays 1, and the server accepts `parent_run_id`, `caller_job`, `results[].workflow`, and `results[].child_run_id`, with `command`, `exit_code`, and `error` required and nullable. That change covers local history files only, including `fixtures/parent-default.json` and `fixtures/child-suite.json`.
+
+The upload body adds fields that are not in those files. They need a separate goodflows_web change, not the history-file allowlist:
+
+- Top-level `graph`, including `GraphJob.call`, the note that a called workflow is referenced by hash rather than nested, and the rule that a graph job is not exactly eight keys (items 1, 2, and 5).
+- Top-level `ci`.
+- Optional `source.branch`.
+
+Until that second change lands, a client that sends `graph`, `ci`, or `source.branch` is asking the server for something the history-file allowlist does not define. Local validation still checks those keys, and a 422 stays pending.
+
+Item 9 (Sprite records omit `source`) describes the code today. If open question 3 is confirmed, a Sprite upload carries `source.commit` and `source.dirty`, and `source.branch` when HEAD is a branch. That `source` is the history-file object, not the envelope. `source.branch` on that record is the same optional history field a local upload already adds, so it still belongs to the envelope change.
+
 ## Risks / Trade-offs
 
 - [Command text leaves the machine] → Opt-in `history = true`. The server redacts it for `pk_` reads. The README states that graph commands include jobs that did not run. This is the same exposure the server design already accepts.
@@ -288,7 +303,7 @@ Items 1, 3, 4 and 5 are required. Items 2, 6, 7, 8 and 9 are clarifications.
 - [The run record uses up budget left by large test reports] → The run record is sent last and may be left `budget_exhausted`. It stays replayable, and `reports upload --budget` covers slow links.
 - [`--no-history` users may expect no upload] → The README and `--help` text for `--no-history` say it controls the local file only. Unsetting the key variable stops uploads.
 - [Remote Sprite spools fill with run records] → They live in the identity's results and are kept until `sprite destroy`, like remote test reports. Each one is a few KB.
-- [Sprite runs are hard to place on a commit] → They have no `source` (D11). This is a sprite-execution rule, not something this change can fix on its own; see Open Questions.
+- [Sprite runs are hard to place on a commit] → Current records omit `source` (D11). Open question 3 recommends filling it from the snapshot. Until that is confirmed, commit and branch filters miss Sprite runs.
 - [Remote runs show `credentials_unavailable` before the controller publishes] → The relayed remote event says the record is pending rather than skipped, and the controller's `reports_upload_summary` that follows reports the final `run_record` state.
 
 ## Migration Plan
@@ -299,14 +314,7 @@ Items 1, 3, 4 and 5 are required. Items 2, 6, 7, 8 and 9 are clarifications.
 
 ## Open Questions
 
-1. **Stay on `schema_version` 1 if the merged server allowlist still rejects the call fields?** (major)
-   - **Why it matters.** The golden files are version 1 and contain `parent_run_id`, `caller_job`, `results[].workflow`, and `results[].child_run_id`. A server that rejects those keys answers 422, and the upload stays pending, for every workflow-call run. They also contain JSON `null` for `error` on every result, and for `command` and `exit_code` on a call. This pass could not re-read goodflows_web PR #7, so the merged allowlist is the reading in "Server contract changes needed", not a fresh copy of the spec.
-   - **Options.**
-     1. Keep `schema_version` 1 and ask the server to allow the four keys as optional on that version, with `command`, `exit_code`, and `error` required and nullable.
-     2. Bump new history files to `schema_version` 2 and ask the server to accept version 2.
-     3. Keep the local file at version 1 and omit the four keys from the uploaded copy until the server allows them.
-     4. Stop writing the four keys in the local file as well, until the server allows them.
-   - **Recommended default:** option 1. The writer and `openspec/specs/run-history` have emitted these keys as version 1 since `999f80e`.
+1. **Resolved.** Keep `schema_version` 1 and widen the goodflows_web history-file allowlist. Thomas decided this. `parent_run_id`, `caller_job`, `results[].workflow`, and `results[].child_run_id` stay optional on version 1. `command`, `exit_code`, and `error` stay required and nullable. The closed alternatives were a version 2 bump, omitting the four keys from the upload only, and stopping writing them locally. The upload envelope is the follow-up above, not part of this decision.
 
 2. **Fill `source.branch` from GitHub Actions ref variables when git has no branch?** (minor)
    - **Why it matters.** A `pull_request` checkout is detached at `refs/pull/<n>/merge`, so `git symbolic-ref` fails and the uploaded record usually has no `source.branch`. List filters on `branch` then miss those runs. Test-report `source.branch` is captured the same way.
@@ -317,11 +325,15 @@ Items 1, 3, 4 and 5 are required. Items 2, 6, 7, 8 and 9 are clarifications.
      4. Try `GITHUB_HEAD_REF`, then `GITHUB_REF_NAME`.
    - **Recommended default:** option 1. The run's branch then stays the same value test reports already store, and the fallback can be added later without a contract change.
 
-3. **Put the controller's commit and branch on a Sprite run record?** (major)
-   - **Why it matters.** A remote record has no `source`, because the archive has no `.git`. `commit` and `branch` filters never match those runs. Copying the controller's HEAD would put controller provenance into a record the sprite-execution spec currently leaves without `source`.
-   - **Options.**
-     1. Keep omitting `source` when native capture finds none.
-     2. Copy the controller's commit and branch into `source` before the controller uploads.
-     3. Add a separate provenance key, which needs a server contract change.
-     4. Record the controller commit only, and leave branch absent.
-   - **Recommended default:** option 1. The sprite-execution spec keeps controller provenance out of native `source`, and the server already accepts a missing `source`.
+3. **Proposal, pending Thomas's confirmation (major): controller captures source at transfer time and sends it with the remote run.**
+   - **Why it matters.** The shipped tree has no `.git`, so the remote history writer finds no commit. `commit` and `branch` filters then miss every Sprite run. The controller already knows what it shipped.
+   - **Recommended mechanism.** While `snapshot::take` builds the archive, record `commit`, `branch`, and `dirty` from that same enumeration, and put them on the existing `Header.provenance`. The header is already framed ahead of the archive and written to the Sprite's `header.json`. `exec-workflow` reads that file before jobs run and passes the triple into every invocation's history and test-report `source`. It does not put the triple in `[sprite] pass_env` or in argv: `pass_env` values reach hooks and jobs, and the header already carries provenance without secrets. Read it once at runner start so a later edit of `header.json` cannot change the record. Root and child invocations share one shipped tree, so they share one `source`.
+   - **`dirty`.** Set `dirty` from the archive, not from today's `capture_source`. That helper uses `git status --porcelain --untracked-files=no`, so a tree whose only difference is a nonignored untracked file is `dirty: false` even though `git ls-files --others --exclude-standard` puts that file in the archive. `dirty` is true when the archive is not the tree of `commit`: a tracked file's shipped bytes differ from HEAD, a tracked file is missing, or a nonignored untracked file was included. Ignored files and `.git` are excluded and do not set `dirty`. `dirty` is false only for an archive that matches HEAD. If HEAD cannot be read, omit `source`.
+   - **`branch`.** `branch` is `git symbolic-ref --short HEAD` at snapshot time, the same value `reporting::source::capture` already stores on `Header.provenance`. A detached HEAD, including a GitHub Actions `pull_request` checkout, omits `branch`. Local history files still omit `branch`; the uploaded Sprite record includes it when HEAD is a branch. The archive has no branch metadata to recover on the Sprite. Filling branch from `GITHUB_HEAD_REF` or `GITHUB_REF_NAME` stays open question 2 and is not part of this proposal.
+   - **Spec text that changes if this is confirmed.** `openspec/specs/sprite-execution/spec.md`, requirement "Run identity and timings are coherent", says controller provenance stays separate from native Git context when `.git` is absent. Its scenario "Snapshot lacks Git metadata" says native history and report source stay unavailable and that controller HEAD, branch, and dirty stay only in the control record. This change's `specs/sprite-execution/spec.md` scenario "Remote record provenance" repeats that: the run record has no `source`. Those three texts are replaced by: the remote history file and test-report `source` are the snapshot provenance (`commit`, `dirty`, and `branch` when HEAD is a branch); the control record keeps the same provenance; native git capture on the Sprite still finds nothing and does not override the supplied source. D11's "no source" behavior and task 5.2's "no source" check stay in force until then.
+   - **Risks.** A clean `dirty: false` with a dirty archive would publish the wrong tree for that commit, which is why `dirty` follows the archive. The published commit is the controller's HEAD, which is the same fact a local run already uploads. A snapshot and a later `capture_source` can disagree if the worktree changes in between, which is why the capture happens inside `snapshot::take`. Child runs must reuse the root's triple rather than capture again.
+   - **Alternatives, not recommended.**
+     1. Keep omitting `source` when the Sprite has no `.git`.
+     2. Have the controller rewrite `source` into the collected spool after the run, instead of sending it with the submission.
+     3. Add a separate provenance key on the server, which needs another wire change.
+     4. Pass commit, branch, and dirty through `pass_env` or an argument. Those channels are visible to jobs, and the header already has the field.
