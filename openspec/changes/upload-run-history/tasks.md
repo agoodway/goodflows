@@ -62,11 +62,11 @@ Prerequisite: the goodci change `validate-job-names` (another thread, branch `t3
   - The controller's existing post-collection loop needs no other change: `replay::upload` sends the record.
   
   Verify with a `trusted_spool` unit test next to `automatic_publication_requires_a_spool_bound_to_this_invocation`, and with `tests/sprite.rs` cases using the fake Sprite and a mock server:
-  - An attached run with a workflow call posts the child's and root's records after collection, with no `source`, and the exit code is unchanged by a 503.
+  - An attached run with a workflow call posts the child's and root's records after collection, both with the same snapshot `source`, and the exit code is unchanged by a 503.
   - A spool listing a run record under a trusted config without `history` is refused and nothing is posted.
   - `pass_env` forwarding of the `GITHUB_*` variables yields `ci`, and without it there is no `ci`.
   - A detached run's collected spool replays the record through `reports upload`.
-- [ ] 5.3 Pending confirmation of design open question 3. Do not start this task before that. When confirmed, capture `commit`, `branch`, and archive-derived `dirty` inside `snapshot::take`, send them on `Header.provenance`, and make `exec-workflow` apply that triple as history and test-report `source` for the root and every child. Replace the "no source" assertion in task 5.2 and the "Remote record provenance" scenario. Verify a clean tree (`dirty` false, branch present), a tracked edit (`dirty` true), a nonignored untracked file (`dirty` true), a detached HEAD (no `branch`), and that `pass_env` is not required for `source`.
+- [ ] 5.3 Capture `commit`, `branch`, and archive-derived `dirty` inside `snapshot::take` (design D11). Send them on `Header.provenance`. `exec-workflow` reads that header once and writes the same `source` into the root and every child history file and test-report record. Do not put the values in `pass_env` or argv. Omit `source` when HEAD cannot be read. Verify a clean branch (`dirty` false, `branch` present), a tracked edit and a deleted tracked file (`dirty` true), a nonignored untracked file with an ignored file present (`dirty` true, ignored file absent from the archive), a detached HEAD (`branch` absent), and a job environment that does not contain the commit.
 
 ## 6. History read commands
 
@@ -87,7 +87,7 @@ Prerequisite: the goodci change `validate-job-names` (another thread, branch `t3
   - "Run history": `[reporting] history = true`, what is uploaded (including graph command text for unrun jobs), that `--no-history` controls only the file, that an unset key skips uploads, and `history list`/`show` with examples.
   - "Test timing reports": the `run-record.json` spool file, manifest version 3 and replay.
   - The `--no-history` help text: the file only.
-  - `docs/sprites.md`: remote run records are published by the controller after collection; they carry no `source`; listing the `GITHUB_*` variables in `pass_env` adds `ci` and also exposes those variables to hooks and jobs.
+  - `docs/sprites.md`: remote run records are published by the controller after collection; their `source` is the snapshot provenance (`commit`, archive-derived `dirty`, and `branch` only when git reports a branch); listing the `GITHUB_*` variables in `pass_env` adds `ci` and also exposes those variables to hooks and jobs, and does not supply `source`.
   
   Verify that the documented `goodflows history list --workflow ci --branch main` and `reports upload` examples run against the mock server in an integration test.
 
@@ -103,4 +103,4 @@ Prerequisite: the goodci change `validate-job-names` (another thread, branch `t3
 
 ## Size
 
-8 task groups, about 27–45 agent-hours if open question 3 is confirmed, and about 24–40 without task 5.3. Confirming Q3 adds about 3–5 hours inside group 5: snapshot-time provenance, the remote runner applying `header.provenance`, and the sprite-execution spec change. The group count stays 8. The risky parts are the local validator (null `command`, `exit_code`, and `error`, the four call fields, and the pairing rules), manifest version 3 next to version 1 and 2 spools, Sprite publication that freezes a record without a key, and, if Q3 is confirmed, setting `dirty` from the shipped archive rather than from `git status --untracked-files=no`. The smoke test stays red until the history-file allowlist accepts the call fields. The upload envelope (`graph`, `ci`, `source.branch`) waits on a separate goodflows_web change.
+8 task groups, about 27–45 agent-hours. The risky parts are the local validator (null `command`, `exit_code`, and `error`, the four call fields, and the pairing rules), manifest version 3 next to version 1 and 2 spools, Sprite publication that freezes a record without a key, and setting `dirty` from the shipped archive rather than from `git status --untracked-files=no`. The smoke test stays red until the history-file allowlist accepts the call fields. The upload envelope (`graph`, `ci`, `source.branch`) waits on a separate goodflows_web change.

@@ -12,7 +12,7 @@ Current goodci state that shapes the approach:
 - `reporting::publish::Publisher` sends test-report snapshots with a shared 30-second budget, at most 3 attempts, and a fixed status mapping (`400/409/413/415/422` are rejections, `408` is pending and not retried). The endpoint path `/test-reports` and the `{id, report_id, status, duplicate}` acknowledgement are hard-coded. `deliver()` creates a new `Publisher` on each call.
 - `reporting::source::capture` records `commit`, `branch` and `dirty`. History keeps only `commit` and `dirty`. Source is captured only when reporting jobs exist or local history is on.
 - Job names are checked only for being non-blank and having no control characters. The 64-byte rule applies only to reporting jobs. `validate-job-names` (another thread, still unmerged) fixes this.
-- `add-sprite-execution` (merged in `efa2b1e`) runs whole workflows on a Sprite. The remote runner (`__sprite-agent exec-workflow`) calls the same `main::execute`/`invocation` path with `Run::sprite_state` set. Its config is rewritten so `[reporting] spool_dir` points into the run's results, and its environment is `base_env()` plus the `[sprite] pass_env` values. The reporting `token_env` is denied there, so remote sessions never have a key: test reports are frozen, delivery is skipped with `credentials_unavailable`, and after collection the controller checks each spool with `sprite::trusted_spool` and publishes it with `reporting::replay::upload`. The source archive excludes `.git`, and the sprite-execution spec forbids injecting controller provenance into native history or report `source` fields.
+- `add-sprite-execution` (merged in `efa2b1e`) runs whole workflows on a Sprite. The remote runner (`__sprite-agent exec-workflow`) calls the same `main::execute`/`invocation` path with `Run::sprite_state` set. Its config is rewritten so `[reporting] spool_dir` points into the run's results, and its environment is `base_env()` plus the `[sprite] pass_env` values. The reporting `token_env` is denied there, so remote sessions never have a key: test reports are frozen, delivery is skipped with `credentials_unavailable`, and after collection the controller checks each spool with `sprite::trusted_spool` and publishes it with `reporting::replay::upload`. The source archive excludes `.git`. The controller captures `commit`, `branch`, and archive-derived `dirty` while it builds that archive, sends them on `Header.provenance`, and the remote runner writes that `source` into history and test-report records. Jobs do not see it.
 
 ## Goals / Non-Goals
 
@@ -22,7 +22,7 @@ Current goodci state that shapes the approach:
 - Reuse the spool, snapshot, acknowledgement, replay and publisher code. A run record is one more frozen item in an invocation's run directory.
 
 **Non-Goals:**
-- `history compare`, uploading old local history files, CI providers other than GitHub Actions, and a branch fallback from CI variables (see Open Questions).
+- `history compare`, uploading old local history files, CI providers other than GitHub Actions, and a branch fallback from CI variables (decision log item 2).
 - Any change to the test-report wire format, the local history file bytes, or `graph_sha256`.
 
 ## Decisions
@@ -154,7 +154,7 @@ A remote Sprite invocation (`Run::sprite_state` is set) has no publisher key by 
 The controller needs no new publication path. After collection it already walks the root's and each bound child's spool, checks it with `trusted_spool`, and calls `replay::upload`, which (D8) now sends the run record after the reports. `trusted_spool` gains one check: a manifest that lists `run_record` is refused unless the controller's trusted configuration has `[reporting] history = true`. A remote config that turned upload on cannot make the controller send command text the caller did not opt into. Replay's own checks cover the rest: re-validation and matching `run_id`, `workflow` and `environment` against the manifest, which `trusted_spool` has already bound to this invocation. As today, delivery never changes the run's exit code. A detached run's record waits in the collected bundle for `reports upload`.
 
 What a remote record contains:
-- **No `source` in the current code.** The archive excludes `.git`, so native capture finds no commit, and the sprite-execution spec keeps controller provenance out of native history and report `source` fields. Open question 3 proposes sending the snapshot's commit, branch, and dirty state with the run. That proposal is recommended and is waiting on Thomas. Until he confirms it, this design still ships remote records without `source`.
+- **`source` from the archive.** `snapshot::take` records `commit`, `branch`, and `dirty` while it builds the tarball and sends them on `Header.provenance`. `exec-workflow` reads that header once and writes the same `source` into the root and every child history file and test-report record. `pass_env` and argv do not carry it. `dirty` is true when the archive is not the tree of `commit` (tracked bytes differ, a tracked file is missing, or a nonignored untracked file is included). Ignored files and `.git` do not set `dirty`. `branch` is set only when `git symbolic-ref` reports a branch, and is omitted when git reports none, with no GitHub Actions fallback. When HEAD cannot be read, `source` is omitted. A remote history file therefore includes `branch` when the snapshot has one. A laptop history file still omits `branch` (D2).
 - **`ci` only through `pass_env`.** The remote runner's environment is `base_env()` plus forwarded values, so `ci` appears only when `[sprite] pass_env` lists `GITHUB_ACTIONS` and the other D3 variables. Forwarded values also reach hooks and jobs, which the README must point out. None of these names is denied by sprite preflight.
 - **`host`** is the Sprite's, and `duration_ms` is the remote invocation's, matching the existing rule that transport and collection time are not added to native metrics.
 
@@ -277,7 +277,7 @@ These are the differences between goodci `main` (checked again at `87da18e`, aft
 7. **`requested_jobs` for child records.** A child invocation always runs its whole workflow and omits `requested_jobs`. The server already accepts the key's absence. No change is needed, but this explains why most child records lack it.
 8. **Branch on CI is often absent.** `source.branch` comes from `git symbolic-ref`, which fails on GitHub Actions `pull_request` checkouts (detached `refs/pull/<n>/merge`). Pull-request runs therefore usually have no `source.branch`, and the server's `branch=main&event=push` filter still works. No contract change is needed. `add-workflow-analytics` should not assume every run has a branch, and should use `ci.pull_request` for pull-request runs.
 
-9. **Sprite runs usually have no `source`.** Records from `goodflows run --sprite` omit `source` (D11). The server already accepts this. No change is needed, but `add-workflow-analytics` must not assume that every run has a commit, and the list's `commit=` and `branch=` filters will never match these runs.
+9. **Sprite `source` is the snapshot, not a remote git capture.** A Sprite record carries `source.commit` and `source.dirty` from the archive, and `source.branch` only when HEAD is a branch (D11). The server already accepts an optional `source`. No new field is required. `add-workflow-analytics` must treat a missing `branch` as a detached HEAD, not as a missing run.
 
 Items 1, 3, 4 and 5 are required. Items 2, 6, 7, 8 and 9 are clarifications.
 
@@ -293,7 +293,7 @@ The upload body adds fields that are not in those files. They need a separate go
 
 Until that second change lands, a client that sends `graph`, `ci`, or `source.branch` is asking the server for something the history-file allowlist does not define. Local validation still checks those keys, and a 422 stays pending.
 
-Item 9 (Sprite records omit `source`) describes the code today. If open question 3 is confirmed, a Sprite upload carries `source.commit` and `source.dirty`, and `source.branch` when HEAD is a branch. That `source` is the history-file object, not the envelope. `source.branch` on that record is the same optional history field a local upload already adds, so it still belongs to the envelope change.
+A Sprite upload carries `source.commit` and `source.dirty`, and `source.branch` when HEAD is a branch (D11). That `source` is the history-file object. `source.branch` on an upload is still the envelope field, so it waits on the separate server change above. When git reports no branch, the field is absent. GitHub Actions environment variables are not a fallback.
 
 ## Risks / Trade-offs
 
@@ -303,7 +303,7 @@ Item 9 (Sprite records omit `source`) describes the code today. If open question
 - [The run record uses up budget left by large test reports] → The run record is sent last and may be left `budget_exhausted`. It stays replayable, and `reports upload --budget` covers slow links.
 - [`--no-history` users may expect no upload] → The README and `--help` text for `--no-history` say it controls the local file only. Unsetting the key variable stops uploads.
 - [Remote Sprite spools fill with run records] → They live in the identity's results and are kept until `sprite destroy`, like remote test reports. Each one is a few KB.
-- [Sprite runs are hard to place on a commit] → Current records omit `source` (D11). Open question 3 recommends filling it from the snapshot. Until that is confirmed, commit and branch filters miss Sprite runs.
+- [Sprite `dirty` misstates the archive] → `dirty` is computed from the shipped tree, including nonignored untracked files. Copying `git status --untracked-files=no` would mark an untracked-only shipment clean.
 - [Remote runs show `credentials_unavailable` before the controller publishes] → The relayed remote event says the record is pending rather than skipped, and the controller's `reports_upload_summary` that follows reports the final `run_record` state.
 
 ## Migration Plan
@@ -312,28 +312,8 @@ Item 9 (Sprite records omit `source`) describes the code today. If open question
 2. Deploy `add-workflow-run-storage` with the server contract changes above before announcing the setting.
 3. Rollback: set `history = false` (or remove it). Spool directories with version 3 manifests need this or a newer goodflows to replay.
 
-## Open Questions
+## Decision log
 
-1. **Resolved.** Keep `schema_version` 1 and widen the goodflows_web history-file allowlist. Thomas decided this. `parent_run_id`, `caller_job`, `results[].workflow`, and `results[].child_run_id` stay optional on version 1. `command`, `exit_code`, and `error` stay required and nullable. The closed alternatives were a version 2 bump, omitting the four keys from the upload only, and stopping writing them locally. The upload envelope is the follow-up above, not part of this decision.
-
-2. **Fill `source.branch` from GitHub Actions ref variables when git has no branch?** (minor)
-   - **Why it matters.** A `pull_request` checkout is detached at `refs/pull/<n>/merge`, so `git symbolic-ref` fails and the uploaded record usually has no `source.branch`. List filters on `branch` then miss those runs. Test-report `source.branch` is captured the same way.
-   - **Options.**
-     1. Leave `source.branch` absent when git reports none.
-     2. Use `GITHUB_HEAD_REF` for pull requests.
-     3. Use `GITHUB_REF_NAME` when `GITHUB_REF_TYPE=branch`.
-     4. Try `GITHUB_HEAD_REF`, then `GITHUB_REF_NAME`.
-   - **Recommended default:** option 1. The run's branch then stays the same value test reports already store, and the fallback can be added later without a contract change.
-
-3. **Proposal, pending Thomas's confirmation (major): controller captures source at transfer time and sends it with the remote run.**
-   - **Why it matters.** The shipped tree has no `.git`, so the remote history writer finds no commit. `commit` and `branch` filters then miss every Sprite run. The controller already knows what it shipped.
-   - **Recommended mechanism.** While `snapshot::take` builds the archive, record `commit`, `branch`, and `dirty` from that same enumeration, and put them on the existing `Header.provenance`. The header is already framed ahead of the archive and written to the Sprite's `header.json`. `exec-workflow` reads that file before jobs run and passes the triple into every invocation's history and test-report `source`. It does not put the triple in `[sprite] pass_env` or in argv: `pass_env` values reach hooks and jobs, and the header already carries provenance without secrets. Read it once at runner start so a later edit of `header.json` cannot change the record. Root and child invocations share one shipped tree, so they share one `source`.
-   - **`dirty`.** Set `dirty` from the archive, not from today's `capture_source`. That helper uses `git status --porcelain --untracked-files=no`, so a tree whose only difference is a nonignored untracked file is `dirty: false` even though `git ls-files --others --exclude-standard` puts that file in the archive. `dirty` is true when the archive is not the tree of `commit`: a tracked file's shipped bytes differ from HEAD, a tracked file is missing, or a nonignored untracked file was included. Ignored files and `.git` are excluded and do not set `dirty`. `dirty` is false only for an archive that matches HEAD. If HEAD cannot be read, omit `source`.
-   - **`branch`.** `branch` is `git symbolic-ref --short HEAD` at snapshot time, the same value `reporting::source::capture` already stores on `Header.provenance`. A detached HEAD, including a GitHub Actions `pull_request` checkout, omits `branch`. Local history files still omit `branch`; the uploaded Sprite record includes it when HEAD is a branch. The archive has no branch metadata to recover on the Sprite. Filling branch from `GITHUB_HEAD_REF` or `GITHUB_REF_NAME` stays open question 2 and is not part of this proposal.
-   - **Spec text that changes if this is confirmed.** `openspec/specs/sprite-execution/spec.md`, requirement "Run identity and timings are coherent", says controller provenance stays separate from native Git context when `.git` is absent. Its scenario "Snapshot lacks Git metadata" says native history and report source stay unavailable and that controller HEAD, branch, and dirty stay only in the control record. This change's `specs/sprite-execution/spec.md` scenario "Remote record provenance" repeats that: the run record has no `source`. Those three texts are replaced by: the remote history file and test-report `source` are the snapshot provenance (`commit`, `dirty`, and `branch` when HEAD is a branch); the control record keeps the same provenance; native git capture on the Sprite still finds nothing and does not override the supplied source. D11's "no source" behavior and task 5.2's "no source" check stay in force until then.
-   - **Risks.** A clean `dirty: false` with a dirty archive would publish the wrong tree for that commit, which is why `dirty` follows the archive. The published commit is the controller's HEAD, which is the same fact a local run already uploads. A snapshot and a later `capture_source` can disagree if the worktree changes in between, which is why the capture happens inside `snapshot::take`. Child runs must reuse the root's triple rather than capture again.
-   - **Alternatives, not recommended.**
-     1. Keep omitting `source` when the Sprite has no `.git`.
-     2. Have the controller rewrite `source` into the collected spool after the run, instead of sending it with the submission.
-     3. Add a separate provenance key on the server, which needs another wire change.
-     4. Pass commit, branch, and dirty through `pass_env` or an argument. Those channels are visible to jobs, and the header already has the field.
+1. **Resolved.** Keep `schema_version` 1 and widen the goodflows_web history-file allowlist. `parent_run_id`, `caller_job`, `results[].workflow`, and `results[].child_run_id` are optional on version 1. `command`, `exit_code`, and `error` stay required and nullable. The upload envelope is a separate server change.
+2. **Resolved.** Leave `source.branch` absent when git reports none. Do not read GitHub Actions environment variables.
+3. **Resolved.** Adopt transfer-time source capture for Sprite runs (D11). Capture `commit`, `branch`, and archive-derived `dirty` while the tarball is built, send them on `Header.provenance`, and write that `source` into the root and child history and test-report records. Jobs do not see it. Omit `source` when HEAD cannot be read.

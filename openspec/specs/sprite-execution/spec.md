@@ -62,15 +62,27 @@ The complete selected graph SHALL execute on the Sprite using a compatible match
 - **THEN** workflow jobs run without those elevated capabilities, including inherited bounding/ambient capabilities, or fail before launch if the restriction cannot be established
 
 ### Requirement: Run identity and timings are coherent
-A remote invocation SHALL have one canonical root run UUID shared by its control record, root summary, requested history, and reporting spool; called workflows keep their own. Lifecycle status SHALL expose preparation/transfer/collection timing separately from native workflow `execute_ms` and `duration_ms`. Transport overhead SHALL NOT be added to those existing metrics. Controller-captured source provenance SHALL be identified separately from native remote Git context when `.git` is absent.
+A remote invocation SHALL have one canonical root run UUID shared by its control record, root summary, requested history, and reporting spool; called workflows keep their own. Lifecycle status SHALL expose preparation/transfer/collection timing separately from native workflow `execute_ms` and `duration_ms`. Transport overhead SHALL NOT be added to those existing metrics. While the controller builds the source archive it SHALL capture `commit`, `branch`, and `dirty` from that archive and SHALL send them on the submission header's provenance. The remote runner SHALL read that provenance once, before jobs run, and SHALL write the same `source` into the root and every child history file and test-report record. Jobs and hooks SHALL NOT receive those values through `pass_env` or argv. `dirty` SHALL be true when the archive is not the tree of `commit`: a tracked file's shipped bytes differ from HEAD, a tracked file is missing, or a nonignored untracked file is included. Ignored files and `.git` SHALL NOT set `dirty`. `dirty` SHALL be false only when the archive matches HEAD. `branch` SHALL be present only when HEAD is a branch, and SHALL be omitted when git reports none, without reading GitHub Actions environment variables. When HEAD cannot be read, `source` SHALL be omitted. Native git capture on the Sprite finds no `.git` and SHALL NOT override the supplied `source`. The control record SHALL keep the same provenance.
 
 #### Scenario: Provisioning takes longer than jobs
 - **WHEN** creation and setup take 30 seconds and workflow execution takes 2 seconds
 - **THEN** native execution metrics describe the workflow interval and lifecycle metrics separately describe creation/setup
 
 #### Scenario: Snapshot lacks Git metadata
-- **WHEN** the source archive omits `.git`
-- **THEN** remote native history/report source capture retains existing unavailable-source behavior; controller HEAD, branch, and dirty provenance stays only in the control record and is never injected into native history/report source fields
+- **WHEN** the source archive omits `.git` and HEAD is the branch `main` at a clean commit
+- **THEN** the root and child history files and test-report records have that commit, `dirty` false, and `branch` `main`, the control record has the same provenance, and no job environment contains those values
+
+#### Scenario: Archive-derived dirty
+- **WHEN** a tracked file's shipped bytes differ from HEAD, or a tracked file is missing, and the archive is built from that tree
+- **THEN** history and test-report `source.dirty` is true
+
+#### Scenario: Untracked-only shipment
+- **WHEN** the only difference from HEAD is a nonignored untracked file, and ignored files are also present
+- **THEN** the archive contains the untracked file, omits the ignored files, and `source.dirty` is true
+
+#### Scenario: Detached HEAD
+- **WHEN** HEAD is detached and the archive matches that commit
+- **THEN** `source` has `commit` and `dirty` false, and `branch` is absent
 
 ### Requirement: Remote work survives controller disconnection
 After durable acceptance, a Sprite-managed service supervisor SHALL own progress independently, renew Tasks API wake holds, and persist phase, process generation, output, and terminal status. Plain attached exec SHALL NOT own execution lifetime. Controller EOF, broken pipes, or connection loss SHALL NOT cancel work, release exclusion, or fabricate a summary. Descendant cleanup and durable terminal results SHALL precede final hold release without depending on reconnect or the release response.
