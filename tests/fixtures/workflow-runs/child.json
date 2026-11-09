@@ -1,0 +1,71 @@
+{
+  "schema_version": 1,
+  "workflow": "suite",
+  "environment": "staging",
+  "run_id": "0e54fb55-a115-4ac7-80fe-8fde26e76afb",
+  "parent_run_id": "fb7d2711-6b67-4f5a-9104-492032a9e1e5",
+  "caller_job": "integration",
+  "started_at": "2026-11-09T13:25:37Z",
+  "outcome": "passed",
+  "duration_ms": 4100,
+  "parallelism": 4,
+  "graph_sha256": "9f2c84412083990dcd93dd9ace366eb765ad497916e27fa2487bee0722474465",
+  "max_in_flight": 1,
+  "host": {
+    "os": "linux",
+    "arch": "x86_64",
+    "logical_cpus": 8,
+    "mem_total_bytes": 16780623872,
+    "mem_available_bytes": 4945465344
+  },
+  "source": {
+    "commit": "5a4a9715f1cd0a9795766bcd9294a77549b5b474",
+    "dirty": false,
+    "branch": "feature/login"
+  },
+  "ci": {
+    "provider": "github_actions",
+    "event": "pull_request",
+    "run_id": "9876543210",
+    "attempt": 1,
+    "pull_request": 42,
+    "runner": "GitHub Actions 7",
+    "url": "https://github.com/acme/app/actions/runs/9876543210"
+  },
+  "results": [
+    {
+      "name": "smoke",
+      "status": "passed",
+      "exit_code": 0,
+      "command": "make smoke",
+      "error": null,
+      "duration_ms": 4090,
+      "started": true,
+      "blocked_ms": 0,
+      "queued_ms": 0,
+      "commands": [
+        {
+          "kind": "command",
+          "wall_ms": 4080,
+          "cpu_user_ms": 3100,
+          "cpu_system_ms": 200,
+          "peak_rss_bytes": 209715200
+        }
+      ]
+    }
+  ],
+  "graph": {
+    "jobs": [
+      {
+        "name": "smoke",
+        "command": "make smoke",
+        "depends_on": [],
+        "partitions": null,
+        "timeout_secs": 300,
+        "shell": true,
+        "condition": null,
+        "steps": []
+      }
+    ]
+  }
+}

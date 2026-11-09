@@ -6,10 +6,12 @@
 //! frozen into immutable request snapshots and published. See README
 //! "Test timing reports" for the on-disk layout.
 
+pub mod ci;
 pub mod collect;
 pub mod contract;
 pub mod publish;
 pub mod replay;
+pub mod run_contract;
 mod source;
 
 use crate::config::{self, Job, Partition, Reporting};

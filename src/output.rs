@@ -39,9 +39,24 @@ pub struct Output {
 
 impl Output {
     pub fn new(json: bool, cancel: watch::Receiver<Option<i32>>) -> Result<Self> {
+        Self::writing(json, cancel, duplicate_stdio(1)?, duplicate_stdio(2)?)
+    }
+
+    /// Output that renders every event and discards it, for unit tests that
+    /// drive real runs.
+    #[cfg(test)]
+    pub fn discard(json: bool, cancel: watch::Receiver<Option<i32>>) -> Result<Self> {
+        let null = || File::options().write(true).open("/dev/null");
+        Self::writing(json, cancel, null()?, null()?)
+    }
+
+    fn writing(
+        json: bool,
+        cancel: watch::Receiver<Option<i32>>,
+        mut out: File,
+        mut err: File,
+    ) -> Result<Self> {
         let (sender, mut receiver) = mpsc::channel::<Request>(32);
-        let mut out = duplicate_stdio(1)?;
-        let mut err = duplicate_stdio(2)?;
         // Blocking terminal/pipe writes must never occupy Tokio workers. This thread
         // is detached so a stopped downstream reader cannot prevent signal shutdown.
         std::thread::Builder::new()

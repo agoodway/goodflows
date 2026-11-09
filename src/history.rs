@@ -266,7 +266,7 @@ pub struct Record<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     source: Option<RecordSource<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    ci: Option<&'a serde_json::Value>,
+    ci: Option<&'a crate::reporting::ci::Ci>,
     results: Vec<Instance<'a>>,
     /// Last, because it is the largest key.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -279,7 +279,7 @@ pub struct Record<'a> {
 pub struct Upload<'a> {
     /// Add the captured source's branch, if any, after `dirty`.
     pub branch: bool,
-    pub ci: Option<&'a serde_json::Value>,
+    pub ci: Option<&'a crate::reporting::ci::Ci>,
     /// The hashed graph document; the record carries its truncated copy.
     pub graph: Option<&'a GraphDocument<'a>>,
 }
@@ -892,7 +892,12 @@ mod tests {
         .unwrap();
         config.validate().unwrap();
         let (_, graph) = graph_sha256(&config.jobs, &|_| unreachable!("no workflow calls"));
-        let ci = serde_json::json!({"provider": "github_actions", "event": "push"});
+        let ci = crate::reporting::ci::capture(|name| match name {
+            "GITHUB_ACTIONS" => Some("true".into()),
+            "GITHUB_EVENT_NAME" => Some("push".into()),
+            _ => None,
+        })
+        .unwrap();
         let upload = record(
             &target,
             &fields,
@@ -920,7 +925,10 @@ mod tests {
 
         let mut upload = serde_json::to_value(&upload).unwrap();
         assert_eq!(upload["source"]["branch"], "main");
-        assert_eq!(upload["ci"], ci);
+        assert_eq!(
+            upload["ci"],
+            serde_json::json!({"provider": "github_actions", "event": "push"})
+        );
         // The record carries the truncated copy of the hashed graph.
         assert_eq!(
             upload["graph"],

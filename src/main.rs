@@ -948,6 +948,234 @@ mod tests {
         assert!(!interrupted("cancelled", [fail_fast]));
     }
 
+    /// Run `config` for real in a fresh git checkout with local history on,
+    /// and return each invocation's upload record: its history file, which
+    /// `history::record` built with no upload keys, plus the `graph`, `ci`
+    /// and `source.branch` an upload adds. With `signal`, the run is sent
+    /// SIGTERM once a job has created the file `started`.
+    async fn upload_records(
+        config: &str,
+        workflow: Option<&str>,
+        profile: Option<&str>,
+        jobs: &[&str],
+        signal: bool,
+    ) -> Vec<serde_json::Value> {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::write(root.join("goodflows.toml"), config).unwrap();
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+                .args(args)
+                .current_dir(&root)
+                .stdout(std::process::Stdio::null())
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        git(&["checkout", "-q", "-b", "main"]);
+        git(&["add", "goodflows.toml"]);
+        git(&["commit", "-q", "-m", "init"]);
+
+        let (document, _) = Config::load(Some(&root.join("goodflows.toml"))).unwrap();
+        let (name, mut selected) = document.workflow(workflow, profile).unwrap();
+        let jobs: Vec<String> = jobs.iter().map(|job| job.to_string()).collect();
+        selected.select(&jobs).unwrap();
+        let targets = document.called_workflows(&selected.jobs, profile).unwrap();
+        // Each invocation's graph, exactly as `invocation` hashes it.
+        let resolve = |target: &str| targets[target].jobs.as_slice();
+        let mut graphs = BTreeMap::new();
+        for (workflow, jobs) in std::iter::once((name.as_str(), &selected.jobs)).chain(
+            targets
+                .iter()
+                .map(|(name, config)| (name.as_str(), &config.jobs)),
+        ) {
+            let (hash, graph) = history::graph_sha256(jobs, &resolve);
+            graphs.insert(workflow.to_owned(), (hash, json!(graph.truncated())));
+        }
+        let source = reporting::capture_source(&root, None).await;
+
+        let (sender, cancel) = watch::channel(None);
+        let history_dir = root.join("history");
+        let run = Run {
+            calls: selected.jobs.iter().any(|job| job.workflow.is_some()),
+            root: selected,
+            targets,
+            profile: profile.map(str::to_owned),
+            parallelism: None,
+            fail_fast: None,
+            history: config::HistoryOverrides {
+                history: Some(true),
+                history_dir: Some(history_dir.clone()),
+                ..Default::default()
+            },
+            requested_jobs: jobs,
+            log_dir: None,
+            legacy_default: !document.jobs.is_empty(),
+            config_path: None,
+            output: Output::discard(true, cancel.clone()).unwrap(),
+            cancel,
+            sprite_state: None,
+        };
+        let started = root.join("started");
+        let signaller = tokio::spawn(async move {
+            if signal {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                while !started.exists() {
+                    assert!(std::time::Instant::now() < deadline, "no job started");
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                sender.send(Some(15)).unwrap();
+            }
+            sender
+        });
+        let code = execute(run, name, retention::RunIdentity::new())
+            .await
+            .unwrap();
+        drop(signaller.await.unwrap());
+        assert_eq!(code, if signal { 143 } else { 0 });
+
+        let ci = reporting::ci::capture(|key| {
+            Some(
+                match key {
+                    "GITHUB_ACTIONS" => "true",
+                    "GITHUB_EVENT_NAME" => "push",
+                    "GITHUB_RUN_ID" => "123",
+                    "GITHUB_RUN_ATTEMPT" => "1",
+                    "GITHUB_REF" => "refs/pull/42/merge",
+                    "RUNNER_NAME" => "runner-1",
+                    "GITHUB_SERVER_URL" => "https://github.com",
+                    "GITHUB_REPOSITORY" => "acme/app",
+                    _ => return None,
+                }
+                .to_owned(),
+            )
+        });
+        let mut records = Vec::new();
+        for workflow in std::fs::read_dir(&history_dir).unwrap() {
+            for file in std::fs::read_dir(workflow.unwrap().path()).unwrap() {
+                let bytes = std::fs::read(file.unwrap().path()).unwrap();
+                let mut record: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                let (hash, graph) = &graphs[record["workflow"].as_str().unwrap()];
+                assert_eq!(record["graph_sha256"], hash.as_str());
+                record["source"]["branch"] = json!(source.branch.as_deref().unwrap());
+                record["ci"] = json!(ci);
+                record["graph"] = graph.clone();
+                records.push(record);
+            }
+        }
+        records
+    }
+
+    #[track_caller]
+    fn valid(record: &serde_json::Value) {
+        let bytes = serde_json::to_vec(record).unwrap();
+        assert_eq!(
+            reporting::run_contract::validate(record, bytes.len()),
+            Ok(()),
+            "{record}"
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_records_of_real_runs_validate() {
+        // A minimal workflow.
+        let records = upload_records(
+            "[[jobs]]\nname = 'a'\ncommand = 'true'\n",
+            None,
+            None,
+            &[],
+            false,
+        )
+        .await;
+        assert_eq!(records.len(), 1);
+        valid(&records[0]);
+        assert_eq!(records[0]["source"]["branch"], "main");
+        assert_eq!(records[0]["ci"]["pull_request"], 42);
+
+        // Partitions with step and condition costs.
+        let records = upload_records(
+            "[[jobs]]\nname = 'test'\npartitions = 2\ncondition = { shell = 'true' }\n\
+             [[jobs.steps]]\nid = 'unit'\ncommand = 'true'\ncondition = { shell = 'true' }\n\
+             [[jobs.steps]]\nid = 'lint'\ncommand = 'true'\n",
+            None,
+            None,
+            &[],
+            false,
+        )
+        .await;
+        let record = &records[0];
+        valid(record);
+        assert_eq!(record["results"].as_array().unwrap().len(), 2);
+        let commands = record["results"][0]["commands"].as_array().unwrap();
+        assert!(commands
+            .iter()
+            .any(|c| c["kind"] == "condition" && c.get("step").is_none()));
+        assert!(commands
+            .iter()
+            .any(|c| c["kind"] == "condition" && c["step"] == "unit"));
+        assert!(commands
+            .iter()
+            .any(|c| c["kind"] == "command" && c["step"] == "lint"));
+
+        // A workflow call: the root and the child record.
+        let records = upload_records(
+            "[[workflows.ci.jobs]]\nname = 'prep'\ncommand = 'true'\n\
+             [[workflows.ci.jobs]]\nname = 'call-suite'\nworkflow = 'suite'\ndepends_on = ['prep']\n\
+             [[workflows.suite.jobs]]\nname = 'work'\ncommand = 'true'\n",
+            Some("ci"),
+            None,
+            &[],
+            false,
+        )
+        .await;
+        assert_eq!(records.len(), 2);
+        records.iter().for_each(valid);
+        let root = records.iter().find(|r| r["workflow"] == "ci").unwrap();
+        let child = records.iter().find(|r| r["workflow"] == "suite").unwrap();
+        assert_eq!(child["parent_run_id"], root["run_id"]);
+        assert_eq!(child["caller_job"], "call-suite");
+        assert_eq!(root["results"][1]["child_run_id"], child["run_id"]);
+        assert_eq!(
+            root["graph"]["jobs"][1]["call"]["graph_sha256"],
+            child["graph_sha256"]
+        );
+
+        // `--env` with `--jobs`.
+        let records = upload_records(
+            "[environments.staging.settings]\nparallelism = 1\n\
+             [[jobs]]\nname = 'a'\ncommand = 'true'\n\
+             [[jobs]]\nname = 'b'\ncommand = 'true'\ndepends_on = ['a']\n\
+             [[jobs]]\nname = 'c'\ncommand = 'true'\n",
+            None,
+            Some("staging"),
+            &["b"],
+            false,
+        )
+        .await;
+        let record = &records[0];
+        valid(record);
+        assert_eq!(record["environment"], "staging");
+        assert_eq!(record["requested_jobs"], json!(["b"]));
+        assert_eq!(record["graph"]["jobs"].as_array().unwrap().len(), 2);
+
+        // A signal-cancelled run.
+        let records = upload_records(
+            "[[jobs]]\nname = 'wait'\ncommand = 'touch started; sleep 30'\n\
+             [[jobs]]\nname = 'after'\ncommand = 'true'\ndepends_on = ['wait']\n",
+            None,
+            None,
+            &[],
+            true,
+        )
+        .await;
+        let record = &records[0];
+        valid(record);
+        assert_eq!(record["outcome"], "cancelled");
+        assert_eq!(record["results"][0]["status"], "cancelled");
+    }
+
     fn parse(args: &[&str]) -> std::result::Result<Cli, clap::Error> {
         Cli::parse_from(std::iter::once("goodflows").chain(args.iter().copied()))
     }

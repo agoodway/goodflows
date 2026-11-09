@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "workflow": "ci",
+  "run_id": "3b1f0c52-8d1e-4a77-9f20-6c5e2d4b7a19",
+  "started_at": "2026-11-09T13:25:31Z",
+  "outcome": "passed",
+  "duration_ms": 0,
+  "parallelism": 1,
+  "graph_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "max_in_flight": 0,
+  "host": {
+    "os": "linux",
+    "arch": "x86_64",
+    "logical_cpus": 1
+  },
+  "results": []
+}
