@@ -325,6 +325,68 @@ fn inspection_never_creates_spools_or_contacts_the_endpoint() {
 }
 
 #[test]
+fn reporting_history_must_be_a_boolean() {
+    let p = project_with(
+        &format!("{REPORTING}history = \"yes\"\n"),
+        "[[jobs]]\nname = \"test\"\ncommand = \"touch ran\"\n",
+    );
+    for args in [vec!["validate", "--json"], vec!["--json"]] {
+        let output = run_with(&p, &args, None);
+        assert_eq!(output.status.code(), Some(1), "{args:?}");
+        let event: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(event["type"], "error");
+        let message = event["message"].as_str().unwrap();
+        assert!(
+            message.contains("reporting.history must be a boolean"),
+            "{message}"
+        );
+        assert!(!p.dir.join("ran").exists());
+        assert!(!p.dir.join(".goodflows").exists());
+    }
+}
+
+#[test]
+fn reporting_history_needs_no_report_jobs() {
+    let p = project_with(
+        &format!("{REPORTING}history = true\n"),
+        "[[jobs]]\nname = \"plain\"\ncommand = 'printf %s \"${GOODFLOWS_RUN_ID-unset}\" > seen'\n",
+    );
+    success(&run_with(&p, &["validate", "--json"], None));
+    let output = run_with(&p, &["--json"], None);
+    success(&output);
+    assert_eq!(p.read("seen"), "unset");
+}
+
+#[test]
+fn inspection_with_history_upload_never_creates_spools_or_contacts_the_endpoint() {
+    let mock = Mock::store();
+    let p = project_with(
+        &format!("{REPORTING}history = true\n"),
+        &format!(
+            "[[jobs]]\nname = \"test\"\ncommand = '{}'\nreports = [\"test-timings\"]\n",
+            copy(&["r1"])
+        ),
+    );
+    for args in [
+        vec!["validate"],
+        vec!["validate", "--json"],
+        vec!["list"],
+        vec!["list", "--json"],
+        vec!["list", "--workflows"],
+    ] {
+        let output = run_with(&p, &args, Some(&mock.url));
+        success(&output);
+        assert!(!stdout(&output).contains(SECRET));
+        if args == ["list", "--json"] {
+            let event: Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(event["reporting"]["history"], true);
+        }
+    }
+    assert!(!p.dir.join(".goodflows").exists());
+    assert_eq!(mock.connections(), 0);
+}
+
+#[test]
 fn workflows_environments_selection_and_relative_spool_dirs_keep_reporting() {
     let p = Project::new("");
     std::fs::create_dir_all(p.dir.join("conf")).unwrap();
