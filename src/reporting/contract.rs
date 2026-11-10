@@ -11,24 +11,11 @@
 //! tables drive three checks: every core key must be present (nullable ones
 //! as `null`), keys outside the common keys, the event's core keys and
 //! [`META`] are rejected, and each value is typed. When the contract changes
-//! incompatibly, add a new `test-timings/<n>` format, bump
-//! [`CONTRACT_VERSION`], and release the CLI before producers emit it.
+//! incompatibly, add a new `test-timings/<n>` format, bump the
+//! `test-reports/<n>` the publisher names in its User-Agent, and release the
+//! CLI before producers emit it.
 
 use serde_json::{Map, Value};
-
-/// The id of the OpenSpec change that defines the contract these tables
-/// implement (`openspec/changes/archive/2026-11-04-generalize-test-timings`, shared with the
-/// GoodFlows server, which pins its mirror of this module to the same change).
-///
-/// It is not a wire format: it is only sent in the publisher's User-Agent
-/// (`goodflows/<version> test-reports/<CONTRACT_VERSION>`) so server logs can
-/// tell which contract revision a stale publisher was built against.
-/// [`REPORT_FORMAT`] is what the server validates and what a reporter emits.
-/// Several revisions of one format may name different changes, so the two
-/// change independently: rename this when an archived change gets its dated
-/// id or a later change revises the tables; bump [`REPORT_FORMAT`] only for an
-/// incompatible wire change.
-pub const CONTRACT_VERSION: &str = "2026-11-04-generalize-test-timings";
 
 /// The wire format in the envelope and in every `suite_started` record: the
 /// [`crate::config::REPORT_FAMILY`] a job requests plus its major version.
@@ -556,7 +543,6 @@ mod tests {
 
     #[test]
     fn contract_is_versioned_and_names_its_format() {
-        assert_eq!(CONTRACT_VERSION, "2026-11-04-generalize-test-timings");
         assert_eq!(REPORT_FORMAT, "test-timings/1");
         assert_eq!(MAX_REQUEST_BYTES, 33_554_432);
         assert_eq!(MAX_FILTER_ENTRIES, 256);

@@ -1,4 +1,5 @@
-//! Bounded, sequential delivery of frozen report snapshots.
+//! Bounded, sequential delivery of frozen documents: test-report snapshots
+//! and run records.
 //!
 //! Diagnostics are structural codes and HTTP status numbers only: response
 //! bodies, request records, URLs and key values are never surfaced.
@@ -14,6 +15,12 @@ use tokio::time::Instant;
 const MAX_ATTEMPTS: usize = 3;
 const MAX_RESPONSE_BYTES: usize = 64 * 1024;
 const MIB: usize = 1024 * 1024;
+/// Names each document contract this publisher speaks.
+const USER_AGENT: &str = concat!(
+    "goodflows/",
+    env!("CARGO_PKG_VERSION"),
+    " test-reports/1 workflow-runs/1"
+);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Limits {
@@ -77,10 +84,39 @@ fn is_tls(error: &(dyn std::error::Error + 'static)) -> bool {
     error.source().is_some_and(is_tls)
 }
 
+/// What a request carries, which selects its endpoint, acknowledgement and
+/// status mapping.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DocumentKind {
+    TestReport,
+    WorkflowRun,
+}
+
+impl DocumentKind {
+    fn collection(self) -> &'static str {
+        match self {
+            Self::TestReport => "test-reports",
+            Self::WorkflowRun => "workflow-runs",
+        }
+    }
+}
+
 pub struct Target {
-    endpoint: Url,
+    /// Validated origin: scheme, host and port only.
+    origin: Url,
+    /// Matches the project slug grammar, so it needs no escaping.
+    project: String,
     key: String,
     loopback: bool,
+}
+
+impl Target {
+    fn endpoint(&self, kind: DocumentKind) -> Url {
+        let path = format!("/api/v1/projects/{}/{}", self.project, kind.collection());
+        self.origin
+            .join(&path)
+            .expect("a validated origin joins an absolute path")
+    }
 }
 
 pub enum Credentials {
@@ -90,17 +126,31 @@ pub enum Credentials {
     InvalidProject,
 }
 
-/// Validate an origin-only base URL and build the project-scoped endpoint.
+impl Credentials {
+    /// Why delivery cannot start, or `None` when the target is ready.
+    pub fn unavailable(&self) -> Option<&'static str> {
+        match self {
+            Self::Ready(_) => None,
+            Self::Missing => Some("credentials_unavailable"),
+            Self::InvalidUrl => Some("invalid_url"),
+            Self::InvalidProject => Some("invalid_project"),
+        }
+    }
+}
+
+/// Validate an origin-only base URL and the project slug the endpoints are scoped to.
 pub fn resolve(url: Option<&str>, key: Option<&str>, project: &str) -> Credentials {
+    // Url::join would normalize `..`, `?` or `#` in the slug, so never trust callers.
     if !crate::config::valid_project_slug(project) {
         return Credentials::InvalidProject;
     }
     let (Some(url), Some(key)) = (url, key) else {
         return Credentials::Missing;
     };
-    match endpoint(url, project) {
-        Some((endpoint, loopback)) => Credentials::Ready(Target {
-            endpoint,
+    match origin(url) {
+        Some((origin, loopback)) => Credentials::Ready(Target {
+            origin,
+            project: project.to_owned(),
             key: key.to_owned(),
             loopback,
         }),
@@ -108,11 +158,19 @@ pub fn resolve(url: Option<&str>, key: Option<&str>, project: &str) -> Credentia
     }
 }
 
+/// The test-report endpoint `resolve` builds for this base URL and project.
+#[cfg(test)]
 fn endpoint(base: &str, project: &str) -> Option<(Url, bool)> {
-    // Url::join would normalize `..`, `?` or `#` in the slug, so never trust callers.
-    if !crate::config::valid_project_slug(project) {
-        return None;
+    match resolve(Some(base), Some("k"), project) {
+        Credentials::Ready(target) => {
+            Some((target.endpoint(DocumentKind::TestReport), target.loopback))
+        }
+        _ => None,
     }
+}
+
+/// The validated origin, and whether it is plaintext loopback.
+fn origin(base: &str) -> Option<(Url, bool)> {
     let url = Url::parse(base).ok()?;
     if !url.username().is_empty()
         || url.password().is_some()
@@ -135,11 +193,8 @@ fn endpoint(base: &str, project: &str) -> Option<(Url, bool)> {
         "http" if loopback => {}
         _ => return None,
     }
-    // The slug grammar ([a-z0-9][a-z0-9_-]*) needs no escaping.
-    let endpoint = url
-        .join(&format!("/api/v1/projects/{project}/test-reports"))
-        .ok()?;
-    Some((endpoint, loopback && url.scheme() == "http"))
+    let plaintext = loopback && url.scheme() == "http";
+    Some((url, plaintext))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -151,23 +206,54 @@ pub struct Ack {
     pub duplicate: bool,
 }
 
+/// The server's acknowledgement of one run record.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RunAck {
+    pub id: String,
+    pub run_id: String,
+    pub duplicate: bool,
+}
+
+/// An acknowledgement type, tied to the document kind it acknowledges.
+pub trait Acknowledgement: Sized {
+    const KIND: DocumentKind;
+    /// Validate a 200/201 body for exactly the document with this id.
+    fn parse(body: &[u8], id: &str) -> Result<Self, &'static str>;
+}
+
+impl Acknowledgement for Ack {
+    const KIND: DocumentKind = DocumentKind::TestReport;
+    fn parse(body: &[u8], report_id: &str) -> Result<Self, &'static str> {
+        acknowledgement(body, report_id)
+    }
+}
+
+impl Acknowledgement for RunAck {
+    const KIND: DocumentKind = DocumentKind::WorkflowRun;
+    fn parse(body: &[u8], run_id: &str) -> Result<Self, &'static str> {
+        run_acknowledgement(body, run_id)
+    }
+}
+
 #[derive(Debug)]
-pub enum Outcome {
-    Uploaded(Ack),
+pub enum Outcome<A = Ack> {
+    Uploaded(A),
     /// Not delivered; a later replay may succeed.
     Pending {
         reason: &'static str,
         http_status: Option<u16>,
     },
-    /// The server permanently refused these exact bytes (400, 409, 413, 415,
-    /// 422); resending the same immutable snapshot cannot succeed.
+    /// The server permanently refused these exact bytes; resending the same
+    /// immutable snapshot cannot succeed. Test reports: 400, 409, 413, 415,
+    /// 422. Run records: 400, 409, 415.
     Rejected {
         reason: &'static str,
         http_status: u16,
     },
 }
 
-impl Outcome {
+impl<A> Outcome<A> {
     pub fn pending(reason: &'static str, http_status: Option<u16>) -> Self {
         Self::Pending {
             reason,
@@ -200,8 +286,27 @@ pub fn acknowledgement(body: &[u8], report_id: &str) -> Result<Ack, &'static str
     })
 }
 
-enum Attempt {
-    Done(Outcome),
+/// Validate a 200/201 acknowledgement for exactly this run record.
+pub fn run_acknowledgement(body: &[u8], run_id: &str) -> Result<RunAck, &'static str> {
+    let value: Value = serde_json::from_slice(body).map_err(|_| "invalid_acknowledgement")?;
+    let data = value.get("data").ok_or("invalid_acknowledgement")?;
+    let id = data["id"].as_str().ok_or("invalid_acknowledgement")?;
+    uuid::Uuid::parse_str(id).map_err(|_| "invalid_acknowledgement")?;
+    let duplicate = data["duplicate"]
+        .as_bool()
+        .ok_or("invalid_acknowledgement")?;
+    if data["run_id"].as_str() != Some(run_id) {
+        return Err("mismatched_acknowledgement");
+    }
+    Ok(RunAck {
+        id: id.to_owned(),
+        run_id: run_id.to_owned(),
+        duplicate,
+    })
+}
+
+enum Attempt<A> {
+    Done(Outcome<A>),
     Retry {
         reason: &'static str,
         http_status: Option<u16>,
@@ -219,7 +324,7 @@ pub struct Publisher {
 }
 
 impl Publisher {
-    /// The shared budget starts now and covers every report sent by this publisher.
+    /// The shared budget starts now and covers every document sent by this publisher.
     pub fn new(
         target: Target,
         limits: Limits,
@@ -228,12 +333,8 @@ impl Publisher {
         let mut builder = reqwest::Client::builder()
             .redirect(redirect::Policy::none())
             .connect_timeout(limits.connect)
-            // Names the contract version so server logs can spot a stale publisher.
-            .user_agent(format!(
-                "goodflows/{} test-reports/{}",
-                env!("CARGO_PKG_VERSION"),
-                super::contract::CONTRACT_VERSION
-            ));
+            // Names the document contracts so server logs can spot a stale publisher.
+            .user_agent(USER_AGENT);
         if target.loopback {
             // Never route plaintext loopback traffic (and its key) through a proxy.
             builder = builder.no_proxy();
@@ -251,12 +352,22 @@ impl Publisher {
         self.cancel.borrow().is_some()
     }
 
-    /// Whether the shared budget is spent, so no further report should be prepared.
+    /// Whether the shared budget is spent, so no further document should be prepared.
     pub fn exhausted(&self) -> bool {
         Instant::now() >= self.deadline
     }
 
+    /// Send one frozen test-report snapshot.
     pub async fn send(&mut self, body: &[u8], report_id: &str) -> Outcome {
+        self.deliver(body, report_id).await
+    }
+
+    /// Send one frozen run record.
+    pub async fn send_run(&mut self, body: &[u8], run_id: &str) -> Outcome<RunAck> {
+        self.deliver(body, run_id).await
+    }
+
+    async fn deliver<A: Acknowledgement>(&mut self, body: &[u8], id: &str) -> Outcome<A> {
         let mut last = ("budget_exhausted", None);
         for attempt in 0..MAX_ATTEMPTS {
             if self.cancelled() {
@@ -266,7 +377,7 @@ impl Publisher {
             if remaining.is_zero() {
                 return Outcome::pending("budget_exhausted", last.1);
             }
-            match self.attempt(body, report_id, remaining).await {
+            match self.attempt::<A>(body, id, remaining).await {
                 Attempt::Done(outcome) => return outcome,
                 Attempt::Cancelled => return Outcome::pending("cancelled", None),
                 Attempt::Retry {
@@ -297,11 +408,16 @@ impl Publisher {
         Outcome::pending(last.0, last.1)
     }
 
-    async fn attempt(&self, body: &[u8], report_id: &str, remaining: Duration) -> Attempt {
+    async fn attempt<A: Acknowledgement>(
+        &self,
+        body: &[u8],
+        id: &str,
+        remaining: Duration,
+    ) -> Attempt<A> {
         let deadline = Instant::now() + self.limits.request_for(body.len()).min(remaining);
         let request = self
             .client
-            .post(self.target.endpoint.clone())
+            .post(self.target.endpoint(A::KIND))
             .header(header::CONTENT_TYPE, "application/json")
             .header(header::ACCEPT, "application/json")
             .bearer_auth(&self.target.key)
@@ -364,11 +480,16 @@ impl Publisher {
                 if oversized {
                     return Attempt::Done(Outcome::pending("invalid_acknowledgement", code));
                 }
-                Attempt::Done(match acknowledgement(&bytes, report_id) {
+                Attempt::Done(match A::parse(&bytes, id) {
                     Ok(ack) => Outcome::Uploaded(ack),
                     Err(reason) => Outcome::pending(reason, code),
                 })
             }
+            StatusCode::REQUEST_TIMEOUT if A::KIND == DocumentKind::WorkflowRun => Attempt::Retry {
+                reason: "request_timeout",
+                http_status: code,
+                retry_after,
+            },
             StatusCode::TOO_MANY_REQUESTS => Attempt::Retry {
                 reason: "rate_limited",
                 http_status: code,
@@ -383,24 +504,28 @@ impl Publisher {
                 http_status: code,
                 retry_after,
             },
-            s => Attempt::Done(match s.as_u16() {
-                status @ (400 | 415) => Outcome::Rejected {
+            s => Attempt::Done(match (A::KIND, s.as_u16()) {
+                (_, status @ (400 | 415)) => Outcome::Rejected {
                     reason: "http_error",
                     http_status: status,
                 },
-                409 => Outcome::Rejected {
+                (_, 409) => Outcome::Rejected {
                     reason: "conflict",
                     http_status: 409,
                 },
-                413 => Outcome::Rejected {
+                // A run record's 413 and 422 may come from a server older than
+                // the record or a lowered body limit, so replay may succeed later.
+                (DocumentKind::WorkflowRun, 413) => Outcome::pending("request_too_large", code),
+                (DocumentKind::WorkflowRun, 422) => Outcome::pending("rejected", code),
+                (DocumentKind::TestReport, 413) => Outcome::Rejected {
                     reason: "request_too_large",
                     http_status: 413,
                 },
-                422 => Outcome::Rejected {
+                (DocumentKind::TestReport, 422) => Outcome::Rejected {
                     reason: "rejected",
                     http_status: 422,
                 },
-                status => Outcome::pending(
+                (_, status) => Outcome::pending(
                     match status {
                         300..=399 => "redirect",
                         401 => "unauthorized",
@@ -895,5 +1020,216 @@ mod tests {
         assert_eq!(reason(&publisher.send(b"{}", "b").await).0, "cancelled");
         assert!(start.elapsed() < Duration::from_secs(2));
         assert_eq!(mock.requests.lock().unwrap().len(), 1);
+    }
+
+    const RUN_ID: &str = "67f7946d-136b-4608-ab01-e1f251a09754";
+
+    fn run_body(run_id: &str, duplicate: bool) -> String {
+        format!(
+            r#"{{"data":{{"id":"0b9c2b8e-8f1e-4c55-9d43-6a0e1c1f2a3b","run_id":"{run_id}","duplicate":{duplicate}}}}}"#
+        )
+    }
+
+    async fn send_run(mock: &Mock, limits: Limits) -> (Outcome<RunAck>, Duration) {
+        let (_tx, rx) = watch::channel(None);
+        let Credentials::Ready(target) = resolve(Some(&mock.url), Some("secret-key"), "goodcases")
+        else {
+            panic!("loopback url must be accepted")
+        };
+        let mut publisher = Publisher::new(target, limits, rx).unwrap();
+        let start = std::time::Instant::now();
+        let outcome = publisher.send_run(br#"{"run":1}"#, RUN_ID).await;
+        (outcome, start.elapsed())
+    }
+
+    fn run_reason(outcome: &Outcome<RunAck>) -> (&'static str, Option<u16>) {
+        match outcome {
+            Outcome::Pending {
+                reason,
+                http_status,
+            } => (reason, *http_status),
+            Outcome::Rejected {
+                reason,
+                http_status,
+            } => (reason, Some(*http_status)),
+            Outcome::Uploaded(_) => ("uploaded", None),
+        }
+    }
+
+    #[test]
+    fn run_acknowledgement_rules() {
+        let id = "0b9c2b8e-8f1e-4c55-9d43-6a0e1c1f2a3b";
+        assert_eq!(
+            run_acknowledgement(run_body(RUN_ID, true).as_bytes(), RUN_ID).unwrap(),
+            RunAck {
+                id: id.into(),
+                run_id: RUN_ID.into(),
+                duplicate: true
+            }
+        );
+        // A test-report acknowledgement does not acknowledge a run record.
+        assert_eq!(
+            run_acknowledgement(ok_body(RUN_ID).as_bytes(), RUN_ID).unwrap_err(),
+            "mismatched_acknowledgement"
+        );
+        for bad in [
+            run_body(RUN_ID, false).replace(id, "not-a-uuid"),
+            run_body(RUN_ID, false).replace(r#","duplicate":false"#, ""),
+            run_body(RUN_ID, false).replace("false", r#""false""#),
+            r#"{"data":null}"#.into(),
+            "not json".into(),
+        ] {
+            assert_eq!(
+                run_acknowledgement(bad.as_bytes(), RUN_ID).unwrap_err(),
+                "invalid_acknowledgement",
+                "{bad}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn run_records_post_to_workflow_runs_and_accept_both_acknowledgements() {
+        for (code, duplicate) in [(201, false), (200, true)] {
+            let mock = mock(vec![Reply::Status(code, "", run_body(RUN_ID, duplicate))]);
+            let (outcome, _) = send_run(&mock, fast()).await;
+            let Outcome::Uploaded(ack) = outcome else {
+                panic!("{code}: {outcome:?}")
+            };
+            assert_eq!(ack.run_id, RUN_ID);
+            assert_eq!(ack.duplicate, duplicate);
+            let requests = mock.requests.lock().unwrap();
+            assert_eq!(requests.len(), 1);
+            let (line, headers, body) = &requests[0];
+            assert_eq!(
+                line.trim(),
+                "POST /api/v1/projects/goodcases/workflow-runs HTTP/1.1"
+            );
+            let headers = headers.to_ascii_lowercase();
+            assert!(headers.contains("authorization: bearer secret-key"));
+            assert!(headers.contains("content-type: application/json"));
+            assert!(headers.contains(&format!(
+                "user-agent: goodflows/{} test-reports/1 workflow-runs/1\r\n",
+                env!("CARGO_PKG_VERSION")
+            )));
+            assert_eq!(body, r#"{"run":1}"#);
+        }
+    }
+
+    #[tokio::test]
+    async fn run_records_stay_pending_on_bad_acknowledgements() {
+        let other = "11111111-2222-4333-8444-555555555555";
+        for (body, expected) in [
+            (run_body(other, false), "mismatched_acknowledgement"),
+            (
+                run_body(RUN_ID, false).replace("0b9c2b8e-8f1e-4c55-9d43-6a0e1c1f2a3b", "nope"),
+                "invalid_acknowledgement",
+            ),
+            (
+                run_body(RUN_ID, false).replace(r#","duplicate":false"#, ""),
+                "invalid_acknowledgement",
+            ),
+        ] {
+            let mock = mock(vec![Reply::Status(201, "", body)]);
+            let (outcome, _) = send_run(&mock, fast()).await;
+            assert_eq!(run_reason(&outcome), (expected, Some(201)));
+            assert!(matches!(outcome, Outcome::Pending { .. }));
+            assert_eq!(mock.requests.lock().unwrap().len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn run_records_retry_transient_responses() {
+        // 408 is retried for run records, then the 201 completes delivery.
+        let timeout_then_ok = mock(vec![
+            Reply::Status(408, "", String::new()),
+            Reply::Status(201, "", run_body(RUN_ID, false)),
+        ]);
+        let (outcome, _) = send_run(&timeout_then_ok, fast()).await;
+        assert!(matches!(outcome, Outcome::Uploaded(_)), "{outcome:?}");
+        assert_eq!(timeout_then_ok.requests.lock().unwrap().len(), 2);
+
+        // Retry-After on 429 and 503 replaces the 20 ms backoff.
+        for code in [429, 503] {
+            let mock = mock(vec![
+                Reply::Status(code, "Retry-After: 1\r\n", String::new()),
+                Reply::Status(201, "", run_body(RUN_ID, false)),
+            ]);
+            let (outcome, elapsed) = send_run(&mock, fast()).await;
+            assert!(
+                matches!(outcome, Outcome::Uploaded(_)),
+                "{code}: {outcome:?}"
+            );
+            assert!(elapsed >= Duration::from_millis(950), "{code}: {elapsed:?}");
+            assert_eq!(mock.requests.lock().unwrap().len(), 2);
+        }
+
+        for (code, expected) in [
+            (500, "server_error"),
+            (408, "request_timeout"),
+            (503, "service_unavailable"),
+        ] {
+            let mock = mock(vec![Reply::Status(code, "", String::new())]);
+            let (outcome, _) = send_run(&mock, fast()).await;
+            assert_eq!(run_reason(&outcome), (expected, Some(code)));
+            assert!(matches!(outcome, Outcome::Pending { .. }));
+            assert_eq!(mock.requests.lock().unwrap().len(), 3, "{code}");
+        }
+    }
+
+    #[tokio::test]
+    async fn run_record_status_mapping() {
+        for (code, expected, terminal) in [
+            (409, "conflict", true),
+            (400, "http_error", true),
+            (415, "http_error", true),
+            // The server, not the bytes, may change: replay resends these.
+            (413, "request_too_large", false),
+            (422, "rejected", false),
+            (401, "unauthorized", false),
+            (403, "forbidden", false),
+            (404, "project_not_found", false),
+            (302, "redirect", false),
+        ] {
+            let mock = mock(vec![Reply::Status(
+                code,
+                "Location: https://elsewhere.example/steal\r\n",
+                r#"{"errors":{"detail":"sensitive-body"}}"#.into(),
+            )]);
+            let (outcome, _) = send_run(&mock, fast()).await;
+            assert_eq!(run_reason(&outcome), (expected, Some(code)));
+            assert_eq!(
+                matches!(outcome, Outcome::Rejected { .. }),
+                terminal,
+                "{code}"
+            );
+            assert_eq!(mock.requests.lock().unwrap().len(), 1, "{code}");
+            assert!(!format!("{outcome:?}").contains("sensitive"));
+        }
+    }
+
+    #[tokio::test]
+    async fn run_record_tls_failures_are_pending_after_one_attempt() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("https://{}", listener.local_addr().unwrap());
+        let connections = Arc::new(Mutex::new(0));
+        let count = connections.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                *count.lock().unwrap() += 1;
+                let mut hello = [0; 512];
+                let _ = stream.read(&mut hello);
+                let _ = stream.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n");
+            }
+        });
+        let (_tx, rx) = watch::channel(None);
+        let Credentials::Ready(target) = resolve(Some(&url), Some("k"), "p") else {
+            panic!("https loopback must be accepted")
+        };
+        let mut publisher = Publisher::new(target, fast(), rx).unwrap();
+        let outcome = publisher.send_run(b"{}", RUN_ID).await;
+        assert_eq!(run_reason(&outcome), ("tls_error", None));
+        assert!(matches!(outcome, Outcome::Pending { .. }));
+        assert_eq!(*connections.lock().unwrap(), 1);
     }
 }

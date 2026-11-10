@@ -29,11 +29,11 @@ Prerequisite: the goodci change `validate-job-names` (another thread, branch `t3
 
 ## 3. Publisher
 
-- [ ] 3.1 Generalize `reporting::publish` (design D7): `Target` keeps the origin and project, and a `DocumentKind` selects `/test-reports` or `/workflow-runs`, the acknowledgement parser and the status mapping. The User-Agent becomes `goodflows/<v> test-reports/1 workflow-runs/1`. Verify that every existing `publish.rs` test passes unchanged for test reports. Add mock tests for `WorkflowRun`:
+- [x] 3.1 Generalize `reporting::publish` (design D7): `Target` keeps the origin and project, and a `DocumentKind` selects `/test-reports` or `/workflow-runs`, the acknowledgement parser and the status mapping. The User-Agent becomes `goodflows/<v> test-reports/1 workflow-runs/1`. Verify that every existing `publish.rs` test passes unchanged for test reports. Add mock tests for `WorkflowRun`:
   - 201 and 200 `duplicate` acknowledgements, and a mismatched `run_id`, a non-UUID id and a missing `duplicate` (pending).
   - 408 then 201 (uploaded); 429 or 503 with `Retry-After`; 500 three times (pending `server_error`).
   - 409 (rejected `conflict`); 400 and 415 (rejected); 413 and 422 (pending, not retried); 401, 403, 404 and 302 (pending); a TLS failure (pending, one attempt).
-- [ ] 3.2 Make `Session` own one lazily created `Publisher` shared by test-report delivery and the run record (design D6), so the 30-second budget covers both. Verify with a unit test (fast limits) where slow report acks exhaust the budget and the run record is left pending with `budget_exhausted` without a request. The existing `shared_budget_is_invocation_wide` test must still pass.
+- [x] 3.2 Make `Session` own one lazily created `Publisher` shared by test-report delivery and the run record (design D6), so the 30-second budget covers both. Verify with a unit test (fast limits) where slow report acks exhaust the budget and the run record is left pending with `budget_exhausted` without a request. The existing `shared_budget_is_invocation_wide` test must still pass.
 
 ## 4. Spool, manifest and invocation flow
 

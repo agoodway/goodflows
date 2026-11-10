@@ -20,7 +20,7 @@ use crate::output::Output;
 use crate::runner::{JobResult, ReportingEnv, ReportingKey, Status};
 use anyhow::Result;
 use collect::{Budget, Collection, Head, JobContext, Sink};
-use publish::{Credentials, Limits};
+use publish::{Credentials, Limits, Publisher, RunAck};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 pub use source::{capture as capture_source, Source};
@@ -312,8 +312,13 @@ struct Run {
 /// Reporting state for one `run` invocation.
 pub struct Session {
     token_env: String,
+    project: String,
     url: Option<String>,
     key: Option<String>,
+    limits: Limits,
+    /// Created on first use and shared by test reports and the run record, so
+    /// one budget covers every request of the invocation.
+    publisher: Option<Publisher>,
     run: Option<Run>,
     skipped: Option<&'static str>,
     /// The source captured for the spool manifest, when one was created.
@@ -340,8 +345,11 @@ impl Session {
         let read = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
         let mut session = Self {
             token_env: reporting.token_env.clone(),
+            project: reporting.project.clone(),
             url: read(&reporting.url_env),
             key: read(&reporting.token_env),
+            limits: Limits::default(),
+            publisher: None,
             run: None,
             skipped: None,
             source: None,
@@ -412,17 +420,6 @@ impl Session {
         cancel: watch::Receiver<Option<i32>>,
         output: &Output,
     ) {
-        self.finish_with(results, cancel, output, Limits::default())
-            .await
-    }
-
-    async fn finish_with(
-        &mut self,
-        results: &[JobResult],
-        cancel: watch::Receiver<Option<i32>>,
-        output: &Output,
-        limits: Limits,
-    ) {
         let Some(mut run) = self.run.take() else {
             return;
         };
@@ -489,7 +486,48 @@ impl Session {
         }
         let credentials =
             publish::resolve(self.url.as_deref(), self.key.as_deref(), &manifest.project);
-        deliver(&run_id, items, credentials, limits, cancel, output).await;
+        deliver(
+            &run_id,
+            items,
+            credentials,
+            &mut self.publisher,
+            self.limits,
+            cancel,
+            output,
+        )
+        .await;
+    }
+
+    /// Send a frozen run record with the invocation's publisher, within what
+    /// is left of the budget test-report delivery started.
+    #[cfg_attr(not(test), expect(dead_code))]
+    pub async fn send_run_record(
+        &mut self,
+        body: &[u8],
+        run_id: &str,
+        cancel: watch::Receiver<Option<i32>>,
+    ) -> publish::Outcome<RunAck> {
+        if cancel.borrow().is_some() {
+            return publish::Outcome::pending("cancelled", None);
+        }
+        if self.publisher.is_none() {
+            match publish::resolve(self.url.as_deref(), self.key.as_deref(), &self.project) {
+                Credentials::Ready(target) => {
+                    self.publisher = Publisher::new(target, self.limits, cancel).ok();
+                }
+                credentials => {
+                    let reason = credentials.unavailable().unwrap_or("client_unavailable");
+                    return publish::Outcome::pending(reason, None);
+                }
+            }
+        }
+        match &mut self.publisher {
+            Some(publisher) if publisher.exhausted() => {
+                publish::Outcome::pending("budget_exhausted", None)
+            }
+            Some(publisher) => publisher.send_run(body, run_id).await,
+            None => publish::Outcome::pending("client_unavailable", None),
+        }
     }
 }
 
@@ -715,11 +753,14 @@ pub struct Delivery {
     pub invalid: usize,
 }
 
-/// Send frozen snapshots sequentially within one shared budget and record acknowledgements.
+/// Send frozen snapshots sequentially within one shared budget and record
+/// acknowledgements. `publisher` is created here on first use with `limits`;
+/// an existing one keeps its budget.
 pub async fn deliver(
     run_id: &str,
     items: Vec<Item>,
     credentials: Credentials,
+    publisher: &mut Option<Publisher>,
     limits: Limits,
     cancel: watch::Receiver<Option<i32>>,
     output: &Output,
@@ -728,22 +769,18 @@ pub async fn deliver(
     let pending = items.len();
     let skip = match &credentials {
         _ if cancel.borrow().is_some() => None,
-        Credentials::Ready(_) => None,
-        Credentials::Missing => Some("credentials_unavailable"),
-        Credentials::InvalidUrl => Some("invalid_url"),
-        Credentials::InvalidProject => Some("invalid_project"),
+        credentials => credentials.unavailable(),
     };
     if let Some(reason) = skip {
         emit(output, json!({"type":"reporting_skipped", "run_id":run_id, "reason":reason, "pending":pending})).await;
         delivery.pending = pending;
         return delivery;
     }
-    let mut publisher = match credentials {
-        Credentials::Ready(target) if cancel.borrow().is_none() => {
-            publish::Publisher::new(target, limits, cancel.clone()).ok()
+    if publisher.is_none() && cancel.borrow().is_none() {
+        if let Credentials::Ready(target) = credentials {
+            *publisher = Publisher::new(target, limits, cancel.clone()).ok();
         }
-        _ => None,
-    };
+    }
     for item in items {
         let pending = |reason: &str, http_status: Option<u16>| {
             Partition::tag(
@@ -751,7 +788,7 @@ pub async fn deliver(
                 json!({"type":"report_upload_pending", "run_id":run_id, "job":item.job, "report_id":item.report_id, "reason":reason, "http_status":http_status}),
             )
         };
-        let outcome = match &mut publisher {
+        let outcome = match publisher {
             _ if cancel.borrow().is_some() => publish::Outcome::pending("cancelled", None),
             Some(publisher) if publisher.exhausted() => {
                 publish::Outcome::pending("budget_exhausted", None)
@@ -1055,5 +1092,119 @@ mod tests {
             entry("a", None),
             entry("a", None)
         ]));
+    }
+
+    #[tokio::test]
+    async fn the_run_record_shares_the_report_budget() {
+        use std::io::Read;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        // Accepts connections and never answers, so every report ack is slow.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let connections = Arc::new(AtomicUsize::new(0));
+        let count = connections.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                count.fetch_add(1, Ordering::SeqCst);
+                std::thread::spawn(move || {
+                    let mut sink = [0; 4096];
+                    while matches!(stream.read(&mut sink), Ok(n) if n > 0) {}
+                });
+            }
+        });
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("goodflows.toml");
+        std::fs::write(
+            &path,
+            "[reporting]\nproject = \"goodcases\"\nurl_env = \"GOODFLOWS_TEST_UNSET_URL\"\n\
+             token_env = \"GOODFLOWS_TEST_UNSET_KEY\"\n\n\
+             [[jobs]]\nname = \"test\"\ncommand = \"true\"\nreports = [\"test-timings\"]\n",
+        )
+        .unwrap();
+        let (document, _) = config::Config::load(Some(&path)).unwrap();
+        let (workflow, config) = document.workflow(None, None).unwrap();
+        let reporting = document.reporting.clone().unwrap();
+        let run_id = "67f7946d-136b-4608-ab01-e1f251a09754";
+        let mut session = Session::start(
+            &reporting,
+            run_id,
+            &workflow,
+            None,
+            &config.jobs,
+            tmp.path(),
+        )
+        .await;
+        session.url = Some(url);
+        session.key = Some("k".into());
+        session.limits = Limits {
+            budget: Duration::from_millis(600),
+            connect: Duration::from_millis(500),
+            request: Duration::from_millis(400),
+            request_per_mib: Duration::ZERO,
+            backoffs: [Duration::from_millis(20), Duration::from_millis(40)],
+        };
+        let reports = tmp
+            .path()
+            .join(".goodflows/reports")
+            .join(run_id)
+            .join("test/reports");
+        for id in ["r1", "r2"] {
+            std::fs::write(
+                reports.join(format!("{id}.jsonl")),
+                collect::tests::complete(id),
+            )
+            .unwrap();
+        }
+        let result = JobResult {
+            name: "test".into(),
+            partition: None,
+            command: Some("true".into()),
+            workflow: None,
+            child_run_id: None,
+            status: Status::Passed,
+            duration_ms: 0,
+            exit_code: Some(0),
+            error: None,
+            outputs: Default::default(),
+            steps: Vec::new(),
+            stdout_tail: None,
+            stderr_tail: None,
+            stdout_truncated: None,
+            stderr_truncated: None,
+            executed: true,
+            started: true,
+            blocked_ms: 0,
+            queued_ms: 0,
+            commands: Vec::new(),
+            fail_fast_skip: false,
+        };
+
+        let (_tx, cancel) = watch::channel(None);
+        let output = Output::discard(true, cancel.clone()).unwrap();
+        let start = std::time::Instant::now();
+        session.finish(&[result], cancel.clone(), &output).await;
+        assert!(start.elapsed() < Duration::from_millis(1500));
+        // Give a stray connection time to be accepted before counting.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let sent = connections.load(Ordering::SeqCst);
+        assert!(sent >= 1, "the reports were never sent");
+
+        let outcome = session.send_run_record(b"{}", run_id, cancel).await;
+        assert!(
+            matches!(
+                outcome,
+                publish::Outcome::Pending {
+                    reason: "budget_exhausted",
+                    http_status: None
+                }
+            ),
+            "{outcome:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(connections.load(Ordering::SeqCst), sent);
     }
 }

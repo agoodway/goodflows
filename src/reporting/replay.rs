@@ -256,7 +256,16 @@ pub async fn upload_with(
             key.as_deref(),
             &manifest.project,
         );
-        let delivery = deliver(run_id, items, credentials, limits, cancel.clone(), output).await;
+        let delivery = deliver(
+            run_id,
+            items,
+            credentials,
+            &mut None,
+            limits,
+            cancel.clone(),
+            output,
+        )
+        .await;
         acknowledged += delivery.uploaded;
         pending = delivery.pending;
         rejected += delivery.rejected;
