@@ -51,12 +51,12 @@ Prerequisite: the goodci change `validate-job-names` (another thread, branch `t3
 
 ## 5. Replay
 
-- [ ] 5.1 Extend `reporting::replay::upload_with` (design D8): after the reports, load a listed run record (bounded read, no symlinks), re-validate it, match `run_id`, `workflow` and `environment` against the manifest, skip it when acknowledged or rejected, and otherwise send it in the same budget and record the outcome. Add `run_record` to `reports_upload_summary`, and count a pending, rejected or invalid record toward a nonzero exit. Verify with `tests/reporting.rs` cases:
+- [x] 5.1 Extend `reporting::replay::upload_with` (design D8): after the reports, load a listed run record (bounded read, no symlinks), re-validate it, match `run_id`, `workflow` and `environment` against the manifest, skip it when acknowledged or rejected, and otherwise send it in the same budget and record the outcome. Add `run_record` to `reports_upload_summary`, and count a pending, rejected or invalid record toward a nonzero exit. Verify with `tests/reporting.rs` cases:
   - Replay after an offline run (sent unchanged, acked, exit 0); replay again (no request, exit 0).
   - Replay after a 409 (no request, `rejected_by_server`, exit 1); after a 422 (resent).
   - A tampered `run-record.json` or a mismatched `run_id` (invalid, exit 1); a missing or symlinked record file (invalid, exit 1).
   - A version 1 or 2 manifest giving `run_record` null.
-- [ ] 5.2 Sprite runs (design D11):
+- [x] 5.2 Sprite runs (design D11):
   - A remote invocation with `history = true` freezes `run-record.json` without a key, sends nothing, and emits `run_upload_pending` with `credentials_unavailable`.
   - `sprite::trusted_spool` refuses a manifest listing `run_record` unless the trusted `Reporting.history` is `true`.
   - The controller's existing post-collection loop needs no other change: `replay::upload` sends the record.
@@ -66,7 +66,7 @@ Prerequisite: the goodci change `validate-job-names` (another thread, branch `t3
   - A spool listing a run record under a trusted config without `history` is refused and nothing is posted.
   - `pass_env` forwarding of the `GITHUB_*` variables yields `ci`, and without it there is no `ci`.
   - A detached run's collected spool replays the record through `reports upload`.
-- [ ] 5.3 Capture `commit`, `branch`, and archive-derived `dirty` inside `snapshot::take` (design D11). Send them on `Header.provenance`. `exec-workflow` reads that header once and writes the same `source` into the root and every child history file and test-report record. Do not put the values in `pass_env` or argv. Omit `source` when HEAD cannot be read. Verify a clean branch (`dirty` false, `branch` present), a tracked edit and a deleted tracked file (`dirty` true), a nonignored untracked file with an ignored file present (`dirty` true, ignored file absent from the archive), a detached HEAD (`branch` absent), and a job environment that does not contain the commit.
+- [x] 5.3 Capture `commit`, `branch`, and archive-derived `dirty` inside `snapshot::take` (design D11). Send them on `Header.provenance`. `exec-workflow` reads that header once and writes the same `source` into the root and every child history file and test-report record. Do not put the values in `pass_env` or argv. Omit `source` when HEAD cannot be read. Verify a clean branch (`dirty` false, `branch` present), a tracked edit and a deleted tracked file (`dirty` true), a nonignored untracked file with an ignored file present (`dirty` true, ignored file absent from the archive), a detached HEAD (`branch` absent), and a job environment that does not contain the commit.
 
 ## 6. History read commands
 

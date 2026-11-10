@@ -4080,3 +4080,245 @@ fn a_lost_run_acknowledgement_is_completed_by_the_stored_duplicate() {
         "00000000-0000-4000-8000-000000000001"
     );
 }
+
+// ---- 5.1 replay of run records ----
+
+/// A run of a report job with `history = true` whose run record the server
+/// at `url` left pending or refused, so it is frozen for replay.
+fn saved_history_run(url: &str) -> (Project, PathBuf, Vec<Value>) {
+    let p = project_with(
+        HISTORY,
+        &format!(
+            "[[jobs]]\nname = \"test\"\ncommand = '{}'\nreports = [\"test-timings\"]\n",
+            copy(&["r1"])
+        ),
+    );
+    let output = run_history(&p, &["--json"], Some(url));
+    success(&output);
+    let dir = run_dirs(&p).pop().unwrap();
+    assert_eq!(manifest(&dir)["version"], 3);
+    (p, dir, events(&output))
+}
+
+fn upload_summary(output: &std::process::Output) -> Value {
+    let summary = events(output).pop().unwrap();
+    assert_eq!(summary["type"], "reports_upload_summary");
+    summary
+}
+
+#[test]
+fn replay_sends_a_pending_run_record_after_the_reports_and_only_once() {
+    // A bound-then-dropped port refuses connections: the run is offline.
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let (p, dir, run) = saved_history_run(&format!("http://127.0.0.1:{port}"));
+    let pending = by_type(&run, "run_upload_pending");
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0]["reason"], "transport_error");
+    assert!(!dir.join("run-record.ack.json").exists());
+    let frozen = std::fs::read(dir.join("run-record.json")).unwrap();
+
+    let mock = Mock::store();
+    let outside = tempfile::tempdir().unwrap();
+    let output = upload(outside.path(), &dir, Some(&mock.url));
+    success(&output);
+    // The report first, then the record's frozen bytes, unchanged.
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[0].path.ends_with("/test-reports"));
+    assert_eq!(requests[1].path, RUNS_PATH);
+    assert_eq!(requests[1].body, frozen);
+    let events = events(&output);
+    let uploaded = by_type(&events, "run_uploaded");
+    assert_eq!(uploaded.len(), 1);
+    let run_id = manifest(&dir)["workflow_run_id"].clone();
+    assert_eq!(uploaded[0]["run_id"], run_id);
+    let ack: Value =
+        serde_json::from_slice(&std::fs::read(dir.join("run-record.ack.json")).unwrap()).unwrap();
+    assert_eq!(ack["run_id"], run_id);
+    let summary = upload_summary(&output);
+    assert_eq!(
+        (
+            &summary["acknowledged"],
+            &summary["run_record"],
+            &summary["success"]
+        ),
+        (&json!(1), &json!("acknowledged"), &json!(true))
+    );
+
+    // Replayed again: nothing is sent, and text mode names the record.
+    let output = replay_text(outside.path(), &dir, &mock.url);
+    success(&output);
+    assert_eq!(mock.requests().len(), 2);
+    assert!(
+        stdout(&output).contains(
+            "Reports: 1 acknowledged, 0 pending, 0 rejected, 0 invalid\nRun history: acknowledged\n"
+        ),
+        "{}",
+        stdout(&output)
+    );
+    assert_no_secret(&p, &output);
+}
+
+fn replay_text(cwd: &Path, run_dir: &Path, url: &str) -> std::process::Output {
+    std::process::Command::new(env!("CARGO_BIN_EXE_goodflows"))
+        .current_dir(cwd)
+        .env("NO_COLOR", "1")
+        .env("GOODFLOWS_URL", url)
+        .env("GOODFLOWS_API_KEY", SECRET)
+        .args(["reports", "upload"])
+        .arg(run_dir)
+        .output()
+        .unwrap()
+}
+
+/// A store that answers every run record with `status`.
+fn refusing_runs(status: u16) -> Mock {
+    let rows = std::sync::Mutex::new(Default::default());
+    let next = std::sync::Mutex::new(0);
+    Mock::start(move |request, _| {
+        if request.path == RUNS_PATH {
+            Reply::Status(status, vec![], String::new())
+        } else {
+            common::mock::store_reply(&rows, &next, request)
+        }
+    })
+}
+
+#[test]
+fn replay_keeps_a_rejected_run_record_and_resends_a_422() {
+    let conflict = refusing_runs(409);
+    let (p, dir, _) = saved_history_run(&conflict.url);
+    assert!(dir.join("run-record.rejected.json").exists());
+    let store = Mock::store();
+    let output = upload(&p.dir, &dir, Some(&store.url));
+    assert_eq!(output.status.code(), Some(1));
+    // The acknowledged report and the refused record are not sent again.
+    assert!(store.requests().is_empty());
+    let pending = by_type(&events(&output), "run_upload_pending");
+    assert_eq!(pending.len(), 1);
+    assert_eq!(
+        (&pending[0]["reason"], &pending[0]["http_status"]),
+        (&json!("rejected_by_server"), &json!(409))
+    );
+    let summary = upload_summary(&output);
+    assert_eq!(
+        (&summary["run_record"], &summary["success"]),
+        (&json!("rejected"), &json!(false))
+    );
+
+    // A 422 is not terminal: replay sends the record again.
+    let unaccepted = refusing_runs(422);
+    let (p, dir, _) = saved_history_run(&unaccepted.url);
+    assert!(!dir.join("run-record.rejected.json").exists());
+    let output = upload(&p.dir, &dir, Some(&store.url));
+    success(&output);
+    let sent = run_requests(&store);
+    assert_eq!(sent.len(), 1);
+    assert_eq!(
+        sent[0].body,
+        std::fs::read(dir.join("run-record.json")).unwrap()
+    );
+    assert_eq!(upload_summary(&output)["run_record"], "acknowledged");
+    assert!(dir.join("run-record.ack.json").exists());
+}
+
+#[test]
+fn replay_refuses_tampered_mismatched_missing_or_symlinked_run_records() {
+    let (p, dir, _) = saved_history_run(&refusing_runs(401).url);
+    let record = dir.join("run-record.json");
+    let original = std::fs::read(&record).unwrap();
+    let edited = |edit: &dyn Fn(&mut Value)| {
+        let mut value: Value = serde_json::from_slice(&original).unwrap();
+        edit(&mut value);
+        serde_json::to_vec(&value).unwrap()
+    };
+    let other = tempfile::tempdir().unwrap();
+    let elsewhere = other.path().join("run-record.json");
+    std::fs::write(&elsewhere, &original).unwrap();
+    let store = Mock::store();
+    type Tamper<'a> = Box<dyn Fn() + 'a>;
+    let cases: [(&str, Tamper); 6] = [
+        (
+            "tampered",
+            Box::new(|| {
+                std::fs::write(
+                    &record,
+                    edited(&|v| v["results"][0]["status"] = json!("ok")),
+                )
+                .unwrap()
+            }),
+        ),
+        (
+            "another run_id",
+            Box::new(|| {
+                std::fs::write(
+                    &record,
+                    edited(&|v| v["run_id"] = json!("0b0e2f55-6c1f-4f4d-9a59-3c3c3f0c1a10")),
+                )
+                .unwrap()
+            }),
+        ),
+        (
+            "another workflow",
+            Box::new(|| {
+                std::fs::write(&record, edited(&|v| v["workflow"] = json!("other"))).unwrap()
+            }),
+        ),
+        (
+            "another environment",
+            Box::new(|| {
+                std::fs::write(&record, edited(&|v| v["environment"] = json!("prod"))).unwrap()
+            }),
+        ),
+        (
+            "missing",
+            Box::new(|| std::fs::remove_file(&record).unwrap()),
+        ),
+        (
+            "symlinked",
+            Box::new(|| {
+                std::fs::remove_file(&record).unwrap();
+                std::os::unix::fs::symlink(&elsewhere, &record).unwrap();
+            }),
+        ),
+    ];
+    for (case, tamper) in cases {
+        tamper();
+        let output = upload(&p.dir, &dir, Some(&store.url));
+        assert_eq!(output.status.code(), Some(1), "{case}");
+        assert!(run_requests(&store).is_empty(), "{case}");
+        let pending = by_type(&events(&output), "run_upload_pending");
+        assert_eq!(pending.len(), 1, "{case}");
+        assert_eq!(pending[0]["reason"], "invalid_record", "{case}");
+        let summary = upload_summary(&output);
+        assert_eq!(summary["run_record"], "invalid", "{case}");
+        assert!(!dir.join("run-record.ack.json").exists(), "{case}");
+        // Restore the frozen record for the next case.
+        let _ = std::fs::remove_file(&record);
+        std::fs::write(&record, &original).unwrap();
+    }
+    // The restored record is sent.
+    success(&upload(&p.dir, &dir, Some(&store.url)));
+    assert_eq!(run_requests(&store).len(), 1);
+}
+
+#[test]
+fn replay_of_version_1_and_2_manifests_has_no_run_record() {
+    let mock = Mock::store();
+    let (p, dir) = saved_run(None);
+    assert_eq!(manifest(&dir)["version"], 1);
+    let output = replay(&p.dir, &dir, Some(&mock.url), &["--json"]);
+    success(&output);
+    assert!(upload_summary(&output)["run_record"].is_null());
+    assert!(!stdout(&replay(&p.dir, &dir, Some(&mock.url), &[])).contains("Run history"));
+    let (p, dir) = saved_partitioned_run();
+    assert_eq!(manifest(&dir)["version"], 2);
+    let output = replay(&p.dir, &dir, Some(&mock.url), &["--json"]);
+    success(&output);
+    assert!(upload_summary(&output)["run_record"].is_null());
+    assert!(run_requests(&mock).is_empty());
+}

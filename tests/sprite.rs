@@ -1409,14 +1409,20 @@ reports = ["test-timings"]
     assert!(collected < uploaded && uploaded < all.len() - 1);
     assert!(!mock.requests.lock().unwrap().is_empty());
     assert!(!fake.argv_log().contains(SENTINEL));
-    // Native remote history keeps the no-Git source; provenance stays in the record.
+    // Remote history carries the snapshot's provenance, as the control record
+    // does; the untracked report fixture shipped, so the archive is dirty.
     let history = all.last().unwrap()["history_file"]
         .as_str()
         .unwrap()
         .to_owned();
     let history: Value = serde_json::from_slice(&std::fs::read(&history).unwrap()).unwrap();
-    assert!(history["source"]["commit"].is_null(), "{history}");
-    assert!(fake.record(&run)["provenance"]["commit"].is_string());
+    let provenance = fake.record(&run)["provenance"].clone();
+    assert!(provenance["commit"].is_string());
+    assert_eq!(
+        history["source"],
+        serde_json::json!({"commit": provenance["commit"], "dirty": true, "branch": provenance["branch"]}),
+        "{history}"
+    );
 
     // Without controller credentials publication is skipped; the result is unchanged.
     let output = fake.run(&["run", "--sprite", "T-1", "--json"]);
@@ -5741,4 +5747,286 @@ fn a_marker_left_by_a_worker_killed_after_its_terminal_record_is_cleared_on_admi
     assert_eq!(fake.record(&run)["phase"], "cancelled");
     let output = fake.run(&["sprite", "status", "T-1", "--json"]);
     assert_eq!(events(&output)[0]["degraded"], false, "{}", text(&output));
+}
+
+// ---------------------------------------------------------------------------
+// Run records (upload-run-history design D11).
+
+const RUN_RECORDS: &str = r#"
+[settings]
+sprite_prefix = "gft"
+history = true
+[sprite]
+setup = "true"
+resume = "true"
+pass_env = ["GITHUB_ACTIONS", "GITHUB_EVENT_NAME", "GITHUB_RUN_ID"]
+[reporting]
+project = "demo"
+history = true
+
+[[workflows.ci.jobs]]
+name = "show"
+command = "env"
+[[workflows.ci.jobs]]
+name = "integration"
+workflow = "suite"
+depends_on = ["show"]
+
+[[workflows.suite.jobs]]
+name = "test"
+command = "env"
+"#;
+
+const RUNS_PATH: &str = "/api/v1/projects/demo/workflow-runs";
+const CI_ENV: [(&str, &str); 3] = [
+    ("GITHUB_ACTIONS", "true"),
+    ("GITHUB_EVENT_NAME", "push"),
+    ("GITHUB_RUN_ID", "4242"),
+];
+
+fn run_records(mock: &common::mock::Mock) -> Vec<Value> {
+    mock.requests()
+        .iter()
+        .filter(|r| r.path == RUNS_PATH)
+        .map(|r| r.json())
+        .collect()
+}
+
+#[test]
+fn remote_run_records_are_frozen_remotely_and_published_after_collection() {
+    use common::mock::{Mock, Reply};
+    let fake = Fake::new(RUN_RECORDS);
+    let mock = Mock::store();
+    let output = fake.env_run(
+        &["run", "ci", "--sprite", "T-1", "--json"],
+        &[
+            CI_ENV[0],
+            CI_ENV[1],
+            CI_ENV[2],
+            ("GOODFLOWS_URL", &mock.url),
+            ("GOODFLOWS_API_KEY", SENTINEL),
+        ],
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+    let all = events(&output);
+    let run = run_id(&all);
+    let child = all.last().unwrap()["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["name"] == "integration")
+        .unwrap()["child_run_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    // Each remote invocation froze its record without a key and sent nothing.
+    let collected = all
+        .iter()
+        .position(|e| e["type"] == "sprite_collected")
+        .unwrap();
+    let remote: Vec<&str> = all[..collected]
+        .iter()
+        .filter(|e| e["type"] == "run_upload_pending")
+        .map(|e| {
+            assert_eq!(e["reason"], "credentials_unavailable", "{e}");
+            e["run_id"].as_str().unwrap()
+        })
+        .collect();
+    assert_eq!(remote, [child.as_str(), run.as_str()]);
+    // The controller sent both after collection: the child's, then the root's.
+    let uploaded: Vec<(usize, &str)> = all
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e["type"] == "run_uploaded")
+        .map(|(i, e)| (i, e["run_id"].as_str().unwrap()))
+        .collect();
+    assert_eq!(
+        uploaded.iter().map(|(_, id)| *id).collect::<Vec<_>>(),
+        [child.as_str(), run.as_str()]
+    );
+    assert!(uploaded.iter().all(|(i, _)| *i > collected));
+    let records = run_records(&mock);
+    assert_eq!(records.len(), 2);
+    assert_eq!(
+        (records[0]["run_id"].as_str(), records[1]["run_id"].as_str()),
+        (Some(child.as_str()), Some(run.as_str()))
+    );
+    assert_eq!(records[0]["parent_run_id"], run.as_str());
+    assert_eq!(records[0]["caller_job"], "integration");
+    // Both carry the snapshot's provenance as `source`, and the forwarded
+    // GitHub variables as `ci`.
+    let provenance = fake.record(&run)["provenance"].clone();
+    let commit = provenance["commit"].as_str().unwrap().to_owned();
+    let source =
+        serde_json::json!({"commit": commit, "dirty": false, "branch": provenance["branch"]});
+    assert!(provenance["branch"].is_string(), "{provenance}");
+    for record in &records {
+        assert_eq!(record["source"], source, "{record}");
+        assert_eq!(
+            record["ci"],
+            serde_json::json!({"provider": "github_actions", "event": "push", "run_id": "4242"})
+        );
+    }
+    // The root and child history files have the same source; jobs never
+    // saw the commit.
+    let summaries = of_type(&all, "summary");
+    assert_eq!(summaries.len(), 2);
+    for summary in summaries {
+        let path = summary["history_file"].as_str().unwrap();
+        let history: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(history["source"], source, "{history}");
+    }
+    let job_output: String = of_type(&all, "job_output")
+        .iter()
+        .map(|e| e["data"].as_str().unwrap().to_owned())
+        .collect();
+    assert!(job_output.contains("GITHUB_RUN_ID=4242"), "{job_output}");
+    assert!(!job_output.contains(&commit), "{job_output}");
+    assert!(!fake.argv_log().contains(&commit));
+    assert!(!fake.argv_log().contains(SENTINEL));
+
+    // Without forwarding there is no `ci`; the edited config ships untracked
+    // bytes, so the archive is dirty. A 503 never changes the exit code.
+    fake.write(
+        "goodflows.toml",
+        &RUN_RECORDS.replace(
+            "pass_env = [\"GITHUB_ACTIONS\", \"GITHUB_EVENT_NAME\", \"GITHUB_RUN_ID\"]\n",
+            "",
+        ),
+    );
+    let unavailable = Mock::start(|_, _| {
+        Reply::Status(503, vec![("Retry-After".into(), "0".into())], String::new())
+    });
+    let output = fake.env_run(
+        &["run", "ci", "--sprite", "T-1", "--json"],
+        &[
+            CI_ENV[0],
+            CI_ENV[1],
+            CI_ENV[2],
+            ("GOODFLOWS_URL", &unavailable.url),
+            ("GOODFLOWS_API_KEY", SENTINEL),
+        ],
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+    let all = events(&output);
+    let pending: Vec<&Value> = of_type(&all, "run_upload_pending")
+        .into_iter()
+        .filter(|e| e["reason"] == "service_unavailable")
+        .collect();
+    assert_eq!(pending.len(), 2, "{all:?}");
+    let records = run_records(&unavailable);
+    assert!(!records.is_empty());
+    for record in &records {
+        assert!(record.get("ci").is_none(), "{record}");
+        assert_eq!(record["source"]["dirty"], true, "{record}");
+    }
+}
+
+#[test]
+fn a_spool_listing_a_run_record_needs_the_trusted_opt_in() {
+    use common::mock::Mock;
+    let config = r#"
+[settings]
+sprite_prefix = "gft"
+[sprite]
+setup = "true"
+resume = "true"
+[reporting]
+project = "demo"
+[[jobs]]
+name = "test"
+command = 'cp report.jsonl "$GOODFLOWS_REPORT_DIR/r1.jsonl"'
+reports = ["test-timings"]
+"#;
+    let fake = Fake::new(config);
+    fake.write("report.jsonl", &common::timing_report("r1", None));
+    let mock = Mock::store();
+    // The controller trusts the config it loaded; the copy that ships, and
+    // that the remote runner uses, turns run-record upload on.
+    fake.arm("snapshot-copy-.gitignore");
+    let child = spawn_args(
+        &fake,
+        &["run", "--sprite", "T-1", "--json"],
+        &[
+            ("GOODFLOWS_URL", &mock.url),
+            ("GOODFLOWS_API_KEY", SENTINEL),
+        ],
+    );
+    fake.wait_reached("snapshot-copy-.gitignore");
+    fake.write(
+        "goodflows.toml",
+        &config.replace("project = \"demo\"", "project = \"demo\"\nhistory = true"),
+    );
+    fake.release("snapshot-copy-.gitignore");
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+    let all = events(&output);
+    // The remote runner froze a record, so the spool lists it.
+    assert!(of_type(&all, "run_upload_pending")
+        .iter()
+        .any(|e| e["reason"] == "credentials_unavailable"));
+    let refused = of_type(&all, "sprite_publication_refused");
+    assert_eq!(refused.len(), 1, "{all:?}");
+    assert!(
+        refused[0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("[reporting] history = true"),
+        "{}",
+        refused[0]
+    );
+    // Neither the run record nor the spool's test report is sent.
+    assert!(mock.requests().is_empty());
+}
+
+#[test]
+fn a_detached_runs_record_is_published_by_reports_upload() {
+    use common::mock::Mock;
+    let fake = Fake::new(&RUN_RECORDS.replace("command = \"env\"", "command = \"sleep 2\""));
+    let mut controller = spawn_args(
+        &fake,
+        &["run", "ci", "--sprite", "T-1", "--json"],
+        &[CI_ENV[0], CI_ENV[1], CI_ENV[2]],
+    );
+    let run = wait_running(&fake);
+    controller.kill().unwrap();
+    let _ = controller.wait();
+    wait_for("remote completion", Duration::from_secs(60), || {
+        fake.record(&run)["phase"] == "completed"
+    });
+    let target = fake.root.join("collected");
+    let output = fake.run(&[
+        "sprite",
+        "collect",
+        "T-1",
+        "--run",
+        &run,
+        "--output",
+        target.to_str().unwrap(),
+        "--json",
+    ]);
+    assert!(output.status.success(), "{}", text(&output));
+    let spool = target.join("result/results/reports").join(&run);
+    let frozen = std::fs::read(spool.join("run-record.json")).unwrap();
+    let mock = Mock::store();
+    let outside = tempfile::tempdir().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_goodflows"))
+        .current_dir(outside.path())
+        .env("GOODFLOWS_URL", &mock.url)
+        .env("GOODFLOWS_API_KEY", SENTINEL)
+        .args(["reports", "upload", "--json"])
+        .arg(&spool)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", text(&output));
+    let summary = events(&output).last().unwrap().clone();
+    assert_eq!(summary["run_record"], "acknowledged", "{summary}");
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].path, RUNS_PATH);
+    assert_eq!(requests[0].body, frozen);
+    assert_eq!(
+        requests[0].json()["source"]["commit"],
+        fake.record(&run)["provenance"]["commit"]
+    );
 }

@@ -476,6 +476,7 @@ async fn run(cli: &Cli, output: &mut Output, cancel: watch::Receiver<Option<i32>
         output: output.clone(),
         cancel,
         sprite_state: None,
+        provenance: None,
     };
     execute(run, name, retention::RunIdentity::new()).await
 }
@@ -522,6 +523,9 @@ pub(crate) struct Run {
     /// `GOODFLOWS_SPRITE_STATE_DIR` for every invocation of a remote Sprite
     /// run; `None` locally.
     pub sprite_state: Option<String>,
+    /// A remote Sprite run's snapshot provenance, the `source` of the root
+    /// and every child invocation (design D11); `None` locally.
+    pub provenance: Option<reporting::Source>,
 }
 
 /// The invocation that activated a child, and the call job that did it.
@@ -682,18 +686,16 @@ async fn invocation(
     if parent.as_ref().is_some_and(|parent| parent.scope.stopped()) {
         return Ok(None);
     }
+    // A remote invocation's source tree has no `.git`; it uses the
+    // snapshot's provenance instead.
+    let origin = match &run.sprite_state {
+        Some(_) => reporting::Origin::Snapshot(run.provenance.as_ref()),
+        None => reporting::Origin::Checkout(&settings.workdir),
+    };
     let mut session = match &config.reporting {
         Some(reporting) => Some(
-            reporting::Session::start(
-                reporting,
-                &identity.id,
-                name,
-                profile,
-                &config.jobs,
-                &settings.workdir,
-                run.sprite_state.is_some(),
-            )
-            .await,
+            reporting::Session::start(reporting, &identity.id, name, profile, &config.jobs, origin)
+                .await,
         ),
         None => None,
     };
@@ -701,15 +703,14 @@ async fn invocation(
     // Reuse the reporting session's capture rather than running git twice.
     let source = match session.as_ref().and_then(reporting::Session::source) {
         Some(source) => Some(source.clone()),
-        None if settings.history => Some(
-            reporting::capture_source(
-                &settings.workdir,
-                config.reporting.as_ref().map(|r| r.token_env.as_str()),
-            )
-            .await,
-        ),
+        None if settings.history => {
+            origin
+                .source(config.reporting.as_ref().map(|r| r.token_env.as_str()))
+                .await
+        }
         None => None,
     };
+    let remote = origin.remote();
     // Legacy root jobs log flat; every named workflow and every called
     // workflow, `default` included, logs under its own namespace.
     let log_base = run.log_dir.as_ref().map(|dir| {
@@ -845,7 +846,8 @@ async fn invocation(
     }
     if settings.history {
         // History covers the jobs only, not reporting uploads after them.
-        match history::write(&target, &fields, execute_ms, &results) {
+        // A remote history file keeps the snapshot's branch (design D11).
+        match history::write(&target, &fields, execute_ms, &results, remote) {
             Ok(written) => {
                 // A prune failure still leaves the new file in place.
                 if let Some(error) = written.pruned {
@@ -1016,7 +1018,10 @@ mod tests {
             let (hash, graph) = history::graph_sha256(jobs, &resolve);
             graphs.insert(workflow.to_owned(), (hash, json!(graph.truncated())));
         }
-        let source = reporting::capture_source(&root, None).await;
+        let source = reporting::Origin::Checkout(&root)
+            .source(None)
+            .await
+            .unwrap();
 
         let (sender, cancel) = watch::channel(None);
         let history_dir = root.join("history");
@@ -1039,6 +1044,7 @@ mod tests {
             output: Output::discard(true, cancel.clone()).unwrap(),
             cancel,
             sprite_state: None,
+            provenance: None,
         };
         let started = root.join("started");
         let signaller = tokio::spawn(async move {
