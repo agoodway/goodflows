@@ -58,7 +58,7 @@ struct Cli {
     /// Write a run history file for this run
     #[arg(long, global = true, conflicts_with = "no_history")]
     history: bool,
-    /// Do not write a run history file, even when settings enable it
+    /// Do not write the local run history file, even when settings enable it (does not stop [reporting] history uploads)
     #[arg(long, global = true)]
     no_history: bool,
     /// Write the run history file under this directory (enables history)

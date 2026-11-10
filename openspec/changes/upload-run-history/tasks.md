@@ -83,7 +83,7 @@ Prerequisite: the goodci change `validate-job-names` (another thread, branch `t3
 
 ## 7. Documentation
 
-- [ ] 7.1 Update the README:
+- [x] 7.1 Update the README:
   - "Run history": `[reporting] history = true`, what is uploaded (including graph command text for unrun jobs), that `--no-history` controls only the file, that an unset key skips uploads, and `history list`/`show` with examples.
   - "Test timing reports": the `run-record.json` spool file, manifest version 3 and replay.
   - The `--no-history` help text: the file only.

@@ -324,7 +324,7 @@ goodflows --log-dir .goodflows-logs --log-runs 5
 
 ### Run history
 
-`history = true`, or `--history`, writes one JSON file per run under `goodflows-history/<workflow>/` next to the config file. `history_dir` in the config is relative to the config file. `--history-dir DIR` is relative to the current directory, and it turns history on. `--no-history` turns it off for that run. The file has timing, queue wait, CPU, peak memory, and host details for each job. It has command text. It has no output and no environment values. `--history-runs N` (default 1000) and `--history-bytes N` (default 10485760) cap what is kept per workflow.
+`history = true`, or `--history`, writes one JSON file per run under `goodflows-history/<workflow>/` next to the config file. `history_dir` in the config is relative to the config file. `--history-dir DIR` is relative to the current directory, and it turns history on. `--no-history` turns the file off for that run. The file has timing, queue wait, CPU, peak memory, and host details for each job. It has command text. It has no output and no environment values. `--history-runs N` (default 1000) and `--history-bytes N` (default 10485760) cap what is kept per workflow.
 
 ```bash
 goodflows --history
@@ -339,9 +339,42 @@ goodflows-history/** text eol=lf linguist-generated
 
 Or add `goodflows-history/` to `.gitignore`. The record layout is in [`openspec/specs/run-history/spec.md`](openspec/specs/run-history/spec.md).
 
+#### Uploading run history
+
+`history = true` inside the [`[reporting]`](#test-timing-reports) block uploads a run record to the GoodFlows server for every invocation: the root run and each called workflow, each under its own run id. No job has to list `reports`. The default is `false`.
+
+```toml
+[reporting]
+project = "my-project"
+history = true
+```
+
+The upload and the local file are separate settings. The `history` setting in `[settings]`, a workflow, or a profile, and `--history`, `--no-history`, and `--history-dir`, control only the file. A run with `--no-history` writes no file and still uploads.
+
+The record holds the same fields the history file would hold: outcome, timings, host, `source.commit` and `dirty`, and for each job its command text, exit code, and error. It adds three keys that the file never has:
+
+- `source.branch`, when git reports a branch. A detached checkout, such as a GitHub Actions pull request, has none.
+- `ci`, when the caller's environment has `GITHUB_ACTIONS=true`. It is built from `GITHUB_EVENT_NAME`, `GITHUB_RUN_ID`, `GITHUB_RUN_ATTEMPT`, `GITHUB_REF`, `RUNNER_NAME`, `GITHUB_SERVER_URL`, and `GITHUB_REPOSITORY`. A value that fails its rule is left out. Settings and job `env` never supply these values.
+- `graph`, the job graph that `graph_sha256` hashes. It lists every selected job with its command, step commands, and condition text, each cut to 1,024 bytes. That includes jobs that were skipped or never started, so the server receives command text for jobs that did not run. A workflow-call job names its target and the target's hash. The target's jobs are in the called workflow's own record.
+
+The key and URL variables must be set when the run starts. When either is unset, the run prints `run history for <workflow> upload skipped: credentials unavailable`, keeps nothing, and sends nothing. Leave the key unset on machines that should not upload, such as laptops. A URL that is not a valid endpoint gives `invalid url` instead. A record that breaks the server's rules, such as a job name longer than 64 bytes, is not sent: the line ends `upload skipped: invalid record at <path>`, where `<path>` is a field path such as `results[3].name`.
+
+The upload runs after the test reports, before the final report, and uses what is left of the same 30-second budget. It never changes the exit code. A record that was not stored stays in the spool, and [`reports upload`](#test-timing-reports) sends it again. That includes a record refused with HTTP 422 by a server that does not accept it yet.
+
+`history list` and `history show` read stored runs with the same `[reporting]` project, URL, and key. Text the server redacts for a `pk_` key, such as commands and errors, prints as `-`.
+
+```bash
+goodflows history list
+goodflows history list --workflow ci --branch main
+goodflows history list --outcome failed --limit 20 --json
+goodflows history show <run-id>
+```
+
+`list` prints one row per run, newest first: start, outcome, workflow, environment, commit (12 characters, `*` when dirty), branch, CI event, duration, and run id. When there is another page it ends with `next: --cursor <cursor>`. The filters are `--workflow`, `--environment`, `--outcome` (`passed`, `failed`, or `cancelled`), `--commit` (a full hash), `--branch`, `--event`, `--graph-sha256`, `--limit` (1 to 200), and `--cursor`. `--branch` and `--event` match `source.branch` and `ci.event`, which need a goodflows_web server change that has not shipped yet. Until it ships, the server ignores both filters, so the list is not narrowed by branch or event, and the BRANCH and EVENT columns print `-`. `show` prints the run's fields, one row per result, and its linked test reports. A bad filter or run id exits 2 without a request. A missing `[reporting]` block, key, or URL, a server error, or an unknown run exits 1. `--json` prints one `history_runs` or `history_run` event. The commands reject run flags such as `--env`, `--jobs`, and the history file flags.
+
 ### Test timing reports
 
-goodflows can collect `test-timings/1` JSON Lines and upload them to a GoodFlows server. Nothing is uploaded unless you add `[reporting]` and a job lists `reports`.
+goodflows can collect `test-timings/1` JSON Lines and upload them to a GoodFlows server. Nothing is uploaded unless you add `[reporting]` and a job lists `reports`, or the block sets [`history = true`](#uploading-run-history).
 
 ```toml
 [reporting]
@@ -369,6 +402,8 @@ goodflows reports upload .goodflows/reports/<run-id> --budget 120
 ```
 
 `--budget` is the publishing time limit in seconds, from 1 to 3600. The default is 30.
+
+With [`[reporting] history = true`](#uploading-run-history), and the key and URL set, each invocation's run directory is created even when no job lists `reports`. It holds `run-record.json`, the exact run record to send, and the manifest is version 3. Without a run record the manifest is version 1, or version 2 when a job is partitioned. `reports upload` sends the reports first, then the run record within the same budget. When the server stores the record, it writes `run-record.ack.json` and later replays send nothing for it. HTTP 400, 409, and 415 write `run-record.rejected.json` and the record is not sent again. HTTP 413 and 422 leave it pending, so the next `reports upload` sends it again. `reports upload` exits nonzero while the record is pending, rejected, or invalid, and its text output ends with `Run history: acknowledged`, `pending`, `rejected`, or `invalid`. A tampered, missing, or symlinked `run-record.json`, or one whose run id, workflow, or environment differs from the manifest, counts as invalid. Older goodflows releases refuse a version 3 manifest as an unsupported version.
 
 The wire format is [`openspec/specs/test-timing-contract/spec.md`](openspec/specs/test-timing-contract/spec.md). Upload and spool behavior are in [`openspec/specs/test-timing-publishing/spec.md`](openspec/specs/test-timing-publishing/spec.md). Reporter packages are in [`openspec/specs/test-reporters/spec.md`](openspec/specs/test-reporters/spec.md).
 

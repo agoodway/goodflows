@@ -4643,3 +4643,113 @@ fn history_help_hides_run_only_flags() {
         assert!(help.contains(filter), "{help}");
     }
 }
+
+/// A README example line, split into the arguments after `goodflows`.
+fn readme_example(line: &str) -> Vec<String> {
+    let readme = include_str!("../README.md");
+    assert!(
+        readme.lines().any(|l| l == line),
+        "README no longer documents `{line}`"
+    );
+    line.split_whitespace().skip(1).map(str::to_owned).collect()
+}
+
+#[test]
+fn readme_history_list_and_reports_upload_examples_run_against_the_server() {
+    // Stores what is posted, and answers a list with the stored records.
+    let stored = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+    let (rows, next) = (
+        std::sync::Mutex::new(Default::default()),
+        std::sync::Mutex::new(0),
+    );
+    let records = stored.clone();
+    let mock = Mock::start(move |request, _| {
+        if request.method == "GET" {
+            let page = json!({"data": *records.lock().unwrap(), "next_cursor": null});
+            return Reply::Status(200, vec![], page.to_string());
+        }
+        if request.path == RUNS_PATH {
+            records.lock().unwrap().push(request.json());
+        }
+        common::mock::store_reply(&rows, &next, request)
+    });
+    let p = project_with(
+        HISTORY,
+        &format!(
+            "[[workflows.ci.jobs]]\nname = \"test\"\ncommand = '{}'\nreports = [\"test-timings\"]\n",
+            copy(&["r1"])
+        ),
+    );
+    git_checkout(&p.dir);
+    // Offline: a bound-then-dropped port refuses connections.
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let output = run_history(
+        &p,
+        &["run", "ci", "--json"],
+        Some(&format!("http://127.0.0.1:{port}")),
+    );
+    success(&output);
+    let dir = run_dirs(&p).pop().unwrap();
+    let run_id = dir.file_name().unwrap().to_str().unwrap().to_owned();
+    assert_eq!(manifest(&dir)["version"], 3);
+    assert_eq!(mock.connections(), 0);
+
+    // `goodflows reports upload .goodflows/reports/<run-id>`, from the
+    // project directory as documented.
+    let args: Vec<String> = readme_example("goodflows reports upload .goodflows/reports/<run-id>")
+        .into_iter()
+        .map(|arg| arg.replace("<run-id>", &run_id))
+        .collect();
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let output = run_history(&p, &args, Some(&mock.url));
+    success(&output);
+    assert!(
+        stdout(&output).contains(
+            "Reports: 1 acknowledged, 0 pending, 0 rejected, 0 invalid\nRun history: acknowledged\n"
+        ),
+        "{}",
+        stdout(&output)
+    );
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[0].path.ends_with("/test-reports"));
+    assert_eq!(requests[1].path, RUNS_PATH);
+    assert_eq!(
+        requests[1].body,
+        std::fs::read(dir.join("run-record.json")).unwrap()
+    );
+    let record = requests[1].json();
+    assert_eq!(
+        (&record["workflow"], &record["source"]["branch"]),
+        (&json!("ci"), &json!("main"))
+    );
+
+    // `goodflows history list --workflow ci --branch main` sends both
+    // filters and prints the stored run.
+    let args = readme_example("goodflows history list --workflow ci --branch main");
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let output = run_history(&p, &args, Some(&mock.url));
+    success(&output);
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[2].method, "GET");
+    assert_eq!(
+        requests[2].path,
+        format!("{RUNS_PATH}?workflow=ci&branch=main")
+    );
+    let text = stdout(&output);
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 2, "{text}");
+    assert!(lines[0].starts_with("STARTED"), "{text}");
+    let row: Vec<&str> = lines[1].split_whitespace().collect();
+    assert_eq!(
+        (row[1], row[2], row[5], row[8]),
+        ("passed", "ci", "main", run_id.as_str()),
+        "{text}"
+    );
+    assert_no_secret(&p, &output);
+}
