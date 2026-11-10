@@ -500,9 +500,22 @@ archive overhead), before checking anything. To find a summary path in the bundl
 staging directory; it is never published, and the next collection into the
 same directory removes it.
 
-Controller Git `HEAD`, branch and dirty state are kept only in the control
-record. The remote source has no `.git`, so native history and report source
-fields keep their existing "unavailable" values.
+The remote source has no `.git`. While it builds the archive, the controller
+records the snapshot's provenance: the `HEAD` commit, the branch when `git
+symbolic-ref` reports one, and `dirty`. It sends them in the submission header
+and keeps them in the control record. The remote runner writes that `source`
+into the root's and every child's history file, test-report records and run
+record. Jobs and hooks never see these values; `pass_env` and argv do not
+carry them. `dirty` describes the archive, not `git status`: it is true when a
+tracked file's shipped bytes or executable bit differ from `HEAD`, when a
+tracked file is missing (deleted, or excluded from the snapshot), or when a
+nonignored untracked file is shipped. Ignored files and `.git` do not count.
+The shipped bytes are hashed without Git filters, so files whose checkout
+differs from their blobs make `dirty` true even in a clean checkout: Git LFS
+files, files with another clean filter, and files with line-ending conversion
+such as `eol=crlf`. A detached `HEAD` has no `branch`; GitHub Actions
+variables are not used in its place. When `HEAD` cannot be read there is no
+`source`.
 
 ### Reporting
 
@@ -524,6 +537,42 @@ refused without looking up any other variable. Publication never changes the
 workflow's exit code. `sprite collect` never publishes; replay a collected
 spool explicitly with `goodflows reports upload <bundle>/results/reports/<uuid>`
 only for invocation data you trust.
+
+With `[reporting] history = true`, each remote invocation, the root and every
+called workflow, freezes its run record (`run-record.json`) in its own spool,
+without a key, and sends nothing. Its relayed `run_upload_pending` event says
+`credentials_unavailable` because the record waits for the controller. After
+collection the controller publishes the run records with the reports, each
+after its spool's reports: child spools first, then the root's. The
+`reports_upload_summary` that follows each spool gives the record's final
+state. A spool that lists a run record is refused, and nothing from it is
+sent, unless the controller's own configuration sets `[reporting] history =
+true`. A remote config that turns the upload on therefore cannot make the
+controller send command text. A detached run's record waits in the collected
+bundle for `reports upload`. Delivery never changes the exit code.
+
+A remote record's `source` is the snapshot provenance described above:
+`commit`, the archive-derived `dirty`, and `branch` only when git reported a
+branch. Its `host` is the Sprite's, and its `duration_ms` is the remote
+invocation's. The remote runner's environment is the minimal base plus
+forwarded values, so the record has `ci` only when `[sprite] pass_env` lists
+`GITHUB_ACTIONS` and the other GitHub variables the README names:
+
+```toml
+[sprite]
+pass_env = ["GITHUB_ACTIONS", "GITHUB_EVENT_NAME", "GITHUB_RUN_ID",
+  "GITHUB_RUN_ATTEMPT", "GITHUB_REF", "RUNNER_NAME", "GITHUB_SERVER_URL",
+  "GITHUB_REPOSITORY"]
+```
+
+Forwarding has the usual effects. The values also reach hooks and jobs. An
+unset name fails the run before anything remote happens, so this config runs
+remotely only where every name is set. A forwarded value of 8 bytes or more
+also excludes every file that contains it from the snapshot (see
+[What is sent](#what-is-sent)), and an excluded tracked file makes `dirty`
+true. Values such as `GITHUB_SERVER_URL=https://github.com` and
+`GITHUB_REPOSITORY` often appear in tracked files. Forwarding these variables
+never supplies `source`.
 
 ## Retention and destruction
 
