@@ -104,7 +104,7 @@ fn rows(results: &[Value]) -> Vec<Row<'_>> {
 }
 
 /// `ms` below a second, `x.ys` below a minute, `XmYYs` from a minute (truncated).
-fn duration(ms: u64) -> String {
+pub(super) fn duration(ms: u64) -> String {
     if ms < 1000 {
         format!("{ms}ms")
     } else if ms < 60_000 {

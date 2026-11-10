@@ -1627,23 +1627,8 @@ async fn command_inner(
     output: &mut Output,
     mut cancel: watch::Receiver<Option<i32>>,
 ) -> Result<u8> {
-    for (set, flag) in [
-        (cli.env.is_some(), "--env"),
-        (cli.parallelism.is_some(), "--parallelism"),
-        (cli.fail_fast, "--fail-fast"),
-        (cli.no_fail_fast, "--no-fail-fast"),
-        (!cli.jobs.is_empty(), "--jobs"),
-        (cli.log_dir.is_some(), "--log-dir"),
-        (cli.history, "--history"),
-        (cli.no_history, "--no-history"),
-        (cli.history_dir.is_some(), "--history-dir"),
-        (cli.log_runs.is_some(), "--log-runs"),
-        (cli.history_runs.is_some(), "--history-runs"),
-        (cli.history_bytes.is_some(), "--history-bytes"),
-    ] {
-        if set {
-            bail!("{flag} cannot be used with sprite commands");
-        }
+    if let Some(flag) = cli.run_only_flag() {
+        bail!("{flag} cannot be used with sprite commands");
     }
     let identity = match command {
         Command::Status { identity }

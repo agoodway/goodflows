@@ -111,11 +111,29 @@ pub struct Target {
 }
 
 impl Target {
-    fn endpoint(&self, kind: DocumentKind) -> Url {
+    pub(super) fn endpoint(&self, kind: DocumentKind) -> Url {
         let path = format!("/api/v1/projects/{}/{}", self.project, kind.collection());
         self.origin
             .join(&path)
             .expect("a validated origin joins an absolute path")
+    }
+
+    pub(super) fn key(&self) -> &str {
+        &self.key
+    }
+
+    /// An HTTP client for this target: no redirects, the contract User-Agent,
+    /// and never a proxy for plaintext loopback traffic (and its key).
+    pub(super) fn client(&self, connect: Duration) -> reqwest::Result<reqwest::Client> {
+        let mut builder = reqwest::Client::builder()
+            .redirect(redirect::Policy::none())
+            .connect_timeout(connect)
+            // Names the document contracts so server logs can spot a stale client.
+            .user_agent(USER_AGENT);
+        if self.loopback {
+            builder = builder.no_proxy();
+        }
+        builder.build()
     }
 }
 
@@ -330,17 +348,8 @@ impl Publisher {
         limits: Limits,
         cancel: watch::Receiver<Option<i32>>,
     ) -> reqwest::Result<Self> {
-        let mut builder = reqwest::Client::builder()
-            .redirect(redirect::Policy::none())
-            .connect_timeout(limits.connect)
-            // Names the document contracts so server logs can spot a stale publisher.
-            .user_agent(USER_AGENT);
-        if target.loopback {
-            // Never route plaintext loopback traffic (and its key) through a proxy.
-            builder = builder.no_proxy();
-        }
         Ok(Self {
-            client: builder.build()?,
+            client: target.client(limits.connect)?,
             target,
             limits,
             deadline: Instant::now() + limits.budget,

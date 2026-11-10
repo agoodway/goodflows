@@ -1,3 +1,4 @@
+mod history;
 mod report;
 
 use anyhow::{Context, Result};
@@ -291,6 +292,8 @@ fn render(json: bool, mut event: Value, out: &mut impl Write, err: &mut impl Wri
                 // tails are JSON-only, since the output already streamed live.
             }
             "summary" => report::report(&event, out)?,
+            "history_runs" => history::runs(&event, out)?,
+            "history_run" => history::run(&event, out)?,
             "config_valid" => {
                 if let Some(workflows) = event["workflows"].as_array() {
                     writeln!(
