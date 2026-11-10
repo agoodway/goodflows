@@ -824,7 +824,7 @@ impl Validator {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use serde_json::json;
 
