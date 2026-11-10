@@ -1204,3 +1204,250 @@ fn run_upload_events_are_versioned_json_lines() {
         assert_eq!(found[0]["run_id"], summary["run_id"]);
     }
 }
+
+// History read commands (design D9).
+
+const RUN_ID: &str = "fb7d2711-6b67-4f5a-9104-492032a9e1e5";
+const READER: &str =
+    "[reporting]\nproject = \"goodcases\"\n[[jobs]]\nname = 'a'\ncommand = 'true'\n";
+
+/// One stored run summary as the server lists it.
+fn summary(run_id: &str, workflow: &str, source: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({"id": "00000000-0000-4000-8000-000000000001", "run_id": run_id,
+        "workflow": workflow, "environment": null, "outcome": "passed",
+        "started_at": "2026-11-09T13:25:31Z", "duration_ms": 9450, "parallelism": 4,
+        "max_in_flight": 2, "graph_sha256": "a".repeat(64), "source": source,
+        "host": {"os": "linux", "arch": "x86_64", "logical_cpus": 8},
+        "inserted_at": "2026-11-09T13:25:41Z"})
+}
+
+/// A `history show` response holding `full.json`, as a `pk_` key sees it
+/// when `public`.
+fn shown(public: bool) -> serde_json::Value {
+    let mut document: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/workflow-runs/full.json")).unwrap();
+    if public {
+        for result in document["results"].as_array_mut().unwrap() {
+            result["command"] = serde_json::Value::Null;
+            result["error"] = serde_json::Value::Null;
+        }
+        for job in document["graph"]["jobs"].as_array_mut().unwrap() {
+            job["command"] = serde_json::Value::Null;
+            for step in job["steps"].as_array_mut().unwrap() {
+                step["command"] = serde_json::Value::Null;
+            }
+        }
+    }
+    serde_json::json!({"data": {"id": "00000000-0000-4000-8000-000000000002", "run_id": RUN_ID,
+        "inserted_at": "2026-11-09T13:25:41Z", "document": document,
+        "test_reports": [{"id": "00000000-0000-4000-8000-000000000003", "job": "test",
+            "job_status": "passed", "suite_id": "suite-1", "report_id": "r1",
+            "partition": "1", "partition_count": 2, "status": "complete"}]}})
+}
+
+/// `history <args>` against a mock that answers 200 with `body`.
+fn read_history(body: serde_json::Value, args: &[&str]) -> std::process::Output {
+    let body = body.to_string();
+    let mock = mock::Mock::start(move |_, _| mock::Reply::Status(200, vec![], body.clone()));
+    let mut all = vec!["history"];
+    all.extend_from_slice(args);
+    run_with_history(READER, Some(&mock.url), &all)
+}
+
+#[test]
+fn history_list_prints_one_row_per_run_and_the_next_cursor() {
+    let commit = "5a4a9715f1cd0a9795766bcd9294a77549b5b474";
+    let page = serde_json::json!({"data": [
+        summary(RUN_ID, "ci", serde_json::json!({"commit": commit, "dirty": true})),
+        summary("0e54fb55-a115-4ac7-80fe-8fde26e76afb", "suite", serde_json::json!({"commit": commit})),
+        summary("1e54fb55-a115-4ac7-80fe-8fde26e76afb", "lint", serde_json::Value::Null),
+    ], "next_cursor": "MjAyNi0xMS0wOVQxMzoyNTozMVp8ZmI3ZA"});
+    let output = read_history(page.clone(), &["list"]);
+    success(&output);
+    let text = stdout(&output);
+    let lines: Vec<_> = text.lines().collect();
+    assert_eq!(lines.len(), 5, "{text}");
+    for column in [
+        "STARTED", "OUTCOME", "WORKFLOW", "ENV", "COMMIT", "BRANCH", "EVENT", "DURATION", "RUN ID",
+    ] {
+        assert!(lines[0].contains(column), "{text}");
+    }
+    let row = |line: &str| {
+        line.split_whitespace()
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        row(lines[1]),
+        [
+            "2026-11-09T13:25:31Z",
+            "passed",
+            "ci",
+            "-",
+            "5a4a9715f1cd*",
+            "-",
+            "-",
+            "9.4s",
+            RUN_ID
+        ]
+    );
+    // A clean or unknown tree has no marker; no source is absent.
+    assert_eq!(row(lines[2])[4], "5a4a9715f1cd");
+    assert_eq!(row(lines[3])[4], "-");
+    assert_eq!(
+        lines[4],
+        "next: --cursor MjAyNi0xMS0wOVQxMzoyNTozMVp8ZmI3ZA"
+    );
+
+    // The last page has no next line.
+    let mut last = page;
+    last["next_cursor"] = serde_json::Value::Null;
+    let output = read_history(last, &["list"]);
+    success(&output);
+    assert!(!stdout(&output).contains("next:"), "{}", stdout(&output));
+    let output = read_history(
+        serde_json::json!({"data": [], "next_cursor": null}),
+        &["list"],
+    );
+    success(&output);
+    assert_eq!(stdout(&output), "No stored runs.\n");
+}
+
+#[test]
+fn history_show_prints_fields_results_and_linked_reports() {
+    let output = read_history(shown(false), &["show", RUN_ID]);
+    success(&output);
+    let text = stdout(&output);
+    for expected in [
+        &format!("Run {RUN_ID}")[..],
+        "  workflow: ci\n",
+        "  environment: staging\n",
+        "  outcome: passed\n",
+        "  started: 2026-11-09T13:25:31Z\n",
+        "  duration: 9.4s\n",
+        "  parallelism: 4 (max in flight 2)\n",
+        "  graph: 4fad73ce6da5edfe83dfd6d50f0afa5a1587d54f96d20a1db47aae7f8dbe31e4\n",
+        "  source: 5a4a9715f1cd0a9795766bcd9294a77549b5b474 (clean) on feature/login\n",
+        "pull request 42",
+        "  host: linux x86_64, 8 CPUs",
+        "  build: make build\n",
+        "  build: make build  if expression env.CI == \"true\"\n",
+        "    unit: make test  if shell test -f Makefile\n",
+        "  integration: calls suite  if expression true\n",
+    ] {
+        assert!(text.contains(expected), "missing {expected:?} in\n{text}");
+    }
+    let rows: Vec<Vec<&str>> = text
+        .split("\nResults\n")
+        .nth(1)
+        .unwrap()
+        .lines()
+        .take_while(|l| !l.is_empty())
+        .map(|l| l.split_whitespace().collect())
+        .collect();
+    assert_eq!(
+        rows[1],
+        ["build", "passed", "1.2s", "0ms", "0ms", "0", "980ms", "50.0", "MiB"]
+    );
+    // Partition instances, and a call result naming its target and child run.
+    assert_eq!(
+        rows[2][..6],
+        ["test", "(1/2)", "passed", "4.1s", "1.2s", "0ms"]
+    );
+    assert_eq!(rows[3][..2], ["test", "(2/2)"]);
+    assert_eq!(
+        rows[4],
+        [
+            "integration",
+            "passed",
+            "4.1s",
+            "5.3s",
+            "0ms",
+            "-",
+            "-",
+            "-",
+            "suite",
+            "run",
+            "0e54fb55-a115-4ac7-80fe-8fde26e76afb"
+        ]
+    );
+    let reports = text.split("\nTest reports\n").nth(1).unwrap();
+    let report: Vec<_> = reports.lines().nth(1).unwrap().split_whitespace().collect();
+    assert_eq!(
+        report,
+        ["test", "1/2", "passed", "suite-1", "r1", "complete"]
+    );
+}
+
+#[test]
+fn history_show_with_a_public_key_prints_redacted_text_as_absent() {
+    let output = read_history(shown(true), &["show", RUN_ID]);
+    success(&output);
+    let text = stdout(&output);
+    let commands = text.split("\nCommands\n").nth(1).unwrap();
+    assert!(
+        commands.starts_with("  build: -\n  test (1/2): -\n"),
+        "{text}"
+    );
+    assert!(!text.contains("make "), "{text}");
+    assert!(
+        text.contains("  build: -  if expression env.CI == \"true\"\n"),
+        "{text}"
+    );
+    assert!(text.contains("    lint: -\n"), "{text}");
+    assert!(!text.contains("\nErrors\n"));
+}
+
+#[test]
+fn history_text_escapes_server_strings() {
+    let hostile = "ci\x1b[2J\rdone";
+    let page = serde_json::json!({"data": [summary(RUN_ID, hostile, serde_json::Value::Null)],
+        "next_cursor": null});
+    let output = read_history(page, &["list"]);
+    success(&output);
+    assert!(
+        stdout(&output).contains("ci\\u{1b}[2J\\rdone"),
+        "{}",
+        stdout(&output)
+    );
+    assert!(!output.stdout.contains(&0x1b));
+    let mut run = shown(false);
+    run["data"]["document"]["workflow"] = serde_json::json!(hostile);
+    run["data"]["document"]["results"][0]["error"] = serde_json::json!("bad\x07");
+    let output = read_history(run, &["show", RUN_ID]);
+    success(&output);
+    let text = stdout(&output);
+    assert!(text.contains("  workflow: ci\\u{1b}[2J\\rdone\n"), "{text}");
+    assert!(text.contains("\nErrors\n  build: bad\\u{7}\n"), "{text}");
+    assert!(!output.stdout.contains(&0x1b) && !output.stdout.contains(&0x07));
+}
+
+#[test]
+fn history_json_emits_exactly_one_event() {
+    let page = serde_json::json!({"data": [summary(RUN_ID, "ci", serde_json::Value::Null)],
+        "next_cursor": "abc"});
+    let output = read_history(page.clone(), &["list", "--json"]);
+    success(&output);
+    let list = events(&output);
+    assert_eq!(list.len(), 1);
+    assert_eq!(
+        list[0],
+        serde_json::json!({"type": "history_runs", "schema_version": 1, "runs": page["data"],
+            "next_cursor": "abc"})
+    );
+    let last = serde_json::json!({"data": [], "next_cursor": null});
+    let list = events(&read_history(last, &["list", "--json"]));
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0]["next_cursor"], serde_json::Value::Null);
+
+    // `show` passes the server's `data` through unchanged.
+    let body = shown(true);
+    let output = read_history(body.clone(), &["show", RUN_ID, "--json"]);
+    success(&output);
+    let show = events(&output);
+    assert_eq!(show.len(), 1);
+    assert_eq!(
+        show[0],
+        serde_json::json!({"type": "history_run", "schema_version": 1, "run": body["data"]})
+    );
+}

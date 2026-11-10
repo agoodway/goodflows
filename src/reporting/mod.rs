@@ -9,6 +9,7 @@
 pub mod ci;
 pub mod collect;
 pub mod contract;
+pub mod history_client;
 pub mod publish;
 pub mod replay;
 pub mod run_contract;

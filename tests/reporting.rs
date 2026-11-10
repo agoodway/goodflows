@@ -4322,3 +4322,324 @@ fn replay_of_version_1_and_2_manifests_has_no_run_record() {
     assert!(upload_summary(&output)["run_record"].is_null());
     assert!(run_requests(&mock).is_empty());
 }
+
+// History read commands (design D9).
+
+const RUN_ID: &str = "fb7d2711-6b67-4f5a-9104-492032a9e1e5";
+const JOB: &str = "[[jobs]]\nname = \"a\"\ncommand = \"true\"\n";
+
+/// A `history show` response holding `full.json` as stored.
+fn shown_run() -> String {
+    let document: Value =
+        serde_json::from_str(include_str!("fixtures/workflow-runs/full.json")).unwrap();
+    json!({"data": {"id": "00000000-0000-4000-8000-000000000001", "run_id": RUN_ID,
+        "inserted_at": "2026-11-09T13:25:41Z", "document": document, "test_reports": []}})
+    .to_string()
+}
+
+fn reply(status: u16, body: String) -> Mock {
+    Mock::start(move |_, _| Reply::Status(status, vec![], body.clone()))
+}
+
+#[test]
+fn history_list_sends_filters_as_query_parameters_once() {
+    let mock = reply(200, r#"{"data":[],"next_cursor":null}"#.into());
+    let p = project(JOB);
+    let commit = "5a4a9715f1cd0a9795766bcd9294a77549b5b474";
+    let output = run_with(
+        &p,
+        &[
+            "history",
+            "list",
+            "--workflow",
+            "ci",
+            "--branch",
+            "main",
+            "--event",
+            "push",
+            "--environment",
+            "stage one",
+            "--outcome",
+            "failed",
+            "--commit",
+            commit,
+            "--graph-sha256",
+            &"a".repeat(64),
+            "--limit",
+            "2",
+            "--cursor",
+            "MjAy_-x",
+            "--json",
+        ],
+        Some(&mock.url),
+    );
+    success(&output);
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 1);
+    let request = &requests[0];
+    assert_eq!(request.method, "GET");
+    assert_eq!(
+        request.path,
+        format!(
+            "{RUNS_PATH}?workflow=ci&environment=stage+one&outcome=failed&commit={commit}\
+             &branch=main&event=push&graph_sha256={}&limit=2&cursor=MjAy_-x",
+            "a".repeat(64)
+        )
+    );
+    assert_eq!(request.headers["accept"], "application/json");
+    assert_eq!(request.headers["authorization"], format!("Bearer {SECRET}"));
+    assert!(request.body.is_empty());
+    // Without filters there is no query string.
+    let output = run_with(&p, &["history", "list"], Some(&mock.url));
+    success(&output);
+    assert_eq!(mock.requests()[1].path, RUNS_PATH);
+    // `--config` is allowed.
+    let output = run_with(
+        &p,
+        &["--config", "goodflows.toml", "history", "show", RUN_ID],
+        Some(&reply(200, shown_run()).url),
+    );
+    success(&output);
+}
+
+#[test]
+fn history_show_requests_the_run_and_reports_404_as_not_found() {
+    let mock = reply(404, r#"{"errors":{"detail":"Not Found"}}"#.into());
+    let p = project(JOB);
+    let output = run_with(&p, &["history", "show", RUN_ID], Some(&mock.url));
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        stderr(&output).contains("run not found (HTTP 404)"),
+        "{}",
+        stderr(&output)
+    );
+    assert_eq!(mock.requests().len(), 1);
+    assert_eq!(mock.requests()[0].path, format!("{RUNS_PATH}/{RUN_ID}"));
+    // `list` names the project instead.
+    let output = run_with(&p, &["history", "list"], Some(&mock.url));
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stderr(&output).contains("project not found (HTTP 404)"));
+}
+
+#[test]
+fn history_failures_report_the_status_only_and_are_not_retried() {
+    let body = format!("internal detail {SECRET}-body");
+    let p = project(JOB);
+    for (args, status) in [
+        (&["history", "list"][..], 503),
+        (&["history", "show", RUN_ID], 503),
+        (&["history", "list", "--json"], 500),
+        (&["history", "list"], 401),
+        (&["history", "list"], 422),
+        (&["history", "list"], 302),
+    ] {
+        let mock = Mock::start({
+            let body = body.clone();
+            move |_, _| {
+                Reply::Status(
+                    status,
+                    vec![
+                        ("Retry-After".into(), "0".into()),
+                        ("Location".into(), "/x".into()),
+                    ],
+                    body.clone(),
+                )
+            }
+        });
+        let output = run_with(&p, args, Some(&mock.url));
+        assert_eq!(output.status.code(), Some(1), "{args:?} {status}");
+        let all = format!("{}{}", stdout(&output), stderr(&output));
+        assert!(all.contains(&format!("(HTTP {status})")), "{all}");
+        assert!(
+            !all.contains("internal detail") && !all.contains(SECRET),
+            "{all}"
+        );
+        assert!(!all.contains(&mock.url), "{all}");
+        assert_eq!(mock.requests().len(), 1, "{args:?} {status}");
+    }
+}
+
+#[test]
+fn history_oversized_or_malformed_responses_fail() {
+    let p = project(JOB);
+    let oversized = format!(
+        r#"{{"data":[],"next_cursor":"{}"}}"#,
+        "a".repeat(16 * 1024 * 1024)
+    );
+    let mut wrong_run: Value = serde_json::from_str(&shown_run()).unwrap();
+    wrong_run["data"]["run_id"] = json!("0e54fb55-a115-4ac7-80fe-8fde26e76afb");
+    let mut no_results: Value = serde_json::from_str(&shown_run()).unwrap();
+    no_results["data"]["document"]["results"] = json!({});
+    for (args, body, message) in [
+        (&["history", "list"][..], oversized, "exceeds 16 MiB"),
+        (&["history", "list"], "not json".into(), "not JSON"),
+        (
+            &["history", "list"],
+            r#"{"data":{}}"#.into(),
+            "not a list of runs",
+        ),
+        (
+            &["history", "list"],
+            r#"{"data":[{"run_id":1}],"next_cursor":null}"#.into(),
+            "not a list of runs",
+        ),
+        (
+            &["history", "show", RUN_ID],
+            r#"{"data":[]}"#.into(),
+            "not a stored run",
+        ),
+        (
+            &["history", "show", RUN_ID],
+            wrong_run.to_string(),
+            "not a stored run",
+        ),
+        (
+            &["history", "show", RUN_ID],
+            no_results.to_string(),
+            "not a stored run",
+        ),
+    ] {
+        let mock = reply(200, body);
+        let output = run_with(&p, args, Some(&mock.url));
+        assert_eq!(output.status.code(), Some(1), "{message}");
+        assert!(stderr(&output).contains(message), "{}", stderr(&output));
+        assert!(stdout(&output).is_empty());
+    }
+}
+
+#[test]
+fn history_without_reporting_credentials_or_a_valid_url_sends_nothing() {
+    let mock = Mock::store();
+    let with_reporting = project(JOB);
+    let without = Project::new(JOB);
+    let cases: [(&Project, Option<&str>, Option<&str>, &str); 4] = [
+        (
+            &without,
+            Some(&mock.url),
+            Some(SECRET),
+            "require a top-level [reporting] block",
+        ),
+        (
+            &with_reporting,
+            None,
+            Some(SECRET),
+            "require GOODFLOWS_URL and GOODFLOWS_API_KEY",
+        ),
+        (
+            &with_reporting,
+            Some(&mock.url),
+            None,
+            "require GOODFLOWS_URL and GOODFLOWS_API_KEY",
+        ),
+        (
+            &with_reporting,
+            Some("http://example.com"),
+            Some(SECRET),
+            "GOODFLOWS_URL must be an origin-only https URL",
+        ),
+    ];
+    for (p, url, key, message) in cases {
+        for args in [&["history", "list"][..], &["history", "show", RUN_ID]] {
+            let mut command = p.command();
+            command.args(args);
+            if let Some(url) = url {
+                command.env("GOODFLOWS_URL", url);
+            }
+            if let Some(key) = key {
+                command.env("GOODFLOWS_API_KEY", key);
+            }
+            let output = command.output().unwrap();
+            assert_eq!(output.status.code(), Some(1), "{message}");
+            assert!(stderr(&output).contains(message), "{}", stderr(&output));
+            assert!(!stderr(&output).contains(SECRET));
+        }
+    }
+    assert_eq!(mock.connections(), 0);
+}
+
+#[test]
+fn history_argument_errors_and_run_only_flags_send_nothing() {
+    let mock = Mock::store();
+    let p = project(JOB);
+    for (args, code, message) in [
+        (
+            &["history", "list", "--outcome", "green"][..],
+            2,
+            "--outcome",
+        ),
+        (&["history", "list", "--limit", "0"], 2, "--limit"),
+        (&["history", "list", "--commit", "HEAD"], 2, "--commit"),
+        (
+            &["history", "show", "FB7D2711-6B67-4F5A-9104-492032A9E1E5"],
+            2,
+            "lowercase canonical UUID",
+        ),
+        (
+            &["history", "list", "--no-history"],
+            1,
+            "--no-history cannot be used with history commands",
+        ),
+        (
+            &["history", "show", RUN_ID, "--env", "ci"],
+            1,
+            "--env cannot be used with history commands",
+        ),
+        (
+            &["--jobs", "a", "history", "list", "--json"],
+            1,
+            "--jobs cannot be used with history commands",
+        ),
+    ] {
+        let output = run_with(&p, args, Some(&mock.url));
+        assert_eq!(output.status.code(), Some(code), "{args:?}");
+        let all = format!("{}{}", stdout(&output), stderr(&output));
+        assert!(all.contains(message), "{args:?}: {all}");
+    }
+    assert_eq!(mock.connections(), 0);
+}
+
+#[test]
+fn history_help_hides_run_only_flags() {
+    let p = project(JOB);
+    for args in [
+        &["history", "--help"][..],
+        &["history", "list", "--help"],
+        &["history", "show", "--help"],
+    ] {
+        let output = p.run(args);
+        success(&output);
+        let help = stdout(&output);
+        for flag in [
+            "--env",
+            "--parallelism",
+            "--jobs",
+            "--no-history",
+            "--history-dir",
+            "--log-runs",
+        ] {
+            // `--env` is a prefix of the `--environment` filter.
+            assert!(
+                !help.contains(&format!("{flag} ")),
+                "{args:?} shows {flag}:\n{help}"
+            );
+        }
+        assert!(
+            help.contains("--config") && help.contains("--json"),
+            "{help}"
+        );
+    }
+    let help = stdout(&p.run(&["history", "list", "--help"]));
+    for filter in [
+        "--workflow",
+        "--environment",
+        "--outcome",
+        "--commit",
+        "--branch",
+        "--event",
+        "--graph-sha256",
+        "--limit",
+        "--cursor",
+    ] {
+        assert!(help.contains(filter), "{help}");
+    }
+}

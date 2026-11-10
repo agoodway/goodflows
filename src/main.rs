@@ -111,6 +111,11 @@ enum Commands {
         #[command(subcommand)]
         command: ReportsCommand,
     },
+    /// Read run records stored by the [reporting] server
+    History {
+        #[command(subcommand)]
+        command: HistoryCommand,
+    },
     /// Inspect, recover, cancel or destroy a caller identity's Sprite
     Sprite {
         #[command(subcommand)]
@@ -136,7 +141,20 @@ enum ReportsCommand {
     },
 }
 
-/// Global flags that only `run` uses; `sprite` commands reject them.
+#[derive(Subcommand)]
+enum HistoryCommand {
+    /// List stored runs, newest first
+    List(reporting::history_client::Filters),
+    /// Show one stored run with its results and linked test reports
+    Show {
+        /// The run's id (a lowercase canonical UUID)
+        #[arg(value_parser = reporting::history_client::run_id)]
+        run_id: String,
+    },
+}
+
+/// Global flags that only `run` uses; `reports upload`, `history` and
+/// `sprite` commands reject them.
 const RUN_ONLY_FLAGS: [&str; 12] = [
     "env",
     "parallelism",
@@ -153,9 +171,9 @@ const RUN_ONLY_FLAGS: [&str; 12] = [
 ];
 
 impl Cli {
-    /// The parser, with run-only global flags hidden from `sprite` help.
-    /// They still parse there, so passing one is rejected with a clear error
-    /// rather than silently ignored.
+    /// The parser, with run-only global flags hidden from `sprite` and
+    /// `history` help. They still parse there, so passing one is rejected
+    /// with a clear error rather than silently ignored.
     fn parser() -> clap::Command {
         let mut command = <Self as clap::CommandFactory>::command();
         // Globals reach subcommands only when the command is built.
@@ -166,7 +184,30 @@ impl Cli {
                 arg.hide(hidden)
             })
         };
-        command.mut_subcommand("sprite", |sprite| hide(sprite).mut_subcommands(hide))
+        command
+            .mut_subcommand("sprite", |sprite| hide(sprite).mut_subcommands(hide))
+            .mut_subcommand("history", |history| hide(history).mut_subcommands(hide))
+    }
+
+    /// The first run-only flag on the command line, as the user typed it, for
+    /// commands that reject them all ([`RUN_ONLY_FLAGS`]).
+    fn run_only_flag(&self) -> Option<&'static str> {
+        [
+            (self.env.is_some(), "--env"),
+            (self.parallelism.is_some(), "--parallelism"),
+            (self.fail_fast, "--fail-fast"),
+            (self.no_fail_fast, "--no-fail-fast"),
+            (!self.jobs.is_empty(), "--jobs"),
+            (self.log_dir.is_some(), "--log-dir"),
+            (self.history, "--history"),
+            (self.no_history, "--no-history"),
+            (self.history_dir.is_some(), "--history-dir"),
+            (self.log_runs.is_some(), "--log-runs"),
+            (self.history_runs.is_some(), "--history-runs"),
+            (self.history_bytes.is_some(), "--history-bytes"),
+        ]
+        .into_iter()
+        .find_map(|(set, flag)| set.then_some(flag))
     }
 
     fn parse_from(
@@ -206,8 +247,12 @@ impl Cli {
                 | Commands::Validate { workflow }
                 | Commands::Init { workflow, .. },
             ) => workflow.as_deref(),
+            // `history list --workflow` is a filter, not the workflow events belong to.
             Some(
-                Commands::Reports { .. } | Commands::Sprite { .. } | Commands::SpriteAgent { .. },
+                Commands::Reports { .. }
+                | Commands::History { .. }
+                | Commands::Sprite { .. }
+                | Commands::SpriteAgent { .. },
             )
             | None => None,
         }
@@ -242,7 +287,12 @@ async fn main() -> ExitCode {
     }
     let (_signal_sender, cancel) = match if matches!(
         cli.command,
-        None | Some(Commands::Run { .. } | Commands::Reports { .. } | Commands::Sprite { .. })
+        None | Some(
+            Commands::Run { .. }
+                | Commands::Reports { .. }
+                | Commands::History { .. }
+                | Commands::Sprite { .. }
+        )
     ) {
         cancellation()
     } else {
@@ -311,27 +361,27 @@ async fn run(cli: &Cli, output: &mut Output, cancel: watch::Receiver<Option<i32>
         },
     }) = &cli.command
     {
-        for (set, flag) in [
-            (cli.config.is_some(), "--config"),
-            (cli.env.is_some(), "--env"),
-            (cli.parallelism.is_some(), "--parallelism"),
-            (cli.fail_fast, "--fail-fast"),
-            (cli.no_fail_fast, "--no-fail-fast"),
-            (!cli.jobs.is_empty(), "--jobs"),
-            (cli.log_dir.is_some(), "--log-dir"),
-            (cli.history, "--history"),
-            (cli.no_history, "--no-history"),
-            (cli.history_dir.is_some(), "--history-dir"),
-            (cli.log_runs.is_some(), "--log-runs"),
-            (cli.history_runs.is_some(), "--history-runs"),
-            (cli.history_bytes.is_some(), "--history-bytes"),
-        ] {
-            if set {
-                anyhow::bail!("{flag} cannot be used with reports upload");
-            }
+        let config = cli.config.is_some().then_some("--config");
+        if let Some(flag) = config.or_else(|| cli.run_only_flag()) {
+            anyhow::bail!("{flag} cannot be used with reports upload");
         }
         let budget = budget.map(std::time::Duration::from_secs);
         return reporting::replay::upload(run_directory, output, cancel, budget).await;
+    }
+    if let Some(Commands::History { command }) = &cli.command {
+        if let Some(flag) = cli.run_only_flag() {
+            anyhow::bail!("{flag} cannot be used with history commands");
+        }
+        let (document, _) = Config::load(cli.config.as_deref())?;
+        let reporting = document.reporting.as_ref();
+        return match command {
+            HistoryCommand::List(filters) => {
+                reporting::history_client::list(reporting, filters, output, cancel).await
+            }
+            HistoryCommand::Show { run_id } => {
+                reporting::history_client::show(reporting, run_id, output, cancel).await
+            }
+        };
     }
     if let Some(Commands::Sprite { command }) = &cli.command {
         return sprite::command(cli, command, output, cancel).await;
@@ -1259,5 +1309,79 @@ mod tests {
         }
         // No upper bound on the byte cap.
         assert!(parse(&["--history-bytes", "18446744073709551615"]).is_ok());
+    }
+
+    #[test]
+    fn history_arguments_are_checked_while_parsing() {
+        let id = "fb7d2711-6b67-4f5a-9104-492032a9e1e5";
+        let commit = "5a4a9715f1cd0a9795766bcd9294a77549b5b474";
+        for bad in [
+            &["history", "list", "--outcome", "green"][..],
+            &["history", "list", "--limit", "0"],
+            &["history", "list", "--limit", "201"],
+            &["history", "list", "--commit", "HEAD"],
+            &["history", "list", "--commit", &commit.to_uppercase()],
+            &["history", "list", "--graph-sha256", commit],
+            &["history", "list", "--workflow", " "],
+            &["history", "list", "--event", &"e".repeat(65)],
+            &["history", "list", "--cursor", "a+b="],
+            &["history", "show", &id.to_uppercase()],
+            &["history", "show", "fb7d27116b674f5a9104492032a9e1e5"],
+        ] {
+            let error = parse(bad).err().unwrap_or_else(|| panic!("{bad:?} parsed"));
+            assert!(
+                matches!(
+                    error.kind(),
+                    clap::error::ErrorKind::ValueValidation | clap::error::ErrorKind::InvalidValue
+                ),
+                "{bad:?}: {:?}",
+                error.kind()
+            );
+            assert_eq!(error.exit_code(), 2, "{bad:?}");
+        }
+        let cli = parse(&[
+            "history",
+            "list",
+            "--outcome",
+            "failed",
+            "--limit",
+            "200",
+            "--commit",
+            commit,
+            "--branch",
+            "main",
+        ])
+        .unwrap();
+        let Some(Commands::History {
+            command: HistoryCommand::List(filters),
+        }) = &cli.command
+        else {
+            panic!("not history list");
+        };
+        assert_eq!(filters.limit, Some(200));
+        assert_eq!(filters.commit.as_deref(), Some(commit));
+        assert!(cli.workflow().is_none());
+        assert!(parse(&["history", "show", id]).is_ok());
+    }
+
+    #[test]
+    fn history_commands_name_a_rejected_run_only_flag() {
+        for (args, flag) in [
+            (&["history", "list", "--env", "ci"][..], "--env"),
+            (&["history", "list", "--no-history"], "--no-history"),
+            (&["--jobs", "a", "history", "list"], "--jobs"),
+            (
+                &["history", "list", "--history-bytes", "1"],
+                "--history-bytes",
+            ),
+        ] {
+            assert_eq!(parse(args).unwrap().run_only_flag(), Some(flag), "{args:?}");
+        }
+        assert_eq!(
+            parse(&["history", "list", "--json"])
+                .unwrap()
+                .run_only_flag(),
+            None
+        );
     }
 }
