@@ -508,6 +508,43 @@ fn render(json: bool, mut event: Value, out: &mut impl Write, err: &mut impl Wri
                 }
                 writeln!(out)?;
             }
+            "run_uploaded" => writeln!(
+                out,
+                "{} uploaded{}",
+                run_history(&event),
+                if event["duplicate"] == true {
+                    " (already stored)"
+                } else {
+                    ""
+                }
+            )?,
+            "run_upload_pending" => {
+                write!(
+                    out,
+                    "{} upload pending: {}",
+                    run_history(&event),
+                    text(&event, "reason").replace('_', " ")
+                )?;
+                if let Some(status) = event["http_status"].as_u64() {
+                    write!(out, " (HTTP {status})")?;
+                }
+                if event["terminal"] == true {
+                    write!(out, ", not retried by reports upload")?;
+                }
+                writeln!(out)?;
+            }
+            "run_upload_skipped" => {
+                write!(
+                    out,
+                    "{} upload skipped: {}",
+                    run_history(&event),
+                    text(&event, "reason").replace('_', " ")
+                )?;
+                if let Some(path) = event["path"].as_str() {
+                    write!(out, " at {}", visible(path))?;
+                }
+                writeln!(out)?;
+            }
             "reports_upload_summary" => writeln!(
                 out,
                 "\nReports: {} acknowledged, {} pending, {} rejected, {} invalid",
@@ -577,6 +614,15 @@ fn invocation_label(event: &Value) -> String {
     match event["invocation_id"].as_str() {
         Some(id) => format!("{workflow} [{}]", visible(short_id(id))),
         None => workflow,
+    }
+}
+
+/// `run history for <workflow>` for a run record event, naming the
+/// invocation when the run calls workflows.
+fn run_history(event: &Value) -> String {
+    match event["workflow"].as_str() {
+        Some(_) => format!("run history for {}", invocation_label(event)),
+        None => "run history".into(),
     }
 }
 

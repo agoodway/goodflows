@@ -2,9 +2,6 @@
 //! (design D3). The values are identities and links, not secrets, but they
 //! are still never printed in diagnostics.
 
-// Read by the run-record upload (GOO-245 task 4.3).
-#![cfg_attr(not(test), expect(dead_code))]
-
 use super::contract::MAX_SAFE_INTEGER;
 use super::run_contract::{valid_label, valid_name, MAX_CI_RUN_ID_BYTES, MAX_URL_BYTES};
 use reqwest::Url;

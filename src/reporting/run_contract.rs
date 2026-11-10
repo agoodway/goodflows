@@ -12,9 +12,6 @@
 //! reported on its enclosing object, so no submitted key or value ever
 //! reaches the error.
 
-// Called before freezing and on replay (GOO-245 tasks 4.3 and 5.1).
-#![cfg_attr(not(test), expect(dead_code))]
-
 use super::contract::MAX_SAFE_INTEGER;
 use reqwest::Url;
 use serde_json::{Map, Value};
