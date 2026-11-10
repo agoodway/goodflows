@@ -93,8 +93,8 @@ Prerequisite: the goodci change `validate-job-names` (another thread, branch `t3
 
 ## 8. Integration
 
-- [ ] 8.1 Run `cargo fmt --check`, `cargo clippy --locked --all-targets -- -D warnings` and `cargo test --locked` and verify they pass.
-- [ ] 8.2 Smoke test against a local goodflows_web running `add-workflow-run-storage` with the server contract changes. Run an upload-enabled workflow with a call and `GITHUB_*` variables set, check that `history list --graph-sha256 <hash>` and `history show` return both records, kill the server mid-run, and replay with `reports upload` (200 `duplicate` or 201). If a Sprite is available, repeat with `run --sprite` and check that the controller publishes both records after collection. Record the commands and the minimum goodflows_web version in the PR description.
+- [x] 8.1 Run `cargo fmt --check`, `cargo clippy --locked --all-targets -- -D warnings` and `cargo test --locked` and verify they pass.
+- [x] 8.2 Smoke test against a local goodflows_web running `add-workflow-run-storage` with the server contract changes. Run an upload-enabled workflow with a call and `GITHUB_*` variables set, check that `history list --graph-sha256 <hash>` and `history show` return both records, kill the server mid-run, and replay with `reports upload` (200 `duplicate` or 201). If a Sprite is available, repeat with `run --sprite` and check that the controller publishes both records after collection. Record the commands and the minimum goodflows_web version in the PR description.
 
 ## Workflow follow-up
 
