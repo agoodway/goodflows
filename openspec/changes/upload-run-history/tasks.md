@@ -10,8 +10,8 @@ Prerequisite: the goodci change `validate-job-names` (another thread, branch `t3
 
 ## 2. CI context and local validation
 
-- [ ] 2.1 Add `reporting::ci` (design D3), which reads the caller environment through an injectable lookup. Verify with a table test covering: the push example from the spec; `refs/pull/42/merge` → `pull_request` 42; `refs/pull/0/merge`, `refs/pull/x/merge`, `refs/heads/main` → no `pull_request`; `GITHUB_RUN_ATTEMPT` values `0`, `+1`, `1.0` and `9007199254740992` dropped; a 65-byte or whitespace-only `RUNNER_NAME` or `GITHUB_EVENT_NAME` dropped; an `http://`, path-carrying or userinfo `GITHUB_SERVER_URL` and a malformed `GITHUB_REPOSITORY` → no `url`; `GITHUB_ACTIONS` unset or `1` → no `ci`.
-- [ ] 2.2 Add `reporting::run_contract` (design D4). It validates a `serde_json::Value` and the encoded length against every rule in goodflows_web `add-workflow-run-storage` `specs/workflow-run-storage/spec.md`, from "The body is a run-history document" through "Outcome agrees with result statuses" and "Malformed or oversized uploads store nothing". It also covers the call fields in design "Server contract changes needed" items 1, 3 and 4. It returns the first `(path, code)`. Verify with unit tests for each server scenario the CLI can produce, including:
+- [x] 2.1 Add `reporting::ci` (design D3), which reads the caller environment through an injectable lookup. Verify with a table test covering: the push example from the spec; `refs/pull/42/merge` → `pull_request` 42; `refs/pull/0/merge`, `refs/pull/x/merge`, `refs/heads/main` → no `pull_request`; `GITHUB_RUN_ATTEMPT` values `0`, `+1`, `1.0` and `9007199254740992` dropped; a 65-byte or whitespace-only `RUNNER_NAME` or `GITHUB_EVENT_NAME` dropped; an `http://`, path-carrying or userinfo `GITHUB_SERVER_URL` and a malformed `GITHUB_REPOSITORY` → no `url`; `GITHUB_ACTIONS` unset or `1` → no `ci`.
+- [x] 2.2 Add `reporting::run_contract` (design D4). It validates a `serde_json::Value` and the encoded length against every rule in goodflows_web `add-workflow-run-storage` `specs/workflow-run-storage/spec.md`, from "The body is a run-history document" through "Outcome agrees with result statuses" and "Malformed or oversized uploads store nothing". It also covers the call fields in design "Server contract changes needed" items 1, 3 and 4. It returns the first `(path, code)`. Verify with unit tests for each server scenario the CLI can produce, including:
   - Required, unknown and null-optional keys, `schema_version` 2, uppercase `run_id`, fractional `started_at`.
   - The name rule at 65 bytes, whitespace-only and with a control character.
   - Empty and 1,025-entry `requested_jobs` and `commands`; 1,025 graph jobs, `depends_on` entries and steps.
@@ -24,8 +24,8 @@ Prerequisite: the goodci change `validate-job-names` (another thread, branch `t3
   - U+0000 in a string, depth 9, a 4,194,305-byte body, and integers above 2^53-1.
   
   Unknown-key errors must name the enclosing path only.
-- [ ] 2.3 Prove the builder and the validator agree. Add a test that builds upload records for real configs and checks that each one validates: a minimal workflow; partitions with step and condition costs; workflow calls with the root and child records; `--env` with `--jobs`; and a signal-cancelled run.
-- [ ] 2.4 Add shared fixtures under `tests/fixtures/workflow-runs/`: `minimal.json`, `full.json` with `environment`, `requested_jobs`, `source.branch`, `ci`, and a `graph` with partitions, steps, conditions and a `call`, plus `child.json`. Verify that each passes `run_contract`, and note in the PR description that goodflows_web task 2.1 should reuse them.
+- [x] 2.3 Prove the builder and the validator agree. Add a test that builds upload records for real configs and checks that each one validates: a minimal workflow; partitions with step and condition costs; workflow calls with the root and child records; `--env` with `--jobs`; and a signal-cancelled run.
+- [x] 2.4 Add shared fixtures under `tests/fixtures/workflow-runs/`: `minimal.json`, `full.json` with `environment`, `requested_jobs`, `source.branch`, `ci`, and a `graph` with partitions, steps, conditions and a `call`, plus `child.json`. Verify that each passes `run_contract`, and note in the PR description that goodflows_web task 2.1 should reuse them.
 
 ## 3. Publisher
 

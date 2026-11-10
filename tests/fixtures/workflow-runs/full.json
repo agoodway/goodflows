@@ -1,0 +1,218 @@
+{
+  "schema_version": 1,
+  "workflow": "ci",
+  "environment": "staging",
+  "requested_jobs": [
+    "integration"
+  ],
+  "run_id": "fb7d2711-6b67-4f5a-9104-492032a9e1e5",
+  "started_at": "2026-11-09T13:25:31Z",
+  "outcome": "passed",
+  "duration_ms": 9450,
+  "parallelism": 4,
+  "graph_sha256": "4fad73ce6da5edfe83dfd6d50f0afa5a1587d54f96d20a1db47aae7f8dbe31e4",
+  "max_in_flight": 2,
+  "host": {
+    "os": "linux",
+    "arch": "x86_64",
+    "logical_cpus": 8,
+    "mem_total_bytes": 16780623872,
+    "mem_available_bytes": 4945465344
+  },
+  "source": {
+    "commit": "5a4a9715f1cd0a9795766bcd9294a77549b5b474",
+    "dirty": false,
+    "branch": "feature/login"
+  },
+  "ci": {
+    "provider": "github_actions",
+    "event": "pull_request",
+    "run_id": "9876543210",
+    "attempt": 1,
+    "pull_request": 42,
+    "runner": "GitHub Actions 7",
+    "url": "https://github.com/acme/app/actions/runs/9876543210"
+  },
+  "results": [
+    {
+      "name": "build",
+      "status": "passed",
+      "exit_code": 0,
+      "command": "make build",
+      "error": null,
+      "duration_ms": 1210,
+      "started": true,
+      "blocked_ms": 0,
+      "queued_ms": 0,
+      "commands": [
+        {
+          "kind": "command",
+          "wall_ms": 1200,
+          "cpu_user_ms": 900,
+          "cpu_system_ms": 80,
+          "peak_rss_bytes": 52428800
+        }
+      ]
+    },
+    {
+      "name": "test",
+      "partition": {
+        "index": 1,
+        "count": 2
+      },
+      "status": "passed",
+      "exit_code": null,
+      "command": null,
+      "error": null,
+      "duration_ms": 4100,
+      "started": true,
+      "blocked_ms": 1210,
+      "queued_ms": 0,
+      "commands": [
+        {
+          "kind": "condition",
+          "step": "unit",
+          "wall_ms": 4,
+          "cpu_user_ms": 1,
+          "cpu_system_ms": 1
+        },
+        {
+          "kind": "command",
+          "step": "unit",
+          "wall_ms": 3300,
+          "cpu_user_ms": 3000,
+          "cpu_system_ms": 90,
+          "peak_rss_bytes": 104857600
+        },
+        {
+          "kind": "command",
+          "step": "lint",
+          "wall_ms": 800,
+          "cpu_user_ms": 700,
+          "cpu_system_ms": 40,
+          "peak_rss_bytes": 62914560
+        }
+      ]
+    },
+    {
+      "name": "test",
+      "partition": {
+        "index": 2,
+        "count": 2
+      },
+      "status": "passed",
+      "exit_code": null,
+      "command": null,
+      "error": null,
+      "duration_ms": 3900,
+      "started": true,
+      "blocked_ms": 1210,
+      "queued_ms": 0,
+      "commands": [
+        {
+          "kind": "condition",
+          "step": "unit",
+          "wall_ms": 4,
+          "cpu_user_ms": 1,
+          "cpu_system_ms": 1
+        },
+        {
+          "kind": "command",
+          "step": "unit",
+          "wall_ms": 3100,
+          "cpu_user_ms": 2800,
+          "cpu_system_ms": 90,
+          "peak_rss_bytes": 104857600
+        },
+        {
+          "kind": "command",
+          "step": "lint",
+          "wall_ms": 800,
+          "cpu_user_ms": 700,
+          "cpu_system_ms": 40,
+          "peak_rss_bytes": 62914560
+        }
+      ]
+    },
+    {
+      "name": "integration",
+      "workflow": "suite",
+      "child_run_id": "0e54fb55-a115-4ac7-80fe-8fde26e76afb",
+      "status": "passed",
+      "exit_code": null,
+      "command": null,
+      "error": null,
+      "duration_ms": 4120,
+      "started": true,
+      "blocked_ms": 5310,
+      "queued_ms": 0
+    }
+  ],
+  "graph": {
+    "jobs": [
+      {
+        "name": "build",
+        "command": "make build",
+        "depends_on": [],
+        "partitions": null,
+        "timeout_secs": 600,
+        "shell": true,
+        "condition": {
+          "kind": "expression",
+          "text": "env.CI == \"true\""
+        },
+        "steps": []
+      },
+      {
+        "name": "test",
+        "command": null,
+        "depends_on": [
+          "build"
+        ],
+        "partitions": {
+          "count": 2,
+          "strategy": "index"
+        },
+        "timeout_secs": null,
+        "shell": true,
+        "condition": null,
+        "steps": [
+          {
+            "id": "unit",
+            "command": "make test",
+            "shell": null,
+            "condition": {
+              "kind": "shell",
+              "text": "test -f Makefile"
+            }
+          },
+          {
+            "id": "lint",
+            "command": "make lint",
+            "shell": false,
+            "condition": null
+          }
+        ]
+      },
+      {
+        "name": "integration",
+        "command": null,
+        "depends_on": [
+          "test"
+        ],
+        "partitions": null,
+        "timeout_secs": null,
+        "shell": true,
+        "condition": {
+          "kind": "expression",
+          "text": "true"
+        },
+        "steps": [],
+        "call": {
+          "workflow": "suite",
+          "graph_sha256": "9f2c84412083990dcd93dd9ace366eb765ad497916e27fa2487bee0722474465"
+        }
+      }
+    ]
+  }
+}
