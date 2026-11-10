@@ -3,15 +3,18 @@
 //! The Git repository containing the selected config is enumerated with
 //! `git ls-files --cached --others --exclude-standard`; current file contents
 //! (not HEAD) are copied once into a private immutable staging directory, and
-//! the manifest and archive derive from those copied bytes.
+//! the manifest and archive derive from those copied bytes. The snapshot's
+//! source context (commit, branch and dirty) is derived from the same copied
+//! bytes, so `dirty` describes the archive, not the working tree.
 
 use super::control::{ManifestEntry, Workdirs};
+use crate::reporting::Source;
 use anyhow::{bail, Context, Result};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::OsStr;
 use std::io::{Read, Write};
-use std::os::unix::ffi::OsStrExt;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -132,6 +135,9 @@ pub struct Snapshot {
     pub archive_sha256: String,
     pub archive_bytes: u64,
     pub workdirs: Workdirs,
+    /// The archive's commit, branch and dirty state (design D11), or `None`
+    /// when HEAD cannot be read.
+    pub source: Option<Source>,
     /// Private staging directory; removed on drop.
     _staging: tempfile::TempDir,
 }
@@ -152,6 +158,32 @@ fn git(root: &Path, args: &[&str]) -> Result<Vec<u8>> {
             args.join(" "),
             String::from_utf8_lossy(&output.stderr).trim()
         );
+    }
+    Ok(output.stdout)
+}
+
+/// `git` with `input` on its stdin.
+fn git_input(root: &Path, args: &[&str], input: &[u8]) -> Result<Vec<u8>> {
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("failed to run git")?;
+    let mut stdin = child.stdin.take().context("git stdin")?;
+    let input = input.to_vec();
+    // Written from another thread so a full stdout pipe cannot deadlock.
+    let writer = std::thread::spawn(move || stdin.write_all(&input));
+    let output = child.wait_with_output()?;
+    writer
+        .join()
+        .map_err(|_| anyhow::anyhow!("git stdin writer panicked"))??;
+    if !output.status.success() {
+        bail!("git {} failed", args.join(" "));
     }
     Ok(output.stdout)
 }
@@ -448,8 +480,13 @@ pub fn take(
             );
         }
     }
-    // Internal symlinks become copies of eligible in-root regular files.
+    // Internal symlinks become copies of eligible in-root regular files. The
+    // link text is kept to compare the shipped tree with HEAD.
+    let mut link_texts = BTreeMap::new();
     for (rel, source) in links {
+        let text =
+            std::fs::read_link(&source).with_context(|| format!("inspect {}", source.display()))?;
+        link_texts.insert(rel.clone(), text.into_os_string().into_vec());
         let target = source.canonicalize().map_err(|_| {
             anyhow::anyhow!(
                 "symlink {} is unresolved or cyclic; Sprite runs cannot materialize it",
@@ -558,6 +595,7 @@ pub fn take(
             executable: s.executable,
         })
         .collect();
+    let source = provenance(root, &staged, &link_texts, staging.path());
     let archive = staging.path().join("source.tar.gz");
     let (archive_sha256, archive_bytes) = write_archive(&archive, staged.values())?;
     Ok(Snapshot {
@@ -569,8 +607,115 @@ pub fn take(
         archive_sha256,
         archive_bytes,
         workdirs,
+        source,
         _staging: staging,
     })
+}
+
+/// The commit, branch and archive-derived `dirty` of a snapshot, or `None`
+/// when HEAD cannot be read. `branch` is present only when HEAD is a branch.
+/// `dirty` is unknown when the comparison itself fails.
+fn provenance(
+    root: &Path,
+    staged: &BTreeMap<Vec<u8>, Staged>,
+    links: &BTreeMap<Vec<u8>, Vec<u8>>,
+    staging: &Path,
+) -> Option<Source> {
+    let line = |bytes: Vec<u8>| {
+        String::from_utf8(bytes)
+            .ok()
+            .map(|s| s.trim_end().to_owned())
+    };
+    let commit = git(root, &["rev-parse", "--verify", "-q", "HEAD^{commit}"])
+        .ok()
+        .and_then(line)
+        .and_then(|c| crate::reporting::valid_commit(&c))?;
+    let branch = git(root, &["symbolic-ref", "--short", "-q", "HEAD"])
+        .ok()
+        .and_then(line)
+        .and_then(|b| crate::reporting::valid_branch(&b));
+    let dirty = archive_differs(root, &commit, staged, links, staging).ok();
+    Some(Source {
+        commit: Some(commit),
+        branch,
+        dirty,
+    })
+}
+
+/// Whether the shipped files are not exactly the tree of `commit`: a
+/// tracked file's bytes or executable bit differ, a tracked file is missing
+/// (deleted, or left out of the snapshot), or an untracked file is included.
+/// Ignored files are never shipped, so they cannot make it differ. A symlink
+/// HEAD tracks matches when its link text does, although its target's bytes
+/// are what ship.
+fn archive_differs(
+    root: &Path,
+    commit: &str,
+    staged: &BTreeMap<Vec<u8>, Staged>,
+    links: &BTreeMap<Vec<u8>, Vec<u8>>,
+    staging: &Path,
+) -> Result<bool> {
+    // `<mode> <type> <oid>\t<path>` per tracked entry.
+    let listing = git(root, &["ls-tree", "-r", "-z", "--full-tree", commit])?;
+    let mut head = BTreeMap::new();
+    for entry in listing.split(|b| *b == 0).filter(|e| !e.is_empty()) {
+        let tab = entry
+            .iter()
+            .position(|b| *b == b'\t')
+            .context("malformed git ls-tree entry")?;
+        let mut fields = entry[..tab].split(|b| *b == b' ');
+        let (Some(mode), Some(_), Some(oid)) = (fields.next(), fields.next(), fields.next()) else {
+            bail!("malformed git ls-tree entry");
+        };
+        head.insert(&entry[tab + 1..], (mode, oid));
+    }
+    if head.len() != staged.len() || !staged.keys().all(|rel| head.contains_key(rel.as_slice())) {
+        return Ok(true);
+    }
+    // Hash what ships with Git's own object format, without filters. Each
+    // input gets a plain numbered name, because `--stdin-paths` reads one
+    // (possibly C-quoted) path per line and shipped paths may contain both.
+    let blobs = staging.join("blobs");
+    crate::fsutil::dir_builder(false).create(&blobs)?;
+    let mut paths = Vec::new();
+    for (index, (rel, file)) in staged.iter().enumerate() {
+        let path = blobs.join(index.to_string());
+        let shipped: &[u8] = match links.get(rel) {
+            Some(_) => b"120000",
+            None if file.executable => b"100755",
+            None => b"100644",
+        };
+        if head[rel.as_slice()].0 != shipped {
+            return Ok(true);
+        }
+        match links.get(rel) {
+            Some(text) => std::fs::write(&path, text)?,
+            None => std::fs::hard_link(&file.staged, &path)?,
+        }
+        paths.extend_from_slice(path.as_os_str().as_bytes());
+        paths.push(b'\n');
+    }
+    let hashed = git_input(
+        root,
+        &["hash-object", "--no-filters", "--stdin-paths"],
+        &paths,
+    )?;
+    std::fs::remove_dir_all(&blobs)?;
+    let oids: Vec<&[u8]> = hashed
+        .split(|b| *b == b'\n')
+        .filter(|l| !l.is_empty())
+        .collect();
+    if oids.len() != staged.len() {
+        bail!(
+            "git hash-object returned {} ids for {} files",
+            oids.len(),
+            staged.len()
+        );
+    }
+    Ok(staged
+        .keys()
+        .zip(oids)
+        .any(|(rel, oid)| head[rel.as_slice()].1 != oid))
 }
 
 struct HashingWriter<W> {
@@ -718,5 +863,144 @@ mod tests {
         assert!(private_key_content(pem("RSA PRIVATE KEY").as_bytes()));
         assert!(!private_key_content(pem("CERTIFICATE").as_bytes()));
         assert!(!private_key_content(include_bytes!("snapshot.rs")));
+    }
+}
+
+#[cfg(test)]
+mod provenance_tests {
+    use super::*;
+
+    fn git(root: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .args(["-c", "user.email=t@example.com", "-c", "user.name=t"])
+            .args(args)
+            .current_dir(root)
+            .stderr(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git {args:?}");
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    }
+
+    /// A committed checkout on `main` with a config, a tracked file, an
+    /// executable script and a tracked symlink, ignoring `ignored/`.
+    fn checkout() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        git(&root, &["init", "-q", "-b", "main"]);
+        std::fs::write(
+            root.join("goodflows.toml"),
+            "[[jobs]]\nname = \"a\"\ncommand = \"true\"\n",
+        )
+        .unwrap();
+        std::fs::write(root.join(".gitignore"), "ignored/\n").unwrap();
+        std::fs::write(root.join("tracked.txt"), "one\n").unwrap();
+        std::fs::write(root.join("tool.sh"), "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(root.join("tool.sh"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        std::os::unix::fs::symlink("tracked.txt", root.join("link.txt")).unwrap();
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-qm", "init"]);
+        (dir, root)
+    }
+
+    fn take_from(root: &Path) -> Snapshot {
+        take(
+            root,
+            &root.join("goodflows.toml"),
+            Workdirs::default(),
+            &[],
+            root,
+            &Sensitive { values: Vec::new() },
+        )
+        .unwrap()
+    }
+
+    fn shipped(snapshot: &Snapshot) -> Vec<&str> {
+        snapshot.manifest.iter().map(|e| e.path.as_str()).collect()
+    }
+
+    #[test]
+    fn a_clean_branch_is_not_dirty_and_names_its_branch() {
+        let (_dir, root) = checkout();
+        // An ignored file ships nowhere and never makes the archive dirty.
+        std::fs::create_dir(root.join("ignored")).unwrap();
+        std::fs::write(root.join("ignored/cache.bin"), "x").unwrap();
+        let snapshot = take_from(&root);
+        assert!(!shipped(&snapshot).iter().any(|p| p.starts_with("ignored")));
+        assert_eq!(
+            snapshot.source,
+            Some(Source {
+                commit: Some(git(&root, &["rev-parse", "HEAD"])),
+                branch: Some("main".into()),
+                dirty: Some(false),
+            })
+        );
+    }
+
+    #[test]
+    fn dirty_describes_the_shipped_tree() {
+        type Change = fn(&Path);
+        let cases: [(&str, Change); 5] = [
+            ("tracked edit", |root| {
+                std::fs::write(root.join("tracked.txt"), "two\n").unwrap()
+            }),
+            ("deleted tracked file", |root| {
+                std::fs::remove_file(root.join("tool.sh")).unwrap()
+            }),
+            ("executable bit", |root| {
+                std::fs::set_permissions(
+                    root.join("tool.sh"),
+                    std::fs::Permissions::from_mode(0o644),
+                )
+                .unwrap()
+            }),
+            ("retargeted symlink", |root| {
+                std::fs::remove_file(root.join("link.txt")).unwrap();
+                std::os::unix::fs::symlink("goodflows.toml", root.join("link.txt")).unwrap();
+            }),
+            ("untracked file next to an ignored one", |root| {
+                std::fs::create_dir(root.join("ignored")).unwrap();
+                std::fs::write(root.join("ignored/cache.bin"), "x").unwrap();
+                std::fs::write(root.join("new.txt"), "new\n").unwrap();
+            }),
+        ];
+        for (case, change) in cases {
+            let (_dir, root) = checkout();
+            change(&root);
+            let snapshot = take_from(&root);
+            let source = snapshot.source.clone().unwrap();
+            assert_eq!(source.dirty, Some(true), "{case}");
+            assert_eq!(source.branch.as_deref(), Some("main"), "{case}");
+            assert!(
+                !shipped(&snapshot).iter().any(|p| p.starts_with("ignored")),
+                "{case}"
+            );
+        }
+        // The untracked file itself ships.
+        let (_dir, root) = checkout();
+        std::fs::write(root.join("new.txt"), "new\n").unwrap();
+        assert!(shipped(&take_from(&root)).contains(&"new.txt"));
+    }
+
+    #[test]
+    fn a_detached_head_has_no_branch_and_no_head_has_no_source() {
+        let (_dir, root) = checkout();
+        let commit = git(&root, &["rev-parse", "HEAD"]);
+        git(&root, &["checkout", "-q", "--detach"]);
+        assert_eq!(
+            take_from(&root).source,
+            Some(Source {
+                commit: Some(commit),
+                branch: None,
+                dirty: Some(false),
+            })
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        git(&root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("goodflows.toml"), "").unwrap();
+        assert_eq!(take_from(&root).source, None);
     }
 }

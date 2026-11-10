@@ -274,7 +274,8 @@ pub struct Record<'a> {
 }
 
 /// The upload-only record keys. Each is omitted when absent, so the local
-/// file, built with `Upload::default()`, never carries them.
+/// file, built with `Upload::default()`, never carries them. A remote Sprite
+/// invocation's file sets only `branch`.
 #[derive(Default)]
 pub struct Upload<'a> {
     /// Add the captured source's branch, if any, after `dirty`.
@@ -285,7 +286,8 @@ pub struct Upload<'a> {
 }
 
 /// The commit the run started from and whether tracked files were modified.
-/// Remotes are never recorded, and the branch only in an upload.
+/// Remotes are never recorded, and the branch only in an upload or a remote
+/// Sprite invocation's history file.
 #[derive(Serialize)]
 struct RecordSource<'a> {
     commit: &'a str,
@@ -492,15 +494,21 @@ pub fn record<'a>(
 }
 
 /// Write the history file and prune its workflow directory. `duration_ms` is
-/// the time spent in `runner::execute`. Any error means nothing was written
-/// and the caller must omit `history_file`.
+/// the time spent in `runner::execute`. `branch` keeps the source's branch,
+/// which only a remote Sprite invocation's file does (design D11). Any error
+/// means nothing was written and the caller must omit `history_file`.
 pub fn write(
     target: &HistoryTarget,
     fields: &RunFields,
     duration_ms: u64,
     results: &[JobResult],
+    branch: bool,
 ) -> Result<Written> {
-    let record = record(target, fields, duration_ms, results, Upload::default());
+    let upload = Upload {
+        branch,
+        ..Upload::default()
+    };
+    let record = record(target, fields, duration_ms, results, upload);
     let mut bytes = serde_json::to_vec(&record)?;
     bytes.push(b'\n');
     crate::fsutil::dir_builder(true)
@@ -867,7 +875,7 @@ mod tests {
         let (results, source) = (fixed_results(), fixed_source());
         let requested = ["test".to_owned()];
         let target = fixed_target(dir.path(), &source, &requested);
-        let written = write(&target, &fixed_fields(), 1500, &results).unwrap();
+        let written = write(&target, &fixed_fields(), 1500, &results, false).unwrap();
         // Pinned from `write` before the record builder was extracted. The
         // source's branch never reaches a local file.
         let command = format!("make {}", "x".repeat(1019));

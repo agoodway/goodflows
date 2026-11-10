@@ -9,8 +9,8 @@
 
 use super::control::{
     self, boot_id, now_ms, process_matches, read_json, sha256_hex, start_ticks, write_durable,
-    write_json, ChildIdentity, Header, Phase, Prepared, ProcessIdentity, Record, Root, Terminal,
-    HOLD_EXPIRE_SECS, HOLD_RENEW_SECS, PROTOCOL, SERVICE_NAME,
+    write_json, ChildIdentity, Header, Phase, Prepared, ProcessIdentity, Provenance, Record, Root,
+    Terminal, HOLD_EXPIRE_SECS, HOLD_RENEW_SECS, PROTOCOL, SERVICE_NAME,
 };
 use super::naming::{Owner, Scope};
 use super::{hold, snapshot};
@@ -2172,6 +2172,17 @@ pub fn drop_capabilities() -> std::io::Result<()> {
     Err(std::io::Error::from_raw_os_error(libc::ENOSYS))
 }
 
+/// The `source` the controller captured from the snapshot, read once from
+/// the header for the root and every child invocation (design D11). `None`
+/// when the controller could not read HEAD. Jobs never see it.
+fn source(provenance: &Provenance) -> Option<crate::reporting::Source> {
+    Some(crate::reporting::Source {
+        commit: Some(provenance.commit.clone()?),
+        branch: provenance.branch.clone(),
+        dirty: provenance.dirty,
+    })
+}
+
 /// The workflow runner: the existing engine with this run's UUID and paths.
 async fn exec_workflow(args: &[String]) -> Result<u8> {
     let run_id = run_id(args.first().context("run id")?)?.to_owned();
@@ -2217,6 +2228,7 @@ async fn exec_workflow(args: &[String]) -> Result<u8> {
             output,
             cancel: cancel.clone(),
             sprite_state: std::env::var(crate::config::SPRITE_STATE_ENV).ok(),
+            provenance: source(&header.provenance),
         };
         crate::execute(
             run,

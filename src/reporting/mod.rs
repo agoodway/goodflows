@@ -23,7 +23,8 @@ use collect::{Budget, Collection, Head, JobContext, Sink};
 use publish::{Credentials, Limits, Publisher, RunAck};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-pub use source::{capture as capture_source, Source};
+pub(crate) use source::{valid_branch, valid_commit};
+pub use source::{Origin, Source};
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -390,7 +391,7 @@ async fn emit(output: &Output, event: Value) {
 
 impl Session {
     /// `run_id` is the invocation's run id, used as the `workflow_run_id`.
-    /// `remote` is set for an invocation on a Sprite, which never has a key
+    /// A remote `origin` is an invocation on a Sprite, which never has a key
     /// and freezes its run record for the controller to publish (design D11).
     pub async fn start(
         reporting: &Reporting,
@@ -398,8 +399,7 @@ impl Session {
         workflow: &str,
         environment: Option<&str>,
         jobs: &[Job],
-        workdir: &Path,
-        remote: bool,
+        origin: Origin<'_>,
     ) -> Self {
         // Capture credentials once; the publisher keeps them in this process only.
         let read = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
@@ -428,7 +428,7 @@ impl Session {
                 &reporting.project,
             );
             session.run_record = match credentials.unavailable() {
-                Some(reason) if !remote => RunRecord::Skipped(reason),
+                Some(reason) if !origin.remote() => RunRecord::Skipped(reason),
                 _ => RunRecord::Upload,
             };
         }
@@ -436,15 +436,14 @@ impl Session {
         if reporting_jobs.is_empty() && session.run_record != RunRecord::Upload {
             return session;
         }
-        let source = source::capture(workdir, Some(&reporting.token_env)).await;
-        session.source = Some(source.clone());
+        session.source = origin.source(Some(&reporting.token_env)).await;
         match create_run(
             reporting,
             run_id,
             workflow,
             environment,
             &reporting_jobs,
-            source,
+            session.source.clone().unwrap_or_default(),
         ) {
             Ok(run) => session.run = Some(run),
             Err(_) => {
@@ -638,68 +637,104 @@ impl Session {
         else {
             return emit(output, skipped("spool_unavailable")).await;
         };
-        let pending = |reason: &str, http_status: Option<u16>| json!({"type":"run_upload_pending", "run_id":run_id, "reason":reason, "http_status":http_status});
-        let event = match self.send_run_record(&body, run_id, cancel).await {
-            publish::Outcome::Uploaded(ack) => match record_marker(&dir, RUN_RECORD_ACK, &ack) {
-                Ok(()) => {
-                    json!({"type":"run_uploaded", "run_id":run_id, "server_id":ack.id, "duplicate":ack.duplicate})
-                }
-                Err(_) => pending("state_write_failed", None),
-            },
-            publish::Outcome::Rejected {
-                reason,
-                http_status,
-            } => {
-                // Recorded so replay does not resend bytes the server can never
-                // accept. If the marker cannot be written, replay sends it again.
-                let marker = RunRejection {
-                    run_id: run_id.to_owned(),
-                    reason: reason.into(),
-                    http_status,
-                };
-                let _ = record_marker(&dir, RUN_RECORD_REJECTED, &marker);
-                let mut event = pending(reason, Some(http_status));
-                event["terminal"] = json!(true);
-                event
-            }
-            publish::Outcome::Pending {
-                reason,
-                http_status,
-            } => pending(reason, http_status),
-        };
-        emit(output, event).await;
+        let credentials = publish::resolve(self.url.as_deref(), self.key.as_deref(), &self.project);
+        let outcome = send_run_record(
+            &mut self.publisher,
+            credentials,
+            self.limits,
+            &body,
+            run_id,
+            cancel,
+        )
+        .await;
+        settle_run_record(&dir, run_id, outcome, output).await;
     }
+}
 
-    /// Send a frozen run record with the invocation's publisher, within what
-    /// is left of the budget test-report delivery started.
-    async fn send_run_record(
-        &mut self,
-        body: &[u8],
-        run_id: &str,
-        cancel: watch::Receiver<Option<i32>>,
-    ) -> publish::Outcome<RunAck> {
-        if cancel.borrow().is_some() {
-            return publish::Outcome::pending("cancelled", None);
-        }
-        if self.publisher.is_none() {
-            match publish::resolve(self.url.as_deref(), self.key.as_deref(), &self.project) {
-                Credentials::Ready(target) => {
-                    self.publisher = Publisher::new(target, self.limits, cancel).ok();
-                }
-                credentials => {
-                    let reason = credentials.unavailable().unwrap_or("client_unavailable");
-                    return publish::Outcome::pending(reason, None);
-                }
+/// Send a frozen run record with the invocation's publisher, created here on
+/// first use from `credentials`, within what is left of the budget that
+/// test-report delivery started.
+async fn send_run_record(
+    publisher: &mut Option<Publisher>,
+    credentials: Credentials,
+    limits: Limits,
+    body: &[u8],
+    run_id: &str,
+    cancel: watch::Receiver<Option<i32>>,
+) -> publish::Outcome<RunAck> {
+    if cancel.borrow().is_some() {
+        return publish::Outcome::pending("cancelled", None);
+    }
+    if publisher.is_none() {
+        match credentials {
+            Credentials::Ready(target) => {
+                *publisher = Publisher::new(target, limits, cancel).ok();
             }
-        }
-        match &mut self.publisher {
-            Some(publisher) if publisher.exhausted() => {
-                publish::Outcome::pending("budget_exhausted", None)
+            credentials => {
+                let reason = credentials.unavailable().unwrap_or("client_unavailable");
+                return publish::Outcome::pending(reason, None);
             }
-            Some(publisher) => publisher.send_run(body, run_id).await,
-            None => publish::Outcome::pending("client_unavailable", None),
         }
     }
+    match publisher {
+        Some(publisher) if publisher.exhausted() => {
+            publish::Outcome::pending("budget_exhausted", None)
+        }
+        Some(publisher) => publisher.send_run(body, run_id).await,
+        None => publish::Outcome::pending("client_unavailable", None),
+    }
+}
+
+/// Record a run record's delivery outcome in its run directory
+/// (`run-record.ack.json` or `run-record.rejected.json`) and emit one
+/// `run_uploaded` or `run_upload_pending` event. Returns the record's state
+/// as `reports_upload_summary` names it.
+async fn settle_run_record(
+    dir: &Path,
+    run_id: &str,
+    outcome: publish::Outcome<RunAck>,
+    output: &Output,
+) -> &'static str {
+    let pending = |reason: &str, http_status: Option<u16>| json!({"type":"run_upload_pending", "run_id":run_id, "reason":reason, "http_status":http_status});
+    let (state, event) = match outcome {
+        publish::Outcome::Uploaded(ack) => match record_marker(dir, RUN_RECORD_ACK, &ack) {
+            Ok(()) => (
+                "acknowledged",
+                json!({"type":"run_uploaded", "run_id":run_id, "server_id":ack.id, "duplicate":ack.duplicate}),
+            ),
+            Err(_) => ("pending", pending("state_write_failed", None)),
+        },
+        publish::Outcome::Rejected {
+            reason,
+            http_status,
+        } => {
+            // Recorded so replay does not resend bytes the server can never
+            // accept. If the marker cannot be written, replay sends it again.
+            let marker = RunRejection {
+                run_id: run_id.to_owned(),
+                reason: reason.into(),
+                http_status,
+            };
+            let _ = record_marker(dir, RUN_RECORD_REJECTED, &marker);
+            let mut event = pending(reason, Some(http_status));
+            event["terminal"] = json!(true);
+            ("rejected", event)
+        }
+        publish::Outcome::Pending {
+            reason,
+            http_status,
+        } => ("pending", pending(reason, http_status)),
+    };
+    emit(output, event).await;
+    state
+}
+
+/// Read a run-record marker from a run directory that is still real, never
+/// through a symlink.
+fn read_run_marker<T: serde::de::DeserializeOwned>(run_dir: &Path, name: &str) -> Option<T> {
+    real_dir(run_dir).ok()?;
+    let bytes = collect::read_bounded(&run_dir.join(name), MAX_MARKER_BYTES).ok()?;
+    serde_json::from_slice(&bytes).ok()
 }
 
 /// Freeze the run record into a finalized run directory (design D5): create
@@ -1479,8 +1514,7 @@ mod tests {
             &workflow,
             None,
             &config.jobs,
-            tmp.path(),
-            false,
+            Origin::Checkout(tmp.path()),
         )
         .await;
         session.url = Some(url);
@@ -1538,7 +1572,20 @@ mod tests {
         let sent = connections.load(Ordering::SeqCst);
         assert!(sent >= 1, "the reports were never sent");
 
-        let outcome = session.send_run_record(b"{}", run_id, cancel).await;
+        let credentials = publish::resolve(
+            session.url.as_deref(),
+            session.key.as_deref(),
+            &session.project,
+        );
+        let outcome = send_run_record(
+            &mut session.publisher,
+            credentials,
+            session.limits,
+            b"{}",
+            run_id,
+            cancel,
+        )
+        .await;
         assert!(
             matches!(
                 outcome,

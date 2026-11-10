@@ -545,11 +545,17 @@ fn render(json: bool, mut event: Value, out: &mut impl Write, err: &mut impl Wri
                 }
                 writeln!(out)?;
             }
-            "reports_upload_summary" => writeln!(
-                out,
-                "\nReports: {} acknowledged, {} pending, {} rejected, {} invalid",
-                event["acknowledged"], event["pending"], event["rejected"], event["invalid"]
-            )?,
+            "reports_upload_summary" => {
+                write!(
+                    out,
+                    "\nReports: {} acknowledged, {} pending, {} rejected, {} invalid",
+                    event["acknowledged"], event["pending"], event["rejected"], event["invalid"]
+                )?;
+                if let Some(state) = event["run_record"].as_str() {
+                    write!(out, "\nRun history: {state}")?;
+                }
+                writeln!(out)?;
+            }
             "error" => {
                 writeln!(err, "Error: {}", text(&event, "message"))?;
             }

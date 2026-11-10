@@ -64,6 +64,31 @@ pub async fn capture(workdir: &Path, token_env: Option<&str>) -> Source {
         .unwrap_or_default()
 }
 
+/// Where an invocation's source context comes from.
+#[derive(Clone, Copy)]
+pub enum Origin<'a> {
+    /// A local checkout, captured with git when it is needed.
+    Checkout(&'a Path),
+    /// A remote Sprite invocation (design D11): the controller's snapshot
+    /// provenance, `None` when HEAD could not be read. The source tree there
+    /// has no `.git`, so nothing is captured natively.
+    Snapshot(Option<&'a Source>),
+}
+
+impl Origin<'_> {
+    pub fn remote(&self) -> bool {
+        matches!(self, Self::Snapshot(_))
+    }
+
+    /// The source context, or `None` when a snapshot has none.
+    pub async fn source(&self, token_env: Option<&str>) -> Option<Source> {
+        match self {
+            Self::Checkout(workdir) => Some(capture(workdir, token_env).await),
+            Self::Snapshot(source) => source.cloned(),
+        }
+    }
+}
+
 pub(crate) fn valid_commit(commit: &str) -> Option<String> {
     (matches!(commit.len(), 40 | 64) && commit.bytes().all(|b| b.is_ascii_hexdigit()))
         .then(|| commit.to_owned())

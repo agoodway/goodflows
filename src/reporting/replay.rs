@@ -6,14 +6,17 @@
 //! derived (never read) from it, and every snapshot is re-validated against the
 //! contract right before it is sent.
 
+use super::publish::RunAck;
 use super::publish::{self, Ack, Limits};
 use super::{
-    deliver, emit, manifest_version, protect_process, Head, Item, JobDirs, Manifest,
-    ManifestPartition, ManifestState, Rejection, MANIFEST, MANIFEST_VERSION,
-    PARTITIONED_MANIFEST_VERSION, RUN_RECORD_MANIFEST_VERSION,
+    deliver, emit, manifest_version, protect_process, read_run_marker, run_contract,
+    send_run_record, settle_run_record, Head, Item, JobDirs, Manifest, ManifestPartition,
+    ManifestState, Rejection, RunRejection, MANIFEST, MANIFEST_VERSION,
+    PARTITIONED_MANIFEST_VERSION, RUN_RECORD, RUN_RECORD_ACK, RUN_RECORD_MANIFEST_VERSION,
+    RUN_RECORD_REJECTED,
 };
 use crate::config::{self, Partition};
-use crate::fsutil::canonical_uuid;
+use crate::fsutil::{canonical_uuid, real_dir};
 use crate::output::Output;
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
@@ -252,23 +255,27 @@ pub async fn upload_with(
             });
         }
     }
-    let mut pending = 0;
-    if !items.is_empty() {
-        let read = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
+    let read = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
+    let credentials = || {
         let key = read(&manifest.token_env);
         if key.is_some() {
             protect_process();
         }
-        let credentials = publish::resolve(
+        publish::resolve(
             read(&manifest.url_env).as_deref(),
             key.as_deref(),
             &manifest.project,
-        );
+        )
+    };
+    // Shared by the reports and the run record, so one budget covers both.
+    let mut publisher = None;
+    let mut pending = 0;
+    if !items.is_empty() {
         let delivery = deliver(
             run_id,
             items,
-            credentials,
-            &mut None,
+            credentials(),
+            &mut publisher,
             limits,
             cancel.clone(),
             output,
@@ -279,12 +286,74 @@ pub async fn upload_with(
         rejected += delivery.rejected;
         invalid += delivery.invalid;
     }
-    let success = pending == 0 && rejected == 0 && invalid == 0;
+    // The run record follows the reports (design D8).
+    let run_record = match manifest.run_record {
+        None => None,
+        Some(_) => {
+            let event = |reason: &str, http_status: Option<u16>| json!({"type":"run_upload_pending", "run_id":run_id, "reason":reason, "http_status":http_status});
+            let state = match load_run_record(run_dir, &manifest) {
+                None => {
+                    emit(output, event("invalid_record", None)).await;
+                    "invalid"
+                }
+                Some(_)
+                    if read_run_marker::<RunAck>(run_dir, RUN_RECORD_ACK)
+                        .is_some_and(|ack| ack.run_id == run_id) =>
+                {
+                    "acknowledged"
+                }
+                Some(body) => {
+                    let rejection = read_run_marker::<RunRejection>(run_dir, RUN_RECORD_REJECTED)
+                        .filter(|marker| marker.run_id == run_id);
+                    if let Some(marker) = rejection {
+                        // The server refused these exact bytes; resending cannot succeed.
+                        emit(
+                            output,
+                            event("rejected_by_server", Some(marker.http_status)),
+                        )
+                        .await;
+                        "rejected"
+                    } else {
+                        let outcome = send_run_record(
+                            &mut publisher,
+                            credentials(),
+                            limits,
+                            &body,
+                            run_id,
+                            cancel.clone(),
+                        )
+                        .await;
+                        settle_run_record(run_dir, run_id, outcome, output).await
+                    }
+                }
+            };
+            Some(state)
+        }
+    };
+    let success = pending == 0
+        && rejected == 0
+        && invalid == 0
+        && run_record.is_none_or(|state| state == "acknowledged");
     output
-        .emit(json!({"type":"reports_upload_summary", "run_id":run_id, "acknowledged":acknowledged, "pending":pending, "rejected":rejected, "invalid":invalid, "success":success}))
+        .emit(json!({"type":"reports_upload_summary", "run_id":run_id, "acknowledged":acknowledged, "pending":pending, "rejected":rejected, "invalid":invalid, "run_record":run_record, "success":success}))
         .await?;
     let signal = *cancel.borrow();
     Ok(signal
         .map(|s| (128 + s) as u8)
         .unwrap_or(if success { 0 } else { 1 }))
+}
+
+/// Read a listed run record for replay (design D8): never through a
+/// symlink, bounded to one byte over the body limit, re-validated against
+/// the contract, and bound to the manifest's run, workflow and environment.
+fn load_run_record(run_dir: &Path, manifest: &Manifest) -> Option<Vec<u8>> {
+    real_dir(run_dir).ok()?;
+    let limit = run_contract::MAX_BODY_BYTES as u64 + 1;
+    let body = super::collect::read_bounded(&run_dir.join(RUN_RECORD), limit).ok()?;
+    let value: Value = serde_json::from_slice(&body).ok()?;
+    run_contract::validate(&value, body.len()).ok()?;
+    let bound = value["run_id"] == manifest.workflow_run_id.as_str()
+        && value["workflow"] == manifest.workflow.as_str()
+        && value.get("environment").and_then(Value::as_str) == manifest.environment.as_deref();
+    bound.then_some(body)
 }

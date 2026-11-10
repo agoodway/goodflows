@@ -939,8 +939,6 @@ pub async fn run(
         },
     )
     .await;
-    let token_env = document.reporting.as_ref().map(|r| r.token_env.as_str());
-    let source = crate::reporting::capture_source(&root, token_env).await;
     // Remote phase.
     // Before any receipt or submission an organization failure (often
     // authentication) is a preflight error.
@@ -1027,10 +1025,11 @@ pub async fn run(
         resume,
         pass_env: sprite_config.pass_env.clone(),
         request,
+        // Captured from the archive itself; jobs never see it (design D11).
         provenance: Provenance {
-            commit: source.commit,
-            branch: source.branch,
-            dirty: source.dirty,
+            commit: snap.source.as_ref().and_then(|s| s.commit.clone()),
+            branch: snap.source.as_ref().and_then(|s| s.branch.clone()),
+            dirty: snap.source.as_ref().and_then(|s| s.dirty),
             controller_version: env!("CARGO_PKG_VERSION").into(),
         },
         upload_timeout_secs: UPLOAD_TIMEOUT_SECS,
@@ -1529,7 +1528,9 @@ async fn collect_run(
 
 /// Automatic publication only for spools bound to this trusted invocation:
 /// the same run, project, workflow, profile, jobs/partitions and credential
-/// variable names. A mismatch never triggers a lookup of other variables.
+/// variable names, and a run record only when the trusted configuration
+/// opted into uploading one. A mismatch never triggers a lookup of other
+/// variables.
 pub fn trusted_spool(
     spool: &Path,
     run_id: &str,
@@ -1550,6 +1551,11 @@ pub fn trusted_spool(
     }
     if manifest.url_env != reporting.url_env || manifest.token_env != reporting.token_env {
         bail!("spool names credential variables that differ from this invocation's configuration");
+    }
+    // A remote config that turned upload on cannot make the controller send
+    // command text its caller did not opt into (design D11).
+    if manifest.run_record.is_some() && !reporting.history {
+        bail!("spool lists a run record, but this invocation's configuration does not set [reporting] history = true");
     }
     for job in &manifest.jobs {
         let configured = selected
@@ -2316,6 +2322,27 @@ partitions = 2
                 .map_err(|e| e.to_string())
         };
         check(&|_| {}).unwrap();
+        // A run record is published only under a trusted `history = true`.
+        let run_record = |m: &mut crate::reporting::Manifest| {
+            m.run_record = Some(crate::reporting::ManifestRunRecord { schema_version: 1 })
+        };
+        let error = check(&run_record).unwrap_err();
+        assert!(error.contains("[reporting] history = true"), "{error}");
+        let mut opted_in = reporting.clone();
+        opted_in.history = true;
+        let dir = tempfile::tempdir().unwrap();
+        spool(dir.path(), run_record);
+        trusted_spool(dir.path(), RUN, &opted_in, "ci", Some("prod"), &selected).unwrap();
+        // Opting in does not relax any other check.
+        let dir = tempfile::tempdir().unwrap();
+        spool(dir.path(), |m| {
+            run_record(m);
+            m.token_env = "OTHER_KEY".into();
+        });
+        let error = trusted_spool(dir.path(), RUN, &opted_in, "ci", Some("prod"), &selected)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("credential variables"), "{error}");
         for (edit, message) in [
             (
                 Box::new(|m: &mut crate::reporting::Manifest| m.token_env = "OTHER_KEY".into())
