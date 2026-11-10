@@ -1009,3 +1009,198 @@ fn call_aware_events_add_only_invocation_identity() {
     }
     assert_eq!(events.last().unwrap()["workflow"], "ci");
 }
+
+const HISTORY: &str = "[reporting]\nproject = \"goodcases\"\nhistory = true\n";
+
+/// A run of `config` without the caller's CI variables, with reporting
+/// credentials for `url` when set.
+fn run_with_history(config: &str, url: Option<&str>, args: &[&str]) -> std::process::Output {
+    let p = Project::new(config);
+    let mut command = p.command();
+    command.env_remove("GITHUB_ACTIONS").args(args);
+    if let Some(url) = url {
+        command
+            .env("GOODFLOWS_URL", url)
+            .env("GOODFLOWS_API_KEY", "synthetic-key");
+    }
+    command.output().unwrap()
+}
+
+/// A mock that answers every request with `status` and an empty body.
+fn status_mock(status: u16) -> mock::Mock {
+    mock::Mock::start(move |_, _| {
+        mock::Reply::Status(
+            status,
+            vec![("Retry-After".into(), "0".into())],
+            String::new(),
+        )
+    })
+}
+
+#[test]
+fn run_upload_events_have_one_text_line_each() {
+    let plain = format!("{HISTORY}[[jobs]]\nname = 'a'\ncommand = 'true'\n");
+    let stored = mock::Mock::store();
+    // The first post is stored but its acknowledgement is lost, so the retry
+    // is acknowledged as already stored.
+    let rows = std::sync::Mutex::new(std::collections::HashMap::new());
+    let next = std::sync::Mutex::new(0u32);
+    let lost = mock::Mock::start(move |request, index| {
+        let reply = mock::store_reply(&rows, &next, request);
+        if index == 0 {
+            mock::Reply::Status(503, vec![("Retry-After".into(), "0".into())], String::new())
+        } else {
+            reply
+        }
+    });
+    let mut cases = vec![
+        (plain.clone(), Some(stored.url.clone()), "uploaded".to_owned()),
+        (
+            plain.clone(),
+            Some(lost.url.clone()),
+            "uploaded (already stored)".into(),
+        ),
+        (
+            plain.clone(),
+            None,
+            "upload skipped: credentials unavailable".into(),
+        ),
+        (
+            plain.clone(),
+            Some("http://example.com".into()),
+            "upload skipped: invalid url".into(),
+        ),
+        (
+            format!(
+                "{HISTORY}spool_dir = 'goodflows.toml/spool'\n[[jobs]]\nname = 'a'\ncommand = 'true'\n"
+            ),
+            Some(stored.url.clone()),
+            "upload skipped: spool unavailable".into(),
+        ),
+        (
+            format!("{HISTORY}[[jobs]]\nname = '{}'\ncommand = 'true'\n", "j".repeat(65)),
+            Some(stored.url.clone()),
+            "upload skipped: invalid record at results[0].name".into(),
+        ),
+    ];
+    let mocks: Vec<_> = [
+        (503, "upload pending: service unavailable (HTTP 503)"),
+        (401, "upload pending: unauthorized (HTTP 401)"),
+        (403, "upload pending: forbidden (HTTP 403)"),
+        (404, "upload pending: project not found (HTTP 404)"),
+        (413, "upload pending: request too large (HTTP 413)"),
+        (422, "upload pending: rejected (HTTP 422)"),
+        (
+            409,
+            "upload pending: conflict (HTTP 409), not retried by reports upload",
+        ),
+        (
+            400,
+            "upload pending: http error (HTTP 400), not retried by reports upload",
+        ),
+        (
+            415,
+            "upload pending: http error (HTTP 415), not retried by reports upload",
+        ),
+    ]
+    .into_iter()
+    .map(|(status, line)| (status_mock(status), line))
+    .collect();
+    for (mock, line) in &mocks {
+        cases.push((plain.clone(), Some(mock.url.clone()), (*line).into()));
+    }
+    for (config, url, line) in cases {
+        let output = run_with_history(&config, url.as_deref(), &[]);
+        success(&output);
+        let text = stdout(&output);
+        let lines: Vec<_> = text
+            .lines()
+            .filter(|l| l.starts_with("run history"))
+            .collect();
+        assert_eq!(lines, [format!("run history for default {line}")], "{text}");
+        assert!(!text.contains("synthetic-key"));
+    }
+}
+
+#[test]
+fn run_upload_lines_name_each_invocation_of_a_call() {
+    let mock = mock::Mock::store();
+    let output = run_with_history(
+        &format!(
+            "{HISTORY}[[workflows.ci.jobs]]\nname = 'call'\nworkflow = 'suite'\n\
+             [[workflows.suite.jobs]]\nname = 'work'\ncommand = 'true'\n"
+        ),
+        Some(&mock.url),
+        &["run", "ci"],
+    );
+    success(&output);
+    let text = stdout(&output);
+    let lines: Vec<_> = text
+        .lines()
+        .filter(|l| l.starts_with("run history"))
+        .collect();
+    assert_eq!(lines.len(), 2, "{text}");
+    assert!(
+        lines[0].starts_with("run history for suite [") && lines[0].ends_with("] uploaded"),
+        "{text}"
+    );
+    assert!(
+        lines[1].starts_with("run history for ci [") && lines[1].ends_with("] uploaded"),
+        "{text}"
+    );
+}
+
+#[test]
+fn run_upload_events_are_versioned_json_lines() {
+    let stored = mock::Mock::store();
+    let conflict = status_mock(409);
+    for (url, kind, keys) in [
+        (
+            Some(stored.url.as_str()),
+            "run_uploaded",
+            &[
+                "duplicate",
+                "run_id",
+                "schema_version",
+                "server_id",
+                "type",
+                "workflow",
+            ][..],
+        ),
+        (
+            Some(conflict.url.as_str()),
+            "run_upload_pending",
+            &[
+                "http_status",
+                "reason",
+                "run_id",
+                "schema_version",
+                "terminal",
+                "type",
+                "workflow",
+            ][..],
+        ),
+        (
+            None,
+            "run_upload_skipped",
+            &["reason", "run_id", "schema_version", "type", "workflow"][..],
+        ),
+    ] {
+        let output = run_with_history(
+            &format!("{HISTORY}[[jobs]]\nname = 'a'\ncommand = 'true'\n"),
+            url,
+            &["--json"],
+        );
+        success(&output);
+        // Every line parses and carries schema_version 1.
+        let events = events(&output);
+        let summary = events.last().unwrap();
+        assert_eq!(summary["type"], "summary");
+        let found: Vec<_> = events.iter().filter(|e| e["type"] == kind).collect();
+        assert_eq!(found.len(), 1, "{kind}");
+        let mut names: Vec<_> = found[0].as_object().unwrap().keys().cloned().collect();
+        names.sort();
+        assert_eq!(names, keys, "{kind}");
+        assert_eq!(found[0]["run_id"], summary["run_id"]);
+    }
+}

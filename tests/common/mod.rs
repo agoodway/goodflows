@@ -154,7 +154,8 @@ pub mod mock {
             }
         }
 
-        /// Emulates the server's idempotent store: 201 new, 200 exact retry, 409 different payload.
+        /// Emulates the server's idempotent store: 201 new, 200 exact retry,
+        /// 409 different payload, for test reports and run records.
         pub fn store() -> Self {
             let rows: Mutex<HashMap<String, (Vec<u8>, String)>> = Mutex::new(HashMap::new());
             let next = Mutex::new(0u32);
@@ -176,11 +177,20 @@ pub mod mock {
         request: &Request,
     ) -> Reply {
         let body = request.json();
-        let report_id = body["report"]["report_id"].as_str().unwrap().to_owned();
-        let key = format!(
-            "{}|{}|{}|{}",
-            request.path, body["workflow_run_id"], body["job"], report_id
-        );
+        let run_record = request.path.ends_with("/workflow-runs");
+        let report_id = if run_record {
+            body["run_id"].as_str().unwrap().to_owned()
+        } else {
+            body["report"]["report_id"].as_str().unwrap().to_owned()
+        };
+        let key = if run_record {
+            format!("{}|{report_id}", request.path)
+        } else {
+            format!(
+                "{}|{}|{}|{}",
+                request.path, body["workflow_run_id"], body["job"], report_id
+            )
+        };
         let mut rows = rows.lock().unwrap();
         let (code, id, duplicate) = match rows.get(&key) {
             Some((stored, id)) if stored == &request.body => (200, id.clone(), true),
@@ -195,7 +205,17 @@ pub mod mock {
                 (201, id, false)
             }
         };
-        Reply::Status(code, vec![], ack(&id, &report_id, duplicate))
+        let body = if run_record {
+            run_ack(&id, &report_id, duplicate)
+        } else {
+            ack(&id, &report_id, duplicate)
+        };
+        Reply::Status(code, vec![], body)
+    }
+
+    /// A `workflow-runs` acknowledgement.
+    pub fn run_ack(id: &str, run_id: &str, duplicate: bool) -> String {
+        format!(r#"{{"data":{{"id":"{id}","run_id":"{run_id}","duplicate":{duplicate}}}}}"#)
     }
 
     pub fn ack(id: &str, report_id: &str, duplicate: bool) -> String {

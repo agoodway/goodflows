@@ -2060,7 +2060,11 @@ fn replay_refuses_tampered_manifests_without_contacting_the_server() {
     let cases: Vec<(Edit, &str)> = vec![
         (
             Box::new(|m| m["version"] = json!(3)),
-            "unsupported manifest version 3",
+            "manifest version 3 requires a run record",
+        ),
+        (
+            Box::new(|m| m["version"] = json!(4)),
+            "unsupported manifest version 4",
         ),
         (
             Box::new(|m| m["version"] = json!(2)),
@@ -2925,7 +2929,11 @@ fn replay_refuses_inconsistent_partition_entries() {
         ),
         (
             Box::new(|m| m["version"] = json!(3)),
-            "unsupported manifest version 3",
+            "manifest version 3 requires a run record",
+        ),
+        (
+            Box::new(|m| m["version"] = json!(4)),
+            "unsupported manifest version 4",
         ),
     ];
     let mock = Mock::store();
@@ -3537,4 +3545,538 @@ fn a_signal_after_child_jobs_passed_cancels_the_call() {
     assert_eq!(root["results"][1]["status"], "cancelled");
     assert_eq!(root["outcome"], "cancelled");
     assert!(!p.dir.join("after").exists());
+}
+
+// ---- 4.x run record upload ----
+
+const HISTORY: &str = "[reporting]\nproject = \"goodcases\"\nhistory = true\n";
+const RUNS_PATH: &str = "/api/v1/projects/goodcases/workflow-runs";
+/// The GitHub Actions variables `reporting::ci` reads.
+const GITHUB: [&str; 8] = [
+    "GITHUB_ACTIONS",
+    "GITHUB_EVENT_NAME",
+    "GITHUB_RUN_ID",
+    "GITHUB_RUN_ATTEMPT",
+    "GITHUB_REF",
+    "RUNNER_NAME",
+    "GITHUB_SERVER_URL",
+    "GITHUB_REPOSITORY",
+];
+
+/// A run of `p` without the caller's own CI variables (these tests may run
+/// on GitHub Actions), with credentials when `url` is set.
+fn history_command(p: &Project, args: &[&str], url: Option<&str>) -> std::process::Command {
+    let mut command = p.command();
+    for name in GITHUB {
+        command.env_remove(name);
+    }
+    command.args(args);
+    if let Some(url) = url {
+        command
+            .env("GOODFLOWS_URL", url)
+            .env("GOODFLOWS_API_KEY", SECRET);
+    }
+    command
+}
+
+fn run_history(p: &Project, args: &[&str], url: Option<&str>) -> std::process::Output {
+    history_command(p, args, url).output().unwrap()
+}
+
+/// The run records the mock received, in order.
+fn run_requests(mock: &Mock) -> Vec<common::mock::Request> {
+    mock.requests()
+        .into_iter()
+        .filter(|r| r.path == RUNS_PATH)
+        .collect()
+}
+
+fn git_checkout(dir: &Path) {
+    let git = |args: &[&str]| {
+        let status = std::process::Command::new("git")
+            .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+            .args(args)
+            .current_dir(dir)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?}");
+    };
+    git(&["init", "-q", "-b", "main"]);
+    std::fs::write(
+        dir.join(".gitignore"),
+        ".goodflows/\ngoodflows-history/\nfixtures/\n",
+    )
+    .unwrap();
+    git(&["add", "goodflows.toml", ".gitignore"]);
+    git(&["commit", "-q", "-m", "init"]);
+}
+
+#[cfg(unix)]
+fn mode(path: &Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+}
+
+#[test]
+fn run_record_without_credentials_is_skipped_and_keeps_nothing() {
+    let mock = Mock::store();
+    for (command, code) in [("true", 0), ("exit 3", 1)] {
+        let p = project_with(
+            HISTORY,
+            &format!("[[jobs]]\nname = \"a\"\ncommand = '{command}'\n"),
+        );
+        for (url, reason) in [
+            (None, "credentials_unavailable"),
+            // Non-loopback plaintext is never a valid endpoint.
+            (Some("http://example.com"), "invalid_url"),
+        ] {
+            let output = run_history(&p, &["--json"], url);
+            assert_eq!(output.status.code(), Some(code), "{reason}");
+            let events = events(&output);
+            let skipped = by_type(&events, "run_upload_skipped");
+            let summary = events.last().unwrap();
+            assert_eq!(summary["type"], "summary");
+            assert_eq!(
+                skipped,
+                [
+                    json!({"type":"run_upload_skipped", "schema_version":1, "workflow":"default",
+                    "run_id":summary["run_id"], "reason":reason})
+                ]
+            );
+            assert!(!p.dir.join(".goodflows").exists(), "{reason}");
+        }
+    }
+    assert_eq!(mock.connections(), 0);
+}
+
+#[test]
+fn run_record_directory_exists_before_jobs_run_without_report_jobs() {
+    let mock = Mock::store();
+    let p = project_with(
+        HISTORY,
+        "[[jobs]]\nname = \"a\"\ncommand = 'ls .goodflows/reports/*/manifest.json > seen && \
+         printf %s \"${GOODFLOWS_REPORT_DIR-unset}:${GOODFLOWS_RUN_ID-unset}\" > env'\n",
+    );
+    let output = run_history(&p, &["--json"], Some(&mock.url));
+    success(&output);
+    let events = events(&output);
+    let summary = events.last().unwrap();
+    assert_eq!(summary["type"], "summary");
+    let run_id = summary["run_id"].as_str().unwrap();
+    // The manifest existed while the job ran; no job sees the spool.
+    assert_eq!(
+        p.read("seen").trim(),
+        format!(".goodflows/reports/{run_id}/manifest.json")
+    );
+    assert_eq!(p.read("env"), "unset:unset");
+
+    let dirs = run_dirs(&p);
+    assert_eq!(dirs.len(), 1);
+    let dir = &dirs[0];
+    let saved = manifest(dir);
+    assert_eq!(saved["version"], 3);
+    assert_eq!(saved["state"], "finalized");
+    assert_eq!(saved["jobs"], json!([]));
+    assert_eq!(saved["run_record"], json!({"schema_version": 1}));
+
+    let requests = run_requests(&mock);
+    assert_eq!(requests.len(), 1);
+    assert_eq!(mock.requests().len(), 1);
+    assert_eq!(requests[0].method, "POST");
+    // The frozen bytes are exactly the bytes sent.
+    assert_eq!(
+        std::fs::read(dir.join("run-record.json")).unwrap(),
+        requests[0].body
+    );
+    assert_eq!(requests[0].json()["run_id"], run_id);
+    let ack: Value =
+        serde_json::from_slice(&std::fs::read(dir.join("run-record.ack.json")).unwrap()).unwrap();
+    assert_eq!(ack["run_id"], run_id);
+    assert_eq!(ack["duplicate"], false);
+    #[cfg(unix)]
+    {
+        assert_eq!(mode(&dir.join("run-record.json")), 0o600);
+        assert_eq!(mode(&dir.join("run-record.ack.json")), 0o600);
+    }
+    let uploaded = by_type(&events, "run_uploaded");
+    assert_eq!(
+        uploaded,
+        [
+            json!({"type":"run_uploaded", "schema_version":1, "workflow":"default",
+            "run_id":run_id, "server_id":ack["id"], "duplicate":false})
+        ]
+    );
+    assert_no_secret(&p, &output);
+
+    // A reporting block without `history` sends no run record.
+    let p = project(&format!(
+        "[[jobs]]\nname = \"test\"\ncommand = '{}'\nreports = [\"test-timings\"]\n",
+        copy(&["r1"])
+    ));
+    let output = run_history(&p, &["--json"], Some(&mock.url));
+    success(&output);
+    assert_eq!(by_type(&events_of(&output), "report_uploaded").len(), 1);
+    let dir = &run_dirs(&p)[0];
+    assert_eq!(manifest(dir)["version"], 1);
+    assert!(manifest(dir).get("run_record").is_none());
+    assert!(!dir.join("run-record.json").exists());
+    assert_eq!(run_requests(&mock).len(), 1);
+}
+
+#[test]
+fn invalid_records_are_skipped_without_freezing() {
+    // Until validate-job-names lands, only reporting job names are capped at 64 bytes.
+    let long = "j".repeat(65);
+    let mock = Mock::store();
+    for (command, code) in [("true", 0), ("exit 3", 1)] {
+        let p = project_with(
+            HISTORY,
+            &format!("[[jobs]]\nname = \"{long}\"\ncommand = '{command}'\n"),
+        );
+        let output = run_history(&p, &["--json", "--history"], Some(&mock.url));
+        assert_eq!(output.status.code(), Some(code));
+        let events = events(&output);
+        let skipped = by_type(&events, "run_upload_skipped");
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(skipped[0]["reason"], "invalid_record");
+        assert_eq!(skipped[0]["path"], "results[0].name");
+        assert!(!skipped[0].to_string().contains(&long));
+        // Nothing is kept for replay and the manifest is as finalized.
+        let dir = &run_dirs(&p)[0];
+        assert!(!dir.join("run-record.json").exists());
+        let saved = manifest(dir);
+        assert_eq!(saved["version"], 1);
+        assert_eq!(saved["state"], "finalized");
+        assert!(saved.get("run_record").is_none());
+        // The local history file is unaffected.
+        let summary = events.last().unwrap();
+        assert_eq!(summary["type"], "summary");
+        assert!(Path::new(summary["history_file"].as_str().unwrap()).exists());
+    }
+    assert!(run_requests(&mock).is_empty());
+}
+
+#[test]
+fn run_record_never_collides_with_a_job_named_like_it() {
+    let mock = Mock::store();
+    let p = project_with(
+        HISTORY,
+        &format!(
+            "[[jobs]]\nname = \"run-record.json\"\ncommand = '{}'\nreports = [\"test-timings\"]\n",
+            copy(&["r1"])
+        ),
+    );
+    let output = run_history(&p, &["--json"], Some(&mock.url));
+    success(&output);
+    let events = events(&output);
+    assert_eq!(by_type(&events, "report_uploaded").len(), 1);
+    assert_eq!(by_type(&events, "run_uploaded").len(), 1);
+    let dir = &run_dirs(&p)[0];
+    let saved = manifest(dir);
+    assert_eq!(saved["version"], 3);
+    let job_dir = saved["jobs"][0]["dir"].as_str().unwrap();
+    assert_ne!(job_dir, "run-record.json");
+    assert!(dir.join(job_dir).join("pending/000.json").is_file());
+    assert!(dir.join("run-record.json").is_file());
+    assert_eq!(
+        std::fs::read(dir.join("run-record.json")).unwrap(),
+        run_requests(&mock)[0].body
+    );
+}
+
+#[test]
+fn a_run_directory_replaced_by_a_symlink_is_refused() {
+    let mock = Mock::store();
+    let p = project_with(
+        HISTORY,
+        "[[jobs]]\nname = \"a\"\ncommand = 'd=$(ls -d .goodflows/reports/*/); d=${d%/}; \
+         mv \"$d\" moved && ln -s \"$PWD/moved\" \"$d\"'\n",
+    );
+    let output = run_history(&p, &["--json"], Some(&mock.url));
+    success(&output);
+    let events = events(&output);
+    let skipped = by_type(&events, "run_upload_skipped");
+    assert_eq!(skipped.len(), 1);
+    assert_eq!(skipped[0]["reason"], "spool_unavailable");
+    assert!(!p.dir.join("moved/run-record.json").exists());
+    assert!(manifest(&p.dir.join("moved")).get("run_record").is_none());
+    assert!(run_requests(&mock).is_empty());
+}
+
+#[test]
+fn run_record_rejections_are_recorded_and_pending_responses_are_not() {
+    for (status, reason, terminal) in [
+        (409, "conflict", true),
+        (400, "http_error", true),
+        (422, "rejected", false),
+        (413, "request_too_large", false),
+    ] {
+        let mock = Mock::start(move |_, _| Reply::Status(status, vec![], "secret-body".into()));
+        for (command, code) in [("true", 0), ("exit 3", 1)] {
+            let p = project_with(
+                HISTORY,
+                &format!("[[jobs]]\nname = \"a\"\ncommand = '{command}'\n"),
+            );
+            let output = run_history(&p, &["--json"], Some(&mock.url));
+            assert_eq!(output.status.code(), Some(code), "{status}");
+            assert!(!stdout(&output).contains("secret-body"));
+            let events = events(&output);
+            let run_id = events.last().unwrap()["run_id"].clone();
+            let mut expected = json!({"type":"run_upload_pending", "schema_version":1,
+                "workflow":"default", "run_id":run_id, "reason":reason, "http_status":status});
+            if terminal {
+                expected["terminal"] = json!(true);
+            }
+            assert_eq!(by_type(&events, "run_upload_pending"), [expected]);
+            let dir = &run_dirs(&p)[0];
+            assert!(dir.join("run-record.json").exists());
+            assert!(!dir.join("run-record.ack.json").exists());
+            let marker = dir.join("run-record.rejected.json");
+            assert_eq!(marker.exists(), terminal, "{status}");
+            if terminal {
+                let marker: Value =
+                    serde_json::from_slice(&std::fs::read(marker).unwrap()).unwrap();
+                assert_eq!(
+                    marker,
+                    json!({"run_id":run_id, "reason":reason, "http_status":status})
+                );
+            }
+        }
+        // Neither terminal nor pending responses are retried in the run.
+        assert_eq!(mock.requests().len(), 2, "{status}");
+    }
+}
+
+#[test]
+fn run_upload_is_independent_of_the_local_history_file() {
+    let mock = Mock::store();
+    let config = "[[jobs]]\nname = \"a\"\ncommand = 'true'\n";
+
+    // Local history off.
+    let p = project_with(HISTORY, config);
+    let output = run_history(&p, &["--json"], Some(&mock.url));
+    success(&output);
+    let summary = events(&output).pop().unwrap();
+    assert!(summary.get("history_file").is_none());
+    assert!(!p.dir.join("goodflows-history").exists());
+    assert_eq!(run_requests(&mock).len(), 1);
+
+    // Settings enable local history and --no-history turns the file off only.
+    let p = project_with(HISTORY, &format!("[settings]\nhistory = true\n{config}"));
+    let output = run_history(&p, &["--json", "--no-history"], Some(&mock.url));
+    success(&output);
+    let summary = events(&output).pop().unwrap();
+    assert!(summary.get("history_file").is_none());
+    assert!(!p.dir.join("goodflows-history").exists());
+    let requests = run_requests(&mock);
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[1].json()["run_id"], summary["run_id"]);
+
+    // Both on, in a checkout on `main` on GitHub Actions: the upload adds
+    // `source.branch`, `ci` and `graph` to exactly the history file's value.
+    let p = project_with(HISTORY, config);
+    git_checkout(&p.dir);
+    let output = history_command(&p, &["--json", "--history"], Some(&mock.url))
+        .envs([
+            ("GITHUB_ACTIONS", "true"),
+            ("GITHUB_EVENT_NAME", "push"),
+            ("GITHUB_RUN_ID", "123"),
+            ("GITHUB_RUN_ATTEMPT", "2"),
+            ("RUNNER_NAME", "runner-1"),
+            ("GITHUB_SERVER_URL", "https://github.com"),
+            ("GITHUB_REPOSITORY", "acme/app"),
+        ])
+        .output()
+        .unwrap();
+    success(&output);
+    let summary = events(&output).pop().unwrap();
+    let file: Value =
+        serde_json::from_slice(&std::fs::read(summary["history_file"].as_str().unwrap()).unwrap())
+            .unwrap();
+    for key in ["graph", "ci"] {
+        assert!(file.get(key).is_none(), "{key}");
+    }
+    assert!(file["source"].get("branch").is_none());
+    let mut sent = run_requests(&mock)[2].json();
+    assert_eq!(sent["source"]["branch"], "main");
+    assert_eq!(
+        sent["ci"],
+        json!({"provider":"github_actions", "event":"push", "run_id":"123", "attempt":2,
+            "runner":"runner-1", "url":"https://github.com/acme/app/actions/runs/123"})
+    );
+    assert_eq!(sent["graph"]["jobs"][0]["name"], "a");
+    assert_eq!(sent["graph"]["jobs"][0]["command"], "true");
+    let sent_object = sent.as_object_mut().unwrap();
+    sent_object.remove("graph");
+    sent_object.remove("ci");
+    sent["source"].as_object_mut().unwrap().remove("branch");
+    assert_eq!(sent, file);
+}
+
+#[test]
+fn ci_comes_from_the_caller_environment_never_settings_env() {
+    let mock = Mock::store();
+    let p = project_with(
+        HISTORY,
+        "[settings.env]\nGITHUB_ACTIONS = \"true\"\nGITHUB_EVENT_NAME = \"push\"\n\
+         [[jobs]]\nname = \"a\"\ncommand = 'printf %s \"$GITHUB_ACTIONS\" > seen'\n",
+    );
+    success(&run_history(&p, &["--json"], Some(&mock.url)));
+    // The job saw the settings value; the record did not take it.
+    assert_eq!(p.read("seen"), "true");
+    assert!(run_requests(&mock)[0].json().get("ci").is_none());
+
+    let output = history_command(&p, &["--json"], Some(&mock.url))
+        .env("GITHUB_ACTIONS", "true")
+        .env("GITHUB_REF", "refs/pull/42/merge")
+        .output()
+        .unwrap();
+    success(&output);
+    // The settings `GITHUB_EVENT_NAME` is not taken either.
+    assert_eq!(
+        run_requests(&mock)[1].json()["ci"],
+        json!({"provider":"github_actions", "pull_request":42})
+    );
+}
+
+#[test]
+fn workflow_calls_upload_the_child_record_before_the_root() {
+    let mock = Mock::store();
+    let p = project_with(
+        HISTORY,
+        "[[workflows.ci.jobs]]\nname = \"prep\"\ncommand = \"true\"\n\
+         [[workflows.ci.jobs]]\nname = \"call-suite\"\nworkflow = \"suite\"\ndepends_on = [\"prep\"]\n\
+         [[workflows.suite.jobs]]\nname = \"work\"\ncommand = \"true\"\n",
+    );
+    let output = run_history(&p, &["run", "ci", "--json"], Some(&mock.url));
+    success(&output);
+    let requests = run_requests(&mock);
+    assert_eq!(requests.len(), 2);
+    let (child, root) = (requests[0].json(), requests[1].json());
+    assert_eq!(child["workflow"], "suite");
+    assert_eq!(root["workflow"], "ci");
+    assert_eq!(child["parent_run_id"], root["run_id"]);
+    assert_eq!(child["caller_job"], "call-suite");
+    assert_eq!(root["results"][1]["workflow"], "suite");
+    assert_eq!(root["results"][1]["child_run_id"], child["run_id"]);
+    assert_eq!(
+        root["graph"]["jobs"][1]["call"]["graph_sha256"],
+        child["graph_sha256"]
+    );
+    // Each invocation freezes into its own run directory, before its summary.
+    assert_eq!(run_dirs(&p).len(), 2);
+    let events = events(&output);
+    for record in [&child, &root] {
+        let position = |kind: &str| {
+            events
+                .iter()
+                .position(|e| e["type"] == kind && e["invocation_id"] == record["run_id"])
+                .unwrap()
+        };
+        assert!(position("run_uploaded") < position("summary"));
+        let dir = p
+            .dir
+            .join(".goodflows/reports")
+            .join(record["run_id"].as_str().unwrap());
+        assert_eq!(manifest(&dir)["version"], 3);
+        assert!(dir.join("run-record.ack.json").exists());
+    }
+}
+
+#[test]
+fn a_signal_during_the_run_upload_cancels_only_the_upload() {
+    let mock = Mock::start(|_, _| Reply::Hang(Duration::from_secs(20)));
+    let p = project_with(HISTORY, "[[jobs]]\nname = \"a\"\ncommand = 'true'\n");
+    let child = history_command(&p, &["--json", "--history"], Some(&mock.url))
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let start = Instant::now();
+    while mock.requests().is_empty() {
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "no request arrived"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // SAFETY: the child PID identifies the CLI spawned above.
+    assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGTERM) }, 0);
+    let output = child.wait_with_output().unwrap();
+    assert!(start.elapsed() < Duration::from_secs(8));
+    assert_eq!(output.status.code(), Some(143));
+    let events = events(&output);
+    let pending = by_type(&events, "run_upload_pending");
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0]["reason"], "cancelled");
+    assert_eq!(pending[0]["http_status"], Value::Null);
+    let summary = events.last().unwrap();
+    assert_eq!(summary["type"], "summary");
+    assert_eq!(summary["outcome"], "passed");
+    assert_eq!(summary["success"], true);
+    let file: Value =
+        serde_json::from_slice(&std::fs::read(summary["history_file"].as_str().unwrap()).unwrap())
+            .unwrap();
+    assert_eq!(file["outcome"], "passed");
+    // The snapshot stays replayable.
+    let dir = &run_dirs(&p)[0];
+    assert_eq!(manifest(dir)["version"], 3);
+    assert!(dir.join("run-record.json").exists());
+    assert!(!dir.join("run-record.ack.json").exists());
+    assert_eq!(mock.requests().len(), 1);
+}
+
+#[test]
+fn summary_duration_covers_a_slow_run_upload() {
+    let mock = Mock::start(|request, _| {
+        std::thread::sleep(Duration::from_millis(600));
+        let run_id = request.json()["run_id"].as_str().unwrap().to_owned();
+        Reply::Status(
+            201,
+            vec![],
+            common::mock::run_ack("00000000-0000-4000-8000-000000000001", &run_id, false),
+        )
+    });
+    let p = project_with(HISTORY, "[[jobs]]\nname = \"a\"\ncommand = 'true'\n");
+    let output = run_history(&p, &["--json"], Some(&mock.url));
+    success(&output);
+    let events = events(&output);
+    assert_eq!(by_type(&events, "run_uploaded").len(), 1);
+    let summary = events.last().unwrap();
+    let (duration, execute) = (
+        summary["duration_ms"].as_u64().unwrap(),
+        summary["execute_ms"].as_u64().unwrap(),
+    );
+    assert!(duration >= execute + 600, "{duration} < {execute} + 600");
+}
+
+#[test]
+fn a_lost_run_acknowledgement_is_completed_by_the_stored_duplicate() {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    // The store commits the first post but its acknowledgement is lost.
+    let rows = Mutex::new(HashMap::new());
+    let next = Mutex::new(0u32);
+    let mock = Mock::start(move |request, index| {
+        let reply = common::mock::store_reply(&rows, &next, request);
+        if index == 0 {
+            Reply::Status(503, vec![("Retry-After".into(), "0".into())], String::new())
+        } else {
+            reply
+        }
+    });
+    let p = project_with(HISTORY, "[[jobs]]\nname = \"a\"\ncommand = 'true'\n");
+    let output = run_history(&p, &["--json"], Some(&mock.url));
+    success(&output);
+    let requests = run_requests(&mock);
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].body, requests[1].body);
+    let uploaded = by_type(&events(&output), "run_uploaded");
+    assert_eq!(uploaded.len(), 1);
+    assert_eq!(uploaded[0]["duplicate"], true);
+    assert_eq!(
+        uploaded[0]["server_id"],
+        "00000000-0000-4000-8000-000000000001"
+    );
 }

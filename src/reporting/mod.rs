@@ -15,7 +15,7 @@ pub mod run_contract;
 mod source;
 
 use crate::config::{self, Job, Partition, Reporting};
-use crate::fsutil::{dir_builder, real_dir, write_atomic};
+use crate::fsutil::{dir_builder, real_dir, write_atomic, Dir};
 use crate::output::Output;
 use crate::runner::{JobResult, ReportingEnv, ReportingKey, Status};
 use anyhow::Result;
@@ -25,6 +25,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 pub use source::{capture as capture_source, Source};
 use std::collections::{BTreeMap, HashMap};
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::watch;
@@ -37,6 +38,16 @@ pub const MANIFEST_VERSION: u32 = 1;
 /// that predate partitions refuse it with a clear version error rather than a
 /// schema error.
 pub const PARTITIONED_MANIFEST_VERSION: u32 = 2;
+/// Version of manifests that list a run record, with or without partition
+/// entries. Goodflows releases without run-record upload refuse it with a
+/// clear version error rather than silently dropping the record.
+pub const RUN_RECORD_MANIFEST_VERSION: u32 = 3;
+/// The frozen run record, its acknowledgement and its rejection marker, in
+/// the run directory. The `.` in each name is always encoded by
+/// `config::path_component`, so no job directory can collide with them.
+pub const RUN_RECORD: &str = "run-record.json";
+pub const RUN_RECORD_ACK: &str = "run-record.ack.json";
+pub const RUN_RECORD_REJECTED: &str = "run-record.rejected.json";
 /// Acknowledgement and rejection markers are tiny; anything larger is not ours.
 const MAX_MARKER_BYTES: u64 = 64 * 1024;
 
@@ -64,6 +75,18 @@ pub struct Manifest {
     pub token_env: String,
     pub source: Source,
     pub jobs: Vec<ManifestJob>,
+    /// Present once `run-record.json` is frozen. Absent from version 1 and
+    /// 2 manifests, so their bytes are unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_record: Option<ManifestRunRecord>,
+}
+
+/// The run record a version 3 manifest lists. Its location is always
+/// [`RUN_RECORD`] in the run directory, never read from the manifest.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManifestRunRecord {
+    pub schema_version: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -118,9 +141,12 @@ impl From<ManifestPartition> for Partition {
     }
 }
 
-/// The version a manifest with these entries is written as (and must carry).
-pub fn manifest_version(jobs: &[ManifestJob]) -> u32 {
-    if jobs.iter().any(|job| job.partition.is_some()) {
+/// The version a manifest with these entries, and with or without a run
+/// record, is written as (and must carry).
+pub fn manifest_version(jobs: &[ManifestJob], run_record: bool) -> u32 {
+    if run_record {
+        RUN_RECORD_MANIFEST_VERSION
+    } else if jobs.iter().any(|job| job.partition.is_some()) {
         PARTITIONED_MANIFEST_VERSION
     } else {
         MANIFEST_VERSION
@@ -144,6 +170,15 @@ pub struct ManifestCollection {
 pub struct ManifestReport {
     pub report_id: String,
     pub index: u32,
+}
+
+/// A terminal server refusal (400, 409, 415) of the frozen run record.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RunRejection {
+    pub run_id: String,
+    pub reason: String,
+    pub http_status: u16,
 }
 
 /// A terminal server refusal (400, 409, 413, 415, 422) of one frozen snapshot.
@@ -309,6 +344,25 @@ struct Run {
     env: HashMap<ReportingKey, Vec<(String, String)>>,
 }
 
+/// A run directory whose manifest was finalized, where the run record is
+/// frozen.
+struct Finalized {
+    dir: PathBuf,
+    manifest: Manifest,
+}
+
+/// What happens to this invocation's run record (design D5).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RunRecord {
+    /// `[reporting] history` is off: nothing is built, frozen or sent.
+    Off,
+    /// Built, validated, frozen and sent after the outcome snapshot.
+    Upload,
+    /// Nothing is built or kept; `run_upload_skipped` with this reason is
+    /// emitted at upload time.
+    Skipped(&'static str),
+}
+
 /// Reporting state for one `run` invocation.
 pub struct Session {
     token_env: String,
@@ -320,7 +374,10 @@ pub struct Session {
     /// one budget covers every request of the invocation.
     publisher: Option<Publisher>,
     run: Option<Run>,
+    /// Set by `finish` once the manifest is finalized.
+    finalized: Option<Finalized>,
     skipped: Option<&'static str>,
+    run_record: RunRecord,
     /// The source captured for the spool manifest, when one was created.
     source: Option<Source>,
 }
@@ -333,6 +390,8 @@ async fn emit(output: &Output, event: Value) {
 
 impl Session {
     /// `run_id` is the invocation's run id, used as the `workflow_run_id`.
+    /// `remote` is set for an invocation on a Sprite, which never has a key
+    /// and freezes its run record for the controller to publish (design D11).
     pub async fn start(
         reporting: &Reporting,
         run_id: &str,
@@ -340,6 +399,7 @@ impl Session {
         environment: Option<&str>,
         jobs: &[Job],
         workdir: &Path,
+        remote: bool,
     ) -> Self {
         // Capture credentials once; the publisher keeps them in this process only.
         let read = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
@@ -351,14 +411,29 @@ impl Session {
             limits: Limits::default(),
             publisher: None,
             run: None,
+            finalized: None,
             skipped: None,
+            run_record: RunRecord::Off,
             source: None,
         };
         if session.key.is_some() {
             protect_process();
         }
+        if reporting.history {
+            // Resolved once: a laptop without a key keeps nothing for a run
+            // record nobody will replay.
+            let credentials = publish::resolve(
+                session.url.as_deref(),
+                session.key.as_deref(),
+                &reporting.project,
+            );
+            session.run_record = match credentials.unavailable() {
+                Some(reason) if !remote => RunRecord::Skipped(reason),
+                _ => RunRecord::Upload,
+            };
+        }
         let reporting_jobs: Vec<_> = jobs.iter().filter(|j| !j.reports.is_empty()).collect();
-        if reporting_jobs.is_empty() {
+        if reporting_jobs.is_empty() && session.run_record != RunRecord::Upload {
             return session;
         }
         let source = source::capture(workdir, Some(&reporting.token_env)).await;
@@ -372,13 +447,26 @@ impl Session {
             source,
         ) {
             Ok(run) => session.run = Some(run),
-            Err(_) => session.skipped = Some("spool_unavailable"),
+            Err(_) => {
+                if !reporting_jobs.is_empty() {
+                    session.skipped = Some("spool_unavailable");
+                }
+                if session.run_record == RunRecord::Upload {
+                    session.run_record = RunRecord::Skipped("spool_unavailable");
+                }
+            }
         }
         session
     }
 
-    /// The source context captured at start, if report-producing jobs made
-    /// the session capture one.
+    /// Whether this invocation builds and uploads a run record, so the
+    /// caller should pass one to [`Session::publish_run_record`].
+    pub fn uploads_run_record(&self) -> bool {
+        self.run_record != RunRecord::Off
+    }
+
+    /// The source context captured at start, if report-producing jobs or the
+    /// run record made the session capture one.
     pub fn source(&self) -> Option<&Source> {
         self.source.as_ref()
     }
@@ -454,6 +542,12 @@ impl Session {
         manifest.state = ManifestState::Finalized;
         // Finalize before emitting anything, so an output failure cannot leave the run unreplayable.
         let finalized = write_manifest(&run.dir, &manifest).is_ok();
+        if finalized {
+            self.finalized = Some(Finalized {
+                dir: run.dir.clone(),
+                manifest: manifest.clone(),
+            });
+        }
         for job in &manifest.jobs {
             let Some(collection) = &job.collection else {
                 continue;
@@ -478,7 +572,10 @@ impl Session {
         }
         if !finalized {
             // Without a finalized manifest nothing is replayable; keep everything local.
-            emit(output, json!({"type":"reporting_skipped", "run_id":run_id, "reason":"spool_unavailable", "pending":items.len()})).await;
+            // A run directory made only for the run record reports that on its own.
+            if !manifest.jobs.is_empty() {
+                emit(output, json!({"type":"reporting_skipped", "run_id":run_id, "reason":"spool_unavailable", "pending":items.len()})).await;
+            }
             return;
         }
         if items.is_empty() {
@@ -498,10 +595,84 @@ impl Session {
         .await;
     }
 
+    /// Validate, freeze and send this invocation's run record (design D5 and
+    /// D6), after `finish` and the outcome snapshot. Emits one
+    /// `run_uploaded`, `run_upload_pending` or `run_upload_skipped` event.
+    /// Never changes check results or the exit code.
+    pub async fn publish_run_record(
+        &mut self,
+        record: &impl Serialize,
+        run_id: &str,
+        cancel: watch::Receiver<Option<i32>>,
+        output: &Output,
+    ) {
+        let skipped =
+            |reason: &str| json!({"type":"run_upload_skipped", "run_id":run_id, "reason":reason});
+        match self.run_record {
+            RunRecord::Off => return,
+            RunRecord::Skipped(reason) => return emit(output, skipped(reason)).await,
+            RunRecord::Upload => {}
+        }
+        // Validate the bytes that are frozen and sent, as a replay reads them back.
+        let checked = serde_json::to_vec(record).map_err(drop).and_then(|body| {
+            let value: Value = serde_json::from_slice(&body).map_err(drop)?;
+            Ok((run_contract::validate(&value, body.len()), body))
+        });
+        let body = match checked {
+            Ok((Ok(()), body)) => body,
+            Ok((Err(violation), _)) => {
+                let mut event = skipped("invalid_record");
+                event["path"] = json!(violation.path);
+                return emit(output, event).await;
+            }
+            Err(()) => {
+                let mut event = skipped("invalid_record");
+                event["path"] = json!("body");
+                return emit(output, event).await;
+            }
+        };
+        let Some(dir) = self
+            .finalized
+            .as_mut()
+            .and_then(|run| freeze_run_record(run, &body).ok())
+        else {
+            return emit(output, skipped("spool_unavailable")).await;
+        };
+        let pending = |reason: &str, http_status: Option<u16>| json!({"type":"run_upload_pending", "run_id":run_id, "reason":reason, "http_status":http_status});
+        let event = match self.send_run_record(&body, run_id, cancel).await {
+            publish::Outcome::Uploaded(ack) => match record_marker(&dir, RUN_RECORD_ACK, &ack) {
+                Ok(()) => {
+                    json!({"type":"run_uploaded", "run_id":run_id, "server_id":ack.id, "duplicate":ack.duplicate})
+                }
+                Err(_) => pending("state_write_failed", None),
+            },
+            publish::Outcome::Rejected {
+                reason,
+                http_status,
+            } => {
+                // Recorded so replay does not resend bytes the server can never
+                // accept. If the marker cannot be written, replay sends it again.
+                let marker = RunRejection {
+                    run_id: run_id.to_owned(),
+                    reason: reason.into(),
+                    http_status,
+                };
+                let _ = record_marker(&dir, RUN_RECORD_REJECTED, &marker);
+                let mut event = pending(reason, Some(http_status));
+                event["terminal"] = json!(true);
+                event
+            }
+            publish::Outcome::Pending {
+                reason,
+                http_status,
+            } => pending(reason, http_status),
+        };
+        emit(output, event).await;
+    }
+
     /// Send a frozen run record with the invocation's publisher, within what
     /// is left of the budget test-report delivery started.
-    #[cfg_attr(not(test), expect(dead_code))]
-    pub async fn send_run_record(
+    async fn send_run_record(
         &mut self,
         body: &[u8],
         run_id: &str,
@@ -529,6 +700,28 @@ impl Session {
             None => publish::Outcome::pending("client_unavailable", None),
         }
     }
+}
+
+/// Freeze the run record into a finalized run directory (design D5): create
+/// `run-record.json` new with mode 0600 relative to the open run directory,
+/// refusing a symlink at either, then atomically rewrite the manifest to list
+/// it as version 3. Returns the run directory.
+fn freeze_run_record(run: &mut Finalized, body: &[u8]) -> std::io::Result<PathBuf> {
+    Dir::open(&run.dir)?.write_new(OsStr::new(RUN_RECORD), body)?;
+    let mut manifest = run.manifest.clone();
+    manifest.run_record = Some(ManifestRunRecord { schema_version: 1 });
+    manifest.version = manifest_version(&manifest.jobs, true);
+    real_dir(&run.dir)?;
+    write_manifest(&run.dir, &manifest).map_err(std::io::Error::other)?;
+    run.manifest = manifest;
+    Ok(run.dir.clone())
+}
+
+/// Atomically write a run-record acknowledgement or rejection marker into a
+/// run directory that is still real.
+fn record_marker<T: Serialize>(run_dir: &Path, name: &str, value: &T) -> Result<()> {
+    real_dir(run_dir)?;
+    write_atomic(&run_dir.join(name), &serde_json::to_vec(value)?, true)
 }
 
 /// Collect every executed job (or instance) of a run into its pending area.
@@ -693,7 +886,7 @@ fn create_run(
         }
     }
     let manifest = Manifest {
-        version: manifest_version(&manifest_jobs),
+        version: manifest_version(&manifest_jobs, false),
         state: ManifestState::Running,
         workflow_run_id: id,
         project: reporting.project.clone(),
@@ -703,6 +896,7 @@ fn create_run(
         token_env: reporting.token_env.clone(),
         source,
         jobs: manifest_jobs,
+        run_record: None,
     };
     write_manifest(&dir, &manifest)?;
     Ok(Run { dir, manifest, env })
@@ -1050,7 +1244,7 @@ mod tests {
         let original: Value = serde_json::from_str(OLDER_MANIFEST).unwrap();
         assert_eq!(serde_json::to_value(&manifest).unwrap(), original);
         // An instance entry records its partition.
-        assert_eq!(manifest_version(&manifest.jobs), MANIFEST_VERSION);
+        assert_eq!(manifest_version(&manifest.jobs, false), MANIFEST_VERSION);
         let mut instance = manifest.jobs[0].clone();
         instance.partition = Some(Partition { index: 2, count: 3 }.into());
         let value = serde_json::to_value(&instance).unwrap();
@@ -1060,7 +1254,157 @@ mod tests {
         assert_eq!(back.instance(), Some(Partition { index: 2, count: 3 }));
         // Any partition entry makes the whole manifest version 2.
         let jobs = [manifest.jobs[0].clone(), instance];
-        assert_eq!(manifest_version(&jobs), PARTITIONED_MANIFEST_VERSION);
+        assert_eq!(manifest_version(&jobs, false), PARTITIONED_MANIFEST_VERSION);
+    }
+
+    /// `OLDER_MANIFEST` with its version, its first job's partition and its
+    /// run record replaced.
+    fn manifest_text(version: u32, partition: bool, run_record: Option<Value>) -> Value {
+        let mut value: Value = serde_json::from_str(OLDER_MANIFEST).unwrap();
+        value["version"] = json!(version);
+        if partition {
+            value["jobs"][0]["partition"] = json!({"index": 1, "count": 2});
+        }
+        if let Some(run_record) = run_record {
+            value["run_record"] = run_record;
+        }
+        value
+    }
+
+    /// Write `value` as a run directory's manifest and load it as replay does.
+    fn load(value: &Value) -> Result<Manifest> {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(MANIFEST),
+            serde_json::to_vec(value).unwrap(),
+        )
+        .unwrap();
+        replay::load_manifest(dir.path())
+    }
+
+    #[test]
+    fn manifest_versions_round_trip_and_are_accepted() {
+        let record = || Some(json!({"schema_version": 1}));
+        for (version, partition, run_record) in [
+            (MANIFEST_VERSION, false, None),
+            (PARTITIONED_MANIFEST_VERSION, true, None),
+            (RUN_RECORD_MANIFEST_VERSION, false, record()),
+            (RUN_RECORD_MANIFEST_VERSION, true, record()),
+        ] {
+            let original = manifest_text(version, partition, run_record.clone());
+            let manifest: Manifest = serde_json::from_value(original.clone()).unwrap();
+            // Serialized unchanged: versions 1 and 2 never gain a `run_record` key.
+            assert_eq!(serde_json::to_value(&manifest).unwrap(), original);
+            assert_eq!(manifest.run_record.is_some(), run_record.is_some());
+            assert_eq!(
+                manifest_version(&manifest.jobs, manifest.run_record.is_some()),
+                version
+            );
+            let loaded = load(&original).unwrap_or_else(|e| panic!("version {version}: {e:#}"));
+            assert_eq!(serde_json::to_value(&loaded).unwrap(), original);
+        }
+    }
+
+    #[test]
+    fn manifest_versions_must_match_the_run_record() {
+        let record = || Some(json!({"schema_version": 1}));
+        for (manifest, message) in [
+            (
+                manifest_text(3, false, None),
+                "manifest version 3 requires a run record",
+            ),
+            (
+                manifest_text(3, true, None),
+                "manifest version 3 requires a run record",
+            ),
+            (
+                manifest_text(2, true, record()),
+                "manifest version 2 requires at least one job with partition entries and no run record",
+            ),
+            (
+                manifest_text(1, false, record()),
+                "manifest version 1 requires no partition entries and no run record",
+            ),
+            (
+                manifest_text(3, false, Some(json!({"schema_version": 2}))),
+                "run record schema_version must be 1",
+            ),
+            (
+                manifest_text(3, false, Some(json!({"schema_version": 1, "path": "x"}))),
+                "invalid manifest",
+            ),
+            (
+                manifest_text(3, false, Some(Value::Null)),
+                "manifest version 3 requires a run record",
+            ),
+            (
+                manifest_text(4, false, record()),
+                "unsupported manifest version 4",
+            ),
+        ] {
+            let error = format!("{:#}", load(&manifest).unwrap_err());
+            assert!(error.contains(message), "{message}: {error}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn freezing_writes_a_private_record_and_lists_it_or_refuses_symlinks() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let manifest: Manifest = serde_json::from_str(OLDER_MANIFEST).unwrap();
+        let finalized = |dir: &Path| {
+            std::fs::create_dir_all(dir).unwrap();
+            write_manifest(dir, &manifest).unwrap();
+            Finalized {
+                dir: dir.to_owned(),
+                manifest: manifest.clone(),
+            }
+        };
+        let saved = |dir: &Path| -> Value {
+            serde_json::from_slice(&std::fs::read(dir.join(MANIFEST)).unwrap()).unwrap()
+        };
+
+        let dir = tmp.path().join("run");
+        let mut run = finalized(&dir);
+        assert_eq!(freeze_run_record(&mut run, b"{\"a\":1}").unwrap(), dir);
+        assert_eq!(std::fs::read(dir.join(RUN_RECORD)).unwrap(), b"{\"a\":1}");
+        let mode = std::fs::metadata(dir.join(RUN_RECORD))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+        let listed = saved(&dir);
+        assert_eq!(listed["version"], 3);
+        assert_eq!(listed["run_record"], json!({"schema_version": 1}));
+        assert_eq!(
+            listed["jobs"],
+            serde_json::to_value(&manifest.jobs).unwrap()
+        );
+        assert_eq!(run.manifest.run_record.unwrap().schema_version, 1);
+        // Created new: a second freeze never replaces the first record.
+        assert!(freeze_run_record(&mut run, b"{}").is_err());
+        assert_eq!(std::fs::read(dir.join(RUN_RECORD)).unwrap(), b"{\"a\":1}");
+
+        // A record name already taken by a symlink is refused, not followed.
+        let planted = tmp.path().join("planted");
+        let mut run = finalized(&planted);
+        let target = tmp.path().join("target.json");
+        std::os::unix::fs::symlink(&target, planted.join(RUN_RECORD)).unwrap();
+        assert!(freeze_run_record(&mut run, b"{}").is_err());
+        assert!(!target.exists());
+        assert_eq!(saved(&planted)["version"], 1);
+
+        // A run directory swapped for a symlink is refused.
+        let real = tmp.path().join("real");
+        let mut run = finalized(&real);
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        run.dir = link;
+        assert!(freeze_run_record(&mut run, b"{}").is_err());
+        assert!(!real.join(RUN_RECORD).exists());
+        assert_eq!(saved(&real)["version"], 1);
+        assert!(saved(&real).get("run_record").is_none());
     }
 
     #[test]
@@ -1136,6 +1480,7 @@ mod tests {
             None,
             &config.jobs,
             tmp.path(),
+            false,
         )
         .await;
         session.url = Some(url);

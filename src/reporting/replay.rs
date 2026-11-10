@@ -10,7 +10,7 @@ use super::publish::{self, Ack, Limits};
 use super::{
     deliver, emit, manifest_version, protect_process, Head, Item, JobDirs, Manifest,
     ManifestPartition, ManifestState, Rejection, MANIFEST, MANIFEST_VERSION,
-    PARTITIONED_MANIFEST_VERSION,
+    PARTITIONED_MANIFEST_VERSION, RUN_RECORD_MANIFEST_VERSION,
 };
 use crate::config::{self, Partition};
 use crate::fsutil::canonical_uuid;
@@ -46,10 +46,10 @@ pub fn load_manifest(run_dir: &Path) -> Result<Manifest> {
         .with_context(|| format!("invalid manifest {}", path.display()))?;
     // Check the version before the schema, which another version may not share.
     let version = value.get("version").and_then(Value::as_u64);
-    let supported = [MANIFEST_VERSION, PARTITIONED_MANIFEST_VERSION].map(u64::from);
+    let supported = u64::from(MANIFEST_VERSION)..=u64::from(RUN_RECORD_MANIFEST_VERSION);
     if !version.is_some_and(|v| supported.contains(&v)) {
         bail!(
-            "unsupported manifest version {} in {} (this goodflows reads versions {MANIFEST_VERSION} and {PARTITIONED_MANIFEST_VERSION})",
+            "unsupported manifest version {} in {} (this goodflows reads versions {MANIFEST_VERSION} to {RUN_RECORD_MANIFEST_VERSION})",
             version.map_or("missing".into(), |v| v.to_string()),
             path.display()
         );
@@ -87,18 +87,26 @@ fn validate(manifest: &Manifest) -> Result<()> {
     {
         bail!("environment name is invalid");
     }
-    // Partition entries exist exactly when the manifest is version 2, so an
-    // older goodflows never meets one under a version it claims to read.
-    if manifest.version != manifest_version(&manifest.jobs) {
+    // A run record is listed exactly when the manifest is version 3, and
+    // otherwise partition entries exist exactly when it is version 2, so an
+    // older goodflows never meets either under a version it claims to read.
+    if manifest.version != manifest_version(&manifest.jobs, manifest.run_record.is_some()) {
         bail!(
-            "manifest version {} requires {} partition entries",
+            "manifest version {} requires {}",
             manifest.version,
-            if manifest.version == MANIFEST_VERSION {
-                "no"
-            } else {
-                "at least one job with"
+            match manifest.version {
+                MANIFEST_VERSION => "no partition entries and no run record",
+                PARTITIONED_MANIFEST_VERSION =>
+                    "at least one job with partition entries and no run record",
+                _ => "a run record",
             }
         );
+    }
+    if manifest
+        .run_record
+        .is_some_and(|record| record.schema_version != 1)
+    {
+        bail!("run record schema_version must be 1");
     }
     // Per job name: `None` for an unpartitioned entry, or the instance count
     // and the indexes seen so far.

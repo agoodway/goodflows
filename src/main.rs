@@ -535,6 +535,8 @@ struct Parent {
 struct Finished {
     outcome: &'static str,
     success: bool,
+    /// The signal at the end of the invocation, which sets the exit code. It
+    /// may have arrived after the outcome snapshot.
     signal: Option<i32>,
     /// The outcome is passed, but a local job or call was skipped by
     /// fail-fast: only an enclosing invocation's failure can do that.
@@ -673,7 +675,7 @@ async fn invocation(
     };
     // The host is sampled at run start too.
     let host = history::Host::current();
-    let (graph_sha256, _) =
+    let (graph_sha256, graph) =
         history::graph_sha256(&config.jobs, &|target| &run.targets[target].jobs);
     // An enclosing fail-fast stop can land after the call's own check; re-check
     // right before the first observable effect (reporting, events, logs).
@@ -689,26 +691,24 @@ async fn invocation(
                 profile,
                 &config.jobs,
                 &settings.workdir,
+                run.sprite_state.is_some(),
             )
             .await,
         ),
         None => None,
     };
-    // The commit and dirty state the run started from, for history only.
+    // The source the run started from, for the run record and history.
     // Reuse the reporting session's capture rather than running git twice.
-    let source = if settings.history {
-        match session.as_ref().and_then(reporting::Session::source) {
-            Some(source) => Some(source.clone()),
-            None => Some(
-                reporting::capture_source(
-                    &settings.workdir,
-                    config.reporting.as_ref().map(|r| r.token_env.as_str()),
-                )
-                .await,
-            ),
-        }
-    } else {
-        None
+    let source = match session.as_ref().and_then(reporting::Session::source) {
+        Some(source) => Some(source.clone()),
+        None if settings.history => Some(
+            reporting::capture_source(
+                &settings.workdir,
+                config.reporting.as_ref().map(|r| r.token_env.as_str()),
+            )
+            .await,
+        ),
+        None => None,
     };
     // Legacy root jobs log flat; every named workflow and every called
     // workflow, `default` included, logs under its own namespace.
@@ -788,10 +788,9 @@ async fn invocation(
         // A non-UTF-8 path cannot be a JSON string; show it lossily.
         summary["log_dir"] = json!(dir.to_string_lossy());
     }
-    summary["duration_ms"] = json!(run_start.elapsed().as_millis() as u64);
-    summary["execute_ms"] = json!(execute_ms);
-    // One snapshot decides the outcome in the history file and the summary,
-    // the report header, the exit code and a calling job's status.
+    // One snapshot decides the outcome in the run record, the history file
+    // and the summary, the report header and a calling job's status. A
+    // signal after it cancels only the run record upload.
     let signal = *cancel.borrow();
     let fields = history::RunFields {
         run_id: identity.id.clone(),
@@ -807,27 +806,44 @@ async fn invocation(
             summary[key] = value;
         }
     }
-    if settings.history {
-        let target = history::HistoryTarget {
-            dir: &settings.history_dir,
-            // Legacy top-level jobs record under `default`, which is their workflow name.
-            workflow: name,
-            environment: profile,
-            // A child always runs its complete workflow.
-            requested_jobs: match &parent {
-                Some(_) => &[],
-                None => &run.requested_jobs,
-            },
-            parent: parent
-                .as_ref()
-                .map(|p| (p.run_id.as_str(), p.caller_job.as_str())),
-            source: source.as_ref(),
-            stem: &identity.stem,
-            runs: settings.history_runs,
-            bytes: settings.history_bytes,
-            workdir: &options.workdir,
-            log_dir: options.log_dir.as_deref(),
+    let target = history::HistoryTarget {
+        dir: &settings.history_dir,
+        // Legacy top-level jobs record under `default`, which is their workflow name.
+        workflow: name,
+        environment: profile,
+        // A child always runs its complete workflow.
+        requested_jobs: match &parent {
+            Some(_) => &[],
+            None => &run.requested_jobs,
+        },
+        parent: parent
+            .as_ref()
+            .map(|p| (p.run_id.as_str(), p.caller_job.as_str())),
+        source: source.as_ref(),
+        stem: &identity.stem,
+        runs: settings.history_runs,
+        bytes: settings.history_bytes,
+        workdir: &options.workdir,
+        log_dir: options.log_dir.as_deref(),
+    };
+    // The run record carries the outcome, so it follows the snapshot.
+    if let Some(session) = session
+        .as_mut()
+        .filter(|session| session.uploads_run_record())
+    {
+        // The caller's own environment, never settings `env`.
+        let ci = reporting::ci::capture(|name| std::env::var(name).ok());
+        let upload = history::Upload {
+            branch: true,
+            ci: ci.as_ref(),
+            graph: Some(&graph),
         };
+        let record = history::record(&target, &fields, execute_ms, &results, upload);
+        session
+            .publish_run_record(&record, &identity.id, cancel.clone(), output)
+            .await;
+    }
+    if settings.history {
         // History covers the jobs only, not reporting uploads after them.
         match history::write(&target, &fields, execute_ms, &results) {
             Ok(written) => {
@@ -840,6 +856,9 @@ async fn invocation(
             Err(error) => eprintln!("goodflows: warning: run history: {error:#}"),
         }
     }
+    // `duration_ms` covers every reporting upload; `execute_ms` only the jobs.
+    summary["duration_ms"] = json!(run_start.elapsed().as_millis() as u64);
+    summary["execute_ms"] = json!(execute_ms);
     // Only the root report offers a rerun, which keeps the calling context.
     let config_path = match &parent {
         Some(_) => None,
@@ -848,10 +867,13 @@ async fn invocation(
     output
         .emit_summary(summary, config_path, None, signal.is_some())
         .await?;
+    // A signal during the run record upload leaves the outcome as
+    // snapshotted but still decides the exit code.
+    let exit_signal = *cancel.borrow();
     Ok(Some(Finished {
         outcome: fields.outcome,
         success,
-        signal,
+        signal: exit_signal,
         interrupted: interrupted(fields.outcome, results.iter().map(|r| r.fail_fast_skip)),
     }))
 }

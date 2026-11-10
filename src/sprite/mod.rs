@@ -2273,7 +2273,7 @@ command = "true"
             })
             .collect();
         let mut manifest = Manifest {
-            version: crate::reporting::manifest_version(&jobs),
+            version: crate::reporting::manifest_version(&jobs, false),
             state: ManifestState::Finalized,
             workflow_run_id: RUN.into(),
             project: "demo".into(),
@@ -2283,9 +2283,11 @@ command = "true"
             token_env: "GOODFLOWS_API_KEY".into(),
             source: Default::default(),
             jobs,
+            run_record: None,
         };
         edit(&mut manifest);
-        manifest.version = crate::reporting::manifest_version(&manifest.jobs);
+        manifest.version =
+            crate::reporting::manifest_version(&manifest.jobs, manifest.run_record.is_some());
         crate::reporting::write_manifest(dir, &manifest).unwrap();
     }
 
