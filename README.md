@@ -509,6 +509,12 @@ Ampcode snapshots the disk after setup succeeds. After you change `.agents/setup
 npx skills add agoodway/goodflows --skill create-ci-skill
 ```
 
+[`maintain-ci-skill`](skills/maintain-ci-skill/SKILL.md) updates that `run-ci-<app>` skill when the GoodFlows config changes. It keeps the scenario answers already in the skill and asks again only about a new, renamed, or removed workflow. It does not write a skill when none exists.
+
+```bash
+npx skills add agoodway/goodflows --skill maintain-ci-skill
+```
+
 ## Development
 
 ```bash
