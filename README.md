@@ -520,4 +520,10 @@ node --test tests/amp-plugin.test.mjs
 
 The Node test needs Node.js 22.18 or newer, and `cargo build` first, because it runs `target/debug/goodflows`. CI on this repository also runs `./target/release/goodflows`, which executes `goodflows.toml`.
 
+### Cursor cloud agents
+
+[`.cursor/environment.json`](.cursor/environment.json) is the cloud agent environment for this repository. The image installs Rust 1.88.0 with rustfmt and clippy, Elixir 1.18.6 on Erlang/OTP 27.3.4.19, and Node.js 24.22.2. [`.cursor/install.sh`](.cursor/install.sh) fetches Cargo, Mix, and Jest fixture dependencies when an environment build runs.
+
+To change a toolchain, edit the version and checksum in [`.cursor/Dockerfile`](.cursor/Dockerfile) and keep them aligned with `Cargo.toml` (`rust-version`), `scripts/sprite-setup.sh`, `reporters/exunit/mix.exs`, and the versions in `.github/workflows/ci.yml` and `.github/workflows/reporters.yml`. The next environment build uses the updated file. Nothing in this repo needs a process kept running, so the environment sets no `start` command.
+
 Behavior that this file does not spell out is in [`openspec/specs/`](openspec/specs/). Release steps for the CLI and for each reporter are in [docs/releasing.md](docs/releasing.md).

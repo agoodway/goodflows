@@ -1,0 +1,8 @@
+{
+  "name": "goodflows",
+  "build": {
+    "dockerfile": "Dockerfile"
+  },
+  "user": "ubuntu",
+  "install": "bash .cursor/install.sh"
+}
