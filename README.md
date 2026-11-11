@@ -503,7 +503,7 @@ Ampcode snapshots the disk after setup succeeds. After you change `.agents/setup
 
 ## Agent skills
 
-[`create-ci-skill`](skills/create-ci-skill/SKILL.md) reads a repository's CI and writes a project-local `run-ci-<app>` skill for the next agent. When that repository has a GoodFlows config, the generated skill runs those jobs with `goodflows`.
+[`create-ci-skill`](skills/create-ci-skill/SKILL.md) reads a repository's GoodFlows config and writes a project-local `run-ci-<app>` skill for the next agent. The generated skill runs those jobs with `goodflows`. A repository with neither `goodflows.toml` nor `.goodflows.toml` gets no skill.
 
 ```bash
 npx skills add agoodway/goodflows --skill create-ci-skill
