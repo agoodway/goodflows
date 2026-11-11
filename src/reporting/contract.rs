@@ -1,11 +1,11 @@
 //! The authoritative definition of the `test-timings/1` wire contract.
 //!
-//! goodflows owns this contract: the GoodFlows server mirrors this module and
-//! the `test-timing-contract` spec, not the other way round. Every vocabulary,
-//! field type, limit and identifier grammar (suite, report, runner and
-//! filter-tag ids) lives here, tied to one contract version, and collection
-//! types every record against it before a request snapshot is frozen. A
-//! frozen snapshot is therefore one a conforming server accepts.
+//! goodflows owns this contract: the GoodFlows server mirrors this module,
+//! not the other way round. Every vocabulary, field type, limit and
+//! identifier grammar (suite, report, runner and filter-tag ids) lives here,
+//! tied to one contract version, and collection types every record against
+//! it before a request snapshot is frozen. A frozen snapshot is therefore one
+//! a conforming server accepts.
 //!
 //! The per-event tables pair each core key with a [`FieldType`]. The same
 //! tables drive three checks: every core key must be present (nullable ones

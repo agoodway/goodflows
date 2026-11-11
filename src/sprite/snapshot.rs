@@ -135,7 +135,7 @@ pub struct Snapshot {
     pub archive_sha256: String,
     pub archive_bytes: u64,
     pub workdirs: Workdirs,
-    /// The archive's commit, branch and dirty state (design D11), or `None`
+    /// The archive's commit, branch and dirty state, or `None`
     /// when HEAD cannot be read.
     pub source: Option<Source>,
     /// Private staging directory; removed on drop.

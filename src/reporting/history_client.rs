@@ -1,5 +1,5 @@
 //! `goodflows history list` and `history show`: read run records back from
-//! the reporting server (design D9).
+//! the reporting server.
 //!
 //! Every filter is checked with the server's rule before any request. The
 //! single GET is not retried. Responses are untrusted: they are bounded,

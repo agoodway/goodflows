@@ -353,7 +353,7 @@ struct Finalized {
     manifest: Manifest,
 }
 
-/// What happens to this invocation's run record (design D5).
+/// What happens to this invocation's run record.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RunRecord {
     /// `[reporting] history` is off: nothing is built, frozen or sent.
@@ -393,7 +393,7 @@ async fn emit(output: &Output, event: Value) {
 impl Session {
     /// `run_id` is the invocation's run id, used as the `workflow_run_id`.
     /// A remote `origin` is an invocation on a Sprite, which never has a key
-    /// and freezes its run record for the controller to publish (design D11).
+    /// and freezes its run record for the controller to publish.
     pub async fn start(
         reporting: &Reporting,
         run_id: &str,
@@ -595,8 +595,8 @@ impl Session {
         .await;
     }
 
-    /// Validate, freeze and send this invocation's run record (design D5 and
-    /// D6), after `finish` and the outcome snapshot. Emits one
+    /// Validate, freeze and send this invocation's run record, after `finish`
+    /// and the outcome snapshot. Emits one
     /// `run_uploaded`, `run_upload_pending` or `run_upload_skipped` event.
     /// Never changes check results or the exit code.
     pub async fn publish_run_record(
@@ -738,7 +738,7 @@ fn read_run_marker<T: serde::de::DeserializeOwned>(run_dir: &Path, name: &str) -
     serde_json::from_slice(&bytes).ok()
 }
 
-/// Freeze the run record into a finalized run directory (design D5): create
+/// Freeze the run record into a finalized run directory: create
 /// `run-record.json` new with mode 0600 relative to the open run directory,
 /// refusing a symlink at either, then atomically rewrite the manifest to list
 /// it as version 3. Returns the run directory.

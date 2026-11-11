@@ -286,7 +286,7 @@ pub async fn upload_with(
         rejected += delivery.rejected;
         invalid += delivery.invalid;
     }
-    // The run record follows the reports (design D8).
+    // The run record follows the reports.
     let run_record = match manifest.run_record {
         None => None,
         Some(_) => {
@@ -343,7 +343,7 @@ pub async fn upload_with(
         .unwrap_or(if success { 0 } else { 1 }))
 }
 
-/// Read a listed run record for replay (design D8): never through a
+/// Read a listed run record for replay: never through a
 /// symlink, bounded to one byte over the body limit, re-validated against
 /// the contract, and bound to the manifest's run, workflow and environment.
 fn load_run_record(run_dir: &Path, manifest: &Manifest) -> Option<Vec<u8>> {

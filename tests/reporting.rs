@@ -4323,7 +4323,7 @@ fn replay_of_version_1_and_2_manifests_has_no_run_record() {
     assert!(run_requests(&mock).is_empty());
 }
 
-// History read commands (design D9).
+// History read commands.
 
 const RUN_ID: &str = "fb7d2711-6b67-4f5a-9104-492032a9e1e5";
 const JOB: &str = "[[jobs]]\nname = \"a\"\ncommand = \"true\"\n";

@@ -25,7 +25,7 @@ own tag:
 A CLI release never touches the reporter mirrors, so a reporter only gets a new
 version when it changes. The reporters write `test-timings/1`, which every
 goodflows release from v0.6.0 accepts. A change to that contract ships as a new
-format (see the `test-timing-contract` spec), not as a reporter release that
+format (see `src/reporting/contract.rs`), not as a reporter release that
 needs a matching CLI.
 
 ## CLI releases

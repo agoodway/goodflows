@@ -2173,7 +2173,7 @@ pub fn drop_capabilities() -> std::io::Result<()> {
 }
 
 /// The `source` the controller captured from the snapshot, read once from
-/// the header for the root and every child invocation (design D11). `None`
+/// the header for the root and every child invocation. `None`
 /// when the controller could not read HEAD. Jobs never see it.
 fn source(provenance: &Provenance) -> Option<crate::reporting::Source> {
     Some(crate::reporting::Source {

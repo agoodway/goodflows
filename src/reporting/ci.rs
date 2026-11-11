@@ -1,6 +1,6 @@
-//! CI context for an uploaded run record, from GitHub Actions variables only
-//! (design D3). The values are identities and links, not secrets, but they
-//! are still never printed in diagnostics.
+//! CI context for an uploaded run record, from GitHub Actions variables only.
+//! The values are identities and links, not secrets, but they are still never
+//! printed in diagnostics.
 
 use super::contract::MAX_SAFE_INTEGER;
 use super::run_contract::{valid_label, valid_name, MAX_CI_RUN_ID_BYTES, MAX_URL_BYTES};

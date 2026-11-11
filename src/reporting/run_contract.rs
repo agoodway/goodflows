@@ -1,9 +1,9 @@
-//! Local validation of an uploaded run record (design D4).
+//! Local validation of an uploaded run record.
 //!
-//! The rules mirror goodflows_web's run-history contract
-//! (`openspec/specs/workflow-run-storage/spec.md`): the history document at
+//! The rules mirror the run-history contract in the goodflows_web repository
+//! (its `workflow-run-storage` spec): the history document at
 //! `schema_version` 1 with the workflow-call fields, plus the upload envelope
-//! (`graph`, `ci`, `source.branch`) from design D2 and D3. Validation runs on
+//! (`graph`, `ci`, `source.branch`). Validation runs on
 //! the encoded `serde_json::Value`, so it checks exactly what is sent and
 //! what a replay reads back.
 //!
@@ -763,7 +763,7 @@ mod tests {
     const MINIMAL: &str = include_str!("../../tests/fixtures/workflow-runs/minimal.json");
     const FULL: &str = include_str!("../../tests/fixtures/workflow-runs/full.json");
     const CHILD: &str = include_str!("../../tests/fixtures/workflow-runs/child.json");
-    /// The history files captured in the upload-run-history design, byte for byte.
+    /// History files captured when run-history upload was designed, byte for byte.
     const HISTORY_PARENT: &str =
         include_str!("../../tests/fixtures/workflow-runs/history-parent-default.json");
     const HISTORY_CHILD: &str =
@@ -813,7 +813,7 @@ mod tests {
         ] {
             assert_eq!(check(&parse(text)), Ok(()), "{name}");
         }
-        // The copies are the design's captured bytes.
+        // The copies are those captured bytes.
         let digest = |text: &str| format!("{:x}", Sha256::digest(text));
         assert_eq!(
             digest(HISTORY_PARENT),

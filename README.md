@@ -198,7 +198,7 @@ The called workflow resolves settings the same way `goodflows run <workflow>` do
 
 When the run includes a call, live lines prefix the job with the workflow name and the first eight characters of that run's id. A called run's report names the call job and the parent run id. The root report is last. It is the only report with a rerun line.
 
-Fail-fast, cancellation, JSON fields (`invocation_id`, `parent_run_id`, `caller_job`, `child_run_id`), log paths, and history records are specified in [`openspec/specs/workflow-calls/spec.md`](openspec/specs/workflow-calls/spec.md).
+Call-aware JSON events carry `invocation_id`, `parent_run_id`, `caller_job`, and `child_run_id`. Fail-fast, cancellation, log paths, and history records for calls are pinned by [`tests/workflows.rs`](tests/workflows.rs).
 
 ### Conditional jobs
 
@@ -260,7 +260,7 @@ command = "MIX_TEST_PARTITION=$GOODFLOWS_PARTITION mix test --partitions $GOODFL
 partitions = 3
 ```
 
-`partitions` is an integer from 1 to 64, or `{ count = N, strategy = "index" }`. `index` is the only strategy. goodflows starts one instance per count. Each instance has its own slot, timeout, and logs. `GOODFLOWS_PARTITION` is 1-based. The command has to split the work. Dependents wait until every instance has passed. The full rules are in [`openspec/specs/job-partitions/spec.md`](openspec/specs/job-partitions/spec.md).
+`partitions` is an integer from 1 to 64, or `{ count = N, strategy = "index" }`. `index` is the only strategy. goodflows starts one instance per count. Each instance has its own slot, timeout, and logs. `GOODFLOWS_PARTITION` is 1-based. The command has to split the work. Dependents wait until every instance has passed.
 
 ### Environment profiles
 
@@ -302,13 +302,13 @@ Those three commands match the file above, which has a default workflow and no w
 
 `test = 6` replaces the declared count of every partitioned job named `test`. A reachable workflow that has an unpartitioned job named `test` makes that `--env` fail before any job starts, including a call hidden by a false condition. A name the workflow does not use is ignored.
 
-Settings precedence is CLI flags, then the profile, then the workflow, then `[settings]`, then the built-in defaults. The same order merges `env` by key. CLI flags do not include an env map. Profile fields follow the same rules as [`openspec/specs/settings-environment/spec.md`](openspec/specs/settings-environment/spec.md).
+Settings precedence is CLI flags, then the profile, then the workflow, then `[settings]`, then the built-in defaults. The same order merges `env` by key. CLI flags do not include an env map. A profile's `settings` take the same fields as a workflow's. `env` values are literal strings with no interpolation, and an empty string sets the variable to empty.
 
 ### Text and JSON output
 
 Text mode writes each output chunk as `[job stream]` followed by the chunk. `stream` is `stdout` or `stderr`. A step is `[job/step stream]`. The run ends with a report: one row per job, then counts, then a `Failures` section when something failed or timed out. The text report does not repeat output tails. The last line of a failed root run is `Rerun failed:` and a `goodflows run` command for the failed jobs and the jobs skipped because a dependency did not pass.
 
-`--json` prints JSON Lines on stdout. Every event has `schema_version` 1. The last event of a finished run has `"type":"summary"`. Its `success` field is true when every selected job passed or was skipped. Failed and timed-out jobs include `stdout_tail` and `stderr_tail`. The report shape is specified in [`openspec/specs/run-report/spec.md`](openspec/specs/run-report/spec.md).
+`--json` prints JSON Lines on stdout. Every event has `schema_version` 1. The last event of a finished run has `"type":"summary"`. Its `success` field is true when every selected job passed or was skipped. Failed and timed-out jobs include `stdout_tail` and `stderr_tail`.
 
 ```bash
 goodflows --json > results.jsonl
@@ -316,7 +316,7 @@ goodflows validate --json
 goodflows list --json
 ```
 
-`--log-dir .goodflows-logs` stores raw stdout and stderr for each run in a new directory under that path. `log_runs` (default 10) is how many of those directories to keep per workflow. The files are not redacted. Add the directory to `.gitignore`. See [`openspec/specs/run-logs/spec.md`](openspec/specs/run-logs/spec.md).
+`--log-dir .goodflows-logs` stores raw stdout and stderr for each run in a new directory under that path. `log_runs` (default 10) is how many of those directories to keep per workflow. The files are not redacted. Add the directory to `.gitignore`.
 
 ```bash
 goodflows --log-dir .goodflows-logs --log-runs 5
@@ -337,7 +337,7 @@ Turn history on where the machine stays comparable from run to run, such as the 
 goodflows-history/** text eol=lf linguist-generated
 ```
 
-Or add `goodflows-history/` to `.gitignore`. The record layout is in [`openspec/specs/run-history/spec.md`](openspec/specs/run-history/spec.md).
+Or add `goodflows-history/` to `.gitignore`. The record layout is defined in [`src/history.rs`](src/history.rs).
 
 #### Uploading run history
 
@@ -405,7 +405,7 @@ goodflows reports upload .goodflows/reports/<run-id> --budget 120
 
 With [`[reporting] history = true`](#uploading-run-history), and the key and URL set, each invocation's run directory is created even when no job lists `reports`. It holds `run-record.json`, the exact run record to send, and the manifest is version 3. Without a run record the manifest is version 1, or version 2 when a job is partitioned. `reports upload` sends the reports first, then the run record within the same budget. When the server stores the record, it writes `run-record.ack.json` and later replays send nothing for it. HTTP 400, 409, and 415 write `run-record.rejected.json` and the record is not sent again. HTTP 413 and 422 leave it pending, so the next `reports upload` sends it again. `reports upload` exits nonzero while the record is pending, rejected, or invalid, and its text output ends with `Run history: acknowledged`, `pending`, `rejected`, or `invalid`. A tampered, missing, or symlinked `run-record.json`, or one whose run id, workflow, or environment differs from the manifest, counts as invalid. Older goodflows releases refuse a version 3 manifest as an unsupported version.
 
-The wire format is [`openspec/specs/test-timing-contract/spec.md`](openspec/specs/test-timing-contract/spec.md). Upload and spool behavior are in [`openspec/specs/test-timing-publishing/spec.md`](openspec/specs/test-timing-publishing/spec.md). Reporter packages are in [`openspec/specs/test-reporters/spec.md`](openspec/specs/test-reporters/spec.md).
+The wire format is defined in [`src/reporting/contract.rs`](src/reporting/contract.rs). Each reporter's setup and behavior are in its README: [ExUnit](reporters/exunit/README.md) and [Jest](reporters/jest/README.md).
 
 Reporters are versioned on their own. Pin a tag. Every release writes `test-timings/1`, which goodflows v0.6.0 and later accept. v0.6.0 is the tag in this repository.
 
@@ -481,7 +481,7 @@ The identity is 1 to 256 UTF-8 bytes, case-sensitive, with no control characters
 
 `status`, `logs`, `collect`, `cancel`, and `destroy` accept `--config` and `--json`. They reject run flags such as `--env`, `--jobs`, `--parallelism`, `--log-dir`, and the history flags. `destroy` asks on a terminal. `--yes` skips the question, and a non-interactive caller must pass it. `destroy` refuses while a run is still active. `collect` writes a bundle under `.goodflows/sprites/<scope-digest>/<run>` in the current directory. The digest covers the organization, prefix, and identity. `--output DIR` uses that directory instead, relative to the current directory.
 
-You need the Sprite CLI on `PATH`, a Git repository, and an organization (`SPRITE_ORG`, or the current org from `sprite org list`). A controller that is not a matching Linux build downloads the checksummed Linux release archive for this exact version. What the snapshot includes, what it drops, and how recovery works are in [docs/sprites.md](docs/sprites.md). Cold boot of a Sprite is not a supported recovery path. The execution contract is [`openspec/specs/sprite-execution/spec.md`](openspec/specs/sprite-execution/spec.md). Ownership, preparation, and exclusive use are [`openspec/specs/sprite-environments/spec.md`](openspec/specs/sprite-environments/spec.md).
+You need the Sprite CLI on `PATH`, a Git repository, and an organization (`SPRITE_ORG`, or the current org from `sprite org list`). A controller that is not a matching Linux build downloads the checksummed Linux release archive for this exact version. What the snapshot includes, what it drops, and how recovery works are in [docs/sprites.md](docs/sprites.md). The same document covers ownership, preparation, exclusive use, and execution. Cold boot of a Sprite is not a supported recovery path.
 
 [examples/sprites/goodflows.toml](examples/sprites/goodflows.toml) is one remote config for this repository. Its `setup` and `resume` scripts live in `scripts/`.
 
@@ -532,4 +532,4 @@ The Node test needs Node.js 22.18 or newer, and `cargo build` first, because it 
 
 To change a toolchain, edit the version and checksum in [`.cursor/Dockerfile`](.cursor/Dockerfile) and keep them aligned with `Cargo.toml` (`rust-version`), `scripts/sprite-setup.sh`, `reporters/exunit/mix.exs`, and the versions in `.github/workflows/ci.yml` and `.github/workflows/reporters.yml`. The next environment build uses the updated file. Nothing in this repo needs a process kept running, so the environment sets no `start` command.
 
-Behavior that this file does not spell out is in [`openspec/specs/`](openspec/specs/). Release steps for the CLI and for each reporter are in [docs/releasing.md](docs/releasing.md).
+Behavior that this file and [`docs/`](docs/) do not spell out is defined by the code and pinned by the tests in [`tests/`](tests/). Release steps for the CLI and for each reporter are in [docs/releasing.md](docs/releasing.md).
