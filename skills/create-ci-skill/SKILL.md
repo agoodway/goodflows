@@ -25,7 +25,7 @@ Answer these from the checkout. Ask the user only for a fact you cannot observe 
 Look, then read what exists:
 
 - **GoodFlows:** `goodflows.toml`, then `.goodflows.toml`. The CLI uses the first of those that exists, unless a command passes `--config`. Read the file. Top-level `[[jobs]]` are the `default` workflow. `[[workflows.NAME.jobs]]` are named workflows. Record each job's `name`, `command` or `steps`, `depends_on`, `workflow` (a call to another workflow), and `condition`.
-- **Hosted CI:** `.github/workflows/*.yml`, and also `.gitlab-ci.yml`, `.circleci/config.yml`, `bitbucket-pipelines.yml`, `azure-pipelines.yml`, `Jenkinsfile`, `.travis.yml`, `.buildkite/`, `appveyor.yml` when present. For each workflow record the `on` triggers, job names, `needs`, matrix, `timeout-minutes`, `services`, `env`, `${{ secrets.* }}` names, cache steps, and the exact `run` lines.
+- **Hosted CI:** `.github/workflows/*.yml` and `.github/workflows/*.yaml`, and also `.gitlab-ci.yml`, `.circleci/config.yml`, `bitbucket-pipelines.yml`, `azure-pipelines.yml`, `Jenkinsfile`, `.travis.yml`, `.buildkite/`, `appveyor.yml` when present. For each workflow record the `on` triggers, job names, `needs`, matrix, `timeout-minutes`, `services`, `env`, `${{ secrets.* }}` names, cache steps, and the exact `run` lines. A repository that only has `.yaml` workflows still has hosted CI.
 - **Local checks:** `Makefile` targets, `package.json` `scripts`, `justfile`, `Taskfile.yml`, `Cargo.toml` / `mix.exs` / `go.mod` / `pyproject.toml` only to identify the toolchain those commands need.
 - **Hooks and bots:** `.pre-commit-config.yaml`, `.husky/`, `lefthook.yml`, `dangerfile*`, review workflows, `CODEOWNERS`, `renovate.json`, `dependabot.yml`. Say whether a bot fails the check or only comments.
 - **Required checks:** `gh api repos/<owner>/<repo>/rulesets` and branch protection for the default branch, when `gh` is authenticated. If the call fails, say the required set was not readable. Do not invent a required check.
@@ -39,11 +39,13 @@ When the repo has a GoodFlows config, local runs of those jobs go through the `g
 |---|---|
 | Default workflow | `goodflows` (same as `goodflows run`) |
 | Named workflow | `goodflows run NAME` |
-| Named jobs plus their `depends_on` | `goodflows --jobs a,b` |
+| Selected jobs plus their `depends_on` | the full-run command, plus `--jobs a,b` |
 | Parse only, run nothing | `goodflows validate` |
 | Print jobs | `goodflows list` |
 | Other config file | `--config PATH` on the command above |
 | Machine-readable result | `--json` (JSON Lines; the last `summary` event has `success`) |
+
+`goodflows --jobs a,b` with no workflow name selects the default workflow and the default config file. A file with no default exits 1 and names the workflows you can pass. A named workflow is `goodflows run NAME --jobs a,b`. Keep `--config` and `--env` on that command when the run used them.
 
 Exit `0` means every selected job passed or was skipped. Exit `1` is a failed job, a timeout, or a config error. Exit `2` is bad arguments. `goodflows list` confirms names when the binary is already installed. Parsing the TOML is enough when it is not.
 
@@ -75,7 +77,7 @@ These sections, in this order, each filled from the interview:
 
 - **CI status on a pull request.** The exact `gh` commands for this repo (`gh pr checks`, `gh run list --branch`, `gh run view <id> --log-failed`). Include the Actions URL `https://github.com/<owner>/<repo>/actions`. If `gh` is not authenticated, say status was not queried from here.
 
-- **Read a failure.** How to tell a failed job from a skipped one. For GoodFlows, the text report's `Failures` section and the final `Rerun failed:` line, and the `--json` summary's `stdout_tail` / `stderr_tail`. Name the rerun: `goodflows --jobs <failed-names>` (it also runs `depends_on`). For every other check, the command and the first thing its failing output means (a formatter diff, a lint warning treated as an error, a timeout). Only name a failure mode the command or a real log supports. Do not invent a past flake.
+- **Read a failure.** How to tell a failed job from a skipped one. For GoodFlows, the text report's `Failures` section and the final `Rerun failed:` line, and the `--json` summary's `stdout_tail` / `stderr_tail`. The rerun command is that `Rerun failed:` line, copied as printed. It is `goodflows run`, with the workflow name, and with `--config`, `--env`, and `--sprite` when the run used them, then `--jobs` for the failed jobs and the jobs skipped because a dependency did not pass. `--jobs` also runs `depends_on`. Do not shorten it to `goodflows --jobs <names>`: with no workflow name that selects the default workflow, and with no `--config` it reads `goodflows.toml` or `.goodflows.toml` instead of the file the run used. When the report says `Selective rerun unavailable` because a job name contains a comma, copy the `Rerun workflow:` line instead. For every other check, the command and the first thing its failing output means (a formatter diff, a lint warning treated as an error, a timeout). Only name a failure mode the command or a real log supports. Do not invent a past flake.
 
 - **Green before merge.** The pull-request jobs, plus required checks you actually read. A tag-only workflow is not part of green. State the OS and toolchain this file's proof ran, and the matrix cells it did not.
 
