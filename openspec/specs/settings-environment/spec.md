@@ -49,7 +49,7 @@ Effective command environments SHALL merge by key in increasing precedence: call
 - **THEN** other workflows and legacy top-level jobs retain the shared value
 
 ### Requirement: Commands and expressions use consistent environments
-Job commands and job conditions SHALL see caller, resolved settings, and job env values. Step commands and step conditions SHALL additionally see that step's env overrides. Shell and expression conditions SHALL agree on ordinary variable values. Job output expressions SHALL see the job environment without step-only overrides. Runner-owned variable injection and scrubbing SHALL retain existing behavior, except that a `GOODFLOWS_OUTPUT` inherited from the caller SHALL NOT be visible to expressions.
+Job commands and job conditions SHALL see caller, resolved settings, and job env values. Step commands and step conditions SHALL additionally see that step's env overrides. Shell and expression conditions SHALL agree on ordinary variable values. Job output expressions SHALL see the job environment without step-only overrides. Runner-owned variable injection and scrubbing SHALL retain existing behavior, except that a `GOODFLOWS_OUTPUT` inherited from the caller SHALL NOT be visible to expressions. CI context for an uploaded run record SHALL be read only from the caller environment; settings and job env values MUST NOT supply or change it.
 
 #### Scenario: Conditions observe profile values
 - **WHEN** a selected profile sets `RUN_CHECKS=1`
@@ -74,6 +74,10 @@ Job commands and job conditions SHALL see caller, resolved settings, and job env
 #### Scenario: Settings do not supply the publisher endpoint
 - **WHEN** settings define the configured reporting `url_env` variable with a value different from the caller's endpoint, or the caller has no endpoint
 - **THEN** commands receive the configured settings value while the publisher resolves its endpoint only from the caller environment, leaving it unavailable when absent there
+
+#### Scenario: Settings do not supply CI context
+- **WHEN** run-record upload is enabled, the caller has no `GITHUB_ACTIONS`, and settings env sets `GITHUB_ACTIONS=true` and `GITHUB_RUN_ID=1`
+- **THEN** commands receive the settings values and the uploaded record has no `ci`
 
 ### Requirement: Every settings map is validated before execution
 All shared, workflow, and profile env maps SHALL follow existing job/step env validation, including malformed keys or values, reserved reporting and partition names, `GOODFLOWS_ENVIRONMENT`, and the configured reporting token variable. Settings env maps SHALL additionally reject `GOODFLOWS_OUTPUT`. Validation SHALL include unselected workflows and profiles and invalid entries hidden by later overrides. Semantic env validation errors after successful TOML deserialization SHALL identify the settings scope without exposing variable values. TOML syntax/type errors SHALL retain existing parser diagnostics, which may include source excerpts and configured values.
