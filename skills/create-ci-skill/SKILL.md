@@ -88,7 +88,9 @@ A helper script is allowed only when a command in the proof block cannot be writ
 Run `### Proof commands` from the repo root, one command at a time, in order. Record the command, the exit code, and one line that shows pass or fail.
 
 - The check ran and exited non-zero: stop. Fix the skill if the command, the path, or the job name was wrong, then run the whole block again from the first command. If the repo itself fails its real check, report that failure. Do not weaken a flag, drop a job, or mark it skipped to produce a green report.
-- The command cannot start: a missing executable, a secret that is unset, or a `services:` dependency this host does not have. Write the exact missing piece in the report and in the skill. That command is blocked, not passed. Continue only with later commands that do not need its outputs.
+- The command cannot start: a missing executable, a secret that is unset, or a `services:` dependency this host does not have. A `uses:` step that installs a language (`actions/setup-node`, `setup-beam`, `rustup toolchain install`) names the version to install. If you cannot install it, every later command that needs that binary is blocked.
+- A script that does start, then exits non-zero because a program inside it is missing (`command not found`, or a job that collects no report because that program is absent), is the same kind of block. Name the missing program and which of the script's jobs ran. Do not delete the job from the proof block to make the script exit 0.
+- Write the exact missing piece in the report and in the skill. A blocked command is not a pass. Continue only with later commands that do not need its outputs.
 - Do not claim a matrix cell you did not run. The proof runs the block once on this machine.
 
 A generated skill that was never run is a draft, not a deliverable. The handoff includes the report: each command, its exit code, and any command left blocked.
