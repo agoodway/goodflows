@@ -6,7 +6,7 @@ disable-model-invocation: true
 
 # Maintain a CI skill
 
-A `run-ci-<app>` skill goes stale when `goodflows.toml` changes. This skill is the upkeep pass for a skill written by `create-ci-skill`. It keeps the scenario answers already in that file, and it edits the file only where a workflow, job, `goodflows` command, or failure note no longer matches the config.
+A `run-ci-<app>` skill goes stale when the GoodFlows config changes. This skill is the upkeep pass for a skill written by `create-ci-skill`. It keeps the scenario answers already in that file, and it edits the file only where a workflow, job, `goodflows` command, or failure note no longer matches the config.
 
 It does not generate a skill. No `run-ci-<app>` directory means stop.
 
@@ -44,7 +44,7 @@ A candidate is a directory whose name starts with `run-ci-`, that contains `SKIL
 
 Read the GoodFlows config and the target skill. Nothing else.
 
-The CLI uses the first of `goodflows.toml` and `.goodflows.toml` that exists in the current directory. Read that file. If every scenario command and the proof block pass the same `--config PATH`, read that path instead of the default file. Do not search the repo for a config.
+The CLI uses the first of `goodflows.toml` and `.goodflows.toml` that exists in the current directory. Read that file. If every scenario command and the proof block pass the same `--config PATH`, read that path instead of the default file. If those commands name more than one `--config` path, ask which file to compare and do not edit until they answer. Do not search the repo for a config.
 
 If neither default file exists, and the skill does not pass `--config`, stop. Leave the skill byte-identical. Say there is no GoodFlows config to compare against, so nothing was updated. Point at the [goodflows README](https://github.com/agoodway/goodflows#install): install the CLI, then from the repo root run `goodflows init`. Do not run `init`. Do not invent jobs.
 
