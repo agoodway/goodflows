@@ -74,6 +74,8 @@ Then the outcome is **unchanged**. Ask nothing. Stop. Do not run the proof block
 
 Otherwise the outcome will be **updated**. Change only the lines that name a workflow, job, command, flag, or failure that drifted. Leave every other line as written, including scenario sentences whose workflow still exists.
 
+`## Keeping this skill accurate` may end with the current sentence or an older one. The current sentence is: When the GoodFlows config changes, run `maintain-ci-skill` to keep this skill accurate. Install it with `npx skills add agoodway/goodflows --skill maintain-ci-skill`. The older one says that section is the maintenance, and that a separate upkeep command does not exist. Neither wording is drift. The older sentence by itself does not make the outcome **updated**. On **unchanged**, leave it so the file stays byte-identical. When the outcome is **updated**, replace the older sentence with the current one if it is still there. If the current sentence is already there, leave it. Leave the rest of that section as written.
+
 Do not ask about a workflow that already has a scenario on the file that workflow belongs to. A bare `goodflows` and `goodflows run default` both run `default`. Ask only in these two cases:
 
 - A workflow is in a selected file and no scenario command that selects that same file runs it. Ask which scenario it is for. Ask where it runs (this machine, `--sprite`, `--env`, or `--config`) only when the skill does not already say where scenarios run. One question per such workflow. Do not invent a purpose while you wait.

@@ -106,7 +106,7 @@ These sections, in this order. The job facts come from the config. The scenario 
 
 - **Green.** The proof invocation exited 0. State the binary path and the workflow that ran.
 
-- **Keeping this skill accurate.** When `goodflows.toml` or `.goodflows.toml` changes, or the answers in section 2 change, re-read the config and edit the job names, the scenario map, and the proof block so they match. Then run the proof block again. There is no `maintain-ci-skill` command to run; this section is the maintenance.
+- **Keeping this skill accurate.** When `goodflows.toml` or `.goodflows.toml` changes, or the answers in section 2 change, the job names, the scenario map, and the proof block have to match the config. End the section with this sentence: When the GoodFlows config changes, run `maintain-ci-skill` to keep this skill accurate. Install it with `npx skills add agoodway/goodflows --skill maintain-ci-skill`.
 
 A helper script is allowed only when a command in the proof block cannot be written inline. It is executable, and the proof block shows how it is invoked.
 
@@ -123,4 +123,4 @@ A generated skill that was never run is a draft, not a deliverable. The handoff 
 
 ## 5. Maintenance
 
-Point the user at the generated skill's `## Keeping this skill accurate` section. That note is how the skill stays true when the GoodFlows config changes. `maintain-ci-skill` is a separate skill and is not part of this one; do not tell the user to run it.
+Tell the user to run `maintain-ci-skill` to keep the generated `run-ci-<app>` skill accurate when the GoodFlows config changes. Install it with `npx skills add agoodway/goodflows --skill maintain-ci-skill` when it is not already installed. The generated skill's `## Keeping this skill accurate` section ends with that same sentence.
