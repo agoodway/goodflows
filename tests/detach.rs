@@ -242,6 +242,55 @@ fn detach_reports_usage_and_config_errors_before_starting() {
 }
 
 #[test]
+fn status_keeps_each_call_of_one_workflow_apart() {
+    // Both calls run `suite`. The first `work` to take `claimed` fails at
+    // once; the other waits for `release`, then passes.
+    let p = Project::new(
+        "[settings]\nfail_fast = false\n\
+         [[workflows.ci.jobs]]\nname = 'call-a'\nworkflow = 'suite'\n\
+         [[workflows.ci.jobs]]\nname = 'call-b'\nworkflow = 'suite'\n\
+         [[workflows.suite.jobs]]\nname = 'work'\n\
+         command = 'mkdir claimed 2>/dev/null && exit 1; touch started; for i in $(seq 600); do test -f release && exit 0; sleep 0.05; done; exit 1'\n",
+    );
+    let id = detach(&p, &["ci"]);
+    wait_for(&p, "started");
+    // The failed call's results may land just after `started`.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        let status = only(&p.run(&["status", &id, "--json"]), "run_status");
+        if status["failed"].as_array().unwrap().len() == 2 {
+            break status;
+        }
+        assert!(Instant::now() < deadline, "{status}");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    std::fs::write(p.dir.join("release"), "").unwrap();
+    // One call and its `work` failed; the other call and its `work` run.
+    let child = |list: &Value| -> String {
+        let names: Vec<_> = list
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n.as_str().unwrap())
+            .collect();
+        assert_eq!(names.len(), 2, "{status}");
+        assert!(names[0] == "call-a" || names[0] == "call-b", "{status}");
+        assert!(
+            names[1].starts_with("suite [") && names[1].ends_with("] work"),
+            "{status}"
+        );
+        names[1].to_owned()
+    };
+    assert_ne!(child(&status["running"]), child(&status["failed"]));
+
+    let done = p.run(&["wait", &id, "--timeout", "30"]);
+    assert_eq!(done.status.code(), Some(1), "{}", stderr(&done));
+    let status = only(&p.run(&["status", &id, "--json"]), "run_status");
+    assert_eq!(status["passed"].as_array().unwrap().len(), 2, "{status}");
+    assert_eq!(status["failed"].as_array().unwrap().len(), 2, "{status}");
+}
+
+#[test]
 fn a_detached_run_that_dies_is_lost_not_running() {
     let p = Project::new(CI);
     let id = detach(&p, &[]);

@@ -297,8 +297,9 @@ fn progress(dir: &Path, run_id: &str) -> Result<Progress> {
     let path = dir.join("events.jsonl");
     let text = std::fs::read(&path).with_context(|| format!("read {}", path.display()))?;
     let mut total = None;
-    // Instances in the order they started, with their latest status.
-    let mut jobs: Vec<(String, String)> = Vec::new();
+    // Instances in the order they started, by invocation id and label, with
+    // their latest status.
+    let mut jobs: Vec<(String, String, String)> = Vec::new();
     // A partly written last line does not parse and is left out.
     for event in text
         .split(|b| *b == b'\n')
@@ -319,9 +320,13 @@ fn progress(dir: &Path, run_id: &str) -> Result<Progress> {
             ),
             _ => continue,
         };
-        match jobs.iter_mut().find(|(name, _)| *name == label) {
-            Some(job) => job.1 = status.into(),
-            None => jobs.push((label, status.into())),
+        let invocation = event["invocation_id"].as_str().unwrap_or_default();
+        match jobs
+            .iter_mut()
+            .find(|(id, name, _)| id == invocation && *name == label)
+        {
+            Some(job) => job.2 = status.into(),
+            None => jobs.push((invocation.into(), label, status.into())),
         }
     }
     let mut by_status: BTreeMap<String, Vec<String>> = BTreeMap::new();
@@ -335,14 +340,14 @@ fn progress(dir: &Path, run_id: &str) -> Result<Progress> {
     ] {
         by_status.insert(status.into(), Vec::new());
     }
-    for (label, status) in jobs {
+    for (_, label, status) in jobs {
         by_status.entry(status).or_default().push(label);
     }
     Ok((total, by_status))
 }
 
-/// `name`, `name (i/N)` for a partition, prefixed with `workflow/` for a
-/// job of a called workflow.
+/// `name`, or `name (i/N)` for a partition, prefixed with its workflow and
+/// short invocation id for a job of a called workflow.
 fn label(event: &Value, value: &Value) -> String {
     let mut name = value["name"].as_str().unwrap_or_default().to_owned();
     if let (Some(index), Some(count)) = (
@@ -351,8 +356,17 @@ fn label(event: &Value, value: &Value) -> String {
     ) {
         name = format!("{name} ({index}/{count})");
     }
-    match (event["parent_run_id"].as_str(), event["workflow"].as_str()) {
-        (Some(_), Some(workflow)) => format!("{workflow}/{name}"),
+    // A called workflow's jobs, like the text output's live lines: two calls
+    // of one workflow differ by their invocation.
+    match (
+        event["parent_run_id"].as_str(),
+        event["invocation_id"].as_str(),
+    ) {
+        (Some(_), Some(id)) => format!(
+            "{} [{}] {name}",
+            event["workflow"].as_str().unwrap_or_default(),
+            id.get(..8).unwrap_or(id)
+        ),
         _ => name,
     }
 }
