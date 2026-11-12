@@ -113,11 +113,13 @@ goodflows --config ./goodflows.toml
 | 0 | Every selected job passed or was skipped | Nothing |
 | 1 | A job failed or timed out, or goodflows hit a runtime error after the command and config were accepted | Fix the code, or report the failure |
 | 2 | A usage or config error: bad arguments, no config, a config that does not parse or validate, or an unknown workflow, job, or environment | Fix the command or the config, then run it again |
-| 75 | Only from [`wait`](#detached-runs): the timeout passed and the run is still going | Run `wait` again |
+| 75 | Only from [`wait` or `cancel`](#detached-runs): the timeout passed and the run is still going | Run the same command again |
 | 130 | Interrupted by SIGINT | |
 | 143 | Interrupted by SIGTERM | |
 
-With `--json`, a run that cannot start ends with one `error` event. Its `code` is stable, so a script can branch on it instead of the message:
+[`last`](#last-run-and-rerunning-failures) and [`wait`](#detached-runs) exit with the exit code of the run they report, so `1` means that run failed. Their own usage errors, and `last` finding no record (`no_last_run`), exit 2. Before this, `last` exited 0 whenever it could show the record; a script that read any non-zero exit from `last` as "no record" must check for exit 2 instead.
+
+With `--json`, a run or other command that cannot do what it was asked ends with one `error` event. Its `code` is stable, so a script can branch on it instead of the message:
 
 | `code` | Exit | Meaning |
 |---|---|---|
@@ -131,7 +133,8 @@ With `--json`, a run that cannot start ends with one `error` event. Its `code` i
 | `unknown_environment` | 2 | The `--env` name is not in the file |
 | `no_last_run` | 2 | [`last` or `run --failed`](#last-run-and-rerunning-failures) found no previous local run, or `run --failed` named a different workflow or environment |
 | `no_failed_jobs` | 2 | `run --failed` found nothing to rerun: the last run had no failed or timed-out job |
-| `unknown_run` | 2 | [`status` or `wait`](#detached-runs) found no detached run with that id for the config |
+| `unknown_run` | 2 | [`status`, `wait`, or `cancel`](#detached-runs) found no detached run with that id for the config |
+| `config_exists` | 2 | `init` would overwrite an existing config; pass `--force` |
 | `runtime` | 1 | Anything else that stopped goodflows, including `history` and `reports upload` request errors and the `--sprite` and `sprite` command checks |
 
 `message` is the same text that text mode prints after `Error:`. An unknown workflow, job, or environment message lists the names that exist. An optional `hint` suggests a fix, such as `did you mean 'test'?` for a close match. Text mode prints it on a `Hint:` line.
@@ -332,13 +335,13 @@ Settings precedence is CLI flags, then the profile, then the workflow, then `[se
 
 `--output` picks how much a run prints in text mode. `--output=failures` prints one status line per job and no job output while the run goes. `--output=stream` also prints step lines, and writes each output chunk as `[job stream]` followed by the chunk. `stream` is `stdout` or `stderr`. A step is `[job/step stream]`. Without the flag, a run uses `failures` when stdout is not a terminal, such as when it is piped to a file, or when a coding agent variable is set (`CLAUDECODE`, `CODEX_*` other than `CODEX_HOME`, `AGENT`, `AI_AGENT`, `CURSOR_AGENT`, `GEMINI_CLI`, or `OPENCODE`). Otherwise it uses `stream`. `--json` ignores `--output`.
 
-The run ends with a report: one row per job, then counts, then a `Failures` section when something failed or timed out. In both modes each `Failures` entry shows the last 4 KiB of the instance's stdout and stderr, and the paths of its log files when `--log-dir` is set. The last line of a failed root run is `Rerun failed:` and a `goodflows run` command for the failed jobs and the jobs skipped because a dependency did not pass.
+The run ends with a report: one row per job, then counts, then a `Failures` section when something failed or timed out. In both modes each `Failures` entry shows the instance's output and the paths of its log files when `--log-dir` is set. Short output is shown whole, in a `stdout:` and a `stderr:` block. Longer output is one `stdout and stderr:` block in the order goodflows read it: the first 4 KiB, a `… N bytes omitted …` line, then the last 4 KiB, with the log paths under it. The last line of a failed root run is `Rerun failed:` and a `goodflows run` command for the failed jobs and the jobs skipped because a dependency did not pass.
 
-`--json` prints JSON Lines on stdout. Every event has `schema_version` 1. The last event of a finished run has `"type":"summary"`. Its `success` field is true when every selected job passed or was skipped. `--json=summary` leaves out the events in between, such as one `job_output` event per output chunk. A run then prints only `run_started`, any `error` event, and the `summary`, plus `sprite_unresolved` when a Sprite run cannot report one. Other commands print the same events as with `--json`.
+`--json` prints JSON Lines on stdout. Every event has `schema_version` 1. The last event of a finished run has `"type":"summary"`. Its `success` field is true when every selected job passed or was skipped. `--json=summary` leaves out the events in between, such as one `job_output` event per output chunk. A run then prints only `run_started`, any `error` event, and the `summary`, plus `sprite_unresolved` when a Sprite run cannot report one. Other commands print the same events as with `--json`. Commands that only report a result, such as `init`, `skills install`, `last`, and `status`, take a plain `--json` with no value.
 
 Each failed or timed-out job in the summary has:
 
-- `output_head` and `output_tail`: the first and last 4 KiB of its stdout and stderr together, in the order goodflows read them. `output_truncated` is true when output between them was left out.
+- `output_head` and `output_tail`: the first and last 4 KiB of its stdout and stderr together, in the order goodflows read them. `output_truncated` is true when output between them was left out, and `output_omitted_bytes` is how many bytes were.
 - `stdout_tail` and `stderr_tail`: the last 4 KiB of each stream. `stdout_truncated` and `stderr_truncated` say whether earlier output was left out.
 
 With `--log-dir`, each job that ran has `stdout_log` and `stderr_log`, the paths of its log files. A failed root run's summary has `rerun_command`, the command on the report's `Rerun failed:` line, or on its `Rerun workflow:` line when a job name contains a comma.
@@ -358,7 +361,7 @@ goodflows --log-dir .goodflows-logs --log-runs 5
 
 ### Last run and rerunning failures
 
-Every local run replaces one record of its results at `.goodflows/last/<config file name>.json`, next to the config file. It is written whether or not history is on. It keeps each invocation's `summary`, including the output tails of failed jobs and the `--log-dir` path. Add `/.goodflows/` to `.gitignore`.
+Every local run replaces one record of its results at `.goodflows/last/<config file name>.json`, next to the config file. It is written whether or not history is on. It keeps each invocation's `summary`, including the output tails of failed jobs and the `--log-dir` path. When `.goodflows/` has no `.gitignore`, goodflows writes one containing `*`, so git ignores the directory. It leaves an existing one as it is.
 
 ```bash
 goodflows last
@@ -366,7 +369,7 @@ goodflows last --json
 goodflows run --failed
 ```
 
-`goodflows last` prints the last run's report again without running anything: each job's status, the Failures section with the command, error, log file paths, and output tails, and the `Rerun failed:` hint. A run that called workflows shows each called workflow's report before the root's, as the run did. With `--json`, it emits the run's `summary` events unchanged. The log files exist only if that run used `--log-dir`, and only until `log_runs` prunes them.
+`goodflows last` prints the last run's report again without running anything: each job's status, the Failures section with the command, error, log file paths, and output tails, and the `Rerun failed:` hint. A run that called workflows shows each called workflow's report before the root's, as the run did. With `--json`, it emits the run's `summary` events unchanged. It exits with the run's exit code: 0 when it passed, 1 when a job failed or timed out, and 130 or 143 when a signal stopped it. The log files exist only if that run used `--log-dir`, and only until `log_runs` prunes them.
 
 `goodflows run --failed` reruns the jobs that the last run's `Rerun failed:` hint names, plus the jobs they depend on. It uses the last run's workflow and `--env`. Those are the failed and timed-out jobs and the jobs skipped because a dependency did not pass. A workflow or `--env` given with `--failed` must match the last run's. `--failed` rejects `--jobs` and `--sprite`. Other run flags, such as `--log-dir` and `--history`, apply as usual. A job whose name contains a comma is rerun too, though the hint cannot select it.
 
@@ -380,15 +383,18 @@ Coding agents often stop a shell command after a couple of minutes, and a full r
 id=$(goodflows run --detach)
 goodflows status "$id"
 goodflows wait "$id" --timeout 90
+goodflows cancel "$id"
 ```
 
 `--detach` checks the command line and the config first, so usage and config errors still exit 2 before anything starts. It takes the same run flags as a foreground run, except `--sprite`.
 
 `goodflows status <run_id>` prints the run's state and which jobs are running, passed, failed, timed out, skipped, or cancelled. With `--json` it prints one `run_status` event with `state` (`running`, `finished`, or `lost`), `exit_code` once finished, and a list of job names for each status. `lost` means the background process died without a result, for example from SIGKILL. `status` exits 0 whenever it can report.
 
-`goodflows wait <run_id> --timeout <secs>` blocks until the run finishes. It then prints the run's report, or its `summary` events with `--json`, exactly as the foreground run would have, and exits with the run's exit code. If the timeout passes first, it prints the same progress as `status` and exits 75. Call `wait` again until the exit code is not 75. Without `--timeout` it waits as long as the run takes. A `lost` run exits 1. Stopping `wait` does not stop the run. To cancel a detached run, send its process SIGTERM; the pid is in `run_dir/pid`.
+`goodflows wait <run_id> --timeout <secs>` blocks until the run finishes. It then prints the run's report, or its `summary` events with `--json`, exactly as the foreground run would have, and exits with the run's exit code. If the timeout passes first, it prints the same progress as `status` and exits 75. Call `wait` again until the exit code is not 75. Without `--timeout` it waits as long as the run takes. A `lost` run exits 1. Stopping `wait` does not stop the run.
 
-`status` and `wait` find the run beside the config, so pass the same `--config` the run used. Each detached run keeps its events, stderr, record, and exit code in `.goodflows/runs/<run_id>/` next to the config file. Nothing removes these directories, so delete old ones when you no longer need them. A detached run also replaces the [last run](#last-run-and-rerunning-failures) record when it finishes.
+`goodflows cancel <run_id>` stops a running detached run. It sends the run SIGTERM, which cancels its running and waiting jobs as Ctrl-C would, waits for the run to record its result, then prints the same report as `status` and exits 0. The run's own exit code is then 143. A run that had already stopped is reported as it is, also with exit 0. With `--json` the `run_status` event adds `was_running`, true when `cancel` stopped the run. If the run is still stopping after 30 seconds, `cancel` prints its progress and exits 75.
+
+`status`, `wait`, and `cancel` find the run beside the config, so pass the same `--config` the run used. Each detached run keeps its events, stderr, record, and exit code in `.goodflows/runs/<run_id>/` next to the config file. Starting a detached run removes the oldest finished runs of the same config file, keeping the newest 10, the new one included. A run that is still going is never removed. A detached run also replaces the [last run](#last-run-and-rerunning-failures) record when it finishes.
 
 ### Run history
 
@@ -462,7 +468,7 @@ reports = ["test-timings"]
 GOODFLOWS_URL=https://flows.example.com GOODFLOWS_API_KEY=secret goodflows
 ```
 
-An upload failure does not change the run's exit code. Snapshots that did not upload stay in `.goodflows/reports/<run-id>/`, which contains `manifest.json`. Add `/.goodflows/` to `.gitignore`. Retry with the run directory:
+An upload failure does not change the run's exit code. Snapshots that did not upload stay in `.goodflows/reports/<run-id>/`, which contains `manifest.json`. Git ignores `.goodflows/` through the `.gitignore` goodflows writes there. Retry with the run directory:
 
 ```bash
 goodflows reports upload .goodflows/reports/<run-id>
@@ -571,13 +577,13 @@ Ampcode snapshots the disk after setup succeeds. After you change `.agents/setup
 
 ## Agent skills
 
-[`create-ci-skill`](skills/create-ci-skill/SKILL.md) reads a repository's GoodFlows config and writes a project-local `run-ci-<app>` skill for the next agent. The generated skill runs those jobs with `goodflows`. A repository with neither `goodflows.toml` nor `.goodflows.toml` gets no skill.
+[`create-ci-skill`](skills/create-ci-skill/SKILL.md) reads a repository's GoodFlows config and writes a project-local `run-ci-<app>` skill for the next agent. The generated skill runs those jobs with `goodflows`. It holds only what is specific to the repository: the workflows, the jobs, and which command to run for which scenario. For how the CLI reports a failure it points at `goodflows agents`. A repository with neither `goodflows.toml` nor `.goodflows.toml` gets no skill.
 
 ```bash
 npx skills add agoodway/goodflows --skill create-ci-skill
 ```
 
-[`maintain-ci-skill`](skills/maintain-ci-skill/SKILL.md) updates that `run-ci-<app>` skill when the GoodFlows config changes. It keeps the scenario answers already in the skill and asks again only about a new, renamed, or removed workflow. It does not write a skill when none exists.
+[`maintain-ci-skill`](skills/maintain-ci-skill/SKILL.md) updates that `run-ci-<app>` skill when the GoodFlows config changes. It keeps the scenario answers already in the skill and asks again only about a new, renamed, or removed workflow. In a skill written by an older `create-ci-skill`, it replaces the exit codes, error codes, and JSON fields copied into it with the pointer to `goodflows agents`. It does not write a skill when none exists.
 
 ```bash
 npx skills add agoodway/goodflows --skill maintain-ci-skill
@@ -603,20 +609,33 @@ goodflows skills install --harness claude
 
 A variable counts only when it is set and not empty. `--harness` skips detection. With no harness detected, the skills go in `.agents/skills`. When the environment names harnesses that load different directories, such as `CLAUDECODE` together with `AGENT=amp`, the command writes nothing and exits 2 with `ambiguous_harness`; pass `--harness`. Harnesses that share a directory, such as T3 Code running Codex, are not ambiguous. With `--json` it prints one `skills_installed` event with `directory`, `harnesses`, `source` (`flag`, `environment`, or `default`), and `files`.
 
+### Agent guide
+
+`goodflows agents` prints a guide for coding agents: the exit codes and error codes, how to read the report's `Failures` section, `last`, `run --failed`, detached runs, and the JSON events and fields. It is built into the binary, so it matches the goodflows that prints it. Generated `run-ci-<app>` skills point at it instead of copying those details.
+
+```bash
+goodflows agents
+```
+
 ## MCP server
 
 `goodflows mcp` serves goodflows to a coding agent as a [Model Context Protocol](https://modelcontextprotocol.io) server over stdin and stdout. Register it with the harness, for example `claude mcp add goodflows -- goodflows mcp`, and start it from the project directory. Each tool runs this goodflows binary in the server's working directory, so it finds `goodflows.toml` or `.goodflows.toml` there unless the call or `goodflows mcp --config PATH` names a config.
 
 | Tool | Parameters | Returns |
 | --- | --- | --- |
-| `run` | `workflow`, `config`, `env`, `jobs`, `failed`, `parallelism`, `fail_fast` | Waits for the run. Whether it passed, its exit code and summary counts, and each job that did not pass |
+| `run` | `workflow`, `config`, `env`, `jobs`, `failed`, `parallelism`, `fail_fast`, `detach` | Waits for the run. Whether it passed, its exit code and summary counts, and each job that did not pass. With `detach`, starts the run in the background and returns its `run_detached` event at once |
+| `wait` | `run_id`, `config`, `timeout` | Waits up to `timeout` seconds (default 60) for a detached run. Once it finished, the same result as `run`. Before that, a line saying the run is still running and its `run_status` event. That is a normal result, not an error |
+| `status` | `run_id`, `config` | A detached run's `run_status` event |
+| `cancel` | `run_id`, `config` | Cancels a detached run, then returns its `run_status` event, as [`goodflows cancel`](#detached-runs) does |
 | `last` | `config` | The last local run, as `goodflows last` shows it, in the same form as `run` |
 | `validate` | `workflow`, `config`, `env`, `jobs` | The `config_valid` event |
 | `list` | `workflow`, `config`, `env`, `workflows` | The `jobs` or `workflows` event |
 
 `run` and `last` never return job output events. The result is a status line (`GoodFlows checks passed.` or `GoodFlows checks failed (exit code N).`), then the root `summary` without `results`, plus `passed`, `exit_code`, and `error`, and a `results` list of the jobs that did not pass with `name`, `status`, `exit_code`, `command`, and `error`. Jobs of called workflows that did not pass are in the list too, with `called_run` naming that run's `workflow`, `run_id`, `caller_job`, and `parent_run_id`. A last text block holds each of those jobs' stdout and stderr tails, at most 4 KiB per stream and less when many jobs failed. `passed` is true only when goodflows exited 0, reported no error, and every root job passed or was skipped. The limits match the Amp plugin's.
 
-When goodflows cannot do what a tool asks, such as for a config or usage error, the tool result is an error (`isError`) with the exit code and goodflows's message. Cancelling a call sends its goodflows process SIGTERM, which cancels the run's jobs as Ctrl-C would. `goodflows mcp` rejects `--json` and the run-only flags; pass them as tool parameters instead.
+A client may stop a tool call that takes longer than its tool timeout. For a run that may take more than a minute or two, call `run` with `detach: true`, then call `wait` with the returned `run_id` and a short `timeout` until it returns the run's result. The server's instructions tell agents to do this. `status`, `wait`, and `cancel` take the `config` the run used.
+
+When goodflows cannot do what a tool asks, such as for a config or usage error or an unknown `run_id`, the tool result is an error (`isError`) with the exit code and goodflows's message. Cancelling a call sends its goodflows process SIGTERM, which cancels a blocking run's jobs as Ctrl-C would. Cancelling a `wait` call does not stop the detached run; use `cancel` for that. `goodflows mcp` rejects `--json` and the run-only flags; pass them as tool parameters instead.
 
 ## Development
 

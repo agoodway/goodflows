@@ -876,7 +876,7 @@ fn create_run(
     source: Source,
 ) -> Result<Run> {
     let spool = reporting.spool_dir();
-    dir_builder(true).create(spool)?;
+    crate::fsutil::create_state_dir(spool)?;
     let id = id.to_owned();
     let dir = spool.join(&id);
     // A non-recursive create fails rather than sharing a directory with another invocation.

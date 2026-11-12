@@ -204,15 +204,33 @@ fn prune_log_runs(base: &Path, current: &str, keep: u64) -> Result<()> {
         }
     }
     older.sort();
+    older.reverse();
+    prune_runs(base, older, keep, LOG_LOCK)
+}
+
+/// Keep the newest `keep` run directories, counting the current one, which
+/// `newest_first` leaves out: it names the other run directories under
+/// `base`, newest first. Each run holds an exclusive `flock` on its
+/// `lock_file` for its whole life. A locked (live) run is never removed; an
+/// unlocked one, or one without that file, is. A directory whose lock file
+/// cannot be opened or locked for any other reason is kept and reported.
+/// An entry that disappears meanwhile (a concurrent run pruned it) counts as
+/// pruned.
+pub fn prune_runs(
+    base: &Path,
+    newest_first: Vec<String>,
+    keep: u64,
+    lock_file: &str,
+) -> Result<()> {
     let mut kept = 1;
     let mut first_error: Option<anyhow::Error> = None;
-    for name in older.into_iter().rev() {
+    for name in newest_first {
         if kept < keep {
             kept += 1;
             continue;
         }
         let dir = base.join(&name);
-        let lock = dir.join(LOG_LOCK);
+        let lock = dir.join(lock_file);
         // Hold the lock while deleting so a live run is never removed. Only a
         // missing lock file means an old or crashed run (or one already gone).
         let guard = match open_lock(&lock, false) {
@@ -230,7 +248,7 @@ fn prune_log_runs(base: &Path, current: &str, keep: u64) -> Result<()> {
             Err(error) if gone(&error) => None,
             Err(error) => {
                 first_error.get_or_insert(anyhow::Error::new(error).context(format!(
-                    "skipped {}: failed to open {LOG_LOCK}",
+                    "skipped {}: failed to open {lock_file}",
                     dir.display()
                 )));
                 continue;

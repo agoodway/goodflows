@@ -62,13 +62,14 @@ pub async fn generate(
             if !terminal {
                 // Nobody declined a prompt, so a caller must not mistake the kept
                 // file for a written one. Exit 2 marks a usage or config error.
-                output
-                    .emit(json!({"type":"error", "message":format!(
+                return Err(crate::config::ConfigError::new(
+                    "config_exists",
+                    format!(
                         "{} already exists; pass --force to overwrite it",
                         path.display()
-                    )}))
-                    .await?;
-                std::process::exit(2);
+                    ),
+                )
+                .into());
             }
             return output
                 .emit(json!({"type":"init_cancelled", "path":path}))

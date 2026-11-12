@@ -279,6 +279,7 @@ command = """printf 'EARLY'; head -c 10000 /dev/zero | tr '\\000' x; printf 'OUT
     assert_eq!(tail.len(), 4096);
     assert!(all_out.ends_with(&out) && all_err.ends_with(&err), "{tail}");
     assert_eq!(result["output_truncated"], true);
+    assert_eq!(result["output_omitted_bytes"], 20024 - 2 * 4096);
     let run = run_dir(&p.dir.join("logs"));
     for stream in ["stdout", "stderr"] {
         let log = result[format!("{stream}_log")].as_str().unwrap();
@@ -339,25 +340,73 @@ command = """printf 'EARLY'; head -c 10000 /dev/zero | tr '\\000' x; printf 'OUT
     );
     assert!(!text[..header].contains("  command: "), "{text}");
     assert_eq!(text[failures..].matches("  command: ").count(), 1, "{text}");
-    // Even in stream mode the Failures entry names the job's log files and
-    // repeats its bounded output tails.
+    // Even in stream mode the Failures entry repeats the start and end of
+    // both streams together, then names the job's log files.
+    let block = "\n  stdout and stderr:\n    ";
+    let at = text[failures..].find(block).expect(&text) + failures + block.len();
+    assert!(
+        text[at..].starts_with("EARLY") || text[at..].starts_with("early"),
+        "{text}"
+    );
+    let omitted = format!("\n    … {} bytes omitted …\n", 20024 - 2 * 4096);
+    let at = text[at..].find(&omitted).expect(&text) + at + omitted.len();
     for (stream, tail) in [
         ("stdout", "x".repeat(4089) + "OUT-END"),
         ("stderr", "y".repeat(4089) + "err_end"),
     ] {
-        let prefix = format!("\n  {stream} log: ");
-        let at = text[failures..].find(&prefix).expect("log path") + failures + prefix.len();
-        let path = text[at..].lines().next().unwrap();
+        let prefix = format!("  {stream} log: ");
+        let path = text[at..]
+            .lines()
+            .find_map(|line| line.strip_prefix(&prefix))
+            .expect(&text);
         assert!(path.ends_with(&format!("/001-fail.{stream}.log")), "{text}");
         let log = std::fs::read_to_string(p.dir.join(path)).unwrap();
         assert!(log.ends_with(&tail[4000..]), "{log}");
-        assert!(
-            text[failures..].contains(&format!(
-                "\n  {stream} (earlier output omitted):\n    {tail}\n"
-            )),
-            "{text}"
-        );
     }
+    assert!(!text.contains("earlier output omitted"), "{text}");
+}
+
+#[test]
+fn a_long_failure_shows_the_start_of_its_output_in_the_text_report() {
+    let p = Project::new(
+        "[[jobs]]\nname = 'build'\n\
+         command = \"echo 'FIRST ERROR here'; seq 1 5000; echo 'LAST line' >&2; exit 1\"\n",
+    );
+    for args in [&["--output=failures"][..], &["--output=stream"]] {
+        let output = p.run(args);
+        assert_eq!(output.status.code(), Some(1));
+        let text = stdout(&output);
+        let failures = &text[text.find("\nFailures\n").expect(&text)..];
+        // 17 + 23893 + 10 bytes, less the first and last 4096.
+        let omitted = 17 + 23893 + 10 - 2 * 4096;
+        let lines: Vec<_> = failures.lines().collect();
+        let start = lines.iter().position(|l| *l == "  stdout and stderr:");
+        let start = start.expect(failures) + 1;
+        let marker = format!("    … {omitted} bytes omitted …");
+        let end = lines.iter().position(|l| *l == marker).expect(failures);
+        // The output's start is in the head. The streams are read
+        // concurrently, so stderr's `LAST line` may come first or anywhere
+        // in it.
+        let head = &lines[start..end];
+        assert!(head[..2].contains(&"    FIRST ERROR here"), "{failures}");
+        assert!(head.contains(&"    1"), "{failures}");
+        // The streams are read concurrently, so where `LAST line` lands
+        // depends on timing; the end of stdout is always in the tail.
+        assert!(failures.contains("\n    5000\n"), "{failures}");
+        assert!(!failures.contains("  stdout:"), "{failures}");
+        // `last` shows the same section.
+        let last = stdout(&p.run(&["last"]));
+        assert!(last.contains("\n    FIRST ERROR here\n"), "{last}");
+    }
+    // Output too short to cut keeps a block per stream.
+    let p = Project::new(
+        "[[jobs]]\nname = 'short'\ncommand = \"echo 'FIRST ERROR here'; echo 'LAST line' >&2; exit 1\"\n",
+    );
+    let text = stdout(&p.run(&["--output=failures"]));
+    assert!(
+        text.contains("\n  stdout:\n    FIRST ERROR here\n  stderr:\n    LAST line\n"),
+        "{text}"
+    );
 }
 
 #[test]

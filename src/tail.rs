@@ -15,6 +15,8 @@ pub struct Tails {
     head: Vec<u8>,
     /// Combined output after `head`.
     rest: Tail,
+    /// Bytes read from both streams.
+    total: usize,
 }
 
 /// The bounded output of a failed job, as its result reports it.
@@ -36,6 +38,9 @@ pub struct Excerpt {
     /// Output between `head` and `tail` was omitted.
     #[serde(rename = "output_truncated")]
     pub truncated: bool,
+    /// How many bytes of output were omitted between `head` and `tail`.
+    #[serde(rename = "output_omitted_bytes")]
+    pub omitted: usize,
 }
 
 impl Tails {
@@ -46,6 +51,7 @@ impl Tails {
             &mut self.stderr
         };
         tail.append(bytes);
+        self.total += bytes.len();
         let room = LIMIT - self.head.len();
         let (head, rest) = bytes.split_at(room.min(bytes.len()));
         self.head.extend_from_slice(head);
@@ -71,14 +77,18 @@ impl Tails {
             bytes.extend(&self.rest.bytes);
             let mut head = String::from_utf8_lossy(&bytes).into_owned();
             let mut tail = head.split_off(floor_char_boundary(&head, LIMIT));
-            let truncated = tail.len() > LIMIT;
-            if truncated {
-                tail = tail.split_off(ceil_char_boundary(&tail, tail.len() - LIMIT));
+            let mut omitted = 0;
+            if tail.len() > LIMIT {
+                // Only lossy decoding makes contiguous output this long.
+                let kept = tail.split_off(ceil_char_boundary(&tail, tail.len() - LIMIT));
+                omitted = tail.len();
+                tail = kept;
             }
             return Excerpt {
                 head,
                 tail,
-                truncated,
+                truncated: omitted > 0,
+                omitted,
             };
         }
         // Drop an incomplete character at the end of the head; its remaining
@@ -94,6 +104,8 @@ impl Tails {
             head,
             tail: self.rest.snapshot().0,
             truncated: true,
+            // The bytes neither `head` nor the retained tail holds.
+            omitted: self.total - self.head.len() - self.rest.bytes.len(),
         }
     }
 }
@@ -193,6 +205,9 @@ mod tests {
         assert_eq!(long.head, a);
         assert_eq!(long.tail, format!("{}€-end", "x".repeat(LIMIT - 7)));
         assert!(long.truncated);
+        // 4097 + 8192 + 7 bytes, less the 4096 kept at each end.
+        assert_eq!(long.omitted, 4104);
+        assert_eq!((short.omitted, whole.omitted), (0, 0));
     }
 
     #[test]
@@ -202,6 +217,8 @@ mod tests {
         assert_eq!(contiguous.head, "\u{fffd}".repeat(LIMIT / 3));
         assert_eq!(contiguous.tail, "\u{fffd}".repeat(LIMIT / 3));
         assert!(contiguous.truncated);
+        // 4106 replacement characters of 3 bytes each, less the 2 * 1365 kept.
+        assert_eq!(contiguous.omitted, 3 * (LIMIT + 10 - 2 * (LIMIT / 3)));
         let cut = excerpt(&[("stdout", &invalid)]);
         assert_eq!(cut.head, "\u{fffd}".repeat(LIMIT / 3));
         assert_eq!(cut.tail, "\u{fffd}".repeat(LIMIT / 3));

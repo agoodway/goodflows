@@ -138,7 +138,17 @@ enum Commands {
         #[arg(long, value_name = "SECS")]
         timeout: Option<u64>,
     },
-    /// Show the last local run's results and failure output again, without running anything
+    /// Cancel a detached run: send it SIGTERM, then report it once it has stopped
+    #[command(after_help = "Examples:
+  id=$(goodflows run --detach)       # start a run in the background
+  goodflows cancel \"$id\"             # stop it; its running and waiting jobs are cancelled
+  goodflows cancel \"$id\" --json      # print one run_status event once it has stopped")]
+    Cancel {
+        /// The run id `run --detach` printed
+        #[arg(value_parser = reporting::history_client::run_id)]
+        run_id: String,
+    },
+    /// Show the last local run's results and failure output again, without running anything, and exit with its exit code
     #[command(after_help = "Examples:
   goodflows last                     # show the last run's results and failure output
   goodflows last --json              # print the last run's summary events as JSON
@@ -218,9 +228,15 @@ enum Commands {
         #[command(subcommand)]
         command: SkillsCommand,
     },
+    /// Print the guide for coding agents: exit codes, error codes, reading a failure, detached runs and JSON fields
+    #[command(after_help = "Examples:
+  goodflows agents                   # print the guide for this goodflows version
+  goodflows last                     # then show the last run's failures again
+  goodflows run --failed             # and rerun only the jobs that failed")]
+    Agents,
     /// Serve goodflows to coding agents as an MCP server on stdin and stdout
     #[command(after_help = "Examples:
-  goodflows mcp                      # serve the run, list, validate and last tools
+  goodflows mcp                      # serve the run, wait, status, cancel, list, validate and last tools
   goodflows mcp --config ci.toml     # tools use ci.toml unless a call passes its own config
   goodflows skills install           # also install the CI skills for this harness")]
     Mcp,
@@ -287,7 +303,7 @@ enum HistoryCommand {
 }
 
 /// Global flags that only `run` uses; `init`, `reports upload`, `history`,
-/// `last`, `status`, `wait`, `sprite`, `skills install` and `mcp` commands
+/// `last`, `status`, `wait`, `cancel`, `sprite`, `skills install`, `agents` and `mcp` commands
 /// reject them. `validate`
 /// and `list` resolve all of them except `--log-dir` into their settings.
 const RUN_ONLY_FLAGS: [&str; 12] = [
@@ -321,11 +337,26 @@ impl Cli {
             })
         }
         let run_only = |command| hide(command, &RUN_ONLY_FLAGS);
+        // A command that runs no jobs has no run events to choose between,
+        // so its `--json` takes no value.
+        fn plain_json(command: clap::Command, help: &'static str) -> clap::Command {
+            // `mut_args` keeps the built command's argument order.
+            command.mut_args(|arg| match arg.get_id().as_str() {
+                "json" => arg.num_args(0).help(help),
+                // Not "see a summary with '-h'": no summary is in sight.
+                "help" => arg
+                    .help("Print help")
+                    .long_help(clap::builder::Resettable::<clap::builder::StyledStr>::Reset),
+                _ => arg,
+            })
+        }
+        const ONE_EVENT: &str = "Print the result as a JSON event";
+        let single = |command| plain_json(run_only(command), ONE_EVENT);
         // `reports upload` and `skills install` reject `--config` too.
         let configless = |command| hide(run_only(command), &["config"]);
         let unlogged = |command| hide(command, &["log_dir"]);
         command
-            .mut_subcommand("init", run_only)
+            .mut_subcommand("init", single)
             .mut_subcommand("validate", unlogged)
             .mut_subcommand("list", unlogged)
             .mut_subcommand("reports", |r| configless(r).mut_subcommands(configless))
@@ -335,10 +366,19 @@ impl Cli {
             .mut_subcommand("history", |history| {
                 run_only(history).mut_subcommands(run_only)
             })
-            .mut_subcommand("last", run_only)
-            .mut_subcommand("status", run_only)
+            .mut_subcommand("last", |last| {
+                // A run that called workflows has a summary for each.
+                plain_json(run_only(last), "Print the result as JSON events")
+            })
+            .mut_subcommand("status", single)
+            .mut_subcommand("cancel", single)
             .mut_subcommand("wait", run_only)
-            .mut_subcommand("skills", |s| configless(s).mut_subcommands(configless))
+            .mut_subcommand("skills", |s| {
+                let configless = |s| plain_json(configless(s), ONE_EVENT);
+                configless(s).mut_subcommands(configless)
+            })
+            // `agents` prints one fixed text.
+            .mut_subcommand("agents", |agents| hide(configless(agents), &["json"]))
             // `mcp` speaks MCP on stdout; `--config` is its tools' default.
             .mut_subcommand("mcp", |mcp| hide(run_only(mcp), &["json"]))
     }
@@ -435,8 +475,10 @@ impl Cli {
                 | Commands::Last
                 | Commands::Status { .. }
                 | Commands::Wait { .. }
+                | Commands::Cancel { .. }
                 | Commands::Sprite { .. }
                 | Commands::Skills { .. }
+                | Commands::Agents
                 | Commands::Mcp
                 | Commands::SpriteAgent { .. },
             )
@@ -552,6 +594,9 @@ async fn main() -> ExitCode {
     ExitCode::from(code)
 }
 
+/// What `goodflows agents` prints after its version line.
+const AGENTS_GUIDE: &str = include_str!("agents_guide.md");
+
 /// A command line that parsed but asks for something goodflows does not do.
 fn usage(message: impl Into<String>) -> anyhow::Error {
     ConfigError::new("usage", message).into()
@@ -626,6 +671,23 @@ async fn run(cli: &Cli, output: &mut Output, cancel: watch::Receiver<Option<i32>
         }
         return skills::install(*harness, output).await;
     }
+    if let Some(Commands::Agents) = &cli.command {
+        let rejected = [
+            (cli.config.is_some(), "--config"),
+            (cli.json.is_some(), "--json"),
+        ];
+        let flag = rejected
+            .into_iter()
+            .find_map(|(set, flag)| set.then_some(flag));
+        if let Some(flag) = flag.or_else(|| cli.run_only_flag()) {
+            return Err(usage(format!("{flag} cannot be used with agents")));
+        }
+        print!(
+            "goodflows {}: running checks and reading a failure\n\n{AGENTS_GUIDE}",
+            env!("CARGO_PKG_VERSION")
+        );
+        return Ok(0);
+    }
     if let Some(Commands::Mcp) = &cli.command {
         let json = cli.json.is_some().then_some("--json");
         if let Some(flag) = json.or_else(|| cli.run_only_flag()) {
@@ -639,11 +701,14 @@ async fn run(cli: &Cli, output: &mut Output, cancel: watch::Receiver<Option<i32>
         }
         return last::show(&Config::locate(cli.config.as_deref())?, output).await;
     }
-    if let Some(Commands::Status { run_id } | Commands::Wait { run_id, .. }) = &cli.command {
-        let command = if matches!(cli.command, Some(Commands::Status { .. })) {
-            "status"
-        } else {
-            "wait"
+    if let Some(
+        Commands::Status { run_id } | Commands::Wait { run_id, .. } | Commands::Cancel { run_id },
+    ) = &cli.command
+    {
+        let command = match cli.command {
+            Some(Commands::Status { .. }) => "status",
+            Some(Commands::Cancel { .. }) => "cancel",
+            _ => "wait",
         };
         if let Some(flag) = cli.run_only_flag() {
             return Err(usage(format!("{flag} cannot be used with {command}")));
@@ -659,6 +724,9 @@ async fn run(cli: &Cli, output: &mut Output, cancel: watch::Receiver<Option<i32>
                     output,
                 )
                 .await
+            }
+            Some(Commands::Cancel { .. }) => {
+                detach::cancel(&config_file, run_id, cli.config.as_deref(), output).await
             }
             _ => detach::status(&config_file, run_id, output).await,
         };
@@ -1269,7 +1337,12 @@ async fn invocation(
         recorder.add(name, profile, invocation, signal.is_some(), summary.clone());
         // The root's summary is last; called workflows finished before it.
         if parent.is_none() {
-            if let Err(error) = recorder.write(run.config_path.as_deref()) {
+            // The exit code `execute` gives, for `last` to exit with.
+            let code = cancel
+                .borrow()
+                .map(|s| (128 + s) as u8)
+                .unwrap_or(if success { 0 } else { 1 });
+            if let Err(error) = recorder.write(run.config_path.as_deref(), code) {
                 eprintln!("goodflows: warning: last run record: {error:#}");
             }
         }
@@ -1805,6 +1878,50 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn commands_that_run_no_jobs_take_a_plain_json_flag() {
+        for path in [
+            &["init"][..],
+            &["skills", "install"],
+            &["last"],
+            &["status"],
+        ] {
+            let args = std::iter::once("goodflows")
+                .chain(path.iter().copied())
+                .chain(["--help"]);
+            let error = Cli::parser().try_get_matches_from(args).err().unwrap();
+            let help = error.render().to_string();
+            assert!(help.contains("      --json\n"), "{path:?}:\n{help}");
+            // `last`'s examples may name the summary events it prints.
+            let (options, _) = help.split_once("\nExamples:").unwrap();
+            assert!(!options.contains("summary"), "{path:?}:\n{help}");
+        }
+        let run_id = "fb7d2711-6b67-4f5a-9104-492032a9e1e5";
+        for args in [
+            &["init"][..],
+            &["skills", "install"],
+            &["last"],
+            &["status", run_id],
+        ] {
+            let json = parse(&[args, &["--json"]].concat()).unwrap().json;
+            assert_eq!(json, Some(output::Json::All), "{args:?}");
+            let error = parse(&[args, &["--json=summary"]].concat()).err();
+            assert!(error.is_some(), "{args:?}");
+        }
+        // A run, and `wait`, which replays one, still choose their events.
+        assert_eq!(
+            parse(&["wait", run_id, "--json=summary"]).unwrap().json,
+            Some(output::Json::Summary)
+        );
+        let help = Cli::parser()
+            .try_get_matches_from(["goodflows", "run", "--help"])
+            .err()
+            .unwrap()
+            .render()
+            .to_string();
+        assert!(help.contains("--json=summary"), "{help}");
     }
 
     #[test]
