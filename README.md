@@ -128,6 +128,8 @@ With `--json`, a run that cannot start ends with one `error` event. Its `code` i
 | `unknown_workflow` | 2 | The workflow name is not in the file |
 | `unknown_job` | 2 | A `--jobs` name is not in the selected workflow |
 | `unknown_environment` | 2 | The `--env` name is not in the file |
+| `no_last_run` | 2 | [`last` or `run --failed`](#last-run-and-rerunning-failures) found no previous local run, or `run --failed` named a different workflow or environment |
+| `no_failed_jobs` | 2 | `run --failed` found nothing to rerun: the last run had no failed or timed-out job |
 | `runtime` | 1 | Anything else that stopped goodflows, including `history` and `reports upload` request errors and the `--sprite` and `sprite` command checks |
 
 `message` is the same text that text mode prints after `Error:`. An unknown workflow, job, or environment message lists the names that exist. An optional `hint` suggests a fix, such as `did you mean 'test'?` for a close match. Text mode prints it on a `Hint:` line.
@@ -343,6 +345,22 @@ goodflows list --json
 ```bash
 goodflows --log-dir .goodflows-logs --log-runs 5
 ```
+
+### Last run and rerunning failures
+
+Every local run replaces one record of its results at `.goodflows/last/<config file name>.json`, next to the config file. It is written whether or not history is on. It keeps each invocation's `summary`, including the output tails of failed jobs and the `--log-dir` path. Add `/.goodflows/` to `.gitignore`.
+
+```bash
+goodflows last
+goodflows last --json
+goodflows run --failed
+```
+
+`goodflows last` prints the last run's report again without running anything: each job's status, the Failures section with the command, error, log file paths, and output tails, and the `Rerun failed:` hint. A run that called workflows shows each called workflow's report before the root's, as the run did. With `--json`, it emits the run's `summary` events unchanged. The log files exist only if that run used `--log-dir`, and only until `log_runs` prunes them.
+
+`goodflows run --failed` reruns the jobs that the last run's `Rerun failed:` hint names, plus the jobs they depend on. It uses the last run's workflow and `--env`. Those are the failed and timed-out jobs and the jobs skipped because a dependency did not pass. A workflow or `--env` given with `--failed` must match the last run's. `--failed` rejects `--jobs` and `--sprite`. Other run flags, such as `--log-dir` and `--history`, apply as usual. A job whose name contains a comma is rerun too, though the hint cannot select it.
+
+When there is no record, both commands exit 2 with `no_last_run`. `run --failed` exits 2 with `no_failed_jobs` when the last run has nothing to rerun. A run that stops before its summary, such as one with a config error, leaves the previous record in place. `run --sprite` writes no record.
 
 ### Run history
 

@@ -3,6 +3,7 @@ mod expression;
 mod fsutil;
 mod history;
 mod init;
+mod last;
 mod output;
 mod reporting;
 mod retention;
@@ -89,7 +90,12 @@ enum Commands {
         /// Text output [default: failures when stdout is not a terminal or a coding agent runs goodflows, else stream]
         #[arg(long, value_enum, value_name = "MODE")]
         output: Option<output::Mode>,
+        /// Rerun only the jobs the last local run's `Rerun failed:` hint names, in its workflow and environment
+        #[arg(long, conflicts_with = "sprite")]
+        failed: bool,
     },
+    /// Show the last local run's results and failure output again, without running anything
+    Last,
     /// Validate config and selections without executing commands
     Validate { workflow: Option<String> },
     /// List jobs and dependencies
@@ -159,8 +165,8 @@ enum HistoryCommand {
     },
 }
 
-/// Global flags that only `run` uses; `reports upload`, `history` and
-/// `sprite` commands reject them.
+/// Global flags that only `run` uses; `reports upload`, `history`, `last`
+/// and `sprite` commands reject them.
 const RUN_ONLY_FLAGS: [&str; 12] = [
     "env",
     "parallelism",
@@ -177,9 +183,9 @@ const RUN_ONLY_FLAGS: [&str; 12] = [
 ];
 
 impl Cli {
-    /// The parser, with run-only global flags hidden from `sprite` and
-    /// `history` help. They still parse there, so passing one is rejected
-    /// with a clear error rather than silently ignored.
+    /// The parser, with run-only global flags hidden from `sprite`,
+    /// `history` and `last` help. They still parse there, so passing one is
+    /// rejected with a clear error rather than silently ignored.
     fn parser() -> clap::Command {
         let mut command = <Self as clap::CommandFactory>::command();
         // Globals reach subcommands only when the command is built.
@@ -193,6 +199,7 @@ impl Cli {
         command
             .mut_subcommand("sprite", |sprite| hide(sprite).mut_subcommands(hide))
             .mut_subcommand("history", |history| hide(history).mut_subcommands(hide))
+            .mut_subcommand("last", hide)
     }
 
     /// The first run-only flag on the command line, as the user typed it, for
@@ -269,6 +276,7 @@ impl Cli {
             Some(
                 Commands::Reports { .. }
                 | Commands::History { .. }
+                | Commands::Last
                 | Commands::Sprite { .. }
                 | Commands::SpriteAgent { .. },
             )
@@ -420,9 +428,35 @@ async fn run(cli: &Cli, output: &mut Output, cancel: watch::Receiver<Option<i32>
     if let Some(Commands::Sprite { command }) = &cli.command {
         return sprite::command(cli, command, output, cancel).await;
     }
+    if let Some(Commands::Last) = &cli.command {
+        if let Some(flag) = cli.run_only_flag() {
+            return Err(usage(format!("{flag} cannot be used with last")));
+        }
+        return last::show(&Config::locate(cli.config.as_deref())?, output).await;
+    }
+    let rerun_failed = matches!(cli.command, Some(Commands::Run { failed: true, .. }));
+    if rerun_failed && !cli.jobs.is_empty() {
+        return Err(usage("--jobs cannot be used with run --failed"));
+    }
     let (document, config_file) = Config::load(cli.config.as_deref())?;
+    // `run --failed` takes its workflow, environment and jobs from the last run.
+    let failed = rerun_failed
+        .then(|| last::failed(&config_file, cli.workflow(), cli.env.as_deref()))
+        .transpose()?;
+    let (workflow, profile, jobs) = match &failed {
+        Some(failed) => {
+            if let Some(environment) = &failed.environment {
+                *output = output.with_environment(environment);
+            }
+            (
+                Some(failed.workflow.as_str()),
+                failed.environment.as_deref(),
+                &failed.jobs,
+            )
+        }
+        None => (cli.workflow(), cli.env.as_deref(), &cli.jobs),
+    };
     let history_cli = cli.history_overrides()?;
-    let profile = cli.env.as_deref();
     // Report an unknown --env before the --jobs check for all-workflow commands;
     // workflow() repeats this lookup.
     document.environment(profile)?;
@@ -484,10 +518,10 @@ async fn run(cli: &Cli, output: &mut Output, cancel: watch::Receiver<Option<i32>
         return Ok(0);
     }
     let legacy_default = !document.jobs.is_empty();
-    let (name, mut config) = document.workflow(cli.workflow(), profile)?;
+    let (name, mut config) = document.workflow(workflow, profile)?;
     *output = output.with_workflow(&name);
     let total_defined_jobs = config.jobs.len();
-    config.select(&cli.jobs)?;
+    config.select(jobs)?;
     // Called workflows run their complete graphs; the selected profile must
     // resolve for each one before anything runs.
     let targets = document.called_workflows(&config.jobs, profile)?;
@@ -559,11 +593,11 @@ async fn run(cli: &Cli, output: &mut Output, cancel: watch::Receiver<Option<i32>
         calls: !calls.is_empty(),
         root: config,
         targets,
-        profile: cli.env.clone(),
+        profile: profile.map(str::to_owned),
         parallelism: cli.parallelism,
         fail_fast: fail_fast_override,
         history: history_cli,
-        requested_jobs: cli.jobs.clone(),
+        requested_jobs: jobs.clone(),
         log_dir: cli.log_dir.clone(),
         legacy_default,
         config_path: cli
@@ -574,6 +608,7 @@ async fn run(cli: &Cli, output: &mut Output, cancel: watch::Receiver<Option<i32>
         cancel,
         sprite_state: None,
         provenance: None,
+        last_run: Some(last::Recorder::new(&config_file)),
     };
     execute(run, name, retention::RunIdentity::new()).await
 }
@@ -623,6 +658,9 @@ pub(crate) struct Run {
     /// A remote Sprite run's snapshot provenance, the `source` of the root
     /// and every child invocation; `None` locally.
     pub provenance: Option<reporting::Source>,
+    /// Collects every invocation's summary for the last-run record; `None`
+    /// on a Sprite, whose local run is the controller's.
+    pub last_run: Option<last::Recorder>,
 }
 
 /// The invocation that activated a child, and the call job that did it.
@@ -964,6 +1002,21 @@ async fn invocation(
         Some(_) => None,
         None => run.config_path.as_deref(),
     };
+    if let Some(recorder) = &run.last_run {
+        let invocation = run.calls.then(|| {
+            let parent = parent
+                .as_ref()
+                .map(|p| (p.run_id.as_str(), p.caller_job.as_str()));
+            (identity.id.as_str(), parent)
+        });
+        recorder.add(name, profile, invocation, signal.is_some(), summary.clone());
+        // The root's summary is last; called workflows finished before it.
+        if parent.is_none() {
+            if let Err(error) = recorder.write(run.config_path.as_deref()) {
+                eprintln!("goodflows: warning: last run record: {error:#}");
+            }
+        }
+    }
     output
         .emit_summary(summary, config_path, None, signal.is_some())
         .await?;
@@ -1143,6 +1196,7 @@ mod tests {
             cancel,
             sprite_state: None,
             provenance: None,
+            last_run: None,
         };
         let started = root.join("started");
         let signaller = tokio::spawn(async move {

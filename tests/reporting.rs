@@ -484,7 +484,7 @@ fn unconfigured_workflows_keep_their_event_stream() {
         kinds,
         ["run_started", "job_started", "job_finished", "summary"]
     );
-    assert!(!p.dir.join(".goodflows").exists());
+    assert!(!p.dir.join(".goodflows/reports").exists());
 }
 
 // ---- 2.x capture and collection ----
@@ -745,7 +745,7 @@ fn unwritable_spool_runs_checks_without_reporting_env() {
         .unwrap();
     success(&output);
     assert_eq!(p.read("plain-seen"), "unset:unset");
-    assert!(!p.dir.join(".goodflows").exists());
+    assert!(!p.dir.join(".goodflows/reports").exists());
 }
 
 #[test]
@@ -3647,7 +3647,7 @@ fn run_record_without_credentials_is_skipped_and_keeps_nothing() {
                     "run_id":summary["run_id"], "reason":reason})
                 ]
             );
-            assert!(!p.dir.join(".goodflows").exists(), "{reason}");
+            assert!(!p.dir.join(".goodflows/reports").exists(), "{reason}");
         }
     }
     assert_eq!(mock.connections(), 0);
