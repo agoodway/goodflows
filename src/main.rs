@@ -148,7 +148,7 @@ enum Commands {
         #[arg(value_parser = reporting::history_client::run_id)]
         run_id: String,
     },
-    /// Show the last local run's results and failure output again, without running anything
+    /// Show the last local run's results and failure output again, without running anything, and exit with its exit code
     #[command(after_help = "Examples:
   goodflows last                     # show the last run's results and failure output
   goodflows last --json              # print the last run's summary events as JSON
@@ -1308,7 +1308,12 @@ async fn invocation(
         recorder.add(name, profile, invocation, signal.is_some(), summary.clone());
         // The root's summary is last; called workflows finished before it.
         if parent.is_none() {
-            if let Err(error) = recorder.write(run.config_path.as_deref()) {
+            // The exit code `execute` gives, for `last` to exit with.
+            let code = cancel
+                .borrow()
+                .map(|s| (128 + s) as u8)
+                .unwrap_or(if success { 0 } else { 1 });
+            if let Err(error) = recorder.write(run.config_path.as_deref(), code) {
                 eprintln!("goodflows: warning: last run record: {error:#}");
             }
         }

@@ -117,6 +117,8 @@ goodflows --config ./goodflows.toml
 | 130 | Interrupted by SIGINT | |
 | 143 | Interrupted by SIGTERM | |
 
+[`last`](#last-run-and-rerunning-failures) and [`wait`](#detached-runs) exit with the exit code of the run they report, so `1` means that run failed. Their own usage errors, and `last` finding no record (`no_last_run`), exit 2. Before this, `last` exited 0 whenever it could show the record; a script that read any non-zero exit from `last` as "no record" must check for exit 2 instead.
+
 With `--json`, a run or other command that cannot do what it was asked ends with one `error` event. Its `code` is stable, so a script can branch on it instead of the message:
 
 | `code` | Exit | Meaning |
@@ -367,7 +369,7 @@ goodflows last --json
 goodflows run --failed
 ```
 
-`goodflows last` prints the last run's report again without running anything: each job's status, the Failures section with the command, error, log file paths, and output tails, and the `Rerun failed:` hint. A run that called workflows shows each called workflow's report before the root's, as the run did. With `--json`, it emits the run's `summary` events unchanged. The log files exist only if that run used `--log-dir`, and only until `log_runs` prunes them.
+`goodflows last` prints the last run's report again without running anything: each job's status, the Failures section with the command, error, log file paths, and output tails, and the `Rerun failed:` hint. A run that called workflows shows each called workflow's report before the root's, as the run did. With `--json`, it emits the run's `summary` events unchanged. It exits with the run's exit code: 0 when it passed, 1 when a job failed or timed out, and 130 or 143 when a signal stopped it. The log files exist only if that run used `--log-dir`, and only until `log_runs` prunes them.
 
 `goodflows run --failed` reruns the jobs that the last run's `Rerun failed:` hint names, plus the jobs they depend on. It uses the last run's workflow and `--env`. Those are the failed and timed-out jobs and the jobs skipped because a dependency did not pass. A workflow or `--env` given with `--failed` must match the last run's. `--failed` rejects `--jobs` and `--sprite`. Other run flags, such as `--log-dir` and `--history`, apply as usual. A job whose name contains a comma is rerun too, though the hint cannot select it.
 

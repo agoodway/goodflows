@@ -31,6 +31,9 @@ struct Record {
     /// The explicit `--config` the run was given, which its rerun hint keeps.
     #[serde(default)]
     config: Option<String>,
+    /// The run's exit code. Records written before it was kept have none.
+    #[serde(default)]
+    exit_code: Option<u8>,
     /// Every invocation's summary in the order the run emitted them: called
     /// workflows first, the root last.
     summaries: Vec<Summary>,
@@ -105,13 +108,15 @@ impl Recorder {
             .push(summary);
     }
 
-    /// Replace the record with the summaries kept so far. The root calls
-    /// this after adding its own summary, which is last.
-    pub fn write(&self, config: Option<&str>) -> Result<()> {
+    /// Replace the record with the summaries kept so far and the run's
+    /// `exit_code`. The root calls this after adding its own summary, which
+    /// is last.
+    pub fn write(&self, config: Option<&str>, exit_code: u8) -> Result<()> {
         let summaries = self.summaries.lock().expect("last run mutex poisoned");
         let mut bytes = serde_json::to_vec(&json!({
             "schema_version": 1,
             "config": config,
+            "exit_code": exit_code,
             "summaries": &*summaries,
         }))?;
         bytes.push(b'\n');
@@ -165,10 +170,25 @@ fn parse(path: &Path, bytes: &[u8]) -> Result<Record> {
 }
 
 /// `goodflows last`: emit the last run's summaries again, exactly as the run
-/// emitted them, so text mode prints the same reports and failure details.
+/// emitted them, so text mode prints the same reports and failure details,
+/// and exit with the run's exit code.
 pub async fn show(config_file: &Path, output: &Output) -> Result<u8> {
-    emit(read(config_file)?, output).await?;
-    Ok(0)
+    let record = read(config_file)?;
+    let root = record
+        .summaries
+        .last()
+        .expect("read keeps the root summary");
+    // A record from before `exit_code` was kept: 0 for a pass, else 1, as
+    // the signal number of an interrupted run is unknown.
+    let code = record
+        .exit_code
+        .unwrap_or(if root.event["success"] == true && !root.interrupted {
+            0
+        } else {
+            1
+        });
+    emit(record, output).await?;
+    Ok(code)
 }
 
 /// Emit the summaries of the record a [`Recorder`] wrote at `path`, as

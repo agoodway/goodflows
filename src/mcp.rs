@@ -622,9 +622,9 @@ fn checks(execution: std::result::Result<Execution, String>, exit_code: bool) ->
         _ => return incomplete(execution.exit_code, "Missing or invalid GoodFlows summary."),
     };
     let results = summary["results"].as_array().expect("checked above");
-    // `last` exits 0 whatever the replayed run did, and a signal during
-    // reporting cancels a run whose jobs all passed, so the recorded outcome
-    // decides too.
+    // `last` and `wait` exit with the recorded run's exit code, and a signal
+    // during reporting cancels a run whose jobs all passed, so the recorded
+    // outcome decides too.
     let passed = execution.exit_code == Some(0)
         && !execution.failed
         && summary["success"] == true
@@ -925,8 +925,8 @@ mod tests {
         let diagnostics: Value = serde_json::from_str(&texts(&result)[1]).unwrap();
         assert_eq!(diagnostics["passed"], true);
         assert_eq!(diagnostics["results"][0]["name"], "b");
-        // A replayed run cancelled during reporting: its jobs passed and
-        // `last` exits 0, but the run did not pass.
+        // A run recorded before `last` kept exit codes, cancelled during
+        // reporting: its jobs passed and `last` exits 0, but it did not pass.
         let mut cancelled = passing.clone();
         cancelled["outcome"] = json!("cancelled");
         let result = checks(Ok(execution(&[cancelled], 0)), false);
