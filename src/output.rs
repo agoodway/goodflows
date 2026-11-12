@@ -691,6 +691,13 @@ fn render(
                     writeln!(out)?;
                 }
             }
+            // Its producer escapes interpolated values, so every newline
+            // left in the message is a line break.
+            "sprite_status" => {
+                for line in text(&event, "message").split('\n') {
+                    writeln!(out, "{}", visible(line))?;
+                }
+            }
             kind if kind.starts_with("sprite_") => {
                 if let Some(message) = event["message"].as_str() {
                     writeln!(out, "{}", visible(message))?;
@@ -799,7 +806,7 @@ fn text<'a>(event: &'a Value, key: &str) -> &'a str {
 
 /// Escapes control characters other than tab (for example `\u{1b}` or `\r`)
 /// so job-provided text cannot move the cursor or restyle the terminal.
-fn visible(text: &str) -> Cow<'_, str> {
+pub(crate) fn visible(text: &str) -> Cow<'_, str> {
     let control = |c: char| c.is_control() && c != '\t';
     if !text.chars().any(control) {
         return Cow::Borrowed(text);
