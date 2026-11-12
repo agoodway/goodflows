@@ -382,12 +382,14 @@ fn a_long_failure_shows_the_start_of_its_output_in_the_text_report() {
         let lines: Vec<_> = failures.lines().collect();
         let start = lines.iter().position(|l| *l == "  stdout and stderr:");
         let start = start.expect(failures) + 1;
-        assert_eq!(lines[start], "    FIRST ERROR here", "{failures}");
-        assert_eq!(lines[start + 1], "    1");
-        assert!(
-            failures.contains(&format!("\n    … {omitted} bytes omitted …\n")),
-            "{failures}"
-        );
+        let marker = format!("    … {omitted} bytes omitted …");
+        let end = lines.iter().position(|l| *l == marker).expect(failures);
+        // The output's start is in the head. The streams are read
+        // concurrently, so stderr's `LAST line` may come first or anywhere
+        // in it.
+        let head = &lines[start..end];
+        assert!(head[..2].contains(&"    FIRST ERROR here"), "{failures}");
+        assert!(head.contains(&"    1"), "{failures}");
         // The streams are read concurrently, so where `LAST line` lands
         // depends on timing; the end of stdout is always in the tail.
         assert!(failures.contains("\n    5000\n"), "{failures}");
