@@ -59,6 +59,17 @@ pub async fn generate(
             available_confirmation().context("failed to read overwrite confirmation")?
         };
         if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+            if !terminal {
+                // Nobody declined a prompt, so a caller must not mistake the kept
+                // file for a written one. Exit 2 marks a usage or config error.
+                output
+                    .emit(json!({"type":"error", "message":format!(
+                        "{} already exists; pass --force to overwrite it",
+                        path.display()
+                    )}))
+                    .await?;
+                std::process::exit(2);
+            }
             return output
                 .emit(json!({"type":"init_cancelled", "path":path}))
                 .await;

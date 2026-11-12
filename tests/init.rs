@@ -39,18 +39,20 @@ fn init_requires_confirmation_to_overwrite() {
         let content = std::fs::read_to_string(&config).unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
 
-        assert!(output.status.success(), "{output:?}");
-        let stdout = String::from_utf8(output.stdout).unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(
             !stdout.contains("Overwrite?"),
             "nonterminal input should not prompt: {stdout}"
         );
         if *overwrite {
+            assert!(output.status.success(), "{output:?}");
             assert!(content.contains("[[jobs]]"));
             assert!(stdout.contains("Wrote goodflows.toml"));
         } else {
+            assert_eq!(output.status.code(), Some(2), "answer: {answer:?}");
             assert_eq!(content, "existing config\n", "answer: {answer:?}");
             assert!(!stdout.contains("Wrote goodflows.toml"));
+            assert!(String::from_utf8_lossy(&output.stderr).contains("pass --force"));
         }
     }
 }
@@ -147,7 +149,7 @@ fn init_honors_custom_path_force_and_generated_workdir() {
 }
 
 #[test]
-fn json_init_declines_existing_config_without_polluting_stdout() {
+fn json_init_without_terminal_refuses_existing_config_and_names_force() {
     let p = Project::new("keep");
     let output = p
         .command()
@@ -155,10 +157,14 @@ fn json_init_declines_existing_config_without_polluting_stdout() {
         .stdin(Stdio::null())
         .output()
         .unwrap();
-    success(&output);
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
     assert_eq!(p.read("goodflows.toml"), "keep");
     let event: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(event["type"], "init_cancelled");
+    assert_eq!(event["type"], "error");
+    assert_eq!(
+        event["message"],
+        "goodflows.toml already exists; pass --force to overwrite it"
+    );
 }
 
 #[test]
@@ -281,7 +287,11 @@ fn nonterminal_init_never_waits_for_unavailable_or_incomplete_input() {
         }
         let output = child.wait_with_output().unwrap();
         assert!(done, "blocked with available input {input:?}");
-        success(&output);
+        assert_eq!(
+            output.status.code(),
+            Some(if overwrite { 0 } else { 2 }),
+            "{input:?}"
+        );
         assert!(output.stderr.is_empty());
         assert_eq!(
             unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_GETFL) },
@@ -290,11 +300,7 @@ fn nonterminal_init_never_waits_for_unavailable_or_incomplete_input() {
         let event: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(
             event["type"],
-            if overwrite {
-                "config_written"
-            } else {
-                "init_cancelled"
-            }
+            if overwrite { "config_written" } else { "error" }
         );
         assert_eq!(p.read("goodflows.toml") != "keep", overwrite);
     }
@@ -302,40 +308,45 @@ fn nonterminal_init_never_waits_for_unavailable_or_incomplete_input() {
 
 #[cfg(unix)]
 #[test]
-fn terminal_init_still_prompts_and_accepts_confirmation() {
+fn terminal_init_still_prompts_and_a_declined_prompt_succeeds() {
     use std::fs::File;
     use std::os::fd::FromRawFd;
-    let p = Project::new("keep");
-    let mut master = -1;
-    let mut slave = -1;
-    // SAFETY: openpty initializes both descriptor outputs; optional arguments are null.
-    assert_eq!(
-        unsafe {
-            libc::openpty(
-                &mut master,
-                &mut slave,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-            )
-        },
-        0
-    );
-    let mut master = unsafe { File::from_raw_fd(master) };
-    let slave = unsafe { File::from_raw_fd(slave) };
-    let child = p
-        .command()
-        .args(["init"])
-        .stdin(Stdio::from(slave))
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    master.write_all(b"yes\n").unwrap();
-    let output = child.wait_with_output().unwrap();
-    success(&output);
-    assert!(stdout(&output).contains("Overwrite? [y/N]"));
-    assert_ne!(p.read("goodflows.toml"), "keep");
+    for (answer, overwrite) in [("yes\n", true), ("n\n", false)] {
+        let p = Project::new("keep");
+        let mut master = -1;
+        let mut slave = -1;
+        // SAFETY: openpty initializes both descriptor outputs; optional arguments are null.
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &mut master,
+                    &mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            },
+            0
+        );
+        let mut master = unsafe { File::from_raw_fd(master) };
+        let slave = unsafe { File::from_raw_fd(slave) };
+        let child = p
+            .command()
+            .args(["init"])
+            .stdin(Stdio::from(slave))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        master.write_all(answer.as_bytes()).unwrap();
+        let output = child.wait_with_output().unwrap();
+        success(&output);
+        assert!(stdout(&output).contains("Overwrite? [y/N]"));
+        assert_eq!(p.read("goodflows.toml") != "keep", overwrite);
+        if !overwrite {
+            assert!(stdout(&output).contains("Kept existing goodflows.toml"));
+        }
+    }
 }
 
 #[test]
@@ -355,7 +366,7 @@ fn generic_placeholder_fails_until_replaced() {
 }
 
 #[test]
-fn nonterminal_decline_does_not_require_valid_project_detection() {
+fn nonterminal_refusal_does_not_require_valid_project_detection() {
     let p = Project::new("keep");
     std::fs::write(p.dir.join("Cargo.toml"), "").unwrap();
     std::fs::write(p.dir.join("package.json"), "invalid manifest").unwrap();
@@ -365,10 +376,10 @@ fn nonterminal_decline_does_not_require_valid_project_detection() {
         .stdin(Stdio::null())
         .output()
         .unwrap();
-    success(&output);
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
     assert_eq!(p.read("goodflows.toml"), "keep");
     let event: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(event["type"], "init_cancelled");
+    assert!(event["message"].as_str().unwrap().contains("--force"));
 }
 
 #[test]
