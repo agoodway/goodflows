@@ -237,10 +237,11 @@ fn log_files_are_private_and_never_follow_a_planted_symlink() {
 
 #[test]
 fn failed_results_include_command_and_separate_bounded_output_tails() {
+    // The streams share no characters, so combined output splits back into them.
     let p = Project::new(
         r#"[[jobs]]
 name = "fail"
-command = """printf 'EARLY'; head -c 10000 /dev/zero | tr '\\000' x; printf 'OUT-END'; head -c 10000 /dev/zero | tr '\\000' y >&2; printf 'ERR-END' >&2; exit 7"""
+command = """printf 'EARLY'; head -c 10000 /dev/zero | tr '\\000' x; printf 'OUT-END'; printf 'early' >&2; head -c 10000 /dev/zero | tr '\\000' y >&2; printf 'err_end' >&2; exit 7"""
 "#,
     );
     let output = p.run(&["--json", "--log-dir", "logs"]);
@@ -254,20 +255,29 @@ command = """printf 'EARLY'; head -c 10000 /dev/zero | tr '\\000' x; printf 'OUT
     );
     assert_eq!(
         result["stderr_tail"].as_str().unwrap(),
-        format!("{}ERR-END", "y".repeat(4089))
+        format!("{}err_end", "y".repeat(4089))
     );
     assert_eq!(result["stdout_truncated"], true);
     assert_eq!(result["stderr_truncated"], true);
     // Both streams together keep their start, where compiler errors usually
-    // are, and their end, with the middle omitted.
-    assert_eq!(
-        result["output_head"].as_str().unwrap(),
-        format!("EARLY{}", "x".repeat(4091))
+    // are, and their end, with the middle omitted. The two streams are read
+    // concurrently, so their chunks can arrive in either order or interleave.
+    let all_out = format!("EARLY{}OUT-END", "x".repeat(10000));
+    let all_err = format!("early{}err_end", "y".repeat(10000));
+    let split = |text: &str| -> (String, String) {
+        text.chars().partition(|c| "EARLYxOUT-END".contains(*c))
+    };
+    let head = result["output_head"].as_str().unwrap();
+    let (out, err) = split(head);
+    assert_eq!(head.len(), 4096);
+    assert!(
+        all_out.starts_with(&out) && all_err.starts_with(&err),
+        "{head}"
     );
-    assert_eq!(
-        result["output_tail"].as_str().unwrap(),
-        format!("{}ERR-END", "y".repeat(4089))
-    );
+    let tail = result["output_tail"].as_str().unwrap();
+    let (out, err) = split(tail);
+    assert_eq!(tail.len(), 4096);
+    assert!(all_out.ends_with(&out) && all_err.ends_with(&err), "{tail}");
     assert_eq!(result["output_truncated"], true);
     let run = run_dir(&p.dir.join("logs"));
     for stream in ["stdout", "stderr"] {
@@ -333,7 +343,7 @@ command = """printf 'EARLY'; head -c 10000 /dev/zero | tr '\\000' x; printf 'OUT
     // repeats its bounded output tails.
     for (stream, tail) in [
         ("stdout", "x".repeat(4089) + "OUT-END"),
-        ("stderr", "y".repeat(4089) + "ERR-END"),
+        ("stderr", "y".repeat(4089) + "err_end"),
     ] {
         let prefix = format!("\n  {stream} log: ");
         let at = text[failures..].find(&prefix).expect("log path") + failures + prefix.len();
