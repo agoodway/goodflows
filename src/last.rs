@@ -60,16 +60,23 @@ struct Invocation {
 
 /// Collects one local run's summaries; the root invocation writes them.
 pub struct Recorder {
-    path: PathBuf,
+    paths: Vec<PathBuf>,
     summaries: Mutex<Vec<Summary>>,
 }
 
 impl Recorder {
     pub fn new(config_file: &Path) -> Self {
         Self {
-            path: path(config_file),
+            paths: vec![path(config_file)],
             summaries: Mutex::default(),
         }
+    }
+
+    /// Also write the record to `path`: a detached run keeps its own copy,
+    /// which a later run cannot replace.
+    pub fn also(mut self, path: PathBuf) -> Self {
+        self.paths.push(path);
+        self
     }
 
     /// Keep one invocation's `summary` event with the context `Output` adds
@@ -108,12 +115,18 @@ impl Recorder {
             "summaries": &*summaries,
         }))?;
         bytes.push(b'\n');
-        let dir = self.path.parent().context("last run path has no parent")?;
-        crate::fsutil::dir_builder(true)
-            .create(dir)
-            .with_context(|| format!("create {}", dir.display()))?;
-        crate::fsutil::write_atomic(&self.path, &bytes, true)
-            .with_context(|| format!("write {}", self.path.display()))
+        // Every path is written even when an earlier one fails; the first
+        // failure is returned.
+        let write = |path: &PathBuf| -> Result<()> {
+            let dir = path.parent().context("last run path has no parent")?;
+            crate::fsutil::dir_builder(true)
+                .create(dir)
+                .with_context(|| format!("create {}", dir.display()))?;
+            crate::fsutil::write_atomic(path, &bytes, true)
+                .with_context(|| format!("write {}", path.display()))
+        };
+        let results: Vec<_> = self.paths.iter().map(write).collect();
+        results.into_iter().collect()
     }
 }
 
@@ -138,8 +151,12 @@ fn read(config_file: &Path) -> Result<Record> {
             return Err(error).with_context(|| format!("read {}", path.display()));
         }
     };
+    parse(&path, &bytes)
+}
+
+fn parse(path: &Path, bytes: &[u8]) -> Result<Record> {
     let record: Record =
-        serde_json::from_slice(&bytes).with_context(|| format!("parse {}", path.display()))?;
+        serde_json::from_slice(bytes).with_context(|| format!("parse {}", path.display()))?;
     anyhow::ensure!(
         !record.summaries.is_empty(),
         "{} holds no run summary",
@@ -151,7 +168,18 @@ fn read(config_file: &Path) -> Result<Record> {
 /// `goodflows last`: emit the last run's summaries again, exactly as the run
 /// emitted them, so text mode prints the same reports and failure details.
 pub async fn show(config_file: &Path, output: &Output) -> Result<u8> {
-    let record = read(config_file)?;
+    emit(read(config_file)?, output).await?;
+    Ok(0)
+}
+
+/// Emit the summaries of the record a [`Recorder`] wrote at `path`, as
+/// [`show`] does.
+pub async fn replay(path: &Path, output: &Output) -> Result<()> {
+    let bytes = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
+    emit(parse(path, &bytes)?, output).await
+}
+
+async fn emit(record: Record, output: &Output) -> Result<()> {
     let root = record.summaries.len() - 1;
     for (index, summary) in record.summaries.into_iter().enumerate() {
         let mut output = output.with_workflow(&summary.workflow);
@@ -171,7 +199,7 @@ pub async fn show(config_file: &Path, output: &Output) -> Result<u8> {
             .emit_summary(summary.event, config, None, summary.interrupted)
             .await?;
     }
-    Ok(0)
+    Ok(())
 }
 
 /// What `goodflows run --failed` reruns: the last run's workflow and
