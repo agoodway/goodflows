@@ -192,7 +192,10 @@ fn mcp_run_returns_only_the_summary_and_failures_including_called_workflows() {
         .map(|tool| tool["name"].as_str().unwrap())
         .collect();
     names.sort();
-    assert_eq!(names, ["last", "list", "run", "validate"]);
+    assert_eq!(
+        names,
+        ["cancel", "last", "list", "run", "status", "validate", "wait"]
+    );
 
     let (texts, error) = client.call("run", json!({"workflow":"ci"}));
     assert!(!error);
@@ -273,4 +276,127 @@ fn mcp_validate_and_list_report_and_config_errors_are_tool_errors() {
     let (texts, error) = client.call("run", json!({"config":"missing.toml"}));
     assert!(error);
     assert!(texts[0].contains("exit code 2"), "{texts:?}");
+}
+
+/// `slow` waits for the file `release` (at most 30 seconds), then fails
+/// with a message; `after` is skipped because it failed.
+const SLOW: &str = "[settings]\nfail_fast = false\n\
+[[jobs]]\nname = 'prep'\ncommand = 'true'\n\
+[[jobs]]\nname = 'slow'\ndepends_on = ['prep']\n\
+command = 'touch started; for i in $(seq 600); do test -f release && break; sleep 0.05; done; echo broken >&2; exit 1'\n\
+[[jobs]]\nname = 'after'\ncommand = 'true'\ndepends_on = ['slow']\n";
+
+/// A `run` or `wait` result's blocks, each JSON block without what differs
+/// between two runs: identity, start time, host and timings.
+fn stable(texts: &[String]) -> Vec<Value> {
+    texts
+        .iter()
+        .map(|text| {
+            let text = text
+                .strip_prefix("Failure log excerpts (JSON):\n")
+                .unwrap_or(text);
+            let mut value = serde_json::from_str(text).unwrap_or_else(|_| json!(text));
+            if let Some(object) = value.as_object_mut() {
+                for key in [
+                    "run_id",
+                    "started_at",
+                    "duration_ms",
+                    "execute_ms",
+                    "max_in_flight",
+                    "host",
+                ] {
+                    object.remove(key);
+                }
+            }
+            value
+        })
+        .collect()
+}
+
+#[test]
+fn mcp_detached_run_polled_with_wait_gives_the_blocking_result() {
+    let p = Project::new(SLOW);
+    let mut client = Client::start(&p);
+    std::fs::write(p.dir.join("release"), "").unwrap();
+    let (blocking, error) = client.call("run", json!({}));
+    assert!(!error, "{blocking:?}");
+    assert_eq!(blocking[0], "GoodFlows checks failed (exit code 1).");
+    for file in ["release", "started"] {
+        std::fs::remove_file(p.dir.join(file)).unwrap();
+    }
+
+    let (texts, error) = client.call("run", json!({"detach":true}));
+    assert!(!error, "{texts:?}");
+    let event: Value = serde_json::from_str(&texts[1]).unwrap();
+    assert_eq!(event["type"], "run_detached");
+    let id = event["run_id"].as_str().unwrap().to_owned();
+    assert!(texts[0].contains(&id), "{texts:?}");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !p.dir.join("started").exists() {
+        assert!(std::time::Instant::now() < deadline, "slow never started");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
+    // A short wait while it runs is a normal result, not an error.
+    let (texts, error) = client.call("wait", json!({"run_id":id, "timeout":1}));
+    assert!(!error, "{texts:?}");
+    assert_eq!(
+        texts[0],
+        "The GoodFlows run is still running; call `wait` again."
+    );
+    let status: Value = serde_json::from_str(&texts[1]).unwrap();
+    assert_eq!(status["running"], json!(["slow"]));
+    let (texts, error) = client.call("status", json!({"run_id":id}));
+    assert!(!error, "{texts:?}");
+    assert_eq!(texts[0], "The GoodFlows run is still running.");
+
+    std::fs::write(p.dir.join("release"), "").unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let done = loop {
+        let (texts, error) = client.call("wait", json!({"run_id":id, "timeout":1}));
+        assert!(!error, "{texts:?}");
+        if !texts[0].contains("still running") {
+            break texts;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the run never finished"
+        );
+    };
+    assert_eq!(stable(&done), stable(&blocking));
+
+    // Cancel: an unknown id is a tool error; a stopped run says so.
+    let (texts, error) = client.call("cancel", json!({"run_id":id}));
+    assert!(!error, "{texts:?}");
+    assert_eq!(texts[0], "The GoodFlows run finished (exit code 1).");
+    let event: Value = serde_json::from_str(&texts[1]).unwrap();
+    assert_eq!(event["was_running"], false);
+    let unknown = "00000000-0000-4000-8000-000000000000";
+    let (texts, error) = client.call("wait", json!({"run_id":unknown}));
+    assert!(error && texts[0].contains("exit code 2"), "{texts:?}");
+}
+
+#[test]
+fn mcp_cancel_stops_a_detached_run() {
+    let p = Project::new(SLOW);
+    let mut client = Client::start(&p);
+    let (texts, error) = client.call("run", json!({"detach":true}));
+    assert!(!error, "{texts:?}");
+    let id = serde_json::from_str::<Value>(&texts[1]).unwrap()["run_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !p.dir.join("started").exists() {
+        assert!(std::time::Instant::now() < deadline, "slow never started");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let (texts, error) = client.call("cancel", json!({"run_id":id}));
+    assert!(!error, "{texts:?}");
+    assert_eq!(texts[0], "The GoodFlows run finished (exit code 143).");
+    let event: Value = serde_json::from_str(&texts[1]).unwrap();
+    assert_eq!(event["was_running"], true);
+    assert_eq!(event["cancelled"], json!(["slow", "after"]));
+    let (texts, _) = client.call("wait", json!({"run_id":id}));
+    assert_eq!(texts[0], "GoodFlows checks failed (exit code 143).");
 }

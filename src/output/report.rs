@@ -860,7 +860,9 @@ mod tests {
         let logs = "  stdout log: logs/run/001-test.p02.stdout.log\n  stderr log: logs/run/001-test.p02.stderr.log\n";
         assert_eq!(
             combined(false, Some(0)),
-            format!("  error: exited with 1\n  stdout and stderr:\n    first error\n    end\n{logs}")
+            format!(
+                "  error: exited with 1\n  stdout and stderr:\n    first error\n    end\n{logs}"
+            )
         );
         assert_eq!(
             combined(true, Some(1234)),

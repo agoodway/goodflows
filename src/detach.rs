@@ -124,8 +124,7 @@ pub async fn start(
 ) -> Result<u8> {
     let run_id = uuid::Uuid::new_v4().hyphenated().to_string();
     let dir = dir(config_file, &run_id);
-    crate::fsutil::create_state_dir(&dir)
-        .with_context(|| format!("create {}", dir.display()))?;
+    crate::fsutil::create_state_dir(&dir).with_context(|| format!("create {}", dir.display()))?;
     let file = |name: &str| create(&dir.join(name));
     // Every event, for `status`, whatever `--json` the caller asked for.
     // `--json` takes its value only after `=`, so no other argument goes.
@@ -218,8 +217,7 @@ fn prune(config_file: &Path, current: &str) -> Result<()> {
             continue;
         };
         let dir = base.join(&name);
-        if name == current || !crate::fsutil::canonical_uuid(&name) || !dir.join("pid").is_file()
-        {
+        if name == current || !crate::fsutil::canonical_uuid(&name) || !dir.join("pid").is_file() {
             continue;
         }
         let meta: Option<Meta> = std::fs::read(dir.join("run.json"))
@@ -310,7 +308,8 @@ fn existing(config_file: &Path, run_id: &str) -> Result<PathBuf> {
         ),
     );
     error.hint = Some(
-        "start one with `goodflows run --detach`; status, wait and cancel need the same config".into(),
+        "start one with `goodflows run --detach`; status, wait and cancel need the same config"
+            .into(),
     );
     Err(error.into())
 }

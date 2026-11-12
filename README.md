@@ -613,14 +613,19 @@ A variable counts only when it is set and not empty. `--harness` skips detection
 
 | Tool | Parameters | Returns |
 | --- | --- | --- |
-| `run` | `workflow`, `config`, `env`, `jobs`, `failed`, `parallelism`, `fail_fast` | Waits for the run. Whether it passed, its exit code and summary counts, and each job that did not pass |
+| `run` | `workflow`, `config`, `env`, `jobs`, `failed`, `parallelism`, `fail_fast`, `detach` | Waits for the run. Whether it passed, its exit code and summary counts, and each job that did not pass. With `detach`, starts the run in the background and returns its `run_detached` event at once |
+| `wait` | `run_id`, `config`, `timeout` | Waits up to `timeout` seconds (default 60) for a detached run. Once it finished, the same result as `run`. Before that, a line saying the run is still running and its `run_status` event. That is a normal result, not an error |
+| `status` | `run_id`, `config` | A detached run's `run_status` event |
+| `cancel` | `run_id`, `config` | Cancels a detached run, then returns its `run_status` event, as [`goodflows cancel`](#detached-runs) does |
 | `last` | `config` | The last local run, as `goodflows last` shows it, in the same form as `run` |
 | `validate` | `workflow`, `config`, `env`, `jobs` | The `config_valid` event |
 | `list` | `workflow`, `config`, `env`, `workflows` | The `jobs` or `workflows` event |
 
 `run` and `last` never return job output events. The result is a status line (`GoodFlows checks passed.` or `GoodFlows checks failed (exit code N).`), then the root `summary` without `results`, plus `passed`, `exit_code`, and `error`, and a `results` list of the jobs that did not pass with `name`, `status`, `exit_code`, `command`, and `error`. Jobs of called workflows that did not pass are in the list too, with `called_run` naming that run's `workflow`, `run_id`, `caller_job`, and `parent_run_id`. A last text block holds each of those jobs' stdout and stderr tails, at most 4 KiB per stream and less when many jobs failed. `passed` is true only when goodflows exited 0, reported no error, and every root job passed or was skipped. The limits match the Amp plugin's.
 
-When goodflows cannot do what a tool asks, such as for a config or usage error, the tool result is an error (`isError`) with the exit code and goodflows's message. Cancelling a call sends its goodflows process SIGTERM, which cancels the run's jobs as Ctrl-C would. `goodflows mcp` rejects `--json` and the run-only flags; pass them as tool parameters instead.
+A client may stop a tool call that takes longer than its tool timeout. For a run that may take more than a minute or two, call `run` with `detach: true`, then call `wait` with the returned `run_id` and a short `timeout` until it returns the run's result. The server's instructions tell agents to do this. `status`, `wait`, and `cancel` take the `config` the run used.
+
+When goodflows cannot do what a tool asks, such as for a config or usage error or an unknown `run_id`, the tool result is an error (`isError`) with the exit code and goodflows's message. Cancelling a call sends its goodflows process SIGTERM, which cancels a blocking run's jobs as Ctrl-C would. Cancelling a `wait` call does not stop the detached run; use `cancel` for that. `goodflows mcp` rejects `--json` and the run-only flags; pass them as tool parameters instead.
 
 ## Development
 

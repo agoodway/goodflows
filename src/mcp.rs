@@ -27,6 +27,10 @@ const LINE_LIMIT: usize = 1_048_576;
 const CALLED_LIMIT: usize = 200;
 const FIELD_LIMIT: usize = 4096;
 const ERROR_LIMIT: usize = 8192;
+/// The `wait` tool's default timeout in seconds, below common tool timeouts.
+const DEFAULT_WAIT: u64 = 60;
+/// `goodflows wait` and `cancel` exit with this while the run goes on.
+const STILL_RUNNING: i32 = crate::detach::STILL_RUNNING as i32;
 
 /// Serve until the client closes stdin or a signal arrives. Tool calls still
 /// running then stop their goodflows process, which cancels its jobs, and
@@ -105,6 +109,29 @@ struct RunParams {
     parallelism: Option<u64>,
     /// true for --fail-fast, false for --no-fail-fast (default: the config's setting)
     fail_fast: Option<bool>,
+    /// Start the run in the background and return its run id at once; follow it with `wait`, `status` and `cancel` (--detach)
+    #[serde(default)]
+    detach: bool,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+struct RunIdParams {
+    /// The run id a detached `run` returned
+    run_id: String,
+    /// Config file the run used (default: the server's --config, else goodflows.toml or .goodflows.toml in its working directory)
+    config: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+struct WaitParams {
+    /// The run id a detached `run` returned
+    run_id: String,
+    /// Config file the run used (default: the server's --config, else goodflows.toml or .goodflows.toml in its working directory)
+    config: Option<String>,
+    /// Seconds to wait before returning "still running" (default 60)
+    timeout: Option<u64>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -153,6 +180,9 @@ impl Server {
         context: RequestContext<RoleServer>,
     ) -> CallToolResult {
         let mut args = self.command(&["run", "--json=summary"], p.config);
+        if p.detach {
+            args.push("--detach".into());
+        }
         option(&mut args, "--env", p.env);
         jobs(&mut args, &p.jobs);
         if p.failed {
@@ -170,7 +200,54 @@ impl Server {
         }
         workflow(&mut args, p.workflow);
         let execution = self.execute(args, context.ct.cancelled()).await;
+        if p.detach {
+            return detached(execution);
+        }
         checks(execution, true)
+    }
+
+    #[tool(
+        description = "Wait for a detached goodflows run for up to `timeout` seconds (default 60). Once it finished, returns the same result `run` gives. While it is still going, returns \"still running\" with its progress, which is not an error: call `wait` again."
+    )]
+    async fn wait(
+        &self,
+        Parameters(p): Parameters<WaitParams>,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        let timeout = p.timeout.unwrap_or(DEFAULT_WAIT).to_string();
+        let mut args = self.command(&["wait", "--json", "--timeout", &timeout], p.config);
+        args.extend(["--".into(), p.run_id.into()]);
+        let execution = self.execute(args, context.ct.cancelled()).await;
+        match execution {
+            Ok(execution) if execution.exit_code == Some(STILL_RUNNING) => progress(Ok(execution)),
+            execution => checks(execution, true),
+        }
+    }
+
+    #[tool(
+        description = "Show a detached goodflows run's progress: its state (running, finished or lost), exit code once finished, and which jobs are running, passed, failed, timed out, skipped or cancelled."
+    )]
+    async fn status(
+        &self,
+        Parameters(p): Parameters<RunIdParams>,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        let mut args = self.command(&["status", "--json"], p.config);
+        args.extend(["--".into(), p.run_id.into()]);
+        progress(self.execute(args, context.ct.cancelled()).await)
+    }
+
+    #[tool(
+        description = "Cancel a detached goodflows run: its running and waiting jobs are cancelled. Returns its status once it stopped; was_running is false when it had already stopped."
+    )]
+    async fn cancel(
+        &self,
+        Parameters(p): Parameters<RunIdParams>,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        let mut args = self.command(&["cancel", "--json"], p.config);
+        args.extend(["--".into(), p.run_id.into()]);
+        progress(self.execute(args, context.ct.cancelled()).await)
     }
 
     #[tool(
@@ -224,7 +301,7 @@ impl ServerHandler for Server {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("goodflows", env!("CARGO_PKG_VERSION")))
             .with_instructions(
-                "Runs this project's goodflows checks. Use `run` to check your work and fix what it reports until `passed` is true; `last` shows the previous run again.",
+                "Runs this project's goodflows checks. Use `run` to check your work and fix what it reports until `passed` is true; `last` shows the previous run again. For a run that may take more than a minute or two, call `run` with detach=true, then call `wait` with its run_id and a short timeout until it returns the run's result instead of \"still running\"; `status` shows progress and `cancel` stops it.",
             )
     }
 }
@@ -423,7 +500,7 @@ impl Execution {
                     }
                 }
             }
-            "summary" | "workflows" | "jobs" | "config_valid" => {
+            "summary" | "workflows" | "jobs" | "config_valid" | "run_detached" | "run_status" => {
                 if self.report.is_some() {
                     self.fail(&format!("Duplicate {kind} event."));
                 }
@@ -654,6 +731,62 @@ fn report(execution: std::result::Result<Execution, String>) -> CallToolResult {
         Ok(execution) => incomplete(execution.exit_code, &execution.error),
         Err(error) => incomplete(None, &error),
     }
+}
+
+/// The result of a detached `run`: its `run_detached` event, and how to
+/// follow it.
+fn detached(execution: std::result::Result<Execution, String>) -> CallToolResult {
+    let run_id = match &execution {
+        Ok(Execution {
+            report: Some(report),
+            ..
+        }) if report["type"] == "run_detached" => report["run_id"].as_str().map(str::to_owned),
+        _ => None,
+    };
+    let mut result = report(execution);
+    if let (Some(run_id), false) = (run_id, result.is_error == Some(true)) {
+        result.content.insert(
+            0,
+            ContentBlock::text(format!(
+                "Started detached GoodFlows run {run_id}. Call `wait` with this run_id until it returns the run's result; `status` shows progress and `cancel` stops it."
+            )),
+        );
+    }
+    result
+}
+
+/// The result of `status` or `cancel`, and of a `wait` that timed out: the
+/// `run_status` event. A run still going (exit 75) is a normal result.
+fn progress(execution: std::result::Result<Execution, String>) -> CallToolResult {
+    let execution = match execution {
+        Ok(execution) => execution,
+        Err(error) => return incomplete(None, &error),
+    };
+    let status = match &execution.report {
+        Some(event)
+            if event["type"] == "run_status"
+                && !execution.failed
+                && matches!(execution.exit_code, Some(0 | STILL_RUNNING)) =>
+        {
+            event
+        }
+        _ => return incomplete(execution.exit_code, &execution.error),
+    };
+    let line = match status["state"].as_str() {
+        Some("running") if execution.exit_code == Some(STILL_RUNNING) => {
+            "The GoodFlows run is still running; call `wait` again.".to_owned()
+        }
+        Some("running") => "The GoodFlows run is still running.".to_owned(),
+        Some("finished") => format!(
+            "The GoodFlows run finished (exit code {}).",
+            code(status["exit_code"].as_i64().map(|c| c as i32))
+        ),
+        _ => "The GoodFlows run stopped without a result.".to_owned(),
+    };
+    CallToolResult::success(vec![
+        ContentBlock::text(line),
+        ContentBlock::text(bounded(&status.to_string(), DIAGNOSTIC_LIMIT)),
+    ])
 }
 
 /// goodflows could not do what the tool asked, such as for a config error

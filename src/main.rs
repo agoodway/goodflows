@@ -230,7 +230,7 @@ enum Commands {
     },
     /// Serve goodflows to coding agents as an MCP server on stdin and stdout
     #[command(after_help = "Examples:
-  goodflows mcp                      # serve the run, list, validate and last tools
+  goodflows mcp                      # serve the run, wait, status, cancel, list, validate and last tools
   goodflows mcp --config ci.toml     # tools use ci.toml unless a call passes its own config
   goodflows skills install           # also install the CI skills for this harness")]
     Mcp,
@@ -338,7 +338,9 @@ impl Cli {
             command.mut_args(|arg| match arg.get_id().as_str() {
                 "json" => arg.num_args(0).help(help),
                 // Not "see a summary with '-h'": no summary is in sight.
-                "help" => arg.help("Print help").long_help(clap::builder::Resettable::<clap::builder::StyledStr>::Reset),
+                "help" => arg
+                    .help("Print help")
+                    .long_help(clap::builder::Resettable::<clap::builder::StyledStr>::Reset),
                 _ => arg,
             })
         }
@@ -1846,7 +1848,12 @@ mod tests {
 
     #[test]
     fn commands_that_run_no_jobs_take_a_plain_json_flag() {
-        for path in [&["init"][..], &["skills", "install"], &["last"], &["status"]] {
+        for path in [
+            &["init"][..],
+            &["skills", "install"],
+            &["last"],
+            &["status"],
+        ] {
             let args = std::iter::once("goodflows")
                 .chain(path.iter().copied())
                 .chain(["--help"]);
@@ -1858,7 +1865,12 @@ mod tests {
             assert!(!options.contains("summary"), "{path:?}:\n{help}");
         }
         let run_id = "fb7d2711-6b67-4f5a-9104-492032a9e1e5";
-        for args in [&["init"][..], &["skills", "install"], &["last"], &["status", run_id]] {
+        for args in [
+            &["init"][..],
+            &["skills", "install"],
+            &["last"],
+            &["status", run_id],
+        ] {
             let json = parse(&[args, &["--json"]].concat()).unwrap().json;
             assert_eq!(json, Some(output::Json::All), "{args:?}");
             let error = parse(&[args, &["--json=summary"]].concat()).err();
