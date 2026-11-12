@@ -353,7 +353,7 @@ Example `sprite status --json` event (nonsecret fields only):
  "degraded":false,"destroying":false,"reconciled":true,
  "runs":[{"run_id":"6d1c...","phase":"running","workflow":"ci","environment":null,"accepted_at_ms":1762500100000,"terminal":null,"timings":[...],"path":"/home/sprite/.goodflows/runs/6d1c..."}],
  "owner":{"organization":"my-org","prefix":"goodflows","identity":"T-1","name":"goodflows-0f3c...","sprite_id":"..."},
- "supervisor":{"protocol":1,"generation":"...","runner":"...","version":"0.6.0"},"schema_version":1}
+ "supervisor":{"protocol":1,"generation":"...","runner":"...","version":"0.7.0"},"schema_version":1}
 ```
 
 Limits of reconciliation: platform or VM loss is reported as `interrupted`
