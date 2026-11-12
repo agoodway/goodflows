@@ -1,4 +1,5 @@
 mod config;
+mod detach;
 mod expression;
 mod fsutil;
 mod history;
@@ -93,6 +94,27 @@ enum Commands {
         /// Rerun only the jobs the last local run's `Rerun failed:` hint names, in its workflow and environment
         #[arg(long, conflicts_with = "sprite")]
         failed: bool,
+        /// Start the run in the background and print its run id; follow it with `status` and `wait`
+        #[arg(long, conflicts_with = "sprite")]
+        detach: bool,
+        /// Internal: run as the background process of a detached run that owns this directory
+        #[arg(long, hide = true, value_name = "DIR", requires = "detach")]
+        detached_run: Option<PathBuf>,
+    },
+    /// Show a detached run's progress: running, passed and failed jobs
+    Status {
+        /// The run id `run --detach` printed
+        #[arg(value_parser = reporting::history_client::run_id)]
+        run_id: String,
+    },
+    /// Wait for a detached run, then print its report and exit with its exit code (75 when the timeout passes first)
+    Wait {
+        /// The run id `run --detach` printed
+        #[arg(value_parser = reporting::history_client::run_id)]
+        run_id: String,
+        /// Stop waiting after this many seconds and exit 75 while the run goes on (default: no limit)
+        #[arg(long, value_name = "SECS")]
+        timeout: Option<u64>,
     },
     /// Show the last local run's results and failure output again, without running anything
     Last,
@@ -165,8 +187,8 @@ enum HistoryCommand {
     },
 }
 
-/// Global flags that only `run` uses; `reports upload`, `history`, `last`
-/// and `sprite` commands reject them.
+/// Global flags that only `run` uses; `reports upload`, `history`, `last`,
+/// `status`, `wait` and `sprite` commands reject them.
 const RUN_ONLY_FLAGS: [&str; 12] = [
     "env",
     "parallelism",
@@ -184,8 +206,9 @@ const RUN_ONLY_FLAGS: [&str; 12] = [
 
 impl Cli {
     /// The parser, with run-only global flags hidden from `sprite`,
-    /// `history` and `last` help. They still parse there, so passing one is
-    /// rejected with a clear error rather than silently ignored.
+    /// `history`, `last`, `status` and `wait` help. They still parse there,
+    /// so passing one is rejected with a clear error rather than silently
+    /// ignored.
     fn parser() -> clap::Command {
         let mut command = <Self as clap::CommandFactory>::command();
         // Globals reach subcommands only when the command is built.
@@ -200,6 +223,8 @@ impl Cli {
             .mut_subcommand("sprite", |sprite| hide(sprite).mut_subcommands(hide))
             .mut_subcommand("history", |history| hide(history).mut_subcommands(hide))
             .mut_subcommand("last", hide)
+            .mut_subcommand("status", hide)
+            .mut_subcommand("wait", hide)
     }
 
     /// The first run-only flag on the command line, as the user typed it, for
@@ -264,9 +289,19 @@ impl Cli {
         .unwrap_or_else(output::Mode::detect)
     }
 
-    /// Whether the command runs a workflow.
+    /// Whether the command runs a workflow. `run --detach` only starts one
+    /// in the background, which runs it.
     fn runs(&self) -> bool {
-        matches!(self.command, None | Some(Commands::Run { .. }))
+        matches!(
+            self.command,
+            None | Some(
+                Commands::Run { detach: false, .. }
+                    | Commands::Run {
+                        detached_run: Some(_),
+                        ..
+                    }
+            )
+        )
     }
 
     fn workflow(&self) -> Option<&str> {
@@ -282,6 +317,8 @@ impl Cli {
                 Commands::Reports { .. }
                 | Commands::History { .. }
                 | Commands::Last
+                | Commands::Status { .. }
+                | Commands::Wait { .. }
                 | Commands::Sprite { .. }
                 | Commands::SpriteAgent { .. },
             )
@@ -318,6 +355,20 @@ async fn main() -> ExitCode {
     if let Some(Commands::SpriteAgent { args }) = &cli.command {
         return ExitCode::from(sprite::agent::main(args).await);
     }
+    // The background process of a detached run holds the run's lock until it exits.
+    let background = match &cli.command {
+        Some(Commands::Run {
+            detached_run: Some(dir),
+            ..
+        }) => match detach::Background::start(dir) {
+            Ok(background) => Some(background),
+            Err(error) => {
+                eprintln!("goodflows: detached run: {error:#}");
+                return ExitCode::FAILURE;
+            }
+        },
+        _ => None,
+    };
     let (_signal_sender, cancel) = match if matches!(
         cli.command,
         None | Some(
@@ -358,8 +409,8 @@ async fn main() -> ExitCode {
     if let Some(name) = &cli.env {
         output = output.with_environment(name);
     }
-    match run(&cli, &mut output, cancel.clone()).await {
-        Ok(code) => ExitCode::from(code),
+    let code = match run(&cli, &mut output, cancel.clone()).await {
+        Ok(code) => code,
         Err(error) => {
             // A usage or config error exits 2; anything else stopped a run
             // that the caller asked for correctly, and exits 1 like a failure.
@@ -373,9 +424,13 @@ async fn main() -> ExitCode {
             }
             let _ = output.emit(event).await;
             let code = if config.is_some() { 2 } else { 1 };
-            ExitCode::from(cancel.borrow().map(|s| (128 + s) as u8).unwrap_or(code))
+            cancel.borrow().map(|s| (128 + s) as u8).unwrap_or(code)
         }
+    };
+    if let Some(background) = background {
+        background.finish(code);
     }
+    ExitCode::from(code)
 }
 
 /// A command line that parsed but asks for something goodflows does not do.
@@ -444,6 +499,30 @@ async fn run(cli: &Cli, output: &mut Output, cancel: watch::Receiver<Option<i32>
             return Err(usage(format!("{flag} cannot be used with last")));
         }
         return last::show(&Config::locate(cli.config.as_deref())?, output).await;
+    }
+    if let Some(Commands::Status { run_id } | Commands::Wait { run_id, .. }) = &cli.command {
+        let command = if matches!(cli.command, Some(Commands::Status { .. })) {
+            "status"
+        } else {
+            "wait"
+        };
+        if let Some(flag) = cli.run_only_flag() {
+            return Err(usage(format!("{flag} cannot be used with {command}")));
+        }
+        let config_file = Config::locate(cli.config.as_deref())?;
+        return match &cli.command {
+            Some(Commands::Wait { timeout, .. }) => {
+                detach::wait(
+                    &config_file,
+                    run_id,
+                    *timeout,
+                    cli.config.as_deref(),
+                    output,
+                )
+                .await
+            }
+            _ => detach::status(&config_file, run_id, output).await,
+        };
     }
     let rerun_failed = matches!(cli.command, Some(Commands::Run { failed: true, .. }));
     if rerun_failed && !cli.jobs.is_empty() {
@@ -600,6 +679,24 @@ async fn run(cli: &Cli, output: &mut Output, cancel: watch::Receiver<Option<i32>
         )
         .await;
     }
+    let detached_run = match &cli.command {
+        Some(Commands::Run {
+            detached_run: Some(dir),
+            ..
+        }) => Some(dir),
+        Some(Commands::Run { detach: true, .. }) => {
+            return detach::start(&config_file, &name, profile, cli.config.as_deref(), output)
+                .await;
+        }
+        _ => None,
+    };
+    let mut last_run = last::Recorder::new(&config_file);
+    let mut identity = retention::RunIdentity::new();
+    if let Some(dir) = detached_run {
+        // The root invocation's run id is the one `run --detach` printed.
+        identity = retention::RunIdentity::with_id(detach::run_id(dir)?);
+        last_run = last_run.also(detach::last_record(dir));
+    }
     let run = Run {
         calls: !calls.is_empty(),
         root: config,
@@ -619,9 +716,9 @@ async fn run(cli: &Cli, output: &mut Output, cancel: watch::Receiver<Option<i32>
         cancel,
         sprite_state: None,
         provenance: None,
-        last_run: Some(last::Recorder::new(&config_file)),
+        last_run: Some(last_run),
     };
-    execute(run, name, retention::RunIdentity::new()).await
+    execute(run, name, identity).await
 }
 
 /// Run a whole invocation tree: the root workflow `name` with `identity`

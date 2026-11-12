@@ -113,6 +113,7 @@ goodflows --config ./goodflows.toml
 | 0 | Every selected job passed or was skipped | Nothing |
 | 1 | A job failed or timed out, or goodflows hit a runtime error after the command and config were accepted | Fix the code, or report the failure |
 | 2 | A usage or config error: bad arguments, no config, a config that does not parse or validate, or an unknown workflow, job, or environment | Fix the command or the config, then run it again |
+| 75 | Only from [`wait`](#detached-runs): the timeout passed and the run is still going | Run `wait` again |
 | 130 | Interrupted by SIGINT | |
 | 143 | Interrupted by SIGTERM | |
 
@@ -130,6 +131,7 @@ With `--json`, a run that cannot start ends with one `error` event. Its `code` i
 | `unknown_environment` | 2 | The `--env` name is not in the file |
 | `no_last_run` | 2 | [`last` or `run --failed`](#last-run-and-rerunning-failures) found no previous local run, or `run --failed` named a different workflow or environment |
 | `no_failed_jobs` | 2 | `run --failed` found nothing to rerun: the last run had no failed or timed-out job |
+| `unknown_run` | 2 | [`status` or `wait`](#detached-runs) found no detached run with that id for the config |
 | `runtime` | 1 | Anything else that stopped goodflows, including `history` and `reports upload` request errors and the `--sprite` and `sprite` command checks |
 
 `message` is the same text that text mode prints after `Error:`. An unknown workflow, job, or environment message lists the names that exist. An optional `hint` suggests a fix, such as `did you mean 'test'?` for a close match. Text mode prints it on a `Hint:` line.
@@ -369,6 +371,24 @@ goodflows run --failed
 `goodflows run --failed` reruns the jobs that the last run's `Rerun failed:` hint names, plus the jobs they depend on. It uses the last run's workflow and `--env`. Those are the failed and timed-out jobs and the jobs skipped because a dependency did not pass. A workflow or `--env` given with `--failed` must match the last run's. `--failed` rejects `--jobs` and `--sprite`. Other run flags, such as `--log-dir` and `--history`, apply as usual. A job whose name contains a comma is rerun too, though the hint cannot select it.
 
 When there is no record, both commands exit 2 with `no_last_run`. `run --failed` exits 2 with `no_failed_jobs` when the last run has nothing to rerun. A run that stops before its summary, such as one with a config error, leaves the previous record in place. `run --sprite` writes no record.
+
+### Detached runs
+
+Coding agents often stop a shell command after a couple of minutes, and a full run can take longer. `goodflows run --detach` starts the run in the background and returns at once. It prints the run id on stdout. With `--json` or `--json=summary`, it prints one `run_detached` event with `run_id`, `pid`, and `run_dir`. The background run always records every event, so `status` can show its progress. The run id is the `run_id` of the run's root `summary`.
+
+```bash
+id=$(goodflows run --detach)
+goodflows status "$id"
+goodflows wait "$id" --timeout 90
+```
+
+`--detach` checks the command line and the config first, so usage and config errors still exit 2 before anything starts. It takes the same run flags as a foreground run, except `--sprite`.
+
+`goodflows status <run_id>` prints the run's state and which jobs are running, passed, failed, timed out, skipped, or cancelled. With `--json` it prints one `run_status` event with `state` (`running`, `finished`, or `lost`), `exit_code` once finished, and a list of job names for each status. `lost` means the background process died without a result, for example from SIGKILL. `status` exits 0 whenever it can report.
+
+`goodflows wait <run_id> --timeout <secs>` blocks until the run finishes. It then prints the run's report, or its `summary` events with `--json`, exactly as the foreground run would have, and exits with the run's exit code. If the timeout passes first, it prints the same progress as `status` and exits 75. Call `wait` again until the exit code is not 75. Without `--timeout` it waits as long as the run takes. A `lost` run exits 1. Stopping `wait` does not stop the run. To cancel a detached run, send its process SIGTERM; the pid is in `run_dir/pid`.
+
+`status` and `wait` find the run beside the config, so pass the same `--config` the run used. Each detached run keeps its events, stderr, record, and exit code in `.goodflows/runs/<run_id>/` next to the config file. Nothing removes these directories, so delete old ones when you no longer need them. A detached run also replaces the [last run](#last-run-and-rerunning-failures) record when it finishes.
 
 ### Run history
 
