@@ -306,7 +306,9 @@ Settings precedence is CLI flags, then the profile, then the workflow, then `[se
 
 ### Text and JSON output
 
-Text mode writes each output chunk as `[job stream]` followed by the chunk. `stream` is `stdout` or `stderr`. A step is `[job/step stream]`. The run ends with a report: one row per job, then counts, then a `Failures` section when something failed or timed out. The text report does not repeat output tails. The last line of a failed root run is `Rerun failed:` and a `goodflows run` command for the failed jobs and the jobs skipped because a dependency did not pass.
+`--output` picks how much a run prints in text mode. `--output=failures` prints one status line per job and no job output while the run goes. `--output=stream` also prints step lines, and writes each output chunk as `[job stream]` followed by the chunk. `stream` is `stdout` or `stderr`. A step is `[job/step stream]`. Without the flag, a run uses `failures` when stdout is not a terminal, such as when it is piped to a file, or when a coding agent variable is set (`CLAUDECODE`, `CODEX_*` other than `CODEX_HOME`, `AGENT`, `AI_AGENT`, `CURSOR_AGENT`, `GEMINI_CLI`, or `OPENCODE`). Otherwise it uses `stream`. `--json` ignores `--output`.
+
+The run ends with a report: one row per job, then counts, then a `Failures` section when something failed or timed out. In both modes each `Failures` entry shows the last 4 KiB of the instance's stdout and stderr, and the paths of its log files when `--log-dir` is set. The last line of a failed root run is `Rerun failed:` and a `goodflows run` command for the failed jobs and the jobs skipped because a dependency did not pass.
 
 `--json` prints JSON Lines on stdout. Every event has `schema_version` 1. The last event of a finished run has `"type":"summary"`. Its `success` field is true when every selected job passed or was skipped. Failed and timed-out jobs include `stdout_tail` and `stderr_tail`.
 

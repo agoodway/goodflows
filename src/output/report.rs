@@ -218,22 +218,28 @@ pub(super) fn report(event: &Value, out: &mut impl Write) -> Result<()> {
         }
     )?;
 
+    let log_dir = event["log_dir"].as_str();
     if failed {
         writeln!(out, "\nFailures")?;
         let mut first = true;
-        for result in results
-            .iter()
-            .filter(|r| matches!(text(r, "status"), "failed" | "timed_out"))
-        {
+        // Results are in selected job order, so a job's position among the
+        // distinct names is the index its log files are named by.
+        let mut job = 0;
+        for (i, result) in results.iter().enumerate() {
+            if i > 0 && text(result, "name") != text(&results[i - 1], "name") {
+                job += 1;
+            }
+            if !matches!(text(result, "status"), "failed" | "timed_out") {
+                continue;
+            }
             if !first {
                 writeln!(out)?;
             }
             first = false;
-            failure(result, out)?;
+            failure(result, log_dir.map(|dir| (dir, job)), out)?;
         }
     }
 
-    let log_dir = event["log_dir"].as_str();
     let history_file = event["history_file"].as_str();
     let failed_rows = rows
         .iter()
@@ -282,9 +288,10 @@ pub(super) fn report(event: &Value, out: &mut impl Write) -> Result<()> {
     Ok(())
 }
 
-/// One Failures entry for a failed or timed-out instance. Output tails stay
-/// in JSON results only; text mode already streamed the full output live.
-fn failure(result: &Value, out: &mut impl Write) -> Result<()> {
+/// One Failures entry for a failed or timed-out instance, with its log files
+/// when `logs` gives the run's log directory and the job's index, and its
+/// output tails.
+fn failure(result: &Value, logs: Option<(&str, usize)>, out: &mut impl Write) -> Result<()> {
     let status = if text(result, "status") == "timed_out" {
         "TIMED OUT"
     } else {
@@ -315,6 +322,34 @@ fn failure(result: &Value, out: &mut impl Write) -> Result<()> {
     }
     if let Some(error) = result["error"].as_str() {
         writeln!(out, "  error: {}", visible(error))?;
+    }
+    // Only a started command job has log files; a call's child has its own.
+    if let Some((dir, index)) =
+        logs.filter(|_| result["started"] == true && result["workflow"].is_null())
+    {
+        let partition = result["partition"]["index"].as_u64().map(|i| i as u32);
+        let stem = crate::runner::log_stem(index, text(result, "name"), partition);
+        for stream in ["stdout", "stderr"] {
+            let path = std::path::Path::new(dir).join(format!("{stem}.{stream}.log"));
+            writeln!(out, "  {stream} log: {}", visible(&path.to_string_lossy()))?;
+        }
+    }
+    for stream in ["stdout", "stderr"] {
+        let Some(tail) = result[format!("{stream}_tail")]
+            .as_str()
+            .filter(|tail| !tail.is_empty())
+        else {
+            continue;
+        };
+        let omitted = if result[format!("{stream}_truncated")] == true {
+            " (earlier output omitted)"
+        } else {
+            ""
+        };
+        writeln!(out, "  {stream}{omitted}:")?;
+        for line in tail.lines() {
+            writeln!(out, "    {}", visible(line))?;
+        }
     }
     Ok(())
 }
@@ -409,7 +444,7 @@ mod tests {
 
     fn rendered(event: Value) -> String {
         let (mut out, mut err) = (Vec::new(), Vec::new());
-        super::super::render(false, event, &mut out, &mut err).unwrap();
+        super::super::render(false, super::super::Mode::Stream, event, &mut out, &mut err).unwrap();
         assert!(err.is_empty());
         String::from_utf8(out).unwrap()
     }
@@ -702,23 +737,31 @@ mod tests {
             let r = with(r, "stdout_tail", json!(""));
             with(r, "stdout_truncated", json!(false))
         };
-        let report = report_of(vec![
+        // The second configured job's partitions log as `002-test.pNN`; an
+        // empty tail is left out and job text stays escaped.
+        let mut event = summary(vec![
+            result("lint", "passed", true, 2),
             failed(1, "boom-1\n"),
-            failed(2, "boom-2\nmore\n"),
+            failed(2, "boom-2\x1b[31m\nmore\n"),
             with(
                 result("other", "cancelled", true, 4),
                 "error",
                 json!("cancelled by signal"),
             ),
         ]);
+        event["log_dir"] = json!("logs/run");
+        colored::control::set_override(false);
+        let report = rendered(event);
         let failures = &report[report.find("\nFailures\n").unwrap()..];
         assert!(
-            failures.starts_with("\nFailures\n--- test (1/2)  FAILED  exit 1\n  command: cargo test\n  error: exited with 1\n\n--- test (2/2)  FAILED  exit 1\n  command: cargo test\n  error: exited with 1\n\n"),
+            failures.starts_with("\nFailures\n--- test (1/2)  FAILED  exit 1\n  command: cargo test\n  error: exited with 1\n  stdout log: logs/run/002-test.p01.stdout.log\n  stderr log: logs/run/002-test.p01.stderr.log\n  stderr:\n    boom-1\n\n--- test (2/2)  FAILED  exit 1\n  command: cargo test\n  error: exited with 1\n  stdout log: logs/run/002-test.p02.stdout.log\n  stderr log: logs/run/002-test.p02.stderr.log\n  stderr (earlier output omitted):\n    boom-2\\u{1b}[31m\n    more\n\n"),
             "{report}"
         );
-        assert!(!failures.contains("tail"), "{report}");
-        assert!(!failures.contains("boom"), "{report}");
         assert!(!failures.contains("other"), "{report}");
+        // Without a log directory there are no log paths.
+        let report = report_of(vec![failed(1, "boom-1\n")]);
+        assert!(!report.contains(" log: "), "{report}");
+        assert!(report.contains("  stderr:\n    boom-1\n"), "{report}");
 
         // A failed step names the step; its command is the step's.
         let stepped = with(
@@ -768,11 +811,11 @@ mod tests {
         let timeout = with(timeout, "stdout_tail", json!("before"));
         let report = report_of(vec![timeout]);
         assert!(
-            report
-                .contains("--- slow  TIMED OUT\n  command: sleep 5\n  error: timed out after 1s\n"),
+            report.contains(
+                "--- slow  TIMED OUT\n  command: sleep 5\n  error: timed out after 1s\n  stdout:\n    before\n"
+            ),
             "{report}"
         );
-        assert!(!report.contains("before"), "{report}");
         assert!(report.contains("  TIMEOUT  slow  1.0s"), "{report}");
 
         // A timed-out step is the failing step; no exit code is invented.
@@ -992,7 +1035,10 @@ mod tests {
             ),
         ]);
         event["invocation_id"] = json!("feedbeef-0000-0000-0000-000000000000");
+        // A call's logs belong to its child run.
+        event["log_dir"] = json!("logs/run");
         let report = rendered(event.clone());
+        assert!(!report.contains(" log: "), "{report}");
         assert!(
             report.starts_with("\nci [feedbeef]  FAILED  in 710ms\n"),
             "{report}"

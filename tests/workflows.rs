@@ -1770,7 +1770,7 @@ command = "echo hi; touch started.$$; i=0; while [ $i -lt 300 ] && [ $(ls starte
     );
 
     // Text lines name the owning workflow and a short invocation id.
-    let text = p.run(&["run", "ci"]);
+    let text = p.run(&["run", "ci", "--output=stream"]);
     success(&text);
     let text = stdout(&text);
     let labels: std::collections::BTreeSet<_> = text

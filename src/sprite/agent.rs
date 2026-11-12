@@ -2190,7 +2190,7 @@ async fn exec_workflow(args: &[String]) -> Result<u8> {
     let run = PathBuf::from(args.get(2).context("run directory")?);
     let header: Header = read_json(&run.join("header.json"))?;
     let (_signals, cancel) = crate::cancellation()?;
-    let output = crate::output::Output::new(true, cancel.clone())?;
+    let output = crate::output::Output::new(true, crate::output::Mode::Stream, cancel.clone())?;
     let results = run.join("results");
     let request = &header.request;
     let invoke = async {

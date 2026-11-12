@@ -52,6 +52,9 @@ struct Cli {
     /// Emit versioned JSON Lines events to stdout
     #[arg(long, global = true)]
     json: bool,
+    /// Run text output [default: failures when stdout is not a terminal or a coding agent runs goodflows, else stream]
+    #[arg(long, value_enum, value_name = "MODE")]
+    output: Option<output::Mode>,
     /// Save raw per-job stdout/stderr files in a new per-run directory under this directory
     #[arg(long, global = true)]
     log_dir: Option<PathBuf>,
@@ -83,6 +86,9 @@ enum Commands {
         /// Run the whole workflow on this caller identity's owned Sprite (see docs/sprites.md)
         #[arg(long, value_name = "IDENTITY", value_parser = sprite::naming::parse_identity)]
         sprite: Option<String>,
+        /// Text output [default: failures when stdout is not a terminal or a coding agent runs goodflows, else stream]
+        #[arg(long, value_enum, value_name = "MODE")]
+        output: Option<output::Mode>,
     },
     /// Validate config and selections without executing commands
     Validate { workflow: Option<String> },
@@ -205,6 +211,7 @@ impl Cli {
             (self.log_runs.is_some(), "--log-runs"),
             (self.history_runs.is_some(), "--history-runs"),
             (self.history_bytes.is_some(), "--history-bytes"),
+            (self.output.is_some(), "--output"),
         ]
         .into_iter()
         .find_map(|(set, flag)| set.then_some(flag))
@@ -237,6 +244,17 @@ impl Cli {
             history_runs: self.history_runs,
             history_bytes: self.history_bytes,
         })
+    }
+
+    /// The text output mode. Only a run streams job output, so every other
+    /// command renders in full.
+    fn output_mode(&self) -> output::Mode {
+        match &self.command {
+            None => self.output,
+            Some(Commands::Run { output, .. }) => output.or(self.output),
+            Some(_) => return output::Mode::Stream,
+        }
+        .unwrap_or_else(output::Mode::detect)
     }
 
     fn workflow(&self) -> Option<&str> {
@@ -274,7 +292,7 @@ async fn main() -> ExitCode {
                 return ExitCode::SUCCESS;
             }
             let (_sender, cancel) = watch::channel(None);
-            if let Ok(output) = Output::new(json_requested, cancel) {
+            if let Ok(output) = Output::new(json_requested, output::Mode::Stream, cancel) {
                 let _ = output
                     .emit(json!({"type":"error", "message":error.to_string()}))
                     .await;
@@ -306,7 +324,7 @@ async fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let output = match Output::new(cli.json, cancel.clone()) {
+    let output = match Output::new(cli.json, cli.output_mode(), cancel.clone()) {
         Ok(output) => output,
         Err(error) => {
             eprintln!("failed to initialize output: {error}");

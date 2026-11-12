@@ -872,8 +872,18 @@ async fn open_logs(
     job: &Job,
     partition: Option<Partition>,
 ) -> Result<[Option<tokio::fs::File>; 2]> {
-    let safe_name: String = job
-        .name
+    let stem = log_stem(index, &job.name, partition.map(|p| p.index));
+    Ok([
+        open_log(log_dir, &format!("{stem}.stdout.log")).await?,
+        open_log(log_dir, &format!("{stem}.stderr.log")).await?,
+    ])
+}
+
+/// The file name of a unit's logs before `.stdout.log` or `.stderr.log`.
+/// `index` is the job's position in the selected job list, so instance logs
+/// sort together.
+pub(crate) fn log_stem(index: usize, name: &str, partition: Option<u32>) -> String {
+    let safe_name: String = name
         .chars()
         .take(60)
         .map(|c| {
@@ -884,15 +894,10 @@ async fn open_logs(
             }
         })
         .collect();
-    // `index` is the job's position in the selected job list, so instance logs sort together.
-    let stem = match partition {
-        Some(partition) => format!("{:03}-{safe_name}.p{:02}", index + 1, partition.index),
+    match partition {
+        Some(partition) => format!("{:03}-{safe_name}.p{partition:02}", index + 1),
         None => format!("{:03}-{safe_name}", index + 1),
-    };
-    Ok([
-        open_log(log_dir, &format!("{stem}.stdout.log")).await?,
-        open_log(log_dir, &format!("{stem}.stderr.log")).await?,
-    ])
+    }
 }
 
 /// The environment a job's conditions and expressions see, before step env

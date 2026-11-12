@@ -27,6 +27,49 @@ struct Invocation {
     parent: Option<(String, String)>,
 }
 
+/// How much of a run text mode prints. JSON output ignores it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum Mode {
+    /// One status line per job, then each failure's output in the report
+    Failures,
+    /// Also every job's step lines and output as they run
+    Stream,
+}
+
+/// Variables that coding agents set in the commands they run. Any `CODEX_*`
+/// variable also counts, except `CODEX_HOME`, which users set themselves.
+const AGENT_VARS: [&str; 6] = [
+    "AGENT",
+    "AI_AGENT",
+    "CLAUDECODE",
+    "CURSOR_AGENT",
+    "GEMINI_CLI",
+    "OPENCODE",
+];
+
+impl Mode {
+    /// `failures` when stdout is not a terminal or a coding agent runs
+    /// goodflows, `stream` otherwise.
+    pub fn detect() -> Self {
+        use std::io::IsTerminal;
+        if !io::stdout().is_terminal() || agent(std::env::vars_os()) {
+            Self::Failures
+        } else {
+            Self::Stream
+        }
+    }
+}
+
+/// Whether the environment names a coding agent with a non-empty value.
+fn agent(vars: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>) -> bool {
+    vars.into_iter().any(|(name, value)| {
+        !value.is_empty()
+            && name.to_str().is_some_and(|name| {
+                AGENT_VARS.contains(&name) || (name.starts_with("CODEX_") && name != "CODEX_HOME")
+            })
+    })
+}
+
 #[derive(Clone)]
 pub struct Output {
     pub json: bool,
@@ -39,8 +82,8 @@ pub struct Output {
 }
 
 impl Output {
-    pub fn new(json: bool, cancel: watch::Receiver<Option<i32>>) -> Result<Self> {
-        Self::writing(json, cancel, duplicate_stdio(1)?, duplicate_stdio(2)?)
+    pub fn new(json: bool, mode: Mode, cancel: watch::Receiver<Option<i32>>) -> Result<Self> {
+        Self::writing(json, mode, cancel, duplicate_stdio(1)?, duplicate_stdio(2)?)
     }
 
     /// Output that renders every event and discards it, for unit tests that
@@ -48,11 +91,12 @@ impl Output {
     #[cfg(test)]
     pub fn discard(json: bool, cancel: watch::Receiver<Option<i32>>) -> Result<Self> {
         let null = || File::options().write(true).open("/dev/null");
-        Self::writing(json, cancel, null()?, null()?)
+        Self::writing(json, Mode::Stream, cancel, null()?, null()?)
     }
 
     fn writing(
         json: bool,
+        mode: Mode,
         cancel: watch::Receiver<Option<i32>>,
         mut out: File,
         mut err: File,
@@ -64,8 +108,8 @@ impl Output {
             .name("goodflows-output".into())
             .spawn(move || {
                 while let Some(request) = receiver.blocking_recv() {
-                    let result =
-                        render(json, request.event, &mut out, &mut err).map_err(|e| e.to_string());
+                    let result = render(json, mode, request.event, &mut out, &mut err)
+                        .map_err(|e| e.to_string());
                     let failed = result.is_err();
                     let _ = request.done.send(result);
                     if failed {
@@ -208,11 +252,26 @@ fn duplicate_stdio(fd: i32) -> io::Result<File> {
 #[cfg(not(unix))]
 compile_error!("goodflows currently supports Linux and macOS (Unix process groups required)");
 
-fn render(json: bool, mut event: Value, out: &mut impl Write, err: &mut impl Write) -> Result<()> {
+fn render(
+    json: bool,
+    mode: Mode,
+    mut event: Value,
+    out: &mut impl Write,
+    err: &mut impl Write,
+) -> Result<()> {
     event["schema_version"] = json!(1);
     if json {
         serde_json::to_writer(&mut *out, &event)?;
         writeln!(out)?;
+    } else if mode == Mode::Failures
+        && matches!(
+            event["type"].as_str(),
+            Some("job_started" | "step_started" | "step_finished" | "job_output")
+        )
+    {
+        // The job_finished status line and the report's Failures section
+        // cover these.
+        return Ok(());
     } else {
         if matches!(
             event["type"].as_str(),
@@ -288,8 +347,8 @@ fn render(json: bool, mut event: Value, out: &mut impl Write, err: &mut impl Wri
                 if let Some(error) = result["error"].as_str() {
                     writeln!(out, "  {}", visible(error))?;
                 }
-                // The command is in the run report's Failures section; output
-                // tails are JSON-only, since the output already streamed live.
+                // The command and output tail are in the run report's
+                // Failures section.
             }
             "summary" => report::report(&event, out)?,
             "history_runs" => history::runs(&event, out)?,
@@ -705,9 +764,20 @@ mod tests {
 
     fn rendered(event: Value) -> String {
         let (mut out, mut err) = (Vec::new(), Vec::new());
-        render(false, event, &mut out, &mut err).unwrap();
+        render(false, Mode::Stream, event, &mut out, &mut err).unwrap();
         assert!(err.is_empty());
         String::from_utf8(out).unwrap()
+    }
+
+    #[test]
+    fn agents_are_detected_from_their_variables() {
+        let detects = |vars: &[(&str, &str)]| agent(vars.iter().map(|(k, v)| (k.into(), v.into())));
+        for name in ["CLAUDECODE", "AGENT", "CODEX_SANDBOX", "CODEX_CI"] {
+            assert!(detects(&[("PATH", "/bin"), (name, "1")]), "{name}");
+        }
+        assert!(!detects(&[("PATH", "/bin"), ("HOME", "/h")]));
+        assert!(!detects(&[("CLAUDECODE", "")]));
+        assert!(!detects(&[("CODEX_HOME", "/h/.codex"), ("AGENTS", "1")]));
     }
 
     /// Text for reporting events with and without a partition instance.

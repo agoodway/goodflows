@@ -126,7 +126,7 @@ shell = false
 command = "printf '%s' 'hello world'"
 "#,
     );
-    let output = p.run(&[]);
+    let output = p.run(&["--output=stream"]);
     success(&output);
     assert!(stdout(&output).contains("hello world"));
 }
