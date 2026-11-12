@@ -118,8 +118,22 @@ From the repo root, run `### Proof commands` one command at a time, in order. Th
 
 Record the command, the exit code, and pass, fail, or blocked.
 
+A command that builds or installs the CLI, `goodflows validate`, and `goodflows list` are quick and run in the foreground. A `goodflows` run of a workflow may take longer than about 2 minutes, a common limit on an agent's shell command, and a shell that stops it leaves no result. Unless the workflow is clearly quicker than that, run it detached, even when the skill's own note does not say to:
+
+1. Start it as `goodflows run --detach`, or `goodflows run NAME --detach`, with the proof's binary and every other flag of the command kept. `--detach` is a flag of `run`: a bare `goodflows --detach` exits `2`. It returns at once and prints the run id on stdout. With `--json` or `--json=summary` it prints one `run_detached` event instead; its `run_id` is the id. A usage or config error still exits `2` here, before anything starts.
+2. Run `goodflows wait RUN_ID --timeout 90` with the printed id written out, not in a shell variable, since the next command may run in a new shell. Add the run's `--config PATH`; without it `wait` looks beside the default config and exits `2` with `unknown_run`. Add `--json=summary` when the run used it.
+3. While `wait` exits `75`, run the same `wait` again. `75` means the timeout passed and the run is still going: it is neither a pass nor a fail, and stopping `wait` does not stop the run. `goodflows status RUN_ID`, with the same `--config`, shows which jobs are running, passed, or failed.
+4. The first `wait` that exits something other than `75` prints the run's report and exits with the run's own exit code, the same one the foreground command would give. Record that as the command's exit code and apply the rules below.
+
+`--detach` rejects `--sprite`, so a `--sprite` command runs in the foreground as written. If the shell stops it before it exits, it has no exit code: report it as stopped by the shell, not as pass, fail, or blocked.
+
+Changing the proof block to the detached form is not part of an update. Leave it as the skill wrote it.
+
 - The `goodflows` command exited `2`: a usage or config error, so the skill's command no longer matches the config. Quote the `Error:` line, or the `error` event's `code` with `--json` (`unknown_job`, `unknown_workflow`, `config_invalid`, and so on). Fix the command in the skill, then run the whole proof again from the first command. Do not edit `goodflows.toml` to make it pass.
 - The `goodflows` command exited `1`: the command is right and a job failed or timed out, or goodflows hit a runtime error. Report fail. Do not weaken a flag, drop a job, or mark it skipped to produce a green report. Do not edit product code.
+- `wait` exited `75`: no result yet. Run the same `wait` again. Never record `75` as pass, fail, or blocked.
+- `wait` exited `1` with `stopped without a result`: the background run died, for example from SIGKILL. Record exit `1`, but do not name a failed job: report that the run stopped without a result, and quote the line with the `stderr.log` path it names.
+- `wait` exited `2` with `unknown_run`: the `wait` named the wrong id or `--config`. Fix the `wait`, not the skill. The run is unaffected.
 - A job's command cannot start because the program it runs is missing (`command not found`, no compiler, no interpreter). That job is blocked, not passed. Name the missing program. Leave the job in the proof block. Do not delete it to make the run exit 0. Continue only with later commands that do not need it.
 - The same rule applies when `goodflows` starts and a job then fails because that program is absent. Report the job as blocked and quote the line that names the missing program.
 - If the CLI cannot be built or installed, the proof is blocked. Leave the build or install command in the proof block and say the binary was not produced.
