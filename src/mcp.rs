@@ -545,9 +545,13 @@ fn checks(execution: std::result::Result<Execution, String>, exit_code: bool) ->
         _ => return incomplete(execution.exit_code, "Missing or invalid GoodFlows summary."),
     };
     let results = summary["results"].as_array().expect("checked above");
+    // `last` exits 0 whatever the replayed run did, and a signal during
+    // reporting cancels a run whose jobs all passed, so the recorded outcome
+    // decides too.
     let passed = execution.exit_code == Some(0)
         && !execution.failed
         && summary["success"] == true
+        && summary["outcome"].as_str().is_none_or(|o| o == "passed")
         && results
             .iter()
             .all(|job| job["status"] == "passed" || job["status"] == "skipped");
@@ -788,6 +792,16 @@ mod tests {
         let diagnostics: Value = serde_json::from_str(&texts(&result)[1]).unwrap();
         assert_eq!(diagnostics["passed"], true);
         assert_eq!(diagnostics["results"][0]["name"], "b");
+        // A replayed run cancelled during reporting: its jobs passed and
+        // `last` exits 0, but the run did not pass.
+        let mut cancelled = passing.clone();
+        cancelled["outcome"] = json!("cancelled");
+        let result = checks(Ok(execution(&[cancelled], 0)), false);
+        assert_eq!(texts(&result)[0], "The last GoodFlows run failed.");
+        let mut recorded = passing.clone();
+        recorded["outcome"] = json!("passed");
+        let result = checks(Ok(execution(&[recorded], 0)), false);
+        assert_eq!(texts(&result)[0], "The last GoodFlows run passed.");
         let result = checks(Ok(execution(&[passing], 130)), true);
         assert_eq!(
             texts(&result)[0],
