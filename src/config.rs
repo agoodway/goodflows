@@ -798,8 +798,19 @@ fn default_true() -> bool {
     true
 }
 
+fn unreadable(path: &Path) -> ConfigError {
+    ConfigError::new(
+        "missing_config",
+        format!("failed to read {}", path.display()),
+    )
+}
+
 impl Config {
-    pub fn load(explicit: Option<&Path>) -> Result<(Self, PathBuf)> {
+    /// The config file `load` reads, canonicalized: `explicit`, else the
+    /// first of `goodflows.toml` and `.goodflows.toml` in the current
+    /// directory. Commands that only need its location, such as `last`, do
+    /// not parse it.
+    pub fn locate(explicit: Option<&Path>) -> Result<PathBuf> {
         let path = match explicit {
             Some(path) => path.to_path_buf(),
             None => ["goodflows.toml", ".goodflows.toml"]
@@ -816,13 +827,11 @@ impl Config {
                     ))
                 })?,
         };
-        let unreadable = |path: &Path| {
-            ConfigError::new(
-                "missing_config",
-                format!("failed to read {}", path.display()),
-            )
-        };
-        let path = path.canonicalize().with_context(|| unreadable(&path))?;
+        path.canonicalize().with_context(|| unreadable(&path))
+    }
+
+    pub fn load(explicit: Option<&Path>) -> Result<(Self, PathBuf)> {
+        let path = Self::locate(explicit)?;
         let content = std::fs::read_to_string(&path).with_context(|| unreadable(&path))?;
         let mut config: Self = toml::from_str(&content).with_context(|| {
             ConfigError::new(

@@ -2229,6 +2229,7 @@ async fn exec_workflow(args: &[String]) -> Result<u8> {
             cancel: cancel.clone(),
             sprite_state: std::env::var(crate::config::SPRITE_STATE_ENV).ok(),
             provenance: source(&header.provenance),
+            last_run: None,
         };
         crate::execute(
             run,

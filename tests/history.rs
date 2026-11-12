@@ -584,7 +584,8 @@ fn workflow_directories_are_encoded_and_never_escape() {
         .map(|e| e.unwrap().file_name().into_string().unwrap())
         .collect();
     top.sort();
-    assert_eq!(top, ["goodflows-history", "goodflows.toml"]);
+    // `.goodflows` holds the last-run record, which every run writes.
+    assert_eq!(top, [".goodflows", "goodflows-history", "goodflows.toml"]);
 }
 
 #[test]
