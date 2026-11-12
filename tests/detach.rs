@@ -206,6 +206,11 @@ fn a_passing_detached_run_exits_0_and_is_the_last_run() {
     success(&output);
     let id = stdout(&output).trim().to_owned();
     assert!(p.dir.join(".goodflows/runs").join(&id).is_dir(), "{id}");
+    assert!(
+        stderr(&output).contains(&format!("`goodflows cancel {id}`")),
+        "{}",
+        stderr(&output)
+    );
     success(&p.run(&["wait", &id]));
 }
 
@@ -229,7 +234,7 @@ fn detach_reports_usage_and_config_errors_before_starting() {
     assert!(!p.dir.join(".goodflows/runs").exists());
 
     let unknown = "00000000-0000-4000-8000-000000000000";
-    for command in ["status", "wait"] {
+    for command in ["status", "wait", "cancel"] {
         let output = p.run(&[command, unknown, "--json"]);
         assert_eq!(output.status.code(), Some(2), "{command}");
         assert_eq!(only(&output, "error")["code"], "unknown_run", "{command}");
@@ -316,4 +321,87 @@ fn a_detached_run_that_dies_is_lost_not_running() {
     let wait = p.run(&["wait", &id, "--json"]);
     assert_eq!(wait.status.code(), Some(1));
     assert_eq!(only(&wait, "error")["code"], "runtime");
+}
+
+#[test]
+fn cancel_stops_a_running_detached_run() {
+    let p = Project::new(CI);
+    let id = detach(&p, &[]);
+    wait_for(&p, "started");
+    let cancel = p.run(&["cancel", &id, "--json"]);
+    success(&cancel);
+    let event = only(&cancel, "run_status");
+    assert_eq!(event["was_running"], true);
+    assert_eq!(event["state"], "finished");
+    assert_eq!(event["exit_code"], 143);
+    assert_eq!(event["running"], json!([]));
+    // `slow` was running and `after` waiting for it.
+    assert_eq!(event["cancelled"], json!(["slow", "after"]));
+    assert_eq!(event["passed"], json!(["prep"]));
+    let status = only(&p.run(&["status", &id, "--json"]), "run_status");
+    assert_eq!(status["state"], "finished");
+    assert_eq!(status["cancelled"], json!(["slow", "after"]));
+    assert_eq!(p.run(&["wait", &id]).status.code(), Some(143));
+
+    // Cancelling it again says it already stopped.
+    let again = p.run(&["cancel", &id]);
+    success(&again);
+    let text = stdout(&again);
+    assert!(
+        text.starts_with(&format!(
+            "Run {id} had already stopped; nothing to cancel.\nRun {id}: finished (exit 143)\n"
+        )),
+        "{text}"
+    );
+}
+
+#[test]
+fn starting_a_detached_run_keeps_the_newest_ten_finished_runs_of_its_config() {
+    let p = Project::new(CI);
+    std::fs::write(
+        p.dir.join("other.toml"),
+        "[[jobs]]\nname = 'a'\ncommand = 'true'\n",
+    )
+    .unwrap();
+    let runs = p.dir.join(".goodflows/runs");
+    let names = || {
+        let mut names: Vec<_> = std::fs::read_dir(&runs)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        names
+    };
+    // A run of another config beside this one is not this config's to prune.
+    let other = detach(&p, &["--config", "other.toml"]);
+    success(&p.run(&["wait", &other, "--config", "other.toml"]));
+    // The first run is still going while eleven more start and finish.
+    let going = detach(&p, &[]);
+    wait_for(&p, "started");
+    std::fs::write(
+        p.dir.join("goodflows.toml"),
+        "[[jobs]]\nname = 'a'\ncommand = 'true'\n",
+    )
+    .unwrap();
+    let mut ids = vec![going.clone()];
+    for _ in 0..11 {
+        let id = detach(&p, &[]);
+        success(&p.run(&["wait", &id]));
+        ids.push(id);
+    }
+    // Twelve runs: the running one stays, the oldest finished one goes.
+    let mut kept: Vec<_> = [&[other.clone(), going.clone()][..], &ids[2..]].concat();
+    kept.sort();
+    assert_eq!(names(), kept);
+
+    // Once it has finished, the next run prunes it too: ten remain.
+    std::fs::write(p.dir.join("release"), "").unwrap();
+    assert_eq!(p.run(&["wait", &going]).status.code(), Some(1));
+    let id = detach(&p, &[]);
+    success(&p.run(&["wait", &id]));
+    ids.push(id);
+    let mut kept: Vec<_> = [&[other][..], &ids[3..]].concat();
+    kept.sort();
+    assert_eq!(names(), kept);
+    assert_eq!(kept.len(), 11);
 }

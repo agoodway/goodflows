@@ -138,6 +138,16 @@ enum Commands {
         #[arg(long, value_name = "SECS")]
         timeout: Option<u64>,
     },
+    /// Cancel a detached run: send it SIGTERM, then report it once it has stopped
+    #[command(after_help = "Examples:
+  id=$(goodflows run --detach)       # start a run in the background
+  goodflows cancel \"$id\"             # stop it; its running and waiting jobs are cancelled
+  goodflows cancel \"$id\" --json      # print one run_status event once it has stopped")]
+    Cancel {
+        /// The run id `run --detach` printed
+        #[arg(value_parser = reporting::history_client::run_id)]
+        run_id: String,
+    },
     /// Show the last local run's results and failure output again, without running anything
     #[command(after_help = "Examples:
   goodflows last                     # show the last run's results and failure output
@@ -287,7 +297,7 @@ enum HistoryCommand {
 }
 
 /// Global flags that only `run` uses; `init`, `reports upload`, `history`,
-/// `last`, `status`, `wait`, `sprite`, `skills install` and `mcp` commands
+/// `last`, `status`, `wait`, `cancel`, `sprite`, `skills install` and `mcp` commands
 /// reject them. `validate`
 /// and `list` resolve all of them except `--log-dir` into their settings.
 const RUN_ONLY_FLAGS: [&str; 12] = [
@@ -353,6 +363,7 @@ impl Cli {
                 plain_json(run_only(last), "Print the result as JSON events")
             })
             .mut_subcommand("status", single)
+            .mut_subcommand("cancel", single)
             .mut_subcommand("wait", run_only)
             .mut_subcommand("skills", |s| {
                 let configless = |s| plain_json(configless(s), ONE_EVENT);
@@ -454,6 +465,7 @@ impl Cli {
                 | Commands::Last
                 | Commands::Status { .. }
                 | Commands::Wait { .. }
+                | Commands::Cancel { .. }
                 | Commands::Sprite { .. }
                 | Commands::Skills { .. }
                 | Commands::Mcp
@@ -658,11 +670,14 @@ async fn run(cli: &Cli, output: &mut Output, cancel: watch::Receiver<Option<i32>
         }
         return last::show(&Config::locate(cli.config.as_deref())?, output).await;
     }
-    if let Some(Commands::Status { run_id } | Commands::Wait { run_id, .. }) = &cli.command {
-        let command = if matches!(cli.command, Some(Commands::Status { .. })) {
-            "status"
-        } else {
-            "wait"
+    if let Some(
+        Commands::Status { run_id } | Commands::Wait { run_id, .. } | Commands::Cancel { run_id },
+    ) = &cli.command
+    {
+        let command = match cli.command {
+            Some(Commands::Status { .. }) => "status",
+            Some(Commands::Cancel { .. }) => "cancel",
+            _ => "wait",
         };
         if let Some(flag) = cli.run_only_flag() {
             return Err(usage(format!("{flag} cannot be used with {command}")));
@@ -678,6 +693,9 @@ async fn run(cli: &Cli, output: &mut Output, cancel: watch::Receiver<Option<i32>
                     output,
                 )
                 .await
+            }
+            Some(Commands::Cancel { .. }) => {
+                detach::cancel(&config_file, run_id, cli.config.as_deref(), output).await
             }
             _ => detach::status(&config_file, run_id, output).await,
         };

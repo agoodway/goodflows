@@ -3,7 +3,8 @@
 //! read it back. Each detached run owns `.goodflows/runs/<run_id>/` beside
 //! the config file:
 //!
-//! - `run.json`: what the parent started (workflow, environment, pid).
+//! - `run.json`: what the parent started (config file name, workflow,
+//!   environment, pid).
 //! - `lock`: held by the background run for its whole life, so a run that
 //!   died without a result is told apart from one still running.
 //! - `pid`: written once the background run holds the lock; the parent
@@ -12,6 +13,10 @@
 //! - `stderr.log`: the run's stderr.
 //! - `last.json`: the run's own last-run record, which `wait` replays.
 //! - `exit_code`: the run's exit code, written last.
+//!
+//! Starting a detached run prunes the finished runs of the same config
+//! beyond the newest [`KEEP_RUNS`]; `goodflows cancel` sends a running one
+//! SIGTERM.
 //!
 //! The background run is the same command line with `--detached-run <dir>`
 //! added and `--json` for every event, in a new session, so it outlives the
@@ -37,6 +42,12 @@ pub const STILL_RUNNING: u8 = 75;
 
 /// How long `run --detach` waits for the background run to start.
 const START_WAIT: Duration = Duration::from_secs(30);
+/// How long `cancel` waits for a signalled run to record its result.
+const CANCEL_WAIT: Duration = Duration::from_secs(30);
+/// Detached runs kept per config, counting the new one, like `--log-runs`.
+const KEEP_RUNS: u64 = crate::config::DEFAULT_LOG_RUNS;
+/// The background run's lock file, which `retention` prunes by.
+const LOCK: &str = "lock";
 const POLL: Duration = Duration::from_millis(100);
 
 /// `.goodflows/runs/<run_id>` beside the config file.
@@ -65,6 +76,9 @@ pub fn run_id(dir: &Path) -> Result<String> {
 #[derive(Serialize, Deserialize)]
 struct Meta {
     run_id: String,
+    /// The config file's name. Runs written before it was recorded have none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    config: Option<String>,
     workflow: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     environment: Option<String>,
@@ -155,6 +169,7 @@ pub async fn start(
     }
     let meta = Meta {
         run_id: run_id.clone(),
+        config: config_name(config_file),
         workflow: workflow.into(),
         environment: environment.map(Into::into),
         pid: child.id(),
@@ -163,6 +178,9 @@ pub async fn start(
     let mut bytes = serde_json::to_vec(&meta)?;
     bytes.push(b'\n');
     crate::fsutil::write_atomic(&dir.join("run.json"), &bytes, true)?;
+    if let Err(error) = prune(config_file, &run_id) {
+        eprintln!("goodflows: warning: prune detached runs: {error:#}");
+    }
     if output.json {
         output
             .emit(json!({"type":"run_detached", "run_id":run_id, "pid":meta.pid, "run_dir":dir.to_string_lossy()}))
@@ -173,10 +191,51 @@ pub async fn start(
             .unwrap_or_default();
         println!("{run_id}");
         eprintln!(
-            "goodflows: started detached run {run_id}; check it with `goodflows status {run_id}{config}`, or wait for its report with `goodflows wait {run_id}{config} --timeout 90`"
+            "goodflows: started detached run {run_id}; check it with `goodflows status {run_id}{config}`, wait for its report with `goodflows wait {run_id}{config} --timeout 90`, or stop it with `goodflows cancel {run_id}{config}`"
         );
     }
     Ok(0)
+}
+
+fn config_name(config_file: &Path) -> Option<String> {
+    Some(config_file.file_name()?.to_string_lossy().into_owned())
+}
+
+/// Remove the oldest finished runs of `config_file` beyond [`KEEP_RUNS`],
+/// counting `current`. A run is listed once its background process wrote
+/// `pid`, so it already holds its lock; a run still going keeps it and is
+/// never removed. A run whose `run.json` names no config, written before
+/// runs recorded one, counts for every config.
+fn prune(config_file: &Path, current: &str) -> Result<()> {
+    let base = dir(config_file, current)
+        .parent()
+        .expect("a run directory has a parent")
+        .to_owned();
+    let config = config_name(config_file);
+    let mut runs = Vec::new();
+    for entry in std::fs::read_dir(&base)? {
+        let Some(name) = entry?.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let dir = base.join(&name);
+        if name == current || !crate::fsutil::canonical_uuid(&name) || !dir.join("pid").is_file()
+        {
+            continue;
+        }
+        let meta: Option<Meta> = std::fs::read(dir.join("run.json"))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok());
+        let started = match meta {
+            Some(meta) if meta.config.is_some() && meta.config != config => continue,
+            Some(meta) => meta.started_at_ms,
+            // Its parent stopped before writing `run.json`: the oldest.
+            None => 0,
+        };
+        runs.push((started, name));
+    }
+    runs.sort_unstable_by(|a, b| b.cmp(a));
+    let newest_first = runs.into_iter().map(|(_, name)| name).collect();
+    crate::retention::prune_runs(&base, newest_first, KEEP_RUNS, LOCK)
 }
 
 /// The background side of a detached run, from `--detached-run <dir>`: holds
@@ -190,7 +249,7 @@ impl Background {
     /// Take the run's lock, then write `pid`, which tells the parent the
     /// run started.
     pub fn start(dir: &Path) -> Result<Self> {
-        let path = dir.join("lock");
+        let path = dir.join(LOCK);
         let lock = create(&path)?;
         flock(&lock, libc::LOCK_EX | libc::LOCK_NB)
             .with_context(|| format!("lock {}", path.display()))?;
@@ -251,7 +310,7 @@ fn existing(config_file: &Path, run_id: &str) -> Result<PathBuf> {
         ),
     );
     error.hint = Some(
-        "start one with `goodflows run --detach`; status and wait need the same config".into(),
+        "start one with `goodflows run --detach`; status, wait and cancel need the same config".into(),
     );
     Err(error.into())
 }
@@ -273,7 +332,7 @@ fn state(dir: &Path) -> Result<State> {
     if let Some(code) = exit_code(dir)? {
         return Ok(State::Finished(code));
     }
-    let path = dir.join("lock");
+    let path = dir.join(LOCK);
     let lock = std::fs::File::open(&path).with_context(|| format!("open {}", path.display()))?;
     match flock(&lock, libc::LOCK_SH | libc::LOCK_NB) {
         Err(error) if error.raw_os_error() == Some(libc::EWOULDBLOCK) => Ok(State::Running),
@@ -370,8 +429,15 @@ fn label(event: &Value, value: &Value) -> String {
     }
 }
 
-/// Report a run's state and progress.
-async fn report(dir: &Path, run_id: &str, state: &State, output: &Output) -> Result<()> {
+/// Report a run's state and progress. `was_running`, from `cancel`, says
+/// whether that command stopped the run.
+async fn report(
+    dir: &Path,
+    run_id: &str,
+    state: &State,
+    was_running: Option<bool>,
+    output: &Output,
+) -> Result<()> {
     let meta: Option<Meta> = std::fs::read(dir.join("run.json"))
         .ok()
         .and_then(|bytes| serde_json::from_slice(&bytes).ok());
@@ -396,12 +462,21 @@ async fn report(dir: &Path, run_id: &str, state: &State, output: &Output) -> Res
         if let State::Finished(code) = state {
             event["exit_code"] = json!(code);
         }
+        // Not `cancelled`, which lists the cancelled jobs.
+        if let Some(was_running) = was_running {
+            event["was_running"] = json!(was_running);
+        }
         for (status, names) in &jobs {
             event[status] = json!(names);
         }
         return output.emit(event).await;
     }
-    let mut text = format!("Run {run_id}: {}", state.name());
+    let mut text = match was_running {
+        Some(true) => format!("Cancelled run {run_id}.\n"),
+        Some(false) => format!("Run {run_id} had already stopped; nothing to cancel.\n"),
+        None => String::new(),
+    };
+    text += &format!("Run {run_id}: {}", state.name());
     if let State::Finished(code) = state {
         text += &format!(" (exit {code})");
     }
@@ -452,7 +527,65 @@ async fn report(dir: &Path, run_id: &str, state: &State, output: &Output) -> Res
 pub async fn status(config_file: &Path, run_id: &str, output: &Output) -> Result<u8> {
     let dir = existing(config_file, run_id)?;
     let state = state(&dir)?;
-    report(&dir, run_id, &state, output).await?;
+    report(&dir, run_id, &state, None, output).await?;
+    Ok(0)
+}
+
+/// `goodflows cancel <run_id>`: send a running detached run SIGTERM, which
+/// cancels its jobs as Ctrl-C would, and report it once it recorded its
+/// result. A run that already stopped is reported as it is. When the run
+/// is still stopping after [`CANCEL_WAIT`], report its progress and exit
+/// [`STILL_RUNNING`].
+pub async fn cancel(
+    config_file: &Path,
+    run_id: &str,
+    config: Option<&Path>,
+    output: &Output,
+) -> Result<u8> {
+    let dir = existing(config_file, run_id)?;
+    let mut state = state(&dir)?;
+    let running = matches!(state, State::Running);
+    if running {
+        let path = dir.join("pid");
+        let pid: i32 = std::fs::read_to_string(&path)
+            .with_context(|| format!("read {}", path.display()))?
+            .trim()
+            .parse()
+            .with_context(|| format!("parse {}", path.display()))?;
+        // SAFETY: kill only sends a signal. The run held its lock just now,
+        // so the pid is still its process.
+        if unsafe { libc::kill(pid, libc::SIGTERM) } != 0 {
+            let error = std::io::Error::last_os_error();
+            // ESRCH: it exited in the meantime.
+            if error.raw_os_error() != Some(libc::ESRCH) {
+                return Err(error).with_context(|| format!("signal detached run {run_id}"));
+            }
+        }
+        let deadline = Instant::now() + CANCEL_WAIT;
+        loop {
+            state = self::state(&dir)?;
+            if !matches!(state, State::Running) {
+                break;
+            }
+            if Instant::now() >= deadline {
+                report(&dir, run_id, &state, None, output).await?;
+                if !output.json {
+                    let config = config
+                        .map(|path| {
+                            format!(" --config {}", output::shell_word(&path.to_string_lossy()))
+                        })
+                        .unwrap_or_default();
+                    println!(
+                        "Still stopping after {}s; check it with `goodflows status {run_id}{config}`",
+                        CANCEL_WAIT.as_secs()
+                    );
+                }
+                return Ok(STILL_RUNNING);
+            }
+            tokio::time::sleep(POLL).await;
+        }
+    }
+    report(&dir, run_id, &state, Some(running), output).await?;
     Ok(0)
 }
 
@@ -478,7 +611,7 @@ pub async fn wait(
                 )
             }
             State::Running if deadline.is_some_and(|deadline| Instant::now() >= deadline) => {
-                report(&dir, run_id, &State::Running, output).await?;
+                report(&dir, run_id, &State::Running, None, output).await?;
                 if !output.json {
                     let config = config
                         .map(|path| {
