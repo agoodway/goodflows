@@ -118,7 +118,8 @@ From the repo root, run `### Proof commands` one command at a time, in order. Th
 
 Record the command, the exit code, and pass, fail, or blocked.
 
-- The check ran and exited non-zero: report fail. Do not weaken a flag, drop a job, or mark it skipped to produce a green report. Do not edit product code.
+- The `goodflows` command exited `2`: a usage or config error, so the skill's command no longer matches the config. Quote the `Error:` line, or the `error` event's `code` with `--json` (`unknown_job`, `unknown_workflow`, `config_invalid`, and so on). Fix the command in the skill, then run the whole proof again from the first command. Do not edit `goodflows.toml` to make it pass.
+- The `goodflows` command exited `1`: the command is right and a job failed or timed out, or goodflows hit a runtime error. Report fail. Do not weaken a flag, drop a job, or mark it skipped to produce a green report. Do not edit product code.
 - A job's command cannot start because the program it runs is missing (`command not found`, no compiler, no interpreter). That job is blocked, not passed. Name the missing program. Leave the job in the proof block. Do not delete it to make the run exit 0. Continue only with later commands that do not need it.
 - The same rule applies when `goodflows` starts and a job then fails because that program is absent. Report the job as blocked and quote the line that names the missing program.
 - If the CLI cannot be built or installed, the proof is blocked. Leave the build or install command in the proof block and say the binary was not produced.
