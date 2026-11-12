@@ -1,0 +1,276 @@
+//! `goodflows skills install` and `goodflows mcp`, through the real binary.
+
+mod common;
+use common::*;
+use serde_json::{json, Value};
+use std::io::{BufRead, BufReader, Write};
+use std::process::Stdio;
+
+/// `skills install` in `p` with only `vars` in the environment.
+fn install(p: &Project, vars: &[(&str, &str)], args: &[&str]) -> std::process::Output {
+    let mut command = p.command();
+    command.env_clear().envs(vars.iter().copied());
+    command
+        .args(["skills", "install"])
+        .args(args)
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn skills_install_in_a_claude_code_session_writes_both_skills_under_claude() {
+    let p = Project::new("");
+    let output = install(&p, &[("CLAUDECODE", "1")], &[]);
+    success(&output);
+    for name in ["create-ci-skill", "maintain-ci-skill"] {
+        let installed = p.read(&format!(".claude/skills/{name}/SKILL.md"));
+        let repo = std::fs::read_to_string(format!("skills/{name}/SKILL.md")).unwrap();
+        assert_eq!(installed, repo, "{name}");
+    }
+    assert!(!p.dir.join(".agents").exists());
+    let text = stdout(&output);
+    assert!(
+        text.starts_with("Installed skills for claude in .claude/skills\n"),
+        "{text}"
+    );
+
+    // Rerunning refreshes an edited copy.
+    std::fs::write(
+        p.dir.join(".claude/skills/create-ci-skill/SKILL.md"),
+        "edited",
+    )
+    .unwrap();
+    success(&install(&p, &[("CLAUDECODE", "1")], &[]));
+    assert!(p
+        .read(".claude/skills/create-ci-skill/SKILL.md")
+        .starts_with("---\nname: create-ci-skill\n"));
+}
+
+#[test]
+fn skills_install_harness_flag_unknown_fallback_and_ambiguity() {
+    let p = Project::new("");
+    success(&install(&p, &[("CLAUDECODE", "1")], &["--harness", "grok"]));
+    assert!(p
+        .dir
+        .join(".grok/skills/maintain-ci-skill/SKILL.md")
+        .exists());
+    assert!(!p.dir.join(".claude").exists());
+
+    let output = install(&p, &[], &["--json"]);
+    success(&output);
+    let event: Value = serde_json::from_str(stdout(&output).trim()).unwrap();
+    assert_eq!(event["type"], "skills_installed");
+    assert_eq!(event["directory"], ".agents/skills");
+    assert_eq!(
+        (&event["source"], &event["harnesses"]),
+        (&json!("default"), &json!([]))
+    );
+    assert!(p
+        .dir
+        .join(".agents/skills/create-ci-skill/SKILL.md")
+        .exists());
+
+    let output = install(&p, &[("CLAUDECODE", "1"), ("AGENT", "amp")], &["--json"]);
+    assert_eq!(output.status.code(), Some(2));
+    let event: Value = serde_json::from_str(stdout(&output).trim()).unwrap();
+    assert_eq!(
+        (&event["type"], &event["code"]),
+        (&json!("error"), &json!("ambiguous_harness"))
+    );
+
+    let output = install(&p, &[], &["--harness", "gemini", "--config", "x.toml"]);
+    assert_eq!(output.status.code(), Some(2));
+    let output = install(&p, &[], &["--harness", "vim"]);
+    assert_eq!(output.status.code(), Some(2));
+}
+
+#[test]
+fn mcp_rejects_flags_it_does_not_use() {
+    let p = Project::new("");
+    for flag in [
+        &["--json"][..],
+        &["--env", "ci"],
+        &["--jobs", "a"],
+        &["--log-dir", "l"],
+    ] {
+        let output = p
+            .command()
+            .arg("mcp")
+            .args(flag)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2), "{flag:?}");
+    }
+}
+
+/// A `goodflows mcp` server in a project, spoken to over its stdio.
+struct Client {
+    child: std::process::Child,
+    lines: std::io::Lines<BufReader<std::process::ChildStdout>>,
+    next: u64,
+}
+
+impl Client {
+    fn start(p: &Project) -> Self {
+        let mut child = p
+            .command()
+            .arg("mcp")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let lines = BufReader::new(child.stdout.take().unwrap()).lines();
+        let mut client = Self {
+            child,
+            lines,
+            next: 0,
+        };
+        let info = client.request(
+            "initialize",
+            json!({"protocolVersion":"2025-06-18", "capabilities":{}, "clientInfo":{"name":"test", "version":"1"}}),
+        );
+        assert_eq!(info["serverInfo"]["name"], "goodflows");
+        client.send(json!({"jsonrpc":"2.0", "method":"notifications/initialized"}));
+        client
+    }
+
+    fn send(&mut self, message: Value) {
+        let stdin = self.child.stdin.as_mut().unwrap();
+        writeln!(stdin, "{message}").unwrap();
+        stdin.flush().unwrap();
+    }
+
+    fn request(&mut self, method: &str, params: Value) -> Value {
+        self.next += 1;
+        let id = self.next;
+        self.send(json!({"jsonrpc":"2.0", "id":id, "method":method, "params":params}));
+        loop {
+            let line = self.lines.next().expect("server closed stdout").unwrap();
+            let message: Value = serde_json::from_str(&line).unwrap();
+            if message["id"] == id {
+                return message["result"].clone();
+            }
+        }
+    }
+
+    /// The text blocks of a tool call's result, and whether it is an error.
+    fn call(&mut self, tool: &str, arguments: Value) -> (Vec<String>, bool) {
+        let result = self.request("tools/call", json!({"name":tool, "arguments":arguments}));
+        let texts = result["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|block| block["text"].as_str().unwrap().to_owned())
+            .collect();
+        (texts, result["isError"] == true)
+    }
+}
+
+impl Drop for Client {
+    fn drop(&mut self) {
+        drop(self.child.stdin.take());
+        let _ = self.child.wait();
+    }
+}
+
+const CALLS: &str = "[[workflows.ci.jobs]]\nname = 'prep'\ncommand = 'echo PREP-OUTPUT'\n\
+[[workflows.ci.jobs]]\nname = 'call-suite'\nworkflow = 'suite'\ndepends_on = ['prep']\n\
+[[workflows.suite.jobs]]\nname = 'work'\n\
+command = 'm=EARLY; echo $m-MARKER; head -c 20000 /dev/zero | tr \"\\\\0\" x; echo boom >&2; exit 3'\n\
+[[workflows.ok.jobs]]\nname = 'fine'\ncommand = 'echo FINE-OUTPUT'\n";
+
+#[test]
+fn mcp_run_returns_only_the_summary_and_failures_including_called_workflows() {
+    let p = Project::new(CALLS);
+    let mut client = Client::start(&p);
+    let tools = client.request("tools/list", json!({}));
+    let mut names: Vec<_> = tools["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap())
+        .collect();
+    names.sort();
+    assert_eq!(names, ["last", "list", "run", "validate"]);
+
+    let (texts, error) = client.call("run", json!({"workflow":"ci"}));
+    assert!(!error);
+    let all = texts.join("\n");
+    for absent in ["PREP-OUTPUT", "EARLY-MARKER", "job_output", "output_head"] {
+        assert!(!all.contains(absent), "{absent}:\n{all}");
+    }
+    assert!(all.len() < 20_000, "{}", all.len());
+    assert_eq!(texts[0], "GoodFlows checks failed (exit code 1).");
+    let diagnostics: Value = serde_json::from_str(&texts[1]).unwrap();
+    assert_eq!(
+        (&diagnostics["passed"], &diagnostics["exit_code"]),
+        (&json!(false), &json!(1))
+    );
+    let results = diagnostics["results"].as_array().unwrap();
+    let names: Vec<_> = results
+        .iter()
+        .map(|r| r["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["call-suite", "work"]);
+    let called = &results[1]["called_run"];
+    assert_eq!(
+        (&called["workflow"], &called["caller_job"]),
+        (&json!("suite"), &json!("call-suite"))
+    );
+    assert_eq!(called["parent_run_id"], diagnostics["run_id"]);
+    assert_eq!(results[1]["exit_code"], 3);
+    let logs = texts[2]
+        .strip_prefix("Failure log excerpts (JSON):\n")
+        .unwrap();
+    let logs: Value = serde_json::from_str(logs).unwrap();
+    assert_eq!(logs[1]["stderr_tail"], "boom\n");
+    assert!(logs[1]["stdout_tail"].as_str().unwrap().ends_with("xxx"));
+    assert_eq!(logs[1]["excerpts_truncated"], true);
+
+    // `last` reports the same failures again without running.
+    let (texts, error) = client.call("last", json!({}));
+    assert!(!error);
+    assert_eq!(texts[0], "The last GoodFlows run failed.");
+    assert!(texts[1].contains("\"called_run\""));
+
+    let (texts, error) = client.call(
+        "run",
+        json!({"workflow":"ok", "jobs":["fine"], "fail_fast":false}),
+    );
+    assert!(!error);
+    assert_eq!(texts[0], "GoodFlows checks passed.");
+    assert!(!texts.join("\n").contains("FINE-OUTPUT"));
+}
+
+#[test]
+fn mcp_validate_and_list_report_and_config_errors_are_tool_errors() {
+    let p = Project::new(CALLS);
+    std::fs::write(
+        p.dir.join("other.toml"),
+        "[[jobs]]\nname = 'solo'\ncommand = 'true'\n",
+    )
+    .unwrap();
+    let mut client = Client::start(&p);
+
+    let (texts, error) = client.call("list", json!({"workflows":true}));
+    assert!(!error);
+    let event: Value = serde_json::from_str(&texts[0]).unwrap();
+    assert_eq!(event["type"], "workflows");
+
+    let (texts, error) = client.call("validate", json!({"workflow":"ci", "jobs":["nope"]}));
+    assert!(error);
+    assert!(
+        texts[0].contains("exit code 2") && texts[0].contains("unknown job 'nope'"),
+        "{texts:?}"
+    );
+
+    // A call's config replaces discovery, like --config.
+    let (texts, error) = client.call("list", json!({"config":"other.toml"}));
+    assert!(!error);
+    assert!(texts[0].contains("\"solo\""), "{texts:?}");
+
+    let (texts, error) = client.call("run", json!({"config":"missing.toml"}));
+    assert!(error);
+    assert!(texts[0].contains("exit code 2"), "{texts:?}");
+}

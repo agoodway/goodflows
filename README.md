@@ -583,6 +583,41 @@ npx skills add agoodway/goodflows --skill create-ci-skill
 npx skills add agoodway/goodflows --skill maintain-ci-skill
 ```
 
+`goodflows skills install` writes `create-ci-skill` and `maintain-ci-skill` into the directory the current coding agent loads project skills from, one directory per skill, such as `.claude/skills/create-ci-skill/SKILL.md`. The skills are built into the binary, so they match the goodflows you run. Rerunning replaces the installed copies with the built-in ones.
+
+```bash
+goodflows skills install
+goodflows skills install --harness claude
+```
+
+| `--harness` | Directory | Detected from |
+| --- | --- | --- |
+| `amp` | `.agents/skills` | `AGENT=amp`, `AI_AGENT=amp`, or `AMP_CURRENT_THREAD_ID` |
+| `claude` | `.claude/skills` | `CLAUDECODE`, or `AI_AGENT` starting with `claude-code` |
+| `codex` | `.agents/skills` | any `CODEX_*` variable except `CODEX_HOME` |
+| `cursor` | `.agents/skills` | `CURSOR_AGENT` |
+| `gemini` | `.agents/skills` | `GEMINI_CLI` (Gemini CLI reads `.agents/skills` as an alias of `.gemini/skills`) |
+| `grok` | `.grok/skills` | `GROK_AGENT` or `GROK_SESSION_ID` |
+| `opencode` | `.agents/skills` | `OPENCODE` |
+| `t3` | `.agents/skills` | `T3CODE_PROJECT_ROOT` or `T3CODE_WORKTREE_PATH` |
+
+A variable counts only when it is set and not empty. `--harness` skips detection. With no harness detected, the skills go in `.agents/skills`. When the environment names harnesses that load different directories, such as `CLAUDECODE` together with `AGENT=amp`, the command writes nothing and exits 2 with `ambiguous_harness`; pass `--harness`. Harnesses that share a directory, such as T3 Code running Codex, are not ambiguous. With `--json` it prints one `skills_installed` event with `directory`, `harnesses`, `source` (`flag`, `environment`, or `default`), and `files`.
+
+## MCP server
+
+`goodflows mcp` serves goodflows to a coding agent as a [Model Context Protocol](https://modelcontextprotocol.io) server over stdin and stdout. Register it with the harness, for example `claude mcp add goodflows -- goodflows mcp`, and start it from the project directory. Each tool runs this goodflows binary in the server's working directory, so it finds `goodflows.toml` or `.goodflows.toml` there unless the call or `goodflows mcp --config PATH` names a config.
+
+| Tool | Parameters | Returns |
+| --- | --- | --- |
+| `run` | `workflow`, `config`, `env`, `jobs`, `failed`, `parallelism`, `fail_fast` | Waits for the run. Whether it passed, its exit code and summary counts, and each job that did not pass |
+| `last` | `config` | The last local run, as `goodflows last` shows it, in the same form as `run` |
+| `validate` | `workflow`, `config`, `env`, `jobs` | The `config_valid` event |
+| `list` | `workflow`, `config`, `env`, `workflows` | The `jobs` or `workflows` event |
+
+`run` and `last` never return job output events. The result is a status line (`GoodFlows checks passed.` or `GoodFlows checks failed (exit code N).`), then the root `summary` without `results`, plus `passed`, `exit_code`, and `error`, and a `results` list of the jobs that did not pass with `name`, `status`, `exit_code`, `command`, and `error`. Jobs of called workflows that did not pass are in the list too, with `called_run` naming that run's `workflow`, `run_id`, `caller_job`, and `parent_run_id`. A last text block holds each of those jobs' stdout and stderr tails, at most 4 KiB per stream and less when many jobs failed. `passed` is true only when goodflows exited 0, reported no error, and every root job passed or was skipped. The limits match the Amp plugin's.
+
+When goodflows cannot do what a tool asks, such as for a config or usage error, the tool result is an error (`isError`) with the exit code and goodflows's message. Cancelling a call sends its goodflows process SIGTERM, which cancels the run's jobs as Ctrl-C would. `goodflows mcp` rejects `--json` and the run-only flags; pass them as tool parameters instead.
+
 ## Development
 
 ```bash
