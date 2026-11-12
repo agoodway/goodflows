@@ -475,7 +475,7 @@ fn non_run_commands_never_write_history() {
         let mut args = vec!["reports", "upload", "spool", flag];
         args.extend(value);
         let output = p.run(&args);
-        assert_eq!(output.status.code(), Some(1), "{flag}");
+        assert_eq!(output.status.code(), Some(2), "{flag}");
         assert!(
             stderr(&output).contains(&format!("{flag} cannot be used with reports upload")),
             "{flag}: {}",
@@ -613,7 +613,7 @@ fn zero_caps_in_workflow_settings_fail_before_jobs_run() {
             "[workflows.ci.settings]\n{cap} = 0\n[[workflows.ci.jobs]]\nname='a'\ncommand='touch ran'\n"
         ));
         let output = p.run(&["run", "ci", "--history", "--log-dir", "logs"]);
-        assert_eq!(output.status.code(), Some(1), "{cap}");
+        assert_eq!(output.status.code(), Some(2), "{cap}");
         assert!(
             stderr(&output).contains(&format!("{cap} must be at least 1")),
             "{cap}: {}",

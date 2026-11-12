@@ -12,7 +12,7 @@ mod tail;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use config::Config;
+use config::{Config, ConfigError};
 use output::Output;
 use runner::{Options, Status};
 use serde_json::json;
@@ -294,7 +294,7 @@ async fn main() -> ExitCode {
             let (_sender, cancel) = watch::channel(None);
             if let Ok(output) = Output::new(json_requested, output::Mode::Stream, cancel) {
                 let _ = output
-                    .emit(json!({"type":"error", "message":error.to_string()}))
+                    .emit(json!({"type":"error", "code":"usage", "message":error.to_string()}))
                     .await;
             }
             return ExitCode::from(2);
@@ -342,12 +342,26 @@ async fn main() -> ExitCode {
     match run(&cli, &mut output, cancel.clone()).await {
         Ok(code) => ExitCode::from(code),
         Err(error) => {
-            let _ = output
-                .emit(json!({"type":"error", "message":format!("{error:#}")}))
-                .await;
-            ExitCode::from(cancel.borrow().map(|s| (128 + s) as u8).unwrap_or(1))
+            // A usage or config error exits 2; anything else stopped a run
+            // that the caller asked for correctly, and exits 1 like a failure.
+            let config = error.downcast_ref::<ConfigError>();
+            let mut event = json!({"type":"error", "code":config.map_or("runtime", |e| e.code), "message":format!("{error:#}")});
+            if let Some(hint) = config.and_then(|e| e.hint.as_ref()) {
+                event["hint"] = json!(hint);
+            }
+            if let Some(config) = config.filter(|e| !e.problems.is_empty()) {
+                event["problems"] = json!(config.problems);
+            }
+            let _ = output.emit(event).await;
+            let code = if config.is_some() { 2 } else { 1 };
+            ExitCode::from(cancel.borrow().map(|s| (128 + s) as u8).unwrap_or(code))
         }
     }
+}
+
+/// A command line that parsed but asks for something goodflows does not do.
+fn usage(message: impl Into<String>) -> anyhow::Error {
+    ConfigError::new("usage", message).into()
 }
 
 async fn run(cli: &Cli, output: &mut Output, cancel: watch::Receiver<Option<i32>>) -> Result<u8> {
@@ -358,9 +372,9 @@ async fn run(cli: &Cli, output: &mut Output, cancel: watch::Receiver<Option<i32>
     }) = &cli.command
     {
         if cli.env.is_some() {
-            anyhow::bail!(
-                "--env cannot be used with init; define environment profiles in the config"
-            );
+            return Err(usage(
+                "--env cannot be used with init; define environment profiles in the config",
+            ));
         }
         init::generate(
             cli.config.as_deref(),
@@ -381,14 +395,16 @@ async fn run(cli: &Cli, output: &mut Output, cancel: watch::Receiver<Option<i32>
     {
         let config = cli.config.is_some().then_some("--config");
         if let Some(flag) = config.or_else(|| cli.run_only_flag()) {
-            anyhow::bail!("{flag} cannot be used with reports upload");
+            return Err(usage(format!("{flag} cannot be used with reports upload")));
         }
         let budget = budget.map(std::time::Duration::from_secs);
         return reporting::replay::upload(run_directory, output, cancel, budget).await;
     }
     if let Some(Commands::History { command }) = &cli.command {
         if let Some(flag) = cli.run_only_flag() {
-            anyhow::bail!("{flag} cannot be used with history commands");
+            return Err(usage(format!(
+                "{flag} cannot be used with history commands"
+            )));
         }
         let (document, _) = Config::load(cli.config.as_deref())?;
         let reporting = document.reporting.as_ref();
@@ -428,25 +444,38 @@ async fn run(cli: &Cli, output: &mut Output, cancel: watch::Receiver<Option<i32>
     );
     if aggregate_validation || list_workflows {
         if !cli.jobs.is_empty() {
-            anyhow::bail!("--jobs requires an explicit workflow for aggregate validation");
+            return Err(usage(
+                "--jobs requires an explicit workflow for aggregate validation",
+            ));
         }
+        // Every workflow and profile that does not resolve, reported together.
+        let mut problems = Vec::new();
         if aggregate_validation && profile.is_none() {
             // Without --env, check that every profile resolves for every
             // workflow, so `validate` passes only if each `run <workflow>
             // --env <profile>` would get past configuration.
             for environment in document.environments.keys() {
                 for name in document.workflow_names() {
-                    document.workflow(Some(&name), Some(environment))?;
+                    if let Err(error) = document.workflow(Some(&name), Some(environment)) {
+                        problems.push(error);
+                    }
                 }
             }
         }
         let mut workflows = Vec::new();
         let mut total = 0;
         for name in document.workflow_names() {
-            let (_, config) = document.workflow(Some(&name), profile)?;
+            let config = match document.workflow(Some(&name), profile) {
+                Ok((_, config)) => config,
+                Err(error) => {
+                    problems.push(error);
+                    continue;
+                }
+            };
             total += config.jobs.len();
             workflows.push(json!({"name":name, "jobs":config.jobs.len(), "selected_jobs":config.jobs.iter().map(|j| &j.name).collect::<Vec<_>>(), "requested_jobs":[], "total_defined_jobs":config.jobs.len(), "settings":config.settings.resolve(cli.parallelism, fail_fast_override, &history_cli)?}));
         }
+        ConfigError::check(problems)?;
         output.emit(if list_workflows {
             json!({"type":"workflows", "workflows":workflows, "default_workflow":document.default_workflow()})
         } else {

@@ -190,7 +190,7 @@ fn assert_rejected(config: &str, message: &str) {
         let output = p.run(args);
         assert_eq!(
             output.status.code(),
-            Some(1),
+            Some(2),
             "accepted {config:?} {args:?}"
         );
         assert!(
@@ -600,4 +600,129 @@ command = "true"
     let output = run(&["run", "--json"]);
     success(&output);
     assert!(!p.dir.join("scripts").exists());
+}
+
+#[test]
+fn unknown_job_exits_2_and_names_the_jobs_that_exist() {
+    let p = Project::new(
+        "[[jobs]]\nname='fmt'\ncommand='touch ran'\n[[jobs]]\nname='test'\ncommand='touch ran'\n[[jobs]]\nname='lint'\ncommand='touch ran'\n",
+    );
+    let output = p.run(&["--jobs", "nope"]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        stderr(&output).contains("unknown job 'nope' (available: fmt, test, lint)"),
+        "{}",
+        stderr(&output)
+    );
+    // Nothing is close to `nope`, so there is no hint.
+    assert!(!stderr(&output).contains("Hint:"), "{}", stderr(&output));
+    let output = p.run(&["--jobs", "tset", "--json"]);
+    assert_eq!(output.status.code(), Some(2));
+    let event: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(event["type"], "error");
+    assert_eq!(event["code"], "unknown_job");
+    assert_eq!(
+        event["message"],
+        "unknown job 'tset' (available: fmt, test, lint)"
+    );
+    assert_eq!(event["hint"], "did you mean 'test'?");
+    assert!(!p.dir.join("ran").exists());
+}
+
+#[test]
+fn validate_reports_every_problem_in_one_pass() {
+    let p = Project::new(
+        "[[jobs]]\nname='a'\ncommand=''\n[[jobs]]\nname='b'\ncommand='true'\ndepends_on=['missing']\n",
+    );
+    let output = p.run(&["validate", "--json"]);
+    assert_eq!(output.status.code(), Some(2));
+    let event: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(event["code"], "config_invalid");
+    assert_eq!(
+        event["problems"],
+        serde_json::json!([
+            "job 'a': empty command",
+            "job 'b' depends on unknown job 'missing'"
+        ])
+    );
+    let output = p.run(&["validate"]);
+    assert_eq!(output.status.code(), Some(2));
+    let text = stderr(&output);
+    assert!(text.contains("2 config problems:"), "{text}");
+    assert!(text.contains("  - job 'a': empty command"), "{text}");
+    assert!(
+        text.contains("  - job 'b' depends on unknown job 'missing'"),
+        "{text}"
+    );
+    // A profile that does not resolve for two workflows reports both.
+    let p = Project::new(
+        "[[workflows.a.jobs]]\nname='test'\ncommand='true'\n\
+         [[workflows.b.jobs]]\nname='test'\ncommand='true'\n\
+         [[workflows.c.jobs]]\nname='test'\ncommand='true'\npartitions=2\n\
+         [environments.local.partitions]\ntest = 3\n",
+    );
+    let not_partitioned = |workflow: &str| {
+        format!("environment 'local': workflow '{workflow}': job 'test' is not partitioned")
+    };
+    for args in [
+        &["validate", "--json"][..],
+        &["validate", "--env", "local", "--json"],
+    ] {
+        let output = p.run(args);
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        let event: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(event["code"], "config_invalid", "{args:?}");
+        assert_eq!(
+            event["problems"],
+            serde_json::json!([not_partitioned("a"), not_partitioned("b")]),
+            "{args:?}"
+        );
+    }
+    // One workflow: one problem, still listed.
+    let output = p.run(&["run", "a", "--env", "local", "--json"]);
+    assert_eq!(output.status.code(), Some(2));
+    let event: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(event["message"], not_partitioned("a"));
+    assert_eq!(event["problems"], serde_json::json!([not_partitioned("a")]));
+}
+
+#[test]
+fn usage_and_config_errors_have_stable_codes_and_exit_2() {
+    let p = Project::new("[workflows.ci]\njobs = [{ name = 'test', command = 'touch ran' }]\n");
+    for (args, code) in [
+        (&["--json"][..], "no_default_workflow"),
+        (&["run", "cl", "--json"], "unknown_workflow"),
+        (
+            &["run", "ci", "--env", "nope", "--json"],
+            "unknown_environment",
+        ),
+        (&["validate", "--jobs", "test", "--json"], "usage"),
+        (&["--parallelism", "x", "--json"], "usage"),
+        (&["--config", "absent.toml", "--json"], "missing_config"),
+    ] {
+        let output = p.run(args);
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        let event: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            (event["type"].as_str(), event["code"].as_str()),
+            (Some("error"), Some(code)),
+            "{args:?}: {event}"
+        );
+    }
+    let event: serde_json::Value =
+        serde_json::from_slice(&p.run(&["run", "cl", "--json"]).stdout).unwrap();
+    assert_eq!(event["hint"], "did you mean 'ci'?");
+    std::fs::write(p.dir.join("goodflows.toml"), "[[jobs]]\nnmae = 'x'\n").unwrap();
+    let output = p.run(&["validate", "--json"]);
+    assert_eq!(output.status.code(), Some(2));
+    let event: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(event["code"], "config_parse");
+    // A failed job is not a config error.
+    std::fs::write(
+        p.dir.join("goodflows.toml"),
+        "[[jobs]]\nname = 'x'\ncommand = 'false'\n",
+    )
+    .unwrap();
+    assert_eq!(p.run(&[]).status.code(), Some(1));
+    assert!(!p.dir.join("ran").exists());
 }

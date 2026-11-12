@@ -64,9 +64,16 @@ Local runs go through the `goodflows` CLI. Do not retype a job's `command` as th
 | Other config file | `--config PATH` on the command above |
 | Machine-readable result | `--json` (JSON Lines; the last `summary` event has `success`) |
 
-`goodflows --jobs a,b` with no workflow name selects the default workflow and the default config file. A file with no default exits 1 and names the workflows you can pass. A named workflow is `goodflows run NAME --jobs a,b`. Keep `--config` and `--env` on that command when the run used them.
+`goodflows --jobs a,b` with no workflow name selects the default workflow and the default config file. A file with no default exits 2 and names the workflows you can pass. A named workflow is `goodflows run NAME --jobs a,b`. Keep `--config` and `--env` on that command when the run used them.
 
-Exit `0` means every selected job passed or was skipped. Exit `1` is a failed job, a timeout, or a config error. Exit `2` is bad arguments. `goodflows list` confirms names when the binary is already installed. Parsing the TOML is enough when it is not.
+| Exit | Meaning | Next step |
+|---|---|---|
+| `0` | Every selected job passed or was skipped | Green |
+| `1` | A job failed or timed out, or goodflows hit a runtime error after it accepted the command and config | Report it; the command is right |
+| `2` | Usage or config error: bad arguments, no config, a config that does not parse or validate, an unknown workflow, job, or environment | Fix the command, then run it again |
+| `130`, `143` | Interrupted by SIGINT or SIGTERM | Rerun when nothing interrupts it |
+
+With `--json`, a run that cannot start ends with `{"type":"error","code":...}`. The `code` names the usage or config error: `usage`, `missing_config`, `config_parse`, `config_invalid`, `no_default_workflow`, `unknown_workflow`, `unknown_job`, or `unknown_environment`. `runtime` is the exit `1` case. An unknown job or workflow message lists the names that exist, and `hint` may suggest a close match. `goodflows list` confirms names when the binary is already installed. Parsing the TOML is enough when it is not.
 
 The binary the proof invokes:
 
@@ -114,7 +121,9 @@ A helper script is allowed only when a command in the proof block cannot be writ
 
 Run `### Proof commands` from the repo root, one command at a time, in order. Record the command, the exit code, and one line that shows pass or fail.
 
-- The check ran and exited non-zero: stop. Fix the skill if the command, the path, or the job name was wrong, then run the whole block again from the first command. If the repo itself fails a job, report that failure. Do not weaken a flag, drop a job, or mark it skipped to produce a green report.
+- The `goodflows` command exited `2`: a usage or config error, so the skill's command is wrong. Quote the `Error:` line, or the `error` event's `code` with `--json`. Fix the command, the path, the `--config`, `--env`, or the workflow or job name, then run the whole block again from the first command. Do not edit `goodflows.toml` to make it pass unless the user said to apply that change.
+- The `goodflows` command exited `1`: the command is right and the repo failed a job, or goodflows hit a runtime error. Stop and report that failure. Do not weaken a flag, drop a job, or mark it skipped to produce a green report.
+- A build or install command before `goodflows` exited non-zero: stop. Fix the command if it was wrong, then run the whole block again; otherwise the proof is blocked (see below).
 - A job's command cannot start because the program it runs is missing (`command not found`, no compiler, no interpreter). That job is blocked, not passed. Name the missing program. Leave the job in the proof block. Do not delete it to make the run exit 0. Continue only with later commands that do not need it.
 - The same rule applies when `goodflows` starts and a job then fails because that program is absent. Report the job as blocked and quote the line that names the missing program.
 - If the CLI cannot be built or installed, the proof is blocked. Still write the skill, with the build or install command in the proof block, and say the binary was not produced.

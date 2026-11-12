@@ -620,6 +620,9 @@ fn render(
             }
             "error" => {
                 writeln!(err, "Error: {}", text(&event, "message"))?;
+                if let Some(hint) = event["hint"].as_str() {
+                    writeln!(err, "Hint: {hint}")?;
+                }
             }
             "sprite_hook_output" => {
                 let data = text(&event, "data");

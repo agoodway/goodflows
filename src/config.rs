@@ -1,9 +1,128 @@
 use crate::expression::{Expression, Reference};
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
+
+/// A usage or config error: the caller has to change the command or the
+/// config, because running it again fails the same way. `main` exits 2 for
+/// it and reports `code`, `hint` and `problems` on the JSON `error` event.
+#[derive(Debug)]
+pub struct ConfigError {
+    /// Stable machine-readable code, such as `unknown_job`.
+    pub code: &'static str,
+    message: String,
+    pub hint: Option<String>,
+    /// Every problem validation found, in order. Empty for other codes.
+    pub problems: Vec<String>,
+}
+
+impl ConfigError {
+    pub fn new(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+            hint: None,
+            problems: Vec::new(),
+        }
+    }
+
+    fn with_hint(mut self, hint: Option<String>) -> Self {
+        self.hint = hint;
+        self
+    }
+
+    /// One `config_invalid` error naming every problem, or `Ok` when there
+    /// are none.
+    pub(crate) fn check(problems: Vec<anyhow::Error>) -> Result<()> {
+        if problems.is_empty() {
+            return Ok(());
+        }
+        Err(Self::invalid(
+            problems.iter().map(|p| format!("{p:#}")).collect(),
+        ))
+    }
+
+    /// A `config_invalid` error naming each of `problems`, which is not empty.
+    fn invalid(problems: Vec<String>) -> anyhow::Error {
+        let message = match problems.as_slice() {
+            [problem] => problem.clone(),
+            all => format!(
+                "{} config problems:\n{}",
+                all.len(),
+                all.iter()
+                    .map(|p| format!("  - {p}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ),
+        };
+        Self {
+            problems,
+            ..Self::new("config_invalid", message)
+        }
+        .into()
+    }
+}
+
+impl std::fmt::Display for ConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ConfigError {}
+
+/// Keep `result`'s error in `problems`, so validation goes on and reports
+/// every problem at once.
+fn note<T>(problems: &mut Vec<anyhow::Error>, result: Result<T>) -> Option<T> {
+    result.map_err(|error| problems.push(error)).ok()
+}
+
+/// `did you mean 'x'?` for the `candidates` closest to the unknown `name`,
+/// or `None` when no candidate is close.
+fn did_you_mean<'a>(name: &str, candidates: impl IntoIterator<Item = &'a str>) -> Option<String> {
+    let limit = (name.chars().count() / 3).max(1);
+    let mut close: Vec<(usize, &str)> = candidates
+        .into_iter()
+        .map(|candidate| (edit_distance(name, candidate), candidate))
+        .filter(|&(distance, _)| distance <= limit)
+        .collect();
+    close.sort();
+    close.dedup();
+    if close.is_empty() {
+        return None;
+    }
+    let names: Vec<_> = close
+        .iter()
+        .take(3)
+        .map(|(_, name)| format!("'{name}'"))
+        .collect();
+    Some(format!("did you mean {}?", names.join(" or ")))
+}
+
+/// Case-insensitive edit distance, counting a swap of two adjacent
+/// characters as one edit.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.to_lowercase().chars().collect();
+    let b: Vec<char> = b.to_lowercase().chars().collect();
+    let mut d: Vec<Vec<usize>> = (0..=a.len())
+        .map(|i| (0..=b.len()).map(|j| if i == 0 { j } else { i }).collect())
+        .collect();
+    for i in 1..=a.len() {
+        for j in 1..=b.len() {
+            let cost = usize::from(a[i - 1] != b[j - 1]);
+            let mut best = (d[i - 1][j] + 1)
+                .min(d[i][j - 1] + 1)
+                .min(d[i - 1][j - 1] + cost);
+            if i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1] {
+                best = best.min(d[i - 2][j - 2] + 1);
+            }
+            d[i][j] = best;
+        }
+    }
+    d[a.len()][b.len()]
+}
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -687,22 +806,43 @@ impl Config {
                 .into_iter()
                 .map(PathBuf::from)
                 .find(|p| p.exists())
-                .context("no config found (looked for goodflows.toml and .goodflows.toml)")?,
+                .ok_or_else(|| {
+                    ConfigError::new(
+                        "missing_config",
+                        "no config found (looked for goodflows.toml and .goodflows.toml)",
+                    )
+                    .with_hint(Some(
+                        "create one with `goodflows init`, or pass --config PATH".into(),
+                    ))
+                })?,
         };
-        let path = path
-            .canonicalize()
-            .with_context(|| format!("failed to read {}", path.display()))?;
-        let content = std::fs::read_to_string(&path)
-            .with_context(|| format!("failed to read {}", path.display()))?;
-        let mut config: Self = toml::from_str(&content)
-            .with_context(|| format!("failed to parse {}", path.display()))?;
+        let unreadable = |path: &Path| {
+            ConfigError::new(
+                "missing_config",
+                format!("failed to read {}", path.display()),
+            )
+        };
+        let path = path.canonicalize().with_context(|| unreadable(&path))?;
+        let content = std::fs::read_to_string(&path).with_context(|| unreadable(&path))?;
+        let mut config: Self = toml::from_str(&content).with_context(|| {
+            ConfigError::new(
+                "config_parse",
+                format!("failed to parse {}", path.display()),
+            )
+        })?;
         let base = path.parent().context("config has no parent directory")?;
+        // Path problems join the validation problems, so one pass reports all.
+        let mut problems = Vec::new();
         let shared_workdir = config.settings.workdir.clone();
         if !config.jobs.is_empty() {
-            config.settings.workdir = Some(resolve_workdir(base, shared_workdir.as_deref())?);
+            config.settings.workdir = note(
+                &mut problems,
+                resolve_workdir(base, shared_workdir.as_deref()),
+            );
         }
         for (name, workflow) in &mut config.workflows {
-            workflow.settings.workdir = Some(
+            workflow.settings.workdir = note(
+                &mut problems,
                 resolve_workdir(
                     base,
                     workflow
@@ -711,19 +851,21 @@ impl Config {
                         .as_deref()
                         .or(shared_workdir.as_deref()),
                 )
-                .with_context(|| format!("workflow '{name}'"))?,
+                .with_context(|| format!("workflow '{name}'")),
             );
         }
         for (name, environment) in &mut config.environments {
             if let Some(workdir) = &environment.settings.workdir {
-                environment.settings.workdir = Some(
+                environment.settings.workdir = note(
+                    &mut problems,
                     resolve_workdir(base, Some(workdir))
-                        .with_context(|| format!("environment '{name}'"))?,
+                        .with_context(|| format!("environment '{name}'")),
                 );
             }
         }
         // History directories resolve like workdir: from the config file's directory.
-        config.settings.history_dir = Some(
+        config.settings.history_dir = note(
+            &mut problems,
             resolve_history_dir(
                 base,
                 config
@@ -732,20 +874,21 @@ impl Config {
                     .as_deref()
                     .unwrap_or(Path::new(DEFAULT_HISTORY_DIR)),
             )
-            .context("settings")?,
+            .context("settings"),
         );
         for (name, workflow) in &mut config.workflows {
             if let Some(dir) = &workflow.settings.history_dir {
-                workflow.settings.history_dir = Some(
-                    resolve_history_dir(base, dir).with_context(|| format!("workflow '{name}'"))?,
+                workflow.settings.history_dir = note(
+                    &mut problems,
+                    resolve_history_dir(base, dir).with_context(|| format!("workflow '{name}'")),
                 );
             }
         }
         for (name, environment) in &mut config.environments {
             if let Some(dir) = &environment.settings.history_dir {
-                environment.settings.history_dir = Some(
-                    resolve_history_dir(base, dir)
-                        .with_context(|| format!("environment '{name}'"))?,
+                environment.settings.history_dir = note(
+                    &mut problems,
+                    resolve_history_dir(base, dir).with_context(|| format!("environment '{name}'")),
                 );
             }
         }
@@ -759,63 +902,95 @@ impl Config {
                 reporting.spool_dir = Some(base.join(reporting.spool_dir()));
             }
         }
-        config.validate()?;
+        problems.extend(config.check());
+        ConfigError::check(problems)?;
         Ok((config, path))
     }
 
     /// Validate every job and store the validated partition settings.
+    /// Reports every problem in one `config_invalid` error.
     pub fn validate(&mut self) -> Result<()> {
+        ConfigError::check(self.check())
+    }
+
+    /// Validate every job, store the validated partition settings, and
+    /// return every problem found.
+    fn check(&mut self) -> Vec<anyhow::Error> {
+        let mut problems = Vec::new();
         if self.jobs.is_empty() && self.workflows.is_empty() {
-            bail!("no jobs defined");
+            problems.push(anyhow!("no jobs defined"));
         }
         if let Some(reporting) = &self.reporting {
-            reporting.validate().context("reporting")?;
+            note(&mut problems, reporting.validate().context("reporting"));
         }
         if let Some(prefix) = &self.settings.sprite_prefix {
             if !valid_sprite_prefix(prefix) {
-                bail!("settings sprite_prefix must be 1-20 bytes of lowercase ASCII letters, digits or hyphens, starting with a letter or digit");
+                problems.push(anyhow!("settings sprite_prefix must be 1-20 bytes of lowercase ASCII letters, digits or hyphens, starting with a letter or digit"));
             }
         }
         if let Some(sprite) = &self.sprite {
-            sprite.validate().context("sprite")?;
+            note(&mut problems, sprite.validate().context("sprite"));
         }
         let reporting = self.reporting.as_ref();
         // Validate every authored settings map, including unselected workflows and
         // profiles and entries a later scope overrides.
-        validate_settings_env(&self.settings.env, reporting).context("settings env")?;
-        self.settings.validate_history().context("settings")?;
+        note(
+            &mut problems,
+            validate_settings_env(&self.settings.env, reporting).context("settings env"),
+        );
+        note(
+            &mut problems,
+            self.settings.validate_history().context("settings"),
+        );
         for (name, workflow) in &self.workflows {
-            validate_settings_env(&workflow.settings.env, reporting)
-                .with_context(|| format!("workflow '{name}' settings env"))?;
-            workflow
-                .settings
-                .validate_history()
-                .with_context(|| format!("workflow '{name}' settings"))?;
+            note(
+                &mut problems,
+                validate_settings_env(&workflow.settings.env, reporting)
+                    .with_context(|| format!("workflow '{name}' settings env")),
+            );
+            note(
+                &mut problems,
+                workflow
+                    .settings
+                    .validate_history()
+                    .with_context(|| format!("workflow '{name}' settings")),
+            );
         }
         for (name, environment) in &self.environments {
-            validate_settings_env(&environment.settings.env, reporting)
-                .with_context(|| format!("environment '{name}' settings env"))?;
-            environment
-                .settings
-                .validate_history()
-                .with_context(|| format!("environment '{name}' settings"))?;
+            note(
+                &mut problems,
+                validate_settings_env(&environment.settings.env, reporting)
+                    .with_context(|| format!("environment '{name}' settings env")),
+            );
+            note(
+                &mut problems,
+                environment
+                    .settings
+                    .validate_history()
+                    .with_context(|| format!("environment '{name}' settings")),
+            );
         }
         if !self.jobs.is_empty() {
             if self.workflows.contains_key("default") {
-                bail!("root jobs conflict with named workflow 'default'");
+                problems.push(anyhow!("root jobs conflict with named workflow 'default'"));
             }
-            let partitions = validate_jobs(&self.jobs, reporting)?;
+            let (partitions, job_problems) = validate_jobs(&self.jobs, reporting);
+            problems.extend(job_problems);
             store_partitions(&mut self.jobs, partitions);
         }
         for (name, workflow) in &mut self.workflows {
-            validate_workflow_name(name)?;
-            let partitions = validate_jobs(&workflow.jobs, reporting)
-                .with_context(|| format!("workflow '{name}'"))?;
+            note(&mut problems, validate_workflow_name(name));
+            let (partitions, job_problems) = validate_jobs(&workflow.jobs, reporting);
+            problems.extend(
+                job_problems
+                    .into_iter()
+                    .map(|problem| problem.context(format!("workflow '{name}'"))),
+            );
             store_partitions(&mut workflow.jobs, partitions);
         }
-        self.validate_calls()?;
+        problems.extend(self.validate_calls());
         for name in self.environments.keys() {
-            validate_name(name, "environment")?;
+            note(&mut problems, validate_name(name, "environment"));
         }
         // Profile partition entries are checked for every profile, selected or
         // not, against jobs that declare `partitions` in any workflow.
@@ -831,24 +1006,28 @@ impl Config {
             .collect();
         for (profile, environment) in &self.environments {
             for (job, &count) in &environment.partitions {
-                partition_count(count)
-                    .with_context(|| format!("environment '{profile}': job '{job}'"))?;
+                note(
+                    &mut problems,
+                    partition_count(count)
+                        .with_context(|| format!("environment '{profile}': job '{job}'")),
+                );
                 if !defined.contains(job.as_str()) {
                     let available = if partitioned.is_empty() {
                         "none".to_owned()
                     } else {
                         partitioned.iter().copied().collect::<Vec<_>>().join(", ")
                     };
-                    bail!(
+                    problems.push(anyhow!(
                         "environment '{profile}': unknown job '{job}' (partitioned jobs: {available})"
-                    );
-                }
-                if !partitioned.contains(job.as_str()) {
-                    bail!("environment '{profile}': job '{job}' is not partitioned");
+                    ));
+                } else if !partitioned.contains(job.as_str()) {
+                    problems.push(anyhow!(
+                        "environment '{profile}': job '{job}' is not partitioned"
+                    ));
                 }
             }
         }
-        Ok(())
+        problems
     }
 
     /// Every workflow's authored jobs by name, including root jobs as `default`.
@@ -867,7 +1046,8 @@ impl Config {
     /// Check every workflow-call target and reject direct and indirect call
     /// cycles across the whole document, whether or not a call is selected or
     /// its condition would pass.
-    fn validate_calls(&self) -> Result<()> {
+    fn validate_calls(&self) -> Vec<anyhow::Error> {
+        let mut problems = Vec::new();
         let workflows = self.workflow_jobs();
         let names: Vec<&str> = workflows.keys().copied().collect();
         let index: HashMap<&str, usize> = names.iter().enumerate().map(|(i, n)| (*n, i)).collect();
@@ -875,18 +1055,24 @@ impl Config {
         let mut edges: Vec<Vec<(usize, &str)>> = vec![Vec::new(); names.len()];
         for (from, jobs) in workflows.values().enumerate() {
             for job in jobs.iter() {
-                let Some(target) = &job.workflow else {
+                // `validate_call` already reports an empty target.
+                let Some(target) = job.workflow.as_deref().filter(|t| !t.is_empty()) else {
                     continue;
                 };
-                let &to = index.get(target.as_str()).with_context(|| {
-                    format!(
+                let Some(&to) = index.get(target) else {
+                    let mut problem = format!(
                         "workflow '{}': job '{}': unknown workflow '{}' (available: {})",
                         names[from],
                         job.name,
                         target.escape_debug(),
                         self.workflow_names().join(", ")
-                    )
-                })?;
+                    );
+                    if let Some(hint) = did_you_mean(target, names.iter().copied()) {
+                        problem = format!("{problem}; {hint}");
+                    }
+                    problems.push(anyhow!(problem));
+                    continue;
+                };
                 edges[from].push((to, &job.name));
             }
         }
@@ -922,7 +1108,11 @@ impl Config {
                         })
                         .collect();
                     path.push(format!("workflow '{}'", names[to]));
-                    bail!("workflow call cycle detected: {}", path.join(" -> "));
+                    problems.push(anyhow!(
+                        "workflow call cycle detected: {}",
+                        path.join(" -> ")
+                    ));
+                    return problems;
                 }
                 if state[to] == 0 {
                     state[to] = 1;
@@ -930,20 +1120,21 @@ impl Config {
                 }
             }
         }
-        Ok(())
+        problems
     }
 
     pub fn environment(&self, requested: Option<&str>) -> Result<Option<&Environment>> {
         requested
             .map(|name| {
-                self.environments.get(name).with_context(|| {
-                    let available = self
-                        .environments
-                        .keys()
-                        .cloned()
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    format!("unknown environment '{name}' (available: {available})")
+                self.environments.get(name).ok_or_else(|| {
+                    let names = self.environments.keys().map(String::as_str);
+                    let available = names.clone().collect::<Vec<_>>().join(", ");
+                    ConfigError::new(
+                        "unknown_environment",
+                        format!("unknown environment '{name}' (available: {available})"),
+                    )
+                    .with_hint(did_you_mean(name, names))
+                    .into()
                 })
             })
             .transpose()
@@ -974,16 +1165,21 @@ impl Config {
         profile: Option<&str>,
     ) -> Result<(String, Config)> {
         let environment = self.environment(profile)?;
-        let available = self.workflow_names().join(", ");
-        let name = requested.or_else(|| self.default_workflow())
-            .with_context(|| format!("no default workflow; choose a workflow with 'goodflows run <workflow>' (available: {available})"))?;
+        let names = self.workflow_names();
+        let available = names.join(", ");
+        let name = requested.or_else(|| self.default_workflow()).ok_or_else(|| {
+            ConfigError::new("no_default_workflow", format!("no default workflow; choose a workflow with 'goodflows run <workflow>' (available: {available})"))
+        })?;
         let (settings, mut jobs) = if name == "default" && !self.jobs.is_empty() {
             (self.settings.clone(), self.jobs.clone())
         } else {
-            let workflow = self
-                .workflows
-                .get(name)
-                .with_context(|| format!("unknown workflow '{name}' (available: {available})"))?;
+            let workflow = self.workflows.get(name).ok_or_else(|| {
+                ConfigError::new(
+                    "unknown_workflow",
+                    format!("unknown workflow '{name}' (available: {available})"),
+                )
+                .with_hint(did_you_mean(name, names.iter().map(String::as_str)))
+            })?;
             (
                 workflow.settings.apply(&self.settings),
                 workflow.jobs.clone(),
@@ -1003,9 +1199,9 @@ impl Config {
                     } else {
                         format!("workflow '{name}'")
                     };
-                    bail!(
+                    return Err(ConfigError::invalid(vec![format!(
                         "environment '{profile}': {workflow}: job '{job_name}' is not partitioned"
-                    );
+                    )]));
                 };
                 // Defensive: `Config::validate` already rejected out-of-range
                 // counts, so this conversion cannot fail for a validated config.
@@ -1068,11 +1264,17 @@ impl Config {
         let mut wanted = HashSet::new();
         let mut stack = Vec::new();
         for name in selected {
-            stack.push(
-                *names
-                    .get(name.as_str())
-                    .with_context(|| format!("unknown job '{name}'"))?,
-            );
+            let Some(&index) = names.get(name.as_str()) else {
+                let jobs = self.jobs.iter().map(|job| job.name.as_str());
+                let available = jobs.clone().collect::<Vec<_>>().join(", ");
+                return Err(ConfigError::new(
+                    "unknown_job",
+                    format!("unknown job '{name}' (available: {available})"),
+                )
+                .with_hint(did_you_mean(name, jobs))
+                .into());
+            };
+            stack.push(index);
         }
         while let Some(index) = stack.pop() {
             if wanted.insert(index) {
@@ -1108,10 +1310,16 @@ fn store_partitions(jobs: &mut [Job], partitions: Vec<Option<Partitions>>) {
     }
 }
 
-/// Returns each job's validated partition setting, in job order.
-fn validate_jobs(jobs: &[Job], reporting: Option<&Reporting>) -> Result<Vec<Option<Partitions>>> {
+/// Returns each job's validated partition setting, in job order, and every
+/// problem found in the jobs.
+fn validate_jobs(
+    jobs: &[Job],
+    reporting: Option<&Reporting>,
+) -> (Vec<Option<Partitions>>, Vec<anyhow::Error>) {
+    let mut problems = Vec::new();
     if jobs.is_empty() {
-        bail!("no jobs defined");
+        problems.push(anyhow!("no jobs defined"));
+        return (Vec::new(), problems);
     }
     let no_outputs: NoOutputs = jobs
         .iter()
@@ -1128,27 +1336,36 @@ fn validate_jobs(jobs: &[Job], reporting: Option<&Reporting>) -> Result<Vec<Opti
         .collect();
     let mut names = HashMap::new();
     let mut partitions = Vec::with_capacity(jobs.len());
+    // A duplicate name or a bad dependency leaves no graph to check for cycles.
+    let mut graph = true;
     for (index, job) in jobs.iter().enumerate() {
         if job.name.trim().is_empty() {
-            bail!("empty job name");
+            problems.push(anyhow!("empty job name"));
         }
         if names.insert(job.name.as_str(), index).is_some() {
-            bail!("duplicate job name '{}'", job.name);
+            problems.push(anyhow!("duplicate job name '{}'", job.name));
+            graph = false;
         }
-        partitions.push(
-            validate_job(job, reporting, &no_outputs)
-                .with_context(|| format!("job '{}'", job.name))?,
+        let (job_partitions, job_problems) = validate_job(job, reporting, &no_outputs);
+        partitions.push(job_partitions);
+        problems.extend(
+            job_problems
+                .into_iter()
+                .map(|problem| problem.context(format!("job '{}'", job.name))),
         );
         if job.timeout_secs == Some(0) {
-            bail!("job '{}' timeout_secs must be greater than zero", job.name);
+            problems.push(anyhow!(
+                "job '{}' timeout_secs must be greater than zero",
+                job.name
+            ));
         }
         // Names appear in text output and rerun hints, so no control characters
         // (including escape sequences). Other name rules are unchanged.
         if job.name.chars().any(char::is_control) {
-            bail!(
+            problems.push(anyhow!(
                 "job '{}' contains invalid control characters",
                 job.name.escape_debug()
-            );
+            ));
         }
     }
     let mut indegrees = vec![0; jobs.len()];
@@ -1157,17 +1374,33 @@ fn validate_jobs(jobs: &[Job], reporting: Option<&Reporting>) -> Result<Vec<Opti
         let mut seen = HashSet::new();
         for dep in &job.depends_on {
             if dep == &job.name {
-                bail!("job '{}' depends on itself", job.name);
+                problems.push(anyhow!("job '{}' depends on itself", job.name));
+                graph = false;
+                continue;
             }
             if !seen.insert(dep) {
-                bail!("job '{}' has duplicate dependency '{}'", job.name, dep);
+                problems.push(anyhow!(
+                    "job '{}' has duplicate dependency '{}'",
+                    job.name,
+                    dep
+                ));
+                continue;
             }
-            let &dep_index = names
-                .get(dep.as_str())
-                .with_context(|| format!("job '{}' depends on unknown job '{}'", job.name, dep))?;
+            let Some(&dep_index) = names.get(dep.as_str()) else {
+                let mut problem = format!("job '{}' depends on unknown job '{}'", job.name, dep);
+                if let Some(hint) = did_you_mean(dep, names.keys().copied()) {
+                    problem = format!("{problem}; {hint}");
+                }
+                problems.push(anyhow!(problem));
+                graph = false;
+                continue;
+            };
             indegrees[index] += 1;
             dependents[dep_index].push(index);
         }
+    }
+    if !graph {
+        return (partitions, problems);
     }
     let mut ready: VecDeque<_> = indegrees
         .iter()
@@ -1185,9 +1418,12 @@ fn validate_jobs(jobs: &[Job], reporting: Option<&Reporting>) -> Result<Vec<Opti
         }
     }
     if visited != jobs.len() {
-        bail!("dependency cycle detected: {}", cycle_path(jobs, &names));
+        problems.push(anyhow!(
+            "dependency cycle detected: {}",
+            cycle_path(jobs, &names)
+        ));
     }
-    Ok(partitions)
+    (partitions, problems)
 }
 
 fn validate_command(command: &str, shell: bool) -> Result<()> {
@@ -1344,51 +1580,68 @@ fn validate_partitions(job: &Job) -> Result<Option<Partitions>> {
     }))
 }
 
-/// Returns the job's validated partition setting.
+/// Returns the job's validated partition setting and every problem found
+/// in the job.
 fn validate_job(
     job: &Job,
     reporting: Option<&Reporting>,
     no_outputs: &NoOutputs,
-) -> Result<Option<Partitions>> {
+) -> (Option<Partitions>, Vec<anyhow::Error>) {
+    let mut problems = Vec::new();
+    let condition = validate_condition(job.condition.as_ref(), &job.depends_on, &[], no_outputs);
     if job.workflow.is_some() {
-        validate_call(job)?;
-        validate_condition(job.condition.as_ref(), &job.depends_on, &[], no_outputs)?;
-        return Ok(None);
+        note(&mut problems, validate_call(job));
+        note(&mut problems, condition);
+        return (None, problems);
     }
-    let partitions = validate_partitions(job)?;
-    validate_reports(job, reporting.is_some())?;
+    let partitions = note(&mut problems, validate_partitions(job)).flatten();
+    note(&mut problems, validate_reports(job, reporting.is_some()));
     match (&job.command, job.steps.is_empty()) {
         (Some(command), true) => {
-            validate_command(command, job.shell)?;
+            note(&mut problems, validate_command(command, job.shell));
             if !job.outputs.is_empty() {
-                bail!("command-only jobs publish outputs directly; output mappings require steps");
+                problems.push(anyhow!(
+                    "command-only jobs publish outputs directly; output mappings require steps"
+                ));
             }
         }
         (None, false) => {}
-        _ => bail!("define either a command or nonempty steps, never both"),
+        _ => problems.push(anyhow!(
+            "define either a command or nonempty steps, never both"
+        )),
     }
-    validate_env(&job.env, reporting)?;
-    validate_condition(job.condition.as_ref(), &job.depends_on, &[], no_outputs)?;
+    note(&mut problems, validate_env(&job.env, reporting));
+    note(&mut problems, condition);
     let mut steps = Vec::new();
     for step in &job.steps {
-        (|| {
-            validate_name(&step.id, "step")?;
-            if steps.contains(&step.id) {
-                bail!("duplicate step id '{}'", step.id);
-            }
-            validate_command(&step.command, step.shell.unwrap_or(job.shell))?;
-            validate_env(&step.env, reporting)?;
-            validate_condition(step.condition.as_ref(), &job.depends_on, &steps, no_outputs)
-        })()
-        .with_context(|| format!("step '{}'", step.id))?;
+        let duplicate = if steps.contains(&step.id) {
+            Err(anyhow!("duplicate step id '{}'", step.id))
+        } else {
+            Ok(())
+        };
+        for check in [
+            validate_name(&step.id, "step"),
+            duplicate,
+            validate_command(&step.command, step.shell.unwrap_or(job.shell)),
+            validate_env(&step.env, reporting),
+            validate_condition(step.condition.as_ref(), &job.depends_on, &steps, no_outputs),
+        ] {
+            note(
+                &mut problems,
+                check.with_context(|| format!("step '{}'", step.id)),
+            );
+        }
         steps.push(step.id.clone());
     }
     for (key, source) in &job.outputs {
-        validate_name(key, "output")?;
-        validate_expression(source, &job.depends_on, &steps, no_outputs)
-            .with_context(|| format!("output '{key}'"))?;
+        note(&mut problems, validate_name(key, "output"));
+        note(
+            &mut problems,
+            validate_expression(source, &job.depends_on, &steps, no_outputs)
+                .with_context(|| format!("output '{key}'")),
+        );
     }
-    Ok(partitions)
+    (partitions, problems)
 }
 
 /// A workflow-call job has no other execution form and none of the
@@ -2211,6 +2464,14 @@ mod tests {
             "{JOB}[settings.env]\nGOODFLOWS_PARTITION = 'x'\n[workflows.ci.settings.env]\nGOODFLOWS_PARTITION = 'y'\n"
         ))
         .unwrap_err();
-        assert!(error.starts_with("settings env"), "{error}");
+        // Validation reports both scopes; the shared one is not hidden by the override.
+        assert!(
+            error.contains("\n  - settings env: env must not set reserved variable"),
+            "{error}"
+        );
+        assert!(
+            error.contains("\n  - workflow 'ci' settings env:"),
+            "{error}"
+        );
     }
 }
