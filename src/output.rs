@@ -527,6 +527,25 @@ fn render(
                 text(&event, "template")
             )?,
             "init_cancelled" => writeln!(out, "Kept existing {}", text(&event, "path"))?,
+            "skills_installed" => {
+                let harnesses = names(&event["harnesses"]);
+                if harnesses.is_empty() {
+                    writeln!(
+                        out,
+                        "No coding agent harness detected; installed skills in {} (pass --harness to choose)",
+                        text(&event, "directory")
+                    )?;
+                } else {
+                    writeln!(
+                        out,
+                        "Installed skills for {harnesses} in {}",
+                        text(&event, "directory")
+                    )?;
+                }
+                for file in event["files"].as_array().into_iter().flatten() {
+                    writeln!(out, "  {}", file.as_str().unwrap_or_default())?;
+                }
+            }
             "workflows" => {
                 writeln!(
                     out,

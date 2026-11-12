@@ -17,6 +17,9 @@ clap = { version = "4", features = ["derive"] }
 colored = "2"
 flate2 = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "rustls-tls-native-roots"] }
+# The official MCP SDK (modelcontextprotocol/rust-sdk), for `goodflows mcp`:
+# stdio server transport and the tool macros only.
+rmcp = { version = "3.9", default-features = false, features = ["server", "macros", "transport-io"] }
 # Direct dependency only to recognize TLS failures in reqwest error chains; reqwest selects the ring provider.
 rustls = { version = "0.23", default-features = false }
 serde = { version = "1", features = ["derive"] }

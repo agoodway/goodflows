@@ -5,10 +5,12 @@ mod fsutil;
 mod history;
 mod init;
 mod last;
+mod mcp;
 mod output;
 mod reporting;
 mod retention;
 mod runner;
+mod skills;
 mod sprite;
 mod tail;
 
@@ -210,6 +212,18 @@ enum Commands {
         #[command(subcommand)]
         command: sprite::Command,
     },
+    /// Install goodflows's agent skills where the current coding agent loads them
+    #[command(after_help = SKILLS_EXAMPLES)]
+    Skills {
+        #[command(subcommand)]
+        command: SkillsCommand,
+    },
+    /// Serve goodflows to coding agents as an MCP server on stdin and stdout
+    #[command(after_help = "Examples:
+  goodflows mcp                      # serve the run, list, validate and last tools
+  goodflows mcp --config ci.toml     # tools use ci.toml unless a call passes its own config
+  goodflows skills install           # also install the CI skills for this harness")]
+    Mcp,
     /// Internal: the remote runner protocol used on a Sprite
     #[command(name = "__sprite-agent", hide = true)]
     SpriteAgent {
@@ -236,6 +250,22 @@ enum ReportsCommand {
     },
 }
 
+const SKILLS_EXAMPLES: &str = "Examples:
+  goodflows skills install                    # install into the directory this harness loads
+  goodflows skills install --harness claude   # install into .claude/skills
+  goodflows skills install --json             # print the files written as a JSON event";
+
+#[derive(Subcommand)]
+enum SkillsCommand {
+    /// Write create-ci-skill and maintain-ci-skill into the harness's skills directory, replacing earlier copies
+    #[command(after_help = SKILLS_EXAMPLES)]
+    Install {
+        /// The harness to install for (default: detected from its environment variables; .agents/skills when none is)
+        #[arg(long, value_enum)]
+        harness: Option<skills::Harness>,
+    },
+}
+
 #[derive(Subcommand)]
 enum HistoryCommand {
     /// List stored runs, newest first
@@ -257,7 +287,8 @@ enum HistoryCommand {
 }
 
 /// Global flags that only `run` uses; `init`, `reports upload`, `history`,
-/// `last`, `status`, `wait` and `sprite` commands reject them. `validate`
+/// `last`, `status`, `wait`, `sprite`, `skills install` and `mcp` commands
+/// reject them. `validate`
 /// and `list` resolve all of them except `--log-dir` into their settings.
 const RUN_ONLY_FLAGS: [&str; 12] = [
     "env",
@@ -290,14 +321,14 @@ impl Cli {
             })
         }
         let run_only = |command| hide(command, &RUN_ONLY_FLAGS);
-        // `reports upload` rejects `--config` too.
-        let reports = |command| hide(run_only(command), &["config"]);
+        // `reports upload` and `skills install` reject `--config` too.
+        let configless = |command| hide(run_only(command), &["config"]);
         let unlogged = |command| hide(command, &["log_dir"]);
         command
             .mut_subcommand("init", run_only)
             .mut_subcommand("validate", unlogged)
             .mut_subcommand("list", unlogged)
-            .mut_subcommand("reports", |r| reports(r).mut_subcommands(reports))
+            .mut_subcommand("reports", |r| configless(r).mut_subcommands(configless))
             .mut_subcommand("sprite", |sprite| {
                 run_only(sprite).mut_subcommands(run_only)
             })
@@ -307,6 +338,9 @@ impl Cli {
             .mut_subcommand("last", run_only)
             .mut_subcommand("status", run_only)
             .mut_subcommand("wait", run_only)
+            .mut_subcommand("skills", |s| configless(s).mut_subcommands(configless))
+            // `mcp` speaks MCP on stdout; `--config` is its tools' default.
+            .mut_subcommand("mcp", |mcp| hide(run_only(mcp), &["json"]))
     }
 
     /// The first run-only flag on the command line, as the user typed it, for
@@ -402,6 +436,8 @@ impl Cli {
                 | Commands::Status { .. }
                 | Commands::Wait { .. }
                 | Commands::Sprite { .. }
+                | Commands::Skills { .. }
+                | Commands::Mcp
                 | Commands::SpriteAgent { .. },
             )
             | None => None,
@@ -458,6 +494,7 @@ async fn main() -> ExitCode {
                 | Commands::Reports { .. }
                 | Commands::History { .. }
                 | Commands::Sprite { .. }
+                | Commands::Mcp
         )
     ) {
         cancellation()
@@ -578,6 +615,23 @@ async fn run(cli: &Cli, output: &mut Output, cancel: watch::Receiver<Option<i32>
     }
     if let Some(Commands::Sprite { command }) = &cli.command {
         return sprite::command(cli, command, output, cancel).await;
+    }
+    if let Some(Commands::Skills {
+        command: SkillsCommand::Install { harness },
+    }) = &cli.command
+    {
+        let config = cli.config.is_some().then_some("--config");
+        if let Some(flag) = config.or_else(|| cli.run_only_flag()) {
+            return Err(usage(format!("{flag} cannot be used with skills install")));
+        }
+        return skills::install(*harness, output).await;
+    }
+    if let Some(Commands::Mcp) = &cli.command {
+        let json = cli.json.is_some().then_some("--json");
+        if let Some(flag) = json.or_else(|| cli.run_only_flag()) {
+            return Err(usage(format!("{flag} cannot be used with mcp")));
+        }
+        return mcp::serve(cli.config.clone(), cancel).await;
     }
     if let Some(Commands::Last) = &cli.command {
         if let Some(flag) = cli.run_only_flag() {
@@ -1715,6 +1769,9 @@ mod tests {
         let mut paths = Vec::new();
         command_paths(&Cli::parser(), Vec::new(), &mut paths);
         assert!(paths.len() > 10, "{paths:?}");
+        for command in [&["skills", "install"][..], &["mcp"]] {
+            assert!(paths.iter().any(|path| path == command), "{command:?}");
+        }
         for path in paths {
             let args = std::iter::once("goodflows")
                 .chain(path.iter().map(String::as_str))
