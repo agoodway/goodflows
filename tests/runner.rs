@@ -118,6 +118,28 @@ fn contradictory_fail_fast_flags_are_rejected() {
 }
 
 #[test]
+fn validate_and_list_reject_log_dir_which_only_a_run_uses() {
+    let p = Project::new("[[jobs]]\nname='a'\ncommand='true'");
+    for (args, command) in [
+        (&["validate", "--log-dir", "logs"][..], "validate"),
+        (&["--log-dir", "logs", "list"], "list"),
+    ] {
+        let output = p.run(args);
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        assert!(
+            stderr(&output).contains(&format!("--log-dir cannot be used with {command}")),
+            "{args:?}: {}",
+            stderr(&output)
+        );
+        // Their help leaves it out, but keeps the flags they resolve.
+        let help = stdout(&p.run(&[command, "--help"]));
+        assert!(!help.contains("--log-dir"), "{help}");
+        assert!(help.contains("--env") && help.contains("--jobs"), "{help}");
+    }
+    assert!(!p.dir.join("logs").exists());
+}
+
+#[test]
 fn direct_exec_preserves_quoted_arguments() {
     let p = Project::new(
         r#"[[jobs]]
