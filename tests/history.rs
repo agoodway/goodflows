@@ -456,11 +456,15 @@ fn non_run_commands_never_write_history() {
         vec!["validate", "--history"],
         vec!["list", "--history"],
         vec!["list", "--workflows"],
-        vec!["init", "--force", "--history"],
     ] {
         let output = p.run(&args);
         success(&output);
     }
+    // init rejects run flags such as --history.
+    assert_eq!(
+        p.run(&["init", "--force", "--history"]).status.code(),
+        Some(2)
+    );
     assert!(!p.dir.join("goodflows-history").exists());
     // Reports upload rejects every history and retention flag, naming it.
     std::fs::create_dir(p.dir.join("spool")).unwrap();

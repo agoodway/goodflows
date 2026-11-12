@@ -506,3 +506,50 @@ fn templates_without_env_defaults_omit_settings_env() {
         }
     }
 }
+
+/// The long options a command's help lists, in order.
+fn help_options(help: &str) -> Vec<String> {
+    help.lines()
+        .map(str::trim_start)
+        .filter(|line| line.starts_with('-'))
+        .flat_map(|line| line.split([',', ' ', '=', '[', '<']))
+        .filter(|token| token.starts_with("--"))
+        .map(str::to_owned)
+        .collect()
+}
+
+#[test]
+fn init_help_lists_only_the_options_init_uses_and_rejects_run_flags() {
+    let p = Project::new("keep");
+    let output = p.run(&["init", "--help"]);
+    success(&output);
+    let help = stdout(&output);
+    assert_eq!(
+        help_options(&help),
+        [
+            "--template",
+            "--force",
+            "--workflow",
+            "--config",
+            "--json",
+            "--help"
+        ],
+        "{help}"
+    );
+    // A run flag that init's help hides still parses, and init names it.
+    for (args, flag) in [
+        (&["init", "--force", "--jobs", "a"][..], "--jobs"),
+        (&["init", "--force", "--history"], "--history"),
+        (&["--log-dir", "logs", "init", "--force"], "--log-dir"),
+        (&["init", "--force", "--fail-fast"], "--fail-fast"),
+    ] {
+        let output = p.run(args);
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        assert!(
+            stderr(&output).contains(&format!("{flag} cannot be used with init")),
+            "{args:?}: {}",
+            stderr(&output)
+        );
+        assert_eq!(p.read("goodflows.toml"), "keep");
+    }
+}
