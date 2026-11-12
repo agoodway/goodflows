@@ -79,7 +79,7 @@ pub async fn read_bounded(
 /// Validate `bytes` (a gzip tar from `export`) for `run_id` and publish it
 /// under `base`: `result/` when complete, a new `partial-<ms>/` otherwise.
 pub fn publish(base: &Path, run_id: &str, bytes: &[u8]) -> Result<Collected> {
-    crate::fsutil::dir_builder(true).create(base)?;
+    crate::fsutil::create_state_dir(base)?;
     // One collection at a time per bundle directory: under this lock every
     // `.collect-*` staging directory is a leftover of a killed collection.
     let _serial = lock_dir(base)?;

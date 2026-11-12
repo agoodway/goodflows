@@ -463,7 +463,7 @@ fn cache_trusted(dir: &Path) -> bool {
 /// private to this user is left alone.
 fn cache_runner(dir: &Path, content: &[u8], digest: &str) -> Result<PathBuf> {
     use std::os::unix::fs::MetadataExt;
-    crate::fsutil::dir_builder(true).create(dir)?;
+    crate::fsutil::create_state_dir(dir)?;
     let meta = std::fs::symlink_metadata(dir)?;
     // SAFETY: geteuid has no preconditions and cannot fail.
     if !meta.is_dir() || meta.uid() != unsafe { libc::geteuid() } || meta.mode() & 0o077 != 0 {
@@ -974,7 +974,7 @@ pub async fn run(
     };
     // The private receipt is durable before the first remote submission.
     let base = bundle_base(&scope, &run_id, None)?;
-    crate::fsutil::dir_builder(true).create(&base)?;
+    crate::fsutil::create_state_dir(&base)?;
     control::write_json(
         &base.join("receipt.json"),
         &json!({"schema": 1, "run_id": run_id, "organization": scope.organization, "prefix": scope.prefix,

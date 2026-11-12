@@ -110,8 +110,7 @@ pub async fn start(
 ) -> Result<u8> {
     let run_id = uuid::Uuid::new_v4().hyphenated().to_string();
     let dir = dir(config_file, &run_id);
-    crate::fsutil::dir_builder(true)
-        .create(&dir)
+    crate::fsutil::create_state_dir(&dir)
         .with_context(|| format!("create {}", dir.display()))?;
     let file = |name: &str| create(&dir.join(name));
     // Every event, for `status`, whatever `--json` the caller asked for.

@@ -36,6 +36,29 @@ pub fn dir_builder(recursive: bool) -> std::fs::DirBuilder {
     builder
 }
 
+/// Create `dir` and its missing parents like [`dir_builder`], and give each
+/// `.goodflows` directory on its path a `.gitignore` of `*` when it has
+/// none, so git never offers goodflows's own state for a commit. An existing
+/// `.gitignore` is left as the user wrote it.
+pub fn create_state_dir(dir: &Path) -> std::io::Result<()> {
+    dir_builder(true).create(dir)?;
+    for state in dir
+        .ancestors()
+        .filter(|path| path.file_name() == Some(OsStr::new(".goodflows")))
+    {
+        let ignore = std::fs::File::options()
+            .write(true)
+            .create_new(true)
+            .open(state.join(".gitignore"));
+        match ignore {
+            Ok(mut file) => file.write_all(b"*\n")?,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
 /// Confirm a path is a real directory, never a symlink to one.
 pub fn real_dir(path: &Path) -> std::io::Result<()> {
     if std::fs::symlink_metadata(path)?.is_dir() {

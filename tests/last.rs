@@ -178,3 +178,26 @@ fn run_failed_reruns_the_rerun_hint_jobs() {
     assert_eq!(nothing.status.code(), Some(2));
     assert_eq!(error_code(&nothing), "no_failed_jobs");
 }
+
+#[test]
+fn a_run_leaves_git_status_clean_and_keeps_a_users_gitignore() {
+    let p = Project::new("[[jobs]]\nname = 'a'\ncommand = 'true'\n");
+    let git = |args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&p.dir)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git {args:?}: {output:?}");
+        String::from_utf8(output.stdout).unwrap()
+    };
+    git(&["init", "-q"]);
+    success(&p.run(&[]));
+    assert_eq!(p.read(".goodflows/.gitignore"), "*\n");
+    assert_eq!(git(&["status", "--short"]), "?? goodflows.toml\n");
+
+    // A user's own rules stay.
+    std::fs::write(p.dir.join(".goodflows/.gitignore"), "last/\n").unwrap();
+    success(&p.run(&[]));
+    assert_eq!(p.read(".goodflows/.gitignore"), "last/\n");
+}

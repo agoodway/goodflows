@@ -119,8 +119,7 @@ impl Recorder {
         // failure is returned.
         let write = |path: &PathBuf| -> Result<()> {
             let dir = path.parent().context("last run path has no parent")?;
-            crate::fsutil::dir_builder(true)
-                .create(dir)
+            crate::fsutil::create_state_dir(dir)
                 .with_context(|| format!("create {}", dir.display()))?;
             crate::fsutil::write_atomic(path, &bytes, true)
                 .with_context(|| format!("write {}", path.display()))

@@ -463,7 +463,8 @@ Text-mode rerun hints keep the original identity, profile and config spelling:
 
 Before the first submission the controller writes a private receipt to
 `.goodflows/sprites/<scope-digest>/<run-uuid>/receipt.json` in the directory
-you ran from (add `/.goodflows/` to `.gitignore`). An attached run then
+you ran from (git ignores it through the `.goodflows/.gitignore` goodflows
+writes). An attached run then
 collects the final bundle into `.../<run-uuid>/result/`; `sprite collect
 --output DIR` uses `DIR` as the base instead. A collection of an unfinished run
 goes to a new `partial-<ms>/` snapshot and never replaces another partial or

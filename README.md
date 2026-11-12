@@ -358,7 +358,7 @@ goodflows --log-dir .goodflows-logs --log-runs 5
 
 ### Last run and rerunning failures
 
-Every local run replaces one record of its results at `.goodflows/last/<config file name>.json`, next to the config file. It is written whether or not history is on. It keeps each invocation's `summary`, including the output tails of failed jobs and the `--log-dir` path. Add `/.goodflows/` to `.gitignore`.
+Every local run replaces one record of its results at `.goodflows/last/<config file name>.json`, next to the config file. It is written whether or not history is on. It keeps each invocation's `summary`, including the output tails of failed jobs and the `--log-dir` path. When `.goodflows/` has no `.gitignore`, goodflows writes one containing `*`, so git ignores the directory. It leaves an existing one as it is.
 
 ```bash
 goodflows last
@@ -462,7 +462,7 @@ reports = ["test-timings"]
 GOODFLOWS_URL=https://flows.example.com GOODFLOWS_API_KEY=secret goodflows
 ```
 
-An upload failure does not change the run's exit code. Snapshots that did not upload stay in `.goodflows/reports/<run-id>/`, which contains `manifest.json`. Add `/.goodflows/` to `.gitignore`. Retry with the run directory:
+An upload failure does not change the run's exit code. Snapshots that did not upload stay in `.goodflows/reports/<run-id>/`, which contains `manifest.json`. Git ignores `.goodflows/` through the `.gitignore` goodflows writes there. Retry with the run directory:
 
 ```bash
 goodflows reports upload .goodflows/reports/<run-id>
