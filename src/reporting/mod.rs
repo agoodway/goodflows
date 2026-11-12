@@ -1555,6 +1555,7 @@ mod tests {
             stderr_tail: None,
             stdout_truncated: None,
             stderr_truncated: None,
+            output: None,
             executed: true,
             started: true,
             blocked_ms: 0,

@@ -1,3 +1,4 @@
+use serde::Serialize;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
@@ -5,25 +6,113 @@ const LIMIT: usize = 4096;
 
 pub type SharedTails = Arc<Mutex<Tails>>;
 
+/// A job's bounded output: the tail of each stream, and the head and tail of
+/// both streams together in the order they were read.
 #[derive(Default)]
 pub struct Tails {
     stdout: Tail,
     stderr: Tail,
+    head: Vec<u8>,
+    /// Combined output after `head`.
+    rest: Tail,
+}
+
+/// The bounded output of a failed job, as its result reports it.
+pub struct Snapshot {
+    pub stdout: (String, bool),
+    pub stderr: (String, bool),
+    pub output: Excerpt,
+}
+
+/// The first and last bytes of a job's stdout and stderr together, in the
+/// order goodflows read them.
+#[derive(Clone, Debug, Serialize)]
+pub struct Excerpt {
+    #[serde(rename = "output_head")]
+    pub head: String,
+    /// The output after `head`, or its end when `truncated`.
+    #[serde(rename = "output_tail")]
+    pub tail: String,
+    /// Output between `head` and `tail` was omitted.
+    #[serde(rename = "output_truncated")]
+    pub truncated: bool,
 }
 
 impl Tails {
-    pub fn append(&mut self, stream: &str, bytes: &[u8]) {
+    pub fn append(&mut self, stream: &str, mut bytes: &[u8]) {
         let tail = if stream == "stdout" {
             &mut self.stdout
         } else {
             &mut self.stderr
         };
         tail.append(bytes);
+        let room = LIMIT - self.head.len();
+        let (head, rest) = bytes.split_at(room.min(bytes.len()));
+        self.head.extend_from_slice(head);
+        bytes = rest;
+        if !bytes.is_empty() {
+            self.rest.append(bytes);
+        }
     }
 
-    pub fn snapshot(&self) -> [(String, bool); 2] {
-        [self.stdout.snapshot(), self.stderr.snapshot()]
+    pub fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            stdout: self.stdout.snapshot(),
+            stderr: self.stderr.snapshot(),
+            output: self.excerpt(),
+        }
     }
+
+    fn excerpt(&self) -> Excerpt {
+        if !self.rest.truncated {
+            // Head and tail are contiguous: decode them together so a character
+            // that spans the boundary survives, then split on a character.
+            let mut bytes = self.head.clone();
+            bytes.extend(&self.rest.bytes);
+            let mut head = String::from_utf8_lossy(&bytes).into_owned();
+            let mut tail = head.split_off(floor_char_boundary(&head, LIMIT));
+            let truncated = tail.len() > LIMIT;
+            if truncated {
+                tail = tail.split_off(ceil_char_boundary(&tail, tail.len() - LIMIT));
+            }
+            return Excerpt {
+                head,
+                tail,
+                truncated,
+            };
+        }
+        // Drop an incomplete character at the end of the head; its remaining
+        // bytes were omitted.
+        let end = match std::str::from_utf8(&self.head) {
+            Err(error) if error.error_len().is_none() => error.valid_up_to(),
+            _ => self.head.len(),
+        };
+        let mut head = String::from_utf8_lossy(&self.head[..end]).into_owned();
+        // Lossy decoding can expand each invalid byte to three UTF-8 bytes.
+        head.truncate(floor_char_boundary(&head, LIMIT));
+        Excerpt {
+            head,
+            tail: self.rest.snapshot().0,
+            truncated: true,
+        }
+    }
+}
+
+/// The largest character boundary of `text` at or below `index`.
+fn floor_char_boundary(text: &str, mut index: usize) -> usize {
+    index = index.min(text.len());
+    while !text.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
+}
+
+/// The smallest character boundary of `text` at or above `index`.
+fn ceil_char_boundary(text: &str, mut index: usize) -> usize {
+    while !text.is_char_boundary(index) {
+        index += 1;
+    }
+    index
 }
 
 #[derive(Default)]
@@ -63,13 +152,59 @@ impl Tail {
         if text.len() > LIMIT {
             // Lossy decoding can expand each invalid byte to three UTF-8 bytes.
             // Bound the rendered field too and never slice inside a character.
-            let mut start = text.len() - LIMIT;
-            while !text.is_char_boundary(start) {
-                start += 1;
-            }
-            text = text.split_off(start);
+            text = text.split_off(ceil_char_boundary(&text, text.len() - LIMIT));
             truncated = true;
         }
         (text, truncated)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn excerpt(chunks: &[(&str, &[u8])]) -> Excerpt {
+        let mut tails = Tails::default();
+        for (stream, bytes) in chunks {
+            tails.append(stream, bytes);
+        }
+        tails.snapshot().output
+    }
+
+    #[test]
+    fn excerpts_keep_the_head_and_tail_of_both_streams_in_order() {
+        let short = excerpt(&[("stderr", b"error: first\n"), ("stdout", b"then out\n")]);
+        assert_eq!(short.head, "error: first\nthen out\n");
+        assert_eq!((short.tail.as_str(), short.truncated), ("", false));
+
+        // Contiguous: the head and tail together are the whole output.
+        let a = "a".repeat(LIMIT - 1);
+        let whole = excerpt(&[("stdout", a.as_bytes()), ("stderr", "é-end".as_bytes())]);
+        assert_eq!(whole.head, a);
+        assert_eq!((whole.tail.as_str(), whole.truncated), ("é-end", false));
+
+        // Too long: the middle is omitted, and a character cut at either edge
+        // is dropped rather than replaced.
+        let long = excerpt(&[
+            ("stderr", format!("{a}é").as_bytes()),
+            ("stdout", "x".repeat(2 * LIMIT).as_bytes()),
+            ("stdout", "€-end".as_bytes()),
+        ]);
+        assert_eq!(long.head, a);
+        assert_eq!(long.tail, format!("{}€-end", "x".repeat(LIMIT - 7)));
+        assert!(long.truncated);
+    }
+
+    #[test]
+    fn excerpts_bound_lossy_expansion() {
+        let invalid = [0xffu8; 3 * LIMIT];
+        let contiguous = excerpt(&[("stdout", &invalid[..LIMIT + 10])]);
+        assert_eq!(contiguous.head, "\u{fffd}".repeat(LIMIT / 3));
+        assert_eq!(contiguous.tail, "\u{fffd}".repeat(LIMIT / 3));
+        assert!(contiguous.truncated);
+        let cut = excerpt(&[("stdout", &invalid)]);
+        assert_eq!(cut.head, "\u{fffd}".repeat(LIMIT / 3));
+        assert_eq!(cut.tail, "\u{fffd}".repeat(LIMIT / 3));
+        assert!(cut.truncated);
     }
 }
