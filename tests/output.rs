@@ -15,7 +15,7 @@ fn events(output: &std::process::Output) -> Vec<serde_json::Value> {
 #[test]
 fn output_is_prefixed_and_optional_logs_preserve_raw_streams() {
     let p = Project::new("[[jobs]]\nname='../unsafe/name'\ncommand=\"printf 'hello\\\\nlast'; printf 'error\\\\n' >&2\"");
-    let output = p.run(&["--log-dir", "logs"]);
+    let output = p.run(&["--output=stream", "--log-dir", "logs"]);
     success(&output);
     assert!(stdout(&output).contains("[../unsafe/name stdout] hello"));
     assert!(stdout(&output).contains("[../unsafe/name stderr] error"));
@@ -223,7 +223,7 @@ command = """printf 'EARLY'; head -c 10000 /dev/zero | tr '\\000' x; printf 'OUT
         .collect();
     assert_eq!(full.len(), 10012);
     assert!(full.starts_with("EARLY"));
-    let output = p.run(&[]);
+    let output = p.run(&["--output=stream", "--log-dir", "logs"]);
     let text = stdout(&output);
     let header = text.find("\ndefault  FAILED  in ").expect("report header");
     let failures = text.find("\nFailures\n").unwrap();
@@ -237,10 +237,24 @@ command = """printf 'EARLY'; head -c 10000 /dev/zero | tr '\\000' x; printf 'OUT
     );
     assert!(!text[..header].contains("  command: "), "{text}");
     assert_eq!(text[failures..].matches("  command: ").count(), 1, "{text}");
-    // Output tails are JSON-only; the text report never repeats output.
-    assert!(!text[header..].contains(" tail"), "{text}");
-    for tail in ["OUT-END\n", "ERR-END\n"] {
-        assert!(!text[failures..].contains(tail), "{text}");
+    // Even in stream mode the Failures entry names the job's log files and
+    // repeats its bounded output tails.
+    for (stream, tail) in [
+        ("stdout", "x".repeat(4089) + "OUT-END"),
+        ("stderr", "y".repeat(4089) + "ERR-END"),
+    ] {
+        let prefix = format!("\n  {stream} log: ");
+        let at = text[failures..].find(&prefix).expect("log path") + failures + prefix.len();
+        let path = text[at..].lines().next().unwrap();
+        assert!(path.ends_with(&format!("/001-fail.{stream}.log")), "{text}");
+        let log = std::fs::read_to_string(p.dir.join(path)).unwrap();
+        assert!(log.ends_with(&tail[4000..]), "{log}");
+        assert!(
+            text[failures..].contains(&format!(
+                "\n  {stream} (earlier output omitted):\n    {tail}\n"
+            )),
+            "{text}"
+        );
     }
 }
 
@@ -511,7 +525,7 @@ fn text_output_names_instances_and_the_summary_counts_them() {
     let p = Project::new(
         "[[jobs]]\nname='compile'\ncommand='true'\n[[jobs]]\nname='test'\npartitions=3\ndepends_on=['compile']\ncommand='echo $GOODFLOWS_PARTITION'\n",
     );
-    let output = p.run(&[]);
+    let output = p.run(&["--output=stream"]);
     success(&output);
     let text = stdout(&output);
     assert!(text.contains("jobs=4"), "{text}");
@@ -536,8 +550,10 @@ fn text_output_names_instances_and_the_summary_counts_them() {
     assert!(!text.contains("Summary:") && !text.contains("All jobs passed"));
 
     let p = Project::new(
-        "[settings]\nfail_fast=false\n[[jobs]]\nname='test'\npartitions=3\ncommand='if [ $GOODFLOWS_PARTITION = 2 ]; then echo boom-$GOODFLOWS_PARTITION >&2; exit 3; fi'\n",
+        "[settings]\nfail_fast=false\n[[jobs]]\nname='test'\npartitions=3\ncommand='echo ok-$GOODFLOWS_PARTITION; if [ $GOODFLOWS_PARTITION = 2 ]; then echo boom-$GOODFLOWS_PARTITION >&2; exit 3; fi'\n",
     );
+    // Piped stdout defaults to the failures mode: no output from passing
+    // instances, only the failure's output in its Failures entry.
     let output = p.run(&[]);
     assert_eq!(output.status.code(), Some(1));
     let text = stdout(&output);
@@ -549,8 +565,8 @@ fn text_output_names_instances_and_the_summary_counts_them() {
         assert!(text.contains(line), "missing {line:?}: {text}");
     }
     let header = text.find("\ndefault  FAILED  in ").expect("report header");
-    // Neither the live failure block nor the report repeats output tails.
-    assert!(!text.contains("stderr tail"), "{text}");
+    assert!(!text.contains("ok-1") && !text.contains("ok-3"), "{text}");
+    assert!(!text[..header].contains("boom-2"), "{text}");
     let report = &text[header..];
     let rows: Vec<_> = report.lines().filter(|l| l.starts_with("  ")).collect();
     assert!(rows[0].starts_with("  FAIL  test "), "{report}");
@@ -561,16 +577,24 @@ fn text_output_names_instances_and_the_summary_counts_them() {
         entry.starts_with("\nFailures\n--- test (2/3)  FAILED  exit 3\n"),
         "{report}"
     );
-    assert!(!entry.contains("boom-2"), "{report}");
+    assert!(
+        entry.contains("\n  stdout:\n    ok-2\n  stderr:\n    boom-2\n"),
+        "{report}"
+    );
     assert!(!entry.contains("test (1/3)") && !entry.contains("test (3/3)"));
     // The report is the last stdout text and ends with the rerun hint.
     assert!(
         text.ends_with("\nRerun failed: goodflows run default --jobs=test\n"),
         "{text}"
     );
+    // `--output=stream` streams every instance's output again.
+    let text = stdout(&p.run(&["--output=stream"]));
+    for line in ["[test (1/3) stdout] ok-1\n", "[test (2/3) stderr] boom-2\n"] {
+        assert!(text.contains(line), "missing {line:?}: {text}");
+    }
 
     let p = Project::new(PARTITIONED);
-    let text = stdout(&p.run(&["--jobs", "stepped"]));
+    let text = stdout(&p.run(&["--jobs", "stepped", "--output=stream"]));
     for index in 1..=2 {
         for line in [
             format!("  → stepped ({index}/2)/unit\n"),
