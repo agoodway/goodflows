@@ -760,7 +760,7 @@ mod tests {
                 Err("unsupported_field"),
             ),
             (Format, json!("test-timings/1"), Ok(())),
-            (Format, json!("exunit-timings"), Err("unsupported_format")),
+            (Format, json!("junit"), Err("unsupported_format")),
             (Format, json!("test-timings/2"), Err("unsupported_format")),
         ];
         for (ty, value, expected) in cases {

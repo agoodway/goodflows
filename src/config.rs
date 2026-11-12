@@ -1548,15 +1548,6 @@ fn validate_reports(job: &Job, reporting: bool) -> Result<()> {
     }
     let mut seen = HashSet::new();
     for format in &job.reports {
-        if format == "exunit-timings" {
-            bail!(
-                "reports: format 'exunit-timings' was retired (supported: {REPORT_FAMILY}); \
-                 use reports = [\"{REPORT_FAMILY}\"] and install the ExUnit reporter \
-                 (goodflows_exunit_reporter, Goodflows.ExUnitReporter); \
-                 see README.md, \"Upgrading from exunit-timings\" \
-                 (https://github.com/agoodway/goodflows#upgrading-from-exunit-timings)"
-            );
-        }
         if format != REPORT_FAMILY {
             bail!(
                 "reports: unsupported format '{}' (supported: {REPORT_FAMILY})",
@@ -1882,15 +1873,6 @@ mod tests {
             )
         };
         assert!(validate(&config("['test-timings']")).is_ok());
-        let error = validate(&config("['exunit-timings']")).unwrap_err();
-        assert_eq!(
-            error,
-            "job 'test': reports: format 'exunit-timings' was retired (supported: test-timings); \
-             use reports = [\"test-timings\"] and install the ExUnit reporter \
-             (goodflows_exunit_reporter, Goodflows.ExUnitReporter); \
-             see README.md, \"Upgrading from exunit-timings\" \
-             (https://github.com/agoodway/goodflows#upgrading-from-exunit-timings)"
-        );
         let error = validate(&config("['test-timings/1']")).unwrap_err();
         assert!(
             error.contains("unsupported format") && error.contains("(supported: test-timings)"),
