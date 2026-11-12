@@ -1,6 +1,66 @@
 # goodflows
 
-goodflows runs the jobs in a `goodflows.toml` file. A job is a shell command, a list of steps, or a call to another workflow in the same file. A job starts after every name in its `depends_on` list has passed. Ready jobs run at the same time, up to the parallelism limit. The run prints what passed, failed, timed out, or was skipped.
+goodflows runs the jobs in a `goodflows.toml` file. A job is a shell command, a list of steps, or a call to another workflow in the same file. A job starts after every job in its `depends_on` list has passed, and ready jobs run at the same time, up to the parallelism limit. The run prints what passed, failed, timed out, or was skipped.
+
+## TLDR
+
+```bash
+cargo install --git https://github.com/agoodway/goodflows.git --locked  # install (Rust 1.88+)
+
+goodflows init                     # write a goodflows.toml for this project
+goodflows validate                 # check the config without running anything
+goodflows list                     # print each job, its dependencies, and its settings
+goodflows                          # run the default workflow
+goodflows run ci                   # run the workflow named ci
+goodflows --jobs test              # run test and the jobs it depends on
+goodflows --env ci                 # apply the ci profile's settings
+goodflows --json=summary           # print JSON Lines that end with a summary event
+
+goodflows last                     # print the last run's report again, and exit with its exit code
+goodflows run --failed             # rerun the jobs that failed last time
+
+id=$(goodflows run --detach)       # start a run in the background and print its id
+goodflows status "$id"             # print which jobs are running, passed, or failed
+goodflows wait "$id" --timeout 90  # wait for the run, and exit 75 if it is still going
+goodflows cancel "$id"             # stop the run
+
+goodflows agents                   # print the guide for coding agents
+goodflows skills install           # install the agent skills into this repository
+goodflows mcp                      # serve goodflows to a coding agent over MCP
+```
+
+A minimal `goodflows.toml`:
+
+```toml
+[[jobs]]
+name = "fmt"
+command = "cargo fmt --check"
+
+[[jobs]]
+name = "test"
+command = "cargo test --locked"
+depends_on = ["fmt"]
+
+[[jobs]]
+name = "lint"
+command = "cargo clippy --locked --all-targets -- -D warnings"
+depends_on = ["fmt"]
+```
+
+`fmt` runs first. After it passes, `test` and `lint` run at the same time.
+
+Exit code 0 means every job passed or was skipped. Exit code 1 means a job failed or timed out. Exit code 2 means the command line or the config is wrong. `last` and `wait` exit with the exit code of the run they report. The [exit code table](#configuration) has the rest.
+
+goodflows keeps local state, such as the last run record and detached runs, in a `.goodflows/` directory. It writes a `.gitignore` there, so git ignores that directory without a change to your own `.gitignore`.
+
+### For agents
+
+- Run `goodflows agents` first. It prints the exit codes, error codes, and JSON fields for the installed version.
+- Run `goodflows --json=summary`. The last line is a `summary` event, and its `success` field is true when the run passed. Each failed job in it carries the start and end of its output.
+- When a run or another command cannot do what it was asked, goodflows prints one `error` event. Its `code`, such as `config_invalid` or `unknown_job`, does not change between releases. Branch on `code`, not on `message`.
+- `goodflows last` shows the last run's failures again and exits with that run's exit code. After a fix, run `goodflows run --failed` to rerun only the failed jobs and the jobs they depend on.
+- If your shell stops commands after a few minutes, start the run with `goodflows run --detach`. Then call `goodflows wait <id> --timeout 90` until the exit code is not 75. `goodflows cancel <id>` stops it.
+- `goodflows skills install` adds skills that teach the next agent to run this repository's checks. `goodflows mcp` offers `run` (with `detach`), `wait`, `status`, `cancel`, `last`, `validate`, and `list` as MCP tools.
 
 ## Install
 
@@ -10,34 +70,15 @@ With Rust 1.88 or newer:
 cargo install --git https://github.com/agoodway/goodflows.git --locked
 ```
 
-Release archives for Linux and macOS, `x86_64` and `aarch64`, are on [GitHub Releases](https://github.com/agoodway/goodflows/releases). v0.7.0 publishes these names. [`.github/workflows/release.yml`](.github/workflows/release.yml) builds the same four targets:
-
-- `goodflows-v<VERSION>-x86_64-unknown-linux-gnu.tar.gz`
-- `goodflows-v<VERSION>-aarch64-unknown-linux-gnu.tar.gz`
-- `goodflows-v<VERSION>-x86_64-apple-darwin.tar.gz`
-- `goodflows-v<VERSION>-aarch64-apple-darwin.tar.gz`
-
-Each archive has a `.sha256` file next to it. The release also includes `SHA256SUMS`, which is those checksum files concatenated. An archive contains `goodflows`, `README.md`, and `LICENSE` at the top level.
-
-Run these in the directory that contains the archive and the `.sha256` file:
+[GitHub Releases](https://github.com/agoodway/goodflows/releases) also has archives for Linux and macOS, on `x86_64` and `aarch64`. Check the archive against its `.sha256` file, unpack it, and put `goodflows` on your `PATH`:
 
 ```bash
 sha256sum -c goodflows-v0.7.0-x86_64-unknown-linux-gnu.tar.gz.sha256
 tar -xzf goodflows-v0.7.0-x86_64-unknown-linux-gnu.tar.gz
-mkdir -p ~/.local/bin
 install -m 755 goodflows ~/.local/bin/goodflows
 ```
 
-On macOS, `shasum -a 256 -c` checks the same `.sha256` file.
-
-Linux archives are linked with Rust 1.88.0 in Debian 12 (`debian:bookworm-slim`). [`scripts/package-release.sh`](scripts/package-release.sh) rejects a binary whose glibc symbol versions are newer than 2.36, the glibc in Debian 12 and in Ampcode orbs. The v0.6.0 Linux archives require glibc 2.34. On both `x86_64-unknown-linux-gnu` and `aarch64-unknown-linux-gnu`, the highest versioned glibc symbol is GLIBC_2.34. A later release can require a glibc up to 2.36. There is no musl archive. For musl, or for a glibc older than the archive you downloaded requires, build from source on that system:
-
-```bash
-cargo build --release --locked
-install -m 755 target/release/goodflows ~/.local/bin/goodflows
-```
-
-Jobs run with `sh -c` unless the job sets `shell = false`. With `shell = false`, goodflows splits the command with shell quoting rules and executes it directly. There is no globbing and no variable expansion. Stdin is closed.
+The v0.6.0 Linux archives need glibc 2.34 or newer. [docs/install.md](docs/install.md) lists every archive name and covers checksums, glibc, and building from source for musl.
 
 ## Quick start
 
@@ -96,7 +137,9 @@ depends_on = ["fmt"]
 
 `parallelism` is how many command and step jobs may run at once. `0`, or leaving it out, uses the logical CPU count. `fail_fast` defaults to true. After a failure, goodflows starts no further jobs, and jobs that have already started run to completion. `workdir` is relative to the config file, must already exist, and defaults to the config file's directory.
 
-Unknown keys are rejected. The whole file is checked before any command runs. `goodflows validate` reports every problem it finds in one pass. A file that is not valid TOML, or that has an unknown key, reports only that first error, because parsing stops there.
+Jobs run with `sh -c` unless the job sets `shell = false`. With `shell = false`, goodflows splits the command with shell quoting rules and executes it directly. There is no globbing and no variable expansion. Stdin is closed.
+
+goodflows rejects unknown keys. It checks the whole file before any command runs. `goodflows validate` reports every problem it finds in one pass. A file that is not valid TOML, or that has an unknown key, reports only that first error, because parsing stops there.
 
 Environment values are literal strings. Layers merge by key, and a later layer replaces the same key: the calling process, `[settings.env]`, the workflow's `settings.env`, the selected profile's `settings.env`, the job's `env`, then the step's `env`.
 
@@ -213,19 +256,19 @@ goodflows run release --jobs publish
 
 That command runs `prepare`, `checks`, and `publish`. The `checks` call runs every job in `ci`. `--jobs` filters only the workflow you named.
 
-A call job accepts `name`, `depends_on`, and `condition`. It rejects `timeout_secs`, `partitions`, `env`, `outputs`, `reports`, and `shell = false`. It publishes no outputs, so `needs.checks.outputs...` is rejected. A job has one of `command`, nonempty `steps`, or `workflow`.
+A call job accepts `name`, `depends_on`, and `condition`. It rejects `timeout_secs`, `partitions`, `env`, `outputs`, `reports`, and `shell = false`. It publishes no outputs, so goodflows rejects `needs.checks.outputs...`. A job has one of `command`, nonempty `steps`, or `workflow`.
 
 `depends_on` is the only ordering. A job with no dependency path to a call can run while that call runs. The call waits until the called workflow finishes, including that workflow's reporting. The call passes when the called workflow passes. Jobs skipped inside it by a condition or a dependency do not fail the call. The call fails when a job inside it fails or times out. A false condition skips the call and does not start the workflow. A failed or skipped call skips its own dependents.
 
 Each call is its own run. Calling `ci` twice runs `ci` twice. Nothing is cached. Called workflows share the working tree, so give them `depends_on` when their writes must not overlap.
 
-Cycles are rejected before anything runs. That check includes workflows you did not select and calls behind a false condition. A workflow that calls itself is a cycle. A named workflow may call `default`.
+goodflows rejects cycles before anything runs. That check includes workflows you did not select and calls behind a false condition. A workflow that calls itself is a cycle. A named workflow may call `default`.
 
 The called workflow resolves settings the same way `goodflows run <workflow>` does: `[settings]`, then its own workflow settings, then the `--env` profile and the CLI flags. It does not inherit settings that exist only on the caller. The root parallelism limit counts command and step jobs in the caller and in every workflow it calls. A called workflow can set a lower limit for its own jobs. A call that is waiting does not use a slot.
 
 When the run includes a call, live lines prefix the job with the workflow name and the first eight characters of that run's id. A called run's report names the call job and the parent run id. The root report is last. It is the only report with a rerun line.
 
-Call-aware JSON events carry `invocation_id`, `parent_run_id`, `caller_job`, and `child_run_id`. Fail-fast, cancellation, log paths, and history records for calls are pinned by [`tests/workflows.rs`](tests/workflows.rs).
+Call-aware JSON events carry `invocation_id`, `parent_run_id`, `caller_job`, and `child_run_id`. The tests in [`tests/workflows.rs`](tests/workflows.rs) pin fail-fast, cancellation, log paths, and history records for calls.
 
 ### Conditional jobs
 
@@ -241,7 +284,7 @@ condition = { shell = "test -f package.json" }
 command = "npm test"
 ```
 
-A condition is checked after the job's dependencies pass. An expression must evaluate to a boolean. `false` skips the job with `condition expression was false`. A non-boolean result fails the job. There is no implicit truthiness, so the string `"false"` is not a boolean. A shell condition that exits nonzero skips the job. A skip does not fail the run. Jobs that depend on the skipped job are skipped.
+goodflows checks a condition after the job's dependencies pass. An expression must evaluate to a boolean. `false` skips the job with `condition expression was false`. A non-boolean result fails the job. There is no implicit truthiness, so the string `"false"` is not a boolean. A shell condition that exits nonzero skips the job. A skip does not fail the run. goodflows also skips the jobs that depend on a skipped job.
 
 Expressions can read `env.NAME`, `needs.JOB.outputs.KEY` for a job listed in `depends_on`, and `steps.ID.outputs.KEY` in a later step of the same job. `??` replaces an unset value. Operators are `!`, `<`, `<=`, `>`, `>=`, `==`, `!=`, `&&`, `||`, and parentheses. `&&` and `||` evaluate the right side only when the left side does not decide the result.
 
@@ -371,7 +414,7 @@ goodflows run --failed
 
 `goodflows last` prints the last run's report again without running anything: each job's status, the Failures section with the command, error, log file paths, and output tails, and the `Rerun failed:` hint. A run that called workflows shows each called workflow's report before the root's, as the run did. With `--json`, it emits the run's `summary` events unchanged. It exits with the run's exit code: 0 when it passed, 1 when a job failed or timed out, and 130 or 143 when a signal stopped it. The log files exist only if that run used `--log-dir`, and only until `log_runs` prunes them.
 
-`goodflows run --failed` reruns the jobs that the last run's `Rerun failed:` hint names, plus the jobs they depend on. It uses the last run's workflow and `--env`. Those are the failed and timed-out jobs and the jobs skipped because a dependency did not pass. A workflow or `--env` given with `--failed` must match the last run's. `--failed` rejects `--jobs` and `--sprite`. Other run flags, such as `--log-dir` and `--history`, apply as usual. A job whose name contains a comma is rerun too, though the hint cannot select it.
+`goodflows run --failed` reruns the jobs that the last run's `Rerun failed:` hint names, plus the jobs they depend on. Those are the failed and timed-out jobs and the jobs skipped because a dependency did not pass. It uses the last run's workflow and `--env`. A workflow or `--env` given with `--failed` must match the last run's. `--failed` rejects `--jobs` and `--sprite`. Other run flags, such as `--log-dir` and `--history`, apply as usual. A job whose name contains a comma is rerun too, though the hint cannot select it.
 
 When there is no record, both commands exit 2 with `no_last_run`. `run --failed` exits 2 with `no_failed_jobs` when the last run has nothing to rerun. A run that stops before its summary, such as one with a config error, leaves the previous record in place. `run --sprite` writes no record.
 
@@ -411,7 +454,7 @@ Turn history on where the machine stays comparable from run to run, such as the 
 goodflows-history/** text eol=lf linguist-generated
 ```
 
-Or add `goodflows-history/` to `.gitignore`. The record layout is defined in [`src/history.rs`](src/history.rs).
+Or add `goodflows-history/` to `.gitignore`. [`src/history.rs`](src/history.rs) defines the record layout.
 
 #### Uploading run history
 
@@ -431,7 +474,7 @@ The record holds the same fields the history file would hold: outcome, timings, 
 - `ci`, when the caller's environment has `GITHUB_ACTIONS=true`. It is built from `GITHUB_EVENT_NAME`, `GITHUB_RUN_ID`, `GITHUB_RUN_ATTEMPT`, `GITHUB_REF`, `RUNNER_NAME`, `GITHUB_SERVER_URL`, and `GITHUB_REPOSITORY`. A value that fails its rule is left out. Settings and job `env` never supply these values.
 - `graph`, the job graph that `graph_sha256` hashes. It lists every selected job with its command, step commands, and condition text, each cut to 1,024 bytes. That includes jobs that were skipped or never started, so the server receives command text for jobs that did not run. A workflow-call job names its target and the target's hash. The target's jobs are in the called workflow's own record.
 
-The key and URL variables must be set when the run starts. When either is unset, the run prints `run history for <workflow> upload skipped: credentials unavailable`, keeps nothing, and sends nothing. Leave the key unset on machines that should not upload, such as laptops. A URL that is not a valid endpoint gives `invalid url` instead. A record that breaks the server's rules, such as a job name longer than 64 bytes, is not sent: the line ends `upload skipped: invalid record at <path>`, where `<path>` is a field path such as `results[3].name`.
+The key and URL variables must be set when the run starts. When either is unset, the run prints `run history for <workflow> upload skipped: credentials unavailable`, keeps nothing, and sends nothing. Leave the key unset on machines that should not upload, such as laptops. A URL that is not a valid endpoint gives `invalid url` instead. goodflows does not send a record that breaks the server's rules, such as a job name longer than 64 bytes. The line then ends `upload skipped: invalid record at <path>`, where `<path>` is a field path such as `results[3].name`.
 
 The upload runs after the test reports, before the final report, and uses what is left of the same 30-second budget. It never changes the exit code. A record that was not stored stays in the spool, and [`reports upload`](#test-timing-reports) sends it again. That includes a record refused with HTTP 422 by a server that does not accept it yet.
 
@@ -448,7 +491,7 @@ goodflows history show <run-id>
 
 ### Test timing reports
 
-goodflows can collect `test-timings/1` JSON Lines and upload them to a GoodFlows server. Nothing is uploaded unless you add `[reporting]` and a job lists `reports`, or the block sets [`history = true`](#uploading-run-history).
+goodflows can collect `test-timings/1` JSON Lines and upload them to a GoodFlows server. goodflows uploads nothing unless you add `[reporting]` and a job lists `reports`, or the block sets [`history = true`](#uploading-run-history).
 
 ```toml
 [reporting]
@@ -477,11 +520,11 @@ goodflows reports upload .goodflows/reports/<run-id> --budget 120
 
 `--budget` is the publishing time limit in seconds, from 1 to 3600. The default is 30.
 
-With [`[reporting] history = true`](#uploading-run-history), and the key and URL set, each invocation's run directory is created even when no job lists `reports`. It holds `run-record.json`, the exact run record to send, and the manifest is version 3. Without a run record the manifest is version 1, or version 2 when a job is partitioned. `reports upload` sends the reports first, then the run record within the same budget. When the server stores the record, it writes `run-record.ack.json` and later replays send nothing for it. HTTP 400, 409, and 415 write `run-record.rejected.json` and the record is not sent again. HTTP 413 and 422 leave it pending, so the next `reports upload` sends it again. `reports upload` exits nonzero while the record is pending, rejected, or invalid, and its text output ends with `Run history: acknowledged`, `pending`, `rejected`, or `invalid`. A tampered, missing, or symlinked `run-record.json`, or one whose run id, workflow, or environment differs from the manifest, counts as invalid. Older goodflows releases refuse a version 3 manifest as an unsupported version.
+With [`[reporting] history = true`](#uploading-run-history), and the key and URL set, goodflows creates each invocation's run directory even when no job lists `reports`. It holds `run-record.json`, the exact run record to send, and the manifest is version 3. Without a run record the manifest is version 1, or version 2 when a job is partitioned. `reports upload` sends the reports first, then the run record within the same budget. When the server stores the record, it writes `run-record.ack.json` and later replays send nothing for it. HTTP 400, 409, and 415 write `run-record.rejected.json`, and goodflows does not send the record again. HTTP 413 and 422 leave it pending, so the next `reports upload` sends it again. `reports upload` exits nonzero while the record is pending, rejected, or invalid, and its text output ends with `Run history: acknowledged`, `pending`, `rejected`, or `invalid`. A tampered, missing, or symlinked `run-record.json`, or one whose run id, workflow, or environment differs from the manifest, counts as invalid. Older goodflows releases refuse a version 3 manifest as an unsupported version.
 
-The wire format is defined in [`src/reporting/contract.rs`](src/reporting/contract.rs). Each reporter's setup and behavior are in its README: [ExUnit](reporters/exunit/README.md) and [Jest](reporters/jest/README.md).
+[`src/reporting/contract.rs`](src/reporting/contract.rs) defines the wire format. Each reporter's README covers its setup and behavior: [ExUnit](reporters/exunit/README.md) and [Jest](reporters/jest/README.md).
 
-Reporters are versioned on their own. Pin a tag. Every release writes `test-timings/1`, which goodflows v0.6.0 and later accept. v0.6.0 is the tag in this repository.
+Each reporter has its own version. Pin a tag. Every release writes `test-timings/1`, which goodflows v0.6.0 and later accept. v0.6.0 is the tag in this repository.
 
 ExUnit (Elixir 1.18 or newer), from [agoodway/goodflows-exunit-reporter](https://github.com/agoodway/goodflows-exunit-reporter):
 
@@ -507,10 +550,6 @@ module.exports = { reporters: ['default', 'goodflows-jest-reporter'] };
 ```
 
 Other runners can write `test-timings/1` themselves. The suite id for the ExUnit reporter is the `:test_timing_suite_id` option, or `TEST_TIMING_SUITE_ID`.
-
-#### Upgrading from `exunit-timings`
-
-Change `reports = ["exunit-timings"]` to `reports = ["test-timings"]` and replace a copied `GC.TestTimingFormatter` with `Goodflows.ExUnitReporter`. The server must accept `test-timings/1`. Snapshots already stored in the old format are not uploaded.
 
 ### Sprites
 
@@ -561,19 +600,7 @@ You need the Sprite CLI on `PATH`, a Git repository, and an organization (`SPRIT
 
 ### Ampcode orbs
 
-Commit `goodflows.toml` at the repository root. Add an executable `.agents/setup` that installs a release archive into `/usr/local/bin`, plus any toolchains the jobs need. Orbs already provide Git, Node.js, Python, `gh`, and `amp`. Tell the agent to run it from `AGENTS.md`:
-
-```markdown
-## Checks
-
-Run `goodflows` from the repository root before finishing.
-`goodflows --json=summary` prints JSON Lines. The final `summary` event has `success`.
-Fix failures and rerun until `success` is true.
-```
-
-Ampcode snapshots the disk after setup succeeds. After you change `.agents/setup`, run `amp projects snapshots delete <project>` so the next thread installs again. Leave `parallelism` unset to use the orb's CPU count. The Linux release binary is linked for Debian 12's glibc, which the orbs provide.
-
-[`.amp/plugins/goodflows.ts`](.amp/plugins/goodflows.ts) registers two palette commands, GoodFlows: Run and GoodFlows: Cancel. Run executes the default workflow, or asks you to pick one, and sends failures to the agent. Cancel stops the goodflows process. Copy the file to a project's `.amp/plugins/` or to `~/.config/amp/plugins/`, then run plugins: reload.
+goodflows runs in Ampcode orbs. Install a release archive from `.agents/setup`, and tell the agent in `AGENTS.md` to run `goodflows --json=summary` before it finishes. [docs/ampcode.md](docs/ampcode.md) has the setup script, the snapshot step, and the Amp palette plugin.
 
 ## Agent skills
 
@@ -637,21 +664,12 @@ A client may stop a tool call that takes longer than its tool timeout. For a run
 
 When goodflows cannot do what a tool asks, such as for a config or usage error or an unknown `run_id`, the tool result is an error (`isError`) with the exit code and goodflows's message. Cancelling a call sends its goodflows process SIGTERM, which cancels a blocking run's jobs as Ctrl-C would. Cancelling a `wait` call does not stop the detached run; use `cancel` for that. `goodflows mcp` rejects `--json` and the run-only flags; pass them as tool parameters instead.
 
-## Development
+## More docs
 
-```bash
-cargo fmt --check
-cargo clippy --locked --all-targets -- -D warnings
-cargo test --locked
-node --test tests/amp-plugin.test.mjs
-```
+- [docs/install.md](docs/install.md) lists the release archives and covers checksums, glibc, and building from source.
+- [docs/sprites.md](docs/sprites.md) explains remote runs on Sprites: snapshots, ownership, recovery, and collection.
+- [docs/ampcode.md](docs/ampcode.md) sets up goodflows in Ampcode orbs and installs the Amp palette plugin.
+- [docs/development.md](docs/development.md) has the checks to run when you change goodflows, and the Cursor cloud agent environment.
+- [docs/releasing.md](docs/releasing.md) has the release steps for the CLI and each reporter.
 
-The Node test needs Node.js 22.18 or newer, and `cargo build` first, because it runs `target/debug/goodflows`. CI on this repository also runs `./target/release/goodflows`, which executes `goodflows.toml`.
-
-### Cursor cloud agents
-
-[`.cursor/environment.json`](.cursor/environment.json) is the cloud agent environment for this repository. The image installs Rust 1.88.0 with rustfmt and clippy, Elixir 1.18.6 on Erlang/OTP 27.3.4.19, and Node.js 24.22.2. [`.cursor/install.sh`](.cursor/install.sh) fetches Cargo, Mix, and Jest fixture dependencies when an environment build runs.
-
-To change a toolchain, edit the version and checksum in [`.cursor/Dockerfile`](.cursor/Dockerfile) and keep them aligned with `Cargo.toml` (`rust-version`), `scripts/sprite-setup.sh`, `reporters/exunit/mix.exs`, and the versions in `.github/workflows/ci.yml` and `.github/workflows/reporters.yml`. The next environment build uses the updated file. Nothing in this repo needs a process kept running, so the environment sets no `start` command.
-
-Behavior that this file and [`docs/`](docs/) do not spell out is defined by the code and pinned by the tests in [`tests/`](tests/). Release steps for the CLI and for each reporter are in [docs/releasing.md](docs/releasing.md).
+When this README and `docs/` say nothing about a behavior, the code defines it and the tests in [`tests/`](tests/) pin it.

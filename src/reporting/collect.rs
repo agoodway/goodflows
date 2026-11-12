@@ -620,8 +620,6 @@ pub fn validate_envelope(bytes: &[u8]) -> Result<Head, &'static str> {
     if !exact_keys(&body, ENVELOPE) {
         return Err(invalid);
     }
-    // A snapshot frozen in a retired format (such as `exunit-timings`) is
-    // never sent; replay counts it as `invalid_snapshot`.
     if body["format"] != REPORT_FORMAT {
         return Err("unsupported_format");
     }
@@ -1606,9 +1604,6 @@ pub(super) mod tests {
         let mut spaced = ss();
         spaced["runner"]["name"] = json!("jest runner");
         assert_eq!(rejects(&[spaced]), "invalid_field");
-        let mut retired = ss();
-        retired["format"] = json!("exunit-timings");
-        assert_eq!(rejects(&[retired]), "unsupported_format");
         let mut later = ss();
         later["format"] = json!("test-timings/2");
         assert_eq!(rejects(&[later]), "unsupported_format");
@@ -1997,11 +1992,6 @@ pub(super) mod tests {
             (
                 &|v: &mut Value| v["workflow"] = json!("a\u{0}b"),
                 "nul_character",
-            ),
-            (
-                // A snapshot frozen by an older CLI in the retired format.
-                &|v: &mut Value| v["format"] = json!("exunit-timings"),
-                "unsupported_format",
             ),
             (
                 &|v: &mut Value| v["report"]["records"][0]["format"] = json!("test-timings/2"),

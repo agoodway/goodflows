@@ -3929,7 +3929,7 @@ fn the_documented_recovery_sequence_returns_the_original_run() {
     let docs =
         std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/sprites.md"))
             .unwrap();
-    let block = docs.split("Recovery from any controller").nth(1).unwrap();
+    let block = docs.split("recover from any controller").nth(1).unwrap();
     let block = block
         .split("```bash")
         .nth(1)

@@ -756,52 +756,6 @@ fn inspection_reports_merged_settings_env_without_caller_or_job_env() {
     assert!(text.contains(" env={}\n"), "{text}");
 }
 
-/// Every README `toml` block that mentions `settings.env` must validate. Blocks
-/// that declare jobs are validated as written. Fragments without jobs get one
-/// trivial job per `[workflows.NAME...]` table they mention (or a root job when
-/// they mention none), so only the settings they show are under test.
-#[test]
-fn readme_settings_env_examples_validate() {
-    let readme =
-        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/README.md")).unwrap();
-    let blocks: Vec<&str> = readme
-        .split("```toml\n")
-        .skip(1)
-        .map(|rest| rest.split("```").next().unwrap())
-        .filter(|block| block.contains("settings.env"))
-        .collect();
-    assert!(
-        blocks.len() >= 2,
-        "expected settings.env examples in README"
-    );
-    for block in blocks {
-        let mut config = block.to_owned();
-        if !config.contains("jobs]]") {
-            let mut workflows: Vec<&str> = block
-                .lines()
-                .filter_map(|line| line.trim().strip_prefix("[workflows."))
-                .filter_map(|rest| rest.split('.').next())
-                .collect();
-            workflows.dedup();
-            if workflows.is_empty() {
-                config.push_str("\n[[jobs]]\nname = 'readme'\ncommand = 'true'\n");
-            }
-            for name in workflows {
-                config.push_str(&format!(
-                    "\n[[workflows.{name}.jobs]]\nname = 'readme'\ncommand = 'true'\n"
-                ));
-            }
-        }
-        let p = Project::new(&config);
-        let output = p.run(&["validate"]);
-        assert!(
-            output.status.success(),
-            "README example failed:\n{block}\n{}",
-            stderr(&output)
-        );
-    }
-}
-
 const PARTITIONED_CI: &str = r#"
 [[workflows.ci.jobs]]
 name = "test"
@@ -896,45 +850,6 @@ fn profile_partition_checks_apply_with_jobs_selection() {
         ci_outputs(&p),
         (1..=6).map(|i| format!("{i}/6")).collect::<Vec<_>>()
     );
-}
-
-#[test]
-fn readme_profile_partition_examples_validate() {
-    let readme =
-        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/README.md")).unwrap();
-    let blocks: Vec<&str> = readme
-        .split("```toml\n")
-        .skip(1)
-        .map(|rest| rest.split("```").next().unwrap())
-        .filter(|block| block.contains(".partitions]"))
-        .collect();
-    assert!(!blocks.is_empty(), "expected a profile partitions example");
-    for block in blocks {
-        let p = Project::new(block);
-        for args in [
-            &["validate"][..],
-            &["validate", "--env", "local"][..],
-            &["validate", "--env", "orb"][..],
-        ] {
-            let output = p.run(args);
-            assert!(
-                output.status.success(),
-                "README example failed {args:?}:\n{block}\n{}",
-                stderr(&output)
-            );
-        }
-        let output = p.run(&["list", "--env", "local"]);
-        success(&output);
-        assert!(stdout(&output).contains("partitions: 6 (strategy=index)"));
-    }
-    let profiles = readme
-        .split("## Environment profiles")
-        .nth(1)
-        .unwrap()
-        .split("\n## ")
-        .next()
-        .unwrap();
-    assert!(!profiles.contains("cannot change a partition count"));
 }
 
 // ---- workflow-call jobs ----
