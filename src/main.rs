@@ -574,7 +574,7 @@ pub(crate) struct Run {
     /// run; `None` locally.
     pub sprite_state: Option<String>,
     /// A remote Sprite run's snapshot provenance, the `source` of the root
-    /// and every child invocation (design D11); `None` locally.
+    /// and every child invocation; `None` locally.
     pub provenance: Option<reporting::Source>,
 }
 
@@ -896,7 +896,8 @@ async fn invocation(
     }
     if settings.history {
         // History covers the jobs only, not reporting uploads after them.
-        // A remote history file keeps the snapshot's branch (design D11).
+        // A remote history file keeps the snapshot's branch, and has none
+        // when the snapshot has none: there is no fallback such as `main`.
         match history::write(&target, &fields, execute_ms, &results, remote) {
             Ok(written) => {
                 // A prune failure still leaves the new file in place.

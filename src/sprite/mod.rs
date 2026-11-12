@@ -1025,7 +1025,7 @@ pub async fn run(
         resume,
         pass_env: sprite_config.pass_env.clone(),
         request,
-        // Captured from the archive itself; jobs never see it (design D11).
+        // Captured from the archive itself; jobs never see it.
         provenance: Provenance {
             commit: snap.source.as_ref().and_then(|s| s.commit.clone()),
             branch: snap.source.as_ref().and_then(|s| s.branch.clone()),
@@ -1553,7 +1553,7 @@ pub fn trusted_spool(
         bail!("spool names credential variables that differ from this invocation's configuration");
     }
     // A remote config that turned upload on cannot make the controller send
-    // command text its caller did not opt into (design D11).
+    // command text its caller did not opt into.
     if manifest.run_record.is_some() && !reporting.history {
         bail!("spool lists a run record, but this invocation's configuration does not set [reporting] history = true");
     }

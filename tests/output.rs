@@ -1205,7 +1205,7 @@ fn run_upload_events_are_versioned_json_lines() {
     }
 }
 
-// History read commands (design D9).
+// History read commands.
 
 const RUN_ID: &str = "fb7d2711-6b67-4f5a-9104-492032a9e1e5";
 const READER: &str =

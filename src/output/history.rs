@@ -1,4 +1,4 @@
-//! Text rendering of `history list` and `history show` (design D9).
+//! Text rendering of `history list` and `history show`.
 //!
 //! Every value comes from the server and is untrusted: each string passes
 //! through [`visible`], and a missing or null value prints as `-`.

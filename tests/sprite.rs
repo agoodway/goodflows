@@ -1590,6 +1590,25 @@ fn snapshot_covers_git_states_odd_paths_and_an_independent_manifest() {
 }
 
 #[test]
+fn a_detached_snapshot_records_no_branch() {
+    let fake = Fake::new(PLAIN);
+    git(&fake.project, &["checkout", "-q", "--detach"]);
+    let output = fake.run(&["run", "--sprite", "T-1", "--json", "--history"]);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let all = events(&output);
+    let provenance = fake.record(&run_id(&all))["provenance"].clone();
+    assert!(provenance["branch"].is_null(), "{provenance}");
+    let path = all.last().unwrap()["history_file"].as_str().unwrap();
+    let history: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    // No branch at all, never a fallback such as `main`.
+    assert_eq!(
+        history["source"],
+        serde_json::json!({"commit": provenance["commit"], "dirty": false}),
+        "{history}"
+    );
+}
+
+#[test]
 fn unsupported_source_entries_fail_before_any_remote_call() {
     type Prepare = Box<dyn Fn(&Fake)>;
     let cases: Vec<(&str, Prepare, &str)> = vec![
@@ -5750,7 +5769,7 @@ fn a_marker_left_by_a_worker_killed_after_its_terminal_record_is_cleared_on_admi
 }
 
 // ---------------------------------------------------------------------------
-// Run records (upload-run-history design D11).
+// Run records.
 
 const RUN_RECORDS: &str = r#"
 [settings]

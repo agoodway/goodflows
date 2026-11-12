@@ -495,7 +495,7 @@ pub fn record<'a>(
 
 /// Write the history file and prune its workflow directory. `duration_ms` is
 /// the time spent in `runner::execute`. `branch` keeps the source's branch,
-/// which only a remote Sprite invocation's file does (design D11). Any error
+/// which only a remote Sprite invocation's file does. Any error
 /// means nothing was written and the caller must omit `history_file`.
 pub fn write(
     target: &HistoryTarget,

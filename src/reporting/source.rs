@@ -69,7 +69,7 @@ pub async fn capture(workdir: &Path, token_env: Option<&str>) -> Source {
 pub enum Origin<'a> {
     /// A local checkout, captured with git when it is needed.
     Checkout(&'a Path),
-    /// A remote Sprite invocation (design D11): the controller's snapshot
+    /// A remote Sprite invocation: the controller's snapshot
     /// provenance, `None` when HEAD could not be read. The source tree there
     /// has no `.git`, so nothing is captured natively.
     Snapshot(Option<&'a Source>),
