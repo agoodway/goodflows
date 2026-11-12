@@ -332,10 +332,18 @@ Settings precedence is CLI flags, then the profile, then the workflow, then `[se
 
 The run ends with a report: one row per job, then counts, then a `Failures` section when something failed or timed out. In both modes each `Failures` entry shows the last 4 KiB of the instance's stdout and stderr, and the paths of its log files when `--log-dir` is set. The last line of a failed root run is `Rerun failed:` and a `goodflows run` command for the failed jobs and the jobs skipped because a dependency did not pass.
 
-`--json` prints JSON Lines on stdout. Every event has `schema_version` 1. The last event of a finished run has `"type":"summary"`. Its `success` field is true when every selected job passed or was skipped. Failed and timed-out jobs include `stdout_tail` and `stderr_tail`.
+`--json` prints JSON Lines on stdout. Every event has `schema_version` 1. The last event of a finished run has `"type":"summary"`. Its `success` field is true when every selected job passed or was skipped. `--json=summary` leaves out the events in between, such as one `job_output` event per output chunk. A run then prints only `run_started`, any `error` event, and the `summary`, plus `sprite_unresolved` when a Sprite run cannot report one. Other commands print the same events as with `--json`.
+
+Each failed or timed-out job in the summary has:
+
+- `output_head` and `output_tail`: the first and last 4 KiB of its stdout and stderr together, in the order goodflows read them. `output_truncated` is true when output between them was left out.
+- `stdout_tail` and `stderr_tail`: the last 4 KiB of each stream. `stdout_truncated` and `stderr_truncated` say whether earlier output was left out.
+
+With `--log-dir`, each job that ran has `stdout_log` and `stderr_log`, the paths of its log files. A failed root run's summary has `rerun_command`, the command on the report's `Rerun failed:` line, or on its `Rerun workflow:` line when a job name contains a comma.
 
 ```bash
-goodflows --json > results.jsonl
+goodflows --json=summary > results.jsonl
+goodflows --json > events.jsonl
 goodflows validate --json
 goodflows list --json
 ```
@@ -533,7 +541,7 @@ Commit `goodflows.toml` at the repository root. Add an executable `.agents/setup
 ## Checks
 
 Run `goodflows` from the repository root before finishing.
-`goodflows --json` prints JSON Lines. The final `summary` event has `success`.
+`goodflows --json=summary` prints JSON Lines. The final `summary` event has `success`.
 Fix failures and rerun until `success` is true.
 ```
 

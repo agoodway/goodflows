@@ -50,9 +50,9 @@ struct Cli {
     /// Run selected jobs and their transitive dependencies
     #[arg(long, global = true, value_delimiter = ',')]
     jobs: Vec<String>,
-    /// Emit versioned JSON Lines events to stdout
-    #[arg(long, global = true)]
-    json: bool,
+    /// Emit versioned JSON Lines events to stdout; `--json=summary` prints only a run's start, errors and summary
+    #[arg(long, global = true, value_enum, value_name = "EVENTS", num_args = 0..=1, require_equals = true, default_missing_value = "all")]
+    json: Option<output::Json>,
     /// Run text output [default: failures when stdout is not a terminal or a coding agent runs goodflows, else stream]
     #[arg(long, value_enum, value_name = "MODE")]
     output: Option<output::Mode>,
@@ -264,6 +264,11 @@ impl Cli {
         .unwrap_or_else(output::Mode::detect)
     }
 
+    /// Whether the command runs a workflow.
+    fn runs(&self) -> bool {
+        matches!(self.command, None | Some(Commands::Run { .. }))
+    }
+
     fn workflow(&self) -> Option<&str> {
         match &self.command {
             Some(
@@ -288,7 +293,9 @@ impl Cli {
 #[tokio::main]
 async fn main() -> ExitCode {
     let raw_args: Vec<_> = std::env::args_os().collect();
-    let json_requested = raw_args.iter().any(|arg| arg == "--json");
+    let json_requested = raw_args
+        .iter()
+        .any(|arg| arg == "--json" || arg.to_string_lossy().starts_with("--json="));
     let cli = match Cli::parse_from(raw_args) {
         Ok(cli) => cli,
         Err(error) => {
@@ -332,7 +339,11 @@ async fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let output = match Output::new(cli.json, cli.output_mode(), cancel.clone()) {
+    let output = match Output::new(cli.json.is_some(), cli.output_mode(), cancel.clone()) {
+        // Only a run has progress events to leave out.
+        Ok(output) if cli.json == Some(output::Json::Summary) && cli.runs() => {
+            output.summary_only()
+        }
         Ok(output) => output,
         Err(error) => {
             eprintln!("failed to initialize output: {error}");

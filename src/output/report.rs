@@ -221,14 +221,9 @@ pub(super) fn report(event: &Value, out: &mut impl Write) -> Result<()> {
     let log_dir = event["log_dir"].as_str();
     if failed {
         writeln!(out, "\nFailures")?;
+        let logs = log_dir.map(|dir| log_paths(results, dir));
         let mut first = true;
-        // Results are in selected job order, so a job's position among the
-        // distinct names is the index its log files are named by.
-        let mut job = 0;
         for (i, result) in results.iter().enumerate() {
-            if i > 0 && text(result, "name") != text(&results[i - 1], "name") {
-                job += 1;
-            }
             if !matches!(text(result, "status"), "failed" | "timed_out") {
                 continue;
             }
@@ -236,27 +231,13 @@ pub(super) fn report(event: &Value, out: &mut impl Write) -> Result<()> {
                 writeln!(out)?;
             }
             first = false;
-            failure(result, log_dir.map(|dir| (dir, job)), out)?;
+            let paths = logs.as_ref().and_then(|logs| logs[i].as_ref());
+            failure(result, paths, out)?;
         }
     }
 
     let history_file = event["history_file"].as_str();
-    let failed_rows = rows
-        .iter()
-        .any(|r| matches!(r.status, "failed" | "timed_out"));
-    // Failed jobs plus dependents skipped because a dependency did not pass;
-    // `--jobs` adds each selected job's prerequisites.
-    // Only the root report offers a rerun: rerunning a child directly would
-    // skip the preparation its caller runs first.
-    let rerun_jobs: Vec<&str> = rows
-        .iter()
-        .filter(|r| {
-            child.is_none()
-                && failed_rows
-                && (matches!(r.status, "failed" | "timed_out") || r.dependency_skipped)
-        })
-        .map(|r| r.name)
-        .collect();
+    let rerun_jobs = rerun_jobs(event, &rows);
     if log_dir.is_some() || history_file.is_some() || !rerun_jobs.is_empty() {
         writeln!(out)?;
     }
@@ -267,12 +248,7 @@ pub(super) fn report(event: &Value, out: &mut impl Write) -> Result<()> {
         writeln!(out, "History: {}", visible(file))?;
     }
     if !rerun_jobs.is_empty() {
-        let context = Rerun {
-            workflow: text(event, "workflow"),
-            environment: event["environment"].as_str(),
-            config: event[CONFIG].as_str(),
-            sprite: event[SPRITE].as_str(),
-        };
+        let context = Rerun::of(event, event[CONFIG].as_str(), event[SPRITE].as_str());
         match rerun_jobs.iter().find(|name| name.contains(',')) {
             Some(name) => {
                 writeln!(
@@ -288,10 +264,76 @@ pub(super) fn report(event: &Value, out: &mut impl Write) -> Result<()> {
     Ok(())
 }
 
+/// The jobs a root report's rerun selects: failed jobs plus dependents
+/// skipped because a dependency did not pass; `--jobs` adds each selected
+/// job's prerequisites. Only the root report offers a rerun: rerunning a
+/// child directly would skip the preparation its caller runs first.
+fn rerun_jobs<'a>(event: &Value, rows: &[Row<'a>]) -> Vec<&'a str> {
+    let failed = |row: &Row| matches!(row.status, "failed" | "timed_out");
+    if !event["parent_run_id"].is_null() || !rows.iter().any(failed) {
+        return Vec::new();
+    }
+    rows.iter()
+        .filter(|row| failed(row) || row.dependency_skipped)
+        .map(|row| row.name)
+        .collect()
+}
+
+/// Adds what the text report prints after the job rows to a JSON summary:
+/// each started command job's `stdout_log` and `stderr_log` under `log_dir`,
+/// and for a failed root run the `rerun_command` that the `Rerun failed:`
+/// line prints, or the `Rerun workflow:` line when a job name contains a
+/// comma.
+pub(super) fn add_report_fields(event: &mut Value, config: Option<&str>, sprite: Option<&str>) {
+    let results: &[Value] = event["results"].as_array().map_or(&[], Vec::as_slice);
+    let rows = rows(results);
+    let jobs = rerun_jobs(event, &rows);
+    let command = (!jobs.is_empty()).then(|| {
+        let selective = !jobs.iter().any(|name| name.contains(','));
+        Rerun::of(event, config, sprite).command(selective.then_some(&jobs[..]))
+    });
+    let logs = event["log_dir"].as_str().map(|dir| log_paths(results, dir));
+    if let Some(command) = command {
+        event["rerun_command"] = command.into();
+    }
+    let results = event["results"].as_array_mut().into_iter().flatten();
+    for (result, paths) in results.zip(logs.into_iter().flatten()) {
+        if let Some([stdout, stderr]) = paths {
+            result["stdout_log"] = stdout.into();
+            result["stderr_log"] = stderr.into();
+        }
+    }
+}
+
+/// Each result's stdout and stderr log paths under the run's log `dir`. Only
+/// a started command job has log files; a call's child has its own.
+fn log_paths(results: &[Value], dir: &str) -> Vec<Option<[String; 2]>> {
+    // Results are in selected job order, so a job's position among the
+    // distinct names is the index its log files are named by.
+    let mut job = 0;
+    results
+        .iter()
+        .enumerate()
+        .map(|(i, result)| {
+            if i > 0 && text(result, "name") != text(&results[i - 1], "name") {
+                job += 1;
+            }
+            if result["started"] != true || !result["workflow"].is_null() {
+                return None;
+            }
+            let partition = result["partition"]["index"].as_u64().map(|i| i as u32);
+            let stem = crate::runner::log_stem(job, text(result, "name"), partition);
+            Some(["stdout", "stderr"].map(|stream| {
+                let path = std::path::Path::new(dir).join(format!("{stem}.{stream}.log"));
+                path.to_string_lossy().into_owned()
+            }))
+        })
+        .collect()
+}
+
 /// One Failures entry for a failed or timed-out instance, with its log files
-/// when `logs` gives the run's log directory and the job's index, and its
-/// output tails.
-fn failure(result: &Value, logs: Option<(&str, usize)>, out: &mut impl Write) -> Result<()> {
+/// when the run has them, and its output tails.
+fn failure(result: &Value, logs: Option<&[String; 2]>, out: &mut impl Write) -> Result<()> {
     let status = if text(result, "status") == "timed_out" {
         "TIMED OUT"
     } else {
@@ -323,15 +365,9 @@ fn failure(result: &Value, logs: Option<(&str, usize)>, out: &mut impl Write) ->
     if let Some(error) = result["error"].as_str() {
         writeln!(out, "  error: {}", visible(error))?;
     }
-    // Only a started command job has log files; a call's child has its own.
-    if let Some((dir, index)) =
-        logs.filter(|_| result["started"] == true && result["workflow"].is_null())
-    {
-        let partition = result["partition"]["index"].as_u64().map(|i| i as u32);
-        let stem = crate::runner::log_stem(index, text(result, "name"), partition);
-        for stream in ["stdout", "stderr"] {
-            let path = std::path::Path::new(dir).join(format!("{stem}.{stream}.log"));
-            writeln!(out, "  {stream} log: {}", visible(&path.to_string_lossy()))?;
+    if let Some(paths) = logs {
+        for (stream, path) in ["stdout", "stderr"].iter().zip(paths) {
+            writeln!(out, "  {stream} log: {}", visible(path))?;
         }
     }
     for stream in ["stdout", "stderr"] {
@@ -364,7 +400,18 @@ struct Rerun<'a> {
     sprite: Option<&'a str>,
 }
 
-impl Rerun<'_> {
+impl<'a> Rerun<'a> {
+    /// The rerun context of the `summary` event with the explicit `--config`
+    /// path and Sprite identity, if any.
+    fn of(event: &'a Value, config: Option<&'a str>, sprite: Option<&'a str>) -> Self {
+        Self {
+            workflow: text(event, "workflow"),
+            environment: event["environment"].as_str(),
+            config,
+            sprite,
+        }
+    }
+
     /// `goodflows run` with the workflow, any config and environment and
     /// (optionally) jobs. Option values use equals form so a leading hyphen is
     /// never read as a flag; a workflow beginning with `-` goes last, after `--`.

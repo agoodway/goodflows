@@ -36,6 +36,19 @@ pub enum Mode {
     Stream,
 }
 
+/// Which JSON events `--json` prints.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum Json {
+    /// Every event (the default for a bare `--json`)
+    All,
+    /// For a run, only `run_started`, `error`, `sprite_unresolved` and `summary`
+    Summary,
+}
+
+/// The events a summary-only run prints: how it started, why it could not
+/// finish, and its result.
+const SUMMARY_EVENTS: [&str; 4] = ["run_started", "error", "sprite_unresolved", "summary"];
+
 /// Variables that coding agents set in the commands they run. Any `CODEX_*`
 /// variable also counts, except `CODEX_HOME`, which users set themselves.
 const AGENT_VARS: [&str; 6] = [
@@ -79,6 +92,8 @@ pub struct Output {
     sender: mpsc::Sender<Request>,
     cancel: watch::Receiver<Option<i32>>,
     suppressed: Arc<AtomicBool>,
+    /// Print only [`SUMMARY_EVENTS`].
+    summary_only: bool,
 }
 
 impl Output {
@@ -125,7 +140,14 @@ impl Output {
             sender,
             cancel,
             suppressed: Arc::new(AtomicBool::new(false)),
+            summary_only: false,
         })
+    }
+
+    /// JSON output that leaves out a run's progress events (`--json=summary`).
+    pub fn summary_only(mut self) -> Self {
+        self.summary_only = true;
+        self
     }
 
     pub fn with_workflow(&self, name: &str) -> Self {
@@ -164,7 +186,8 @@ impl Output {
 
     /// Emits the run `summary`. Text mode alone also receives the explicit
     /// `--config` path and any Sprite identity for the rerun hint and whether
-    /// a signal arrived; none of them is part of the JSON event.
+    /// a signal arrived; none of them is part of the JSON event. JSON gets the
+    /// log paths and rerun command that the text report prints instead.
     pub async fn emit_summary(
         &self,
         mut event: Value,
@@ -172,7 +195,11 @@ impl Output {
         sprite: Option<&str>,
         interrupted: bool,
     ) -> Result<()> {
-        if !self.json {
+        if self.json {
+            // The rerun names the workflow and environment that `emit` adds.
+            self.tag(&mut event);
+            report::add_report_fields(&mut event, config, sprite);
+        } else {
             if let Some(config) = config {
                 event[report::CONFIG] = json!(config);
             }
@@ -185,20 +212,11 @@ impl Output {
     }
 
     pub async fn emit(&self, mut event: Value) -> Result<()> {
-        if let Some(workflow) = &self.workflow {
-            event["workflow"] = json!(workflow);
-        }
-        if let Some(environment) = &self.environment {
-            event["environment"] = json!(environment);
-        }
-        if let Some(invocation) = &self.invocation {
-            event["invocation_id"] = json!(invocation.id);
-            if let Some((run_id, job)) = &invocation.parent {
-                event["parent_run_id"] = json!(run_id);
-                event["caller_job"] = json!(job);
-            }
-        }
-        if self.suppressed.load(Ordering::Relaxed) {
+        self.tag(&mut event);
+        if self.suppressed.load(Ordering::Relaxed)
+            || (self.summary_only
+                && !SUMMARY_EVENTS.contains(&event["type"].as_str().unwrap_or_default()))
+        {
             return Ok(());
         }
         let (done, ack) = oneshot::channel();
@@ -227,6 +245,23 @@ impl Output {
             Err(_) => {
                 self.suppressed.store(true, Ordering::Relaxed);
                 Ok(())
+            }
+        }
+    }
+
+    /// Adds this output's workflow, environment and invocation context.
+    fn tag(&self, event: &mut Value) {
+        if let Some(workflow) = &self.workflow {
+            event["workflow"] = json!(workflow);
+        }
+        if let Some(environment) = &self.environment {
+            event["environment"] = json!(environment);
+        }
+        if let Some(invocation) = &self.invocation {
+            event["invocation_id"] = json!(invocation.id);
+            if let Some((run_id, job)) = &invocation.parent {
+                event["parent_run_id"] = json!(run_id);
+                event["caller_job"] = json!(job);
             }
         }
     }

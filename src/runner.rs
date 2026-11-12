@@ -1,4 +1,4 @@
-use crate::tail::{SharedTails, Tails};
+use crate::tail::{Excerpt, SharedTails, Tails};
 use crate::{
     config::{self, Condition, Job, Partition},
     expression::{Expression, Reference},
@@ -63,6 +63,10 @@ pub struct JobResult {
     pub stdout_truncated: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stderr_truncated: Option<bool>,
+    /// A failed or timed-out job's output head and tail across both streams,
+    /// as `output_head`, `output_tail` and `output_truncated`.
+    #[serde(flatten)]
+    pub output: Option<Excerpt>,
     /// Whether the job started (as opposed to being skipped or cancelled before launch).
     #[serde(skip)]
     pub executed: bool,
@@ -179,6 +183,7 @@ impl JobResult {
             stderr_tail: None,
             stdout_truncated: None,
             stderr_truncated: None,
+            output: None,
             executed: false,
             started: false,
             blocked_ms: 0,
@@ -1190,12 +1195,14 @@ async fn run_job(
     result.commands = commands.into_inner().expect("command cost mutex poisoned");
     result.duration_ms = start.elapsed().as_millis();
     if matches!(result.status, Status::Failed | Status::TimedOut) {
-        let [(stdout, stdout_truncated), (stderr, stderr_truncated)] =
-            tails.lock().expect("tail mutex poisoned").snapshot();
+        let snapshot = tails.lock().expect("tail mutex poisoned").snapshot();
+        let ((stdout, stdout_truncated), (stderr, stderr_truncated)) =
+            (snapshot.stdout, snapshot.stderr);
         result.stdout_tail = Some(stdout);
         result.stderr_tail = Some(stderr);
         result.stdout_truncated = Some(stdout_truncated);
         result.stderr_truncated = Some(stderr_truncated);
+        result.output = Some(snapshot.output);
     }
     result
 }

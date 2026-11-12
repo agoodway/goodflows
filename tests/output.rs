@@ -67,6 +67,68 @@ fn json_works_for_validation_list_and_errors() {
 }
 
 #[test]
+fn summary_json_prints_only_the_start_errors_and_summary() {
+    let p = Project::new(
+        r#"
+[settings]
+fail_fast = false
+[[jobs]]
+name = "fail"
+command = "printf 'E1\\n' >&2; sleep 0.2; printf 'O1\\n'; sleep 0.2; printf 'E2\\n' >&2; exit 1"
+[[jobs]]
+name = "dependent"
+command = "true"
+depends_on = ["fail"]
+[[jobs]]
+name = "pass"
+command = "echo ok"
+"#,
+    );
+    let output = p.run(&["--json=summary", "--log-dir", "logs"]);
+    assert_eq!(output.status.code(), Some(1));
+    let run = events(&output);
+    let kinds: Vec<_> = run.iter().map(|e| e["type"].as_str().unwrap()).collect();
+    assert_eq!(kinds, ["run_started", "summary"]);
+    let summary = &run[1];
+    let [fail, dependent, pass] = summary["results"].as_array().unwrap().as_slice() else {
+        panic!("{summary}");
+    };
+    // One excerpt keeps the order the streams were written in.
+    assert_eq!(fail["output_head"], "E1\nO1\nE2\n");
+    assert_eq!(fail["output_tail"], "");
+    assert_eq!(fail["output_truncated"], false);
+    assert_eq!(fail["stderr_tail"], "E1\nE2\n");
+    assert_eq!(
+        p.read(fail["stdout_log"].as_str().unwrap()),
+        "O1\n",
+        "{fail}"
+    );
+    assert_eq!(p.read(fail["stderr_log"].as_str().unwrap()), "E1\nE2\n");
+    // A passed job has log paths but no excerpt; a job that never started has neither.
+    assert_eq!(p.read(pass["stdout_log"].as_str().unwrap()), "ok\n");
+    assert!(pass.get("output_head").is_none(), "{pass}");
+    assert!(dependent.get("stdout_log").is_none(), "{dependent}");
+    assert_eq!(
+        summary["rerun_command"],
+        "goodflows run default --jobs='fail,dependent'"
+    );
+
+    let output = p.run(&["--json=summary", "--jobs", "missing"]);
+    assert_eq!(output.status.code(), Some(2));
+    let error = events(&output);
+    assert_eq!(error.len(), 1);
+    assert_eq!(error[0]["code"], "unknown_job");
+    // Other commands print their one result, and a bare --json every event.
+    let output = p.run(&["validate", "--json=summary"]);
+    assert_eq!(events(&output)[0]["type"], "config_valid");
+    let output = p.run(&["--json", "--jobs", "pass"]);
+    let all = events(&output);
+    assert!(all.iter().any(|e| e["type"] == "job_output"));
+    // A passing run has no rerun command.
+    assert!(all.last().unwrap().get("rerun_command").is_none());
+}
+
+#[test]
 fn non_utf8_and_large_partial_lines_are_streamed_without_corrupting_logs() {
     let p = Project::new("[[jobs]]\nname='bytes'\ncommand=\"printf '\\\\377'; head -c 100000 /dev/zero | tr '\\\\000' x\"");
     let output = p.run(&["--json", "--log-dir", "logs"]);
@@ -196,13 +258,43 @@ command = """printf 'EARLY'; head -c 10000 /dev/zero | tr '\\000' x; printf 'OUT
     );
     assert_eq!(result["stdout_truncated"], true);
     assert_eq!(result["stderr_truncated"], true);
+    // Both streams together keep their start, where compiler errors usually
+    // are, and their end, with the middle omitted.
+    assert_eq!(
+        result["output_head"].as_str().unwrap(),
+        format!("EARLY{}", "x".repeat(4091))
+    );
+    assert_eq!(
+        result["output_tail"].as_str().unwrap(),
+        format!("{}ERR-END", "y".repeat(4089))
+    );
+    assert_eq!(result["output_truncated"], true);
+    let run = run_dir(&p.dir.join("logs"));
+    for stream in ["stdout", "stderr"] {
+        let log = result[format!("{stream}_log")].as_str().unwrap();
+        assert_eq!(
+            p.dir.join(log),
+            run.join(format!("001-fail.{stream}.log")),
+            "{result}"
+        );
+    }
+    assert_eq!(
+        events.last().unwrap()["rerun_command"],
+        "goodflows run default --jobs=fail"
+    );
     let finished = events.iter().find(|e| e["type"] == "job_finished").unwrap();
-    // The summary result adds only `started` and the optimizer fields; the
-    // live event never carries them.
+    // The summary result adds only `started`, the optimizer fields and the
+    // log paths; the live event never carries them.
     let mut projected = result.clone();
     let projected_fields = projected.as_object_mut().unwrap();
     assert_eq!(projected_fields.remove("started"), Some(true.into()));
-    for field in ["blocked_ms", "queued_ms", "commands"] {
+    for field in [
+        "blocked_ms",
+        "queued_ms",
+        "commands",
+        "stdout_log",
+        "stderr_log",
+    ] {
         assert!(
             projected_fields.remove(field).is_some(),
             "{field}: {result}"

@@ -2002,14 +2002,27 @@ command = "true"
     let history = summary["history_file"].as_str().unwrap();
     assert!(history.contains(&run) && Path::new(history).exists());
     assert!(summary["log_dir"].as_str().unwrap().contains(&run));
-    // The saved native summary is relayed verbatim.
+    // The saved native summary is relayed verbatim, except that the rerun
+    // command keeps the caller's Sprite identity.
     let saved = std::fs::read_to_string(fake.run_dir(&run).join("workflow.jsonl")).unwrap();
     let saved: Value = serde_json::from_str(saved.lines().last().unwrap()).unwrap();
     let mut relayed = summary.clone();
     assert_eq!(relayed["workflow"], saved["workflow"]);
-    relayed.as_object_mut().unwrap().remove("workflow");
+    assert_eq!(
+        relayed["rerun_command"],
+        "goodflows run default --sprite=T-1 --jobs='slow,after'"
+    );
+    assert_eq!(
+        saved["rerun_command"],
+        "goodflows run default --jobs='slow,after'"
+    );
+    for key in ["workflow", "rerun_command"] {
+        relayed.as_object_mut().unwrap().remove(key);
+    }
     let mut saved = saved;
-    saved.as_object_mut().unwrap().remove("workflow");
+    for key in ["workflow", "rerun_command"] {
+        saved.as_object_mut().unwrap().remove(key);
+    }
     assert_eq!(relayed, saved);
     // Fail-fast (the default) stops launching after the timeout.
     let output = fake.run(&["run", "--sprite", "T-1", "--json", "--jobs", "slow,after"]);
