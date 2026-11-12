@@ -36,7 +36,7 @@ On **unchanged**, do not write any file. Do not reformat, reorder, or rewrap. Th
 
 A candidate is a directory whose name starts with `run-ci-`, that contains `SKILL.md`, and whose frontmatter `name` equals the directory name. Do not search other directories. Do not treat `skills/create-ci-skill` or `skills/maintain-ci-skill` as a candidate.
 
-- None: stop. Say this repo has no `run-ci-<app>` skill, so nothing was updated. Point at `create-ci-skill` (`npx skills add agoodway/goodflows --skill create-ci-skill`, then run it). Do not create a directory, a `SKILL.md`, or a partial file.
+- None: stop. Say this repo has no `run-ci-<app>` skill, so nothing was updated. Point at `create-ci-skill` (install it with `goodflows skills install`, then run it). Do not create a directory, a `SKILL.md`, or a partial file.
 - Several: ask which one to update. Do not edit until they answer. This is the only question that is not about a config change.
 - One: that is the target. Update it where it sits. Do not move it, and do not write a second copy for the harness you are running in.
 
@@ -74,7 +74,7 @@ Then the outcome is **unchanged**. Ask nothing. Stop. Do not run the proof block
 
 Otherwise the outcome will be **updated**. Change only the lines that name a workflow, job, command, flag, or failure that drifted. Leave every other line as written, including scenario sentences whose workflow still exists.
 
-`## Keeping this skill accurate` may end with the current sentence or an older one. The current sentence is: When the GoodFlows config changes, run `maintain-ci-skill` to keep this skill accurate. Install it with `npx skills add agoodway/goodflows --skill maintain-ci-skill`. The older one says that section is the maintenance, and that a separate upkeep command does not exist. Neither wording is drift. The older sentence by itself does not make the outcome **updated**. On **unchanged**, leave it so the file stays byte-identical. When the outcome is **updated**, replace the older sentence with the current one if it is still there. If the current sentence is already there, leave it. Leave the rest of that section as written.
+`## Keeping this skill accurate` may end with the current sentence or one of two older ones. The current sentence is: When the GoodFlows config changes, run `maintain-ci-skill` to keep this skill accurate. Install it with `goodflows skills install`. The first older one is the same sentence ending with: Install it with `npx skills add agoodway/goodflows --skill maintain-ci-skill`. The second older one says that section is the maintenance, and that a separate upkeep command does not exist. None of these wordings is drift. An older sentence by itself does not make the outcome **updated**. On **unchanged**, leave whichever sentence is there so the file stays byte-identical. When the outcome is **updated**, replace an older sentence with the current one if it is still there. If the current sentence is already there, leave it. Leave the rest of that section as written.
 
 Do not ask about a workflow that already has a scenario on the file that workflow belongs to. A bare `goodflows` and `goodflows run default` both run `default`. Ask only in these two cases:
 
