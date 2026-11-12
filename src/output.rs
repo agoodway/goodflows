@@ -561,6 +561,9 @@ fn render(json: bool, mut event: Value, out: &mut impl Write, err: &mut impl Wri
             }
             "error" => {
                 writeln!(err, "Error: {}", text(&event, "message"))?;
+                if let Some(hint) = event["hint"].as_str() {
+                    writeln!(err, "Hint: {hint}")?;
+                }
             }
             "sprite_hook_output" => {
                 let data = text(&event, "data");

@@ -470,16 +470,20 @@ fn argument_and_preflight_errors_have_no_remote_side_effects() {
     assert_eq!(output.status.code(), Some(1));
     assert!(stderr(&output).contains("pass_env variable FORWARDED is not set"));
     // Denied credential forwarding and configured overrides, even unselected.
-    for (config, name) in [
-        (BASIC.replace("\"MODE\"]", "\"MODE\", \"SPRITE_TOKEN\"]"), "SPRITE_TOKEN"),
-        (BASIC.replace("\"MODE\"]", "\"MODE\", \"SPRITES_TOKEN\"]"), "SPRITES_TOKEN"),
+    // A reserved variable fails config validation (exit 2); Sprite's own
+    // preflight checks still exit 1.
+    for (config, name, code) in [
+        (BASIC.replace("\"MODE\"]", "\"MODE\", \"SPRITE_TOKEN\"]"), "SPRITE_TOKEN", 1),
+        (BASIC.replace("\"MODE\"]", "\"MODE\", \"SPRITES_TOKEN\"]"), "SPRITES_TOKEN", 1),
         (
             format!("{BASIC}\n[environments.unused.settings.env]\nGOODFLOWS_SPRITE_STATE_DIR = \"x\"\n"),
             "GOODFLOWS_SPRITE_STATE_DIR",
+            2,
         ),
         (
             format!("{BASIC}\n[workflows.other.settings.env]\nSPRITE_TOKEN = \"{SENTINEL}\"\n[[workflows.other.jobs]]\nname = \"x\"\ncommand = \"true\"\n"),
             "SPRITE_TOKEN",
+            1,
         ),
     ] {
         fake.write("goodflows.toml", &config);
@@ -488,7 +492,7 @@ fn argument_and_preflight_errors_have_no_remote_side_effects() {
             .args(["run", "--sprite", "T-1", "--json"])
             .output()
             .unwrap();
-        assert_eq!(output.status.code(), Some(1), "{}", stdout(&output));
+        assert_eq!(output.status.code(), Some(code), "{}", stdout(&output));
         let text = format!("{}{}", stdout(&output), stderr(&output));
         assert!(text.contains(name), "{text}");
         assert!(!text.contains(SENTINEL), "{text}");

@@ -202,7 +202,7 @@ fn invalid_reporting_config_fails_before_any_job_runs() {
         let p = Project::new(&format!("{reporting}\n{jobs}"));
         for args in [vec!["validate", "--json"], vec!["--json"]] {
             let output = p.run(&args);
-            assert_eq!(output.status.code(), Some(1), "{reporting}{jobs}");
+            assert_eq!(output.status.code(), Some(2), "{reporting}{jobs}");
             let event: Value = serde_json::from_slice(&output.stdout).unwrap();
             assert_eq!(event["type"], "error");
             assert!(
@@ -243,7 +243,7 @@ fn job_level_reporting_errors_name_the_job() {
             "{reporting}\n[[jobs]]\nname = \"{name}\"\n{body}\n"
         ));
         let output = p.run(&["--json"]);
-        assert_eq!(output.status.code(), Some(1), "{name}");
+        assert_eq!(output.status.code(), Some(2), "{name}");
         let event: Value = serde_json::from_slice(&output.stdout).unwrap();
         let text = event["message"].as_str().unwrap();
         assert!(text.contains(message), "{message}: {text}");
@@ -332,9 +332,10 @@ fn reporting_history_must_be_a_boolean() {
     );
     for args in [vec!["validate", "--json"], vec!["--json"]] {
         let output = run_with(&p, &args, None);
-        assert_eq!(output.status.code(), Some(1), "{args:?}");
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
         let event: Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(event["type"], "error");
+        assert_eq!(event["code"], "config_parse");
         let message = event["message"].as_str().unwrap();
         assert!(
             message.contains("reporting.history must be a boolean"),
@@ -1781,8 +1782,9 @@ fn replay_rejects_flags_that_do_not_apply() {
         let mut args = flag.clone();
         args.push("--json");
         let output = replay(&p.dir, &dir, None, &args);
-        assert_eq!(output.status.code(), Some(1), "{flag:?}");
+        assert_eq!(output.status.code(), Some(2), "{flag:?}");
         let event = events(&output).pop().unwrap();
+        assert_eq!(event["code"], "usage");
         assert!(event["message"]
             .as_str()
             .unwrap()
@@ -4576,17 +4578,17 @@ fn history_argument_errors_and_run_only_flags_send_nothing() {
         ),
         (
             &["history", "list", "--no-history"],
-            1,
+            2,
             "--no-history cannot be used with history commands",
         ),
         (
             &["history", "show", RUN_ID, "--env", "ci"],
-            1,
+            2,
             "--env cannot be used with history commands",
         ),
         (
             &["--jobs", "a", "history", "list", "--json"],
-            1,
+            2,
             "--jobs cannot be used with history commands",
         ),
     ] {

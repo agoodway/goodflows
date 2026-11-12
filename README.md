@@ -96,7 +96,7 @@ depends_on = ["fmt"]
 
 `parallelism` is how many command and step jobs may run at once. `0`, or leaving it out, uses the logical CPU count. `fail_fast` defaults to true. After a failure, goodflows starts no further jobs, and jobs that have already started run to completion. `workdir` is relative to the config file, must already exist, and defaults to the config file's directory.
 
-Unknown keys are rejected. The whole file is checked before any command runs.
+Unknown keys are rejected. The whole file is checked before any command runs. `goodflows validate` reports every problem it finds in one pass. A file that is not valid TOML, or that has an unknown key, reports only that first error, because parsing stops there.
 
 Environment values are literal strings. Layers merge by key, and a later layer replaces the same key: the calling process, `[settings.env]`, the workflow's `settings.env`, the selected profile's `settings.env`, the job's `env`, then the step's `env`.
 
@@ -108,13 +108,33 @@ goodflows --no-fail-fast --jobs fmt,test
 goodflows --config ./goodflows.toml
 ```
 
-| Exit code | Meaning |
-|---|---|
-| 0 | Every selected job passed or was skipped |
-| 1 | A job failed or timed out, or a config or runtime error |
-| 2 | The arguments did not parse |
-| 130 | Interrupted by SIGINT |
-| 143 | Interrupted by SIGTERM |
+| Exit code | Meaning | What to do |
+|---|---|---|
+| 0 | Every selected job passed or was skipped | Nothing |
+| 1 | A job failed or timed out, or goodflows hit a runtime error after the command and config were accepted | Fix the code, or report the failure |
+| 2 | A usage or config error: bad arguments, no config, a config that does not parse or validate, or an unknown workflow, job, or environment | Fix the command or the config, then run it again |
+| 130 | Interrupted by SIGINT | |
+| 143 | Interrupted by SIGTERM | |
+
+With `--json`, a run that cannot start ends with one `error` event. Its `code` is stable, so a script can branch on it instead of the message:
+
+| `code` | Exit | Meaning |
+|---|---|---|
+| `usage` | 2 | The arguments did not parse, or combine flags that do not go together |
+| `missing_config` | 2 | No `goodflows.toml` or `.goodflows.toml`, or the `--config` file cannot be read |
+| `config_parse` | 2 | The file is not valid TOML, or has an unknown key or a wrong type |
+| `config_invalid` | 2 | The file parsed but failed validation; `problems` lists every problem |
+| `no_default_workflow` | 2 | The file has no default workflow and the command named none |
+| `unknown_workflow` | 2 | The workflow name is not in the file |
+| `unknown_job` | 2 | A `--jobs` name is not in the selected workflow |
+| `unknown_environment` | 2 | The `--env` name is not in the file |
+| `runtime` | 1 | Anything else that stopped goodflows, including `history` and `reports upload` request errors and the `--sprite` and `sprite` command checks |
+
+`message` is the same text that text mode prints after `Error:`. An unknown workflow, job, or environment message lists the names that exist. An optional `hint` suggests a fix, such as `did you mean 'test'?` for a close match. Text mode prints it on a `Hint:` line.
+
+```json
+{"type":"error","code":"unknown_job","message":"unknown job 'tset' (available: fmt, test)","hint":"did you mean 'test'?","workflow":"default","schema_version":1}
+```
 
 ### Named workflows
 
@@ -147,7 +167,7 @@ goodflows validate
 goodflows validate ci --jobs test
 ```
 
-Top-level `[[jobs]]` are the `default` workflow. You can also declare `[workflows.default]`. If the file has no default, `goodflows` and `goodflows list` exit 1 and name the workflows you can pass. When the file has a `[workflows]` table, `goodflows validate` with no name checks every workflow and rejects `--jobs`. `goodflows list --workflows` prints the workflows and the default name. It rejects a workflow argument and `--jobs`.
+Top-level `[[jobs]]` are the `default` workflow. You can also declare `[workflows.default]`. If the file has no default, `goodflows` and `goodflows list` exit 2 and name the workflows you can pass. When the file has a `[workflows]` table, `goodflows validate` with no name checks every workflow and rejects `--jobs`. `goodflows list --workflows` prints the workflows and the default name. It rejects a workflow argument and `--jobs`.
 
 Job names and `depends_on` belong to one workflow. A workflow's settings replace `[settings]` one field at a time. A field the workflow omits keeps the shared value. `settings.env` still merges by key.
 
@@ -370,7 +390,7 @@ goodflows history list --outcome failed --limit 20 --json
 goodflows history show <run-id>
 ```
 
-`list` prints one row per run, newest first: start, outcome, workflow, environment, commit (12 characters, `*` when dirty), branch, CI event, duration, and run id. When there is another page it ends with `next: --cursor <cursor>`. The filters are `--workflow`, `--environment`, `--outcome` (`passed`, `failed`, or `cancelled`), `--commit` (a full hash), `--branch`, `--event`, `--graph-sha256`, `--limit` (1 to 200), and `--cursor`. `--branch` and `--event` match `source.branch` and `ci.event` exactly. A run uploaded without a branch or CI context prints `-` in the BRANCH or EVENT column and does not match those filters. `show` prints the run's fields, one row per result, and its linked test reports. A bad filter or run id exits 2 without a request. A missing `[reporting]` block, key, or URL, a server error, or an unknown run exits 1. `--json` prints one `history_runs` or `history_run` event. The commands reject run flags such as `--env`, `--jobs`, and the history file flags.
+`list` prints one row per run, newest first: start, outcome, workflow, environment, commit (12 characters, `*` when dirty), branch, CI event, duration, and run id. When there is another page it ends with `next: --cursor <cursor>`. The filters are `--workflow`, `--environment`, `--outcome` (`passed`, `failed`, or `cancelled`), `--commit` (a full hash), `--branch`, `--event`, `--graph-sha256`, `--limit` (1 to 200), and `--cursor`. `--branch` and `--event` match `source.branch` and `ci.event` exactly. A run uploaded without a branch or CI context prints `-` in the BRANCH or EVENT column and does not match those filters. `show` prints the run's fields, one row per result, and its linked test reports. A bad filter or run id exits 2 without a request. A missing `[reporting]` block, key, or URL, a server error, or an unknown run exits 1. `--json` prints one `history_runs` or `history_run` event. The commands reject run flags such as `--env`, `--jobs`, and the history file flags, and exit 2.
 
 ### Test timing reports
 

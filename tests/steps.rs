@@ -277,7 +277,7 @@ fn step_structure_and_expression_scopes_are_validated_without_running_anything()
         let p = Project::new(&format!("[[jobs]]\nname='safe'\ncommand='touch ran'\n{invalid}"));
         for command in [vec!["--jobs", "safe"], vec!["validate"], vec!["list"]] {
             let output = p.run(&command);
-            assert_eq!(output.status.code(), Some(1), "accepted {invalid}: {}", stdout(&output));
+            assert_eq!(output.status.code(), Some(2), "accepted {invalid}: {}", stdout(&output));
             assert!(!p.dir.join("ran").exists());
         }
     }
@@ -388,7 +388,7 @@ fn a_call_job_cannot_also_define_steps() {
          [[workflows.ci.jobs]]\nname='call'\nworkflow='default'\n[[workflows.ci.jobs.steps]]\nid='s'\ncommand='touch step'\n",
     );
     let output = p.run(&["run", "ci", "--json"]);
-    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(output.status.code(), Some(2));
     assert_eq!(
         events(&output).last().unwrap()["message"],
         "workflow 'ci': job 'call': define exactly one of a command, nonempty steps, or a workflow"

@@ -855,7 +855,7 @@ fn profile_partition_entry_fails_where_the_job_is_not_partitioned() {
         &["validate"][..],
     ] {
         let output = p.run(args);
-        assert_eq!(output.status.code(), Some(1), "{args:?}");
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
         assert!(
             stderr(&output).contains(message),
             "{args:?}: {}",
@@ -865,7 +865,7 @@ fn profile_partition_entry_fails_where_the_job_is_not_partitioned() {
     }
     // The JSON error event names the workflow too.
     let output = p.run(&["run", "nightly", "--env", "local", "--json"]);
-    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(output.status.code(), Some(2));
     assert!(stdout(&output).contains(message), "{}", stdout(&output));
     // Without the profile, nightly still runs and the other commands pass.
     success(&p.run(&["validate", "nightly"]));
@@ -882,7 +882,7 @@ fn profile_partition_checks_apply_with_jobs_selection() {
     ));
     // The check covers the whole workflow, not only the --jobs selection.
     let output = p.run(&["run", "nightly", "--jobs", "lint", "--env", "local"]);
-    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(output.status.code(), Some(2));
     assert!(
         stderr(&output)
             .contains("environment 'local': workflow 'nightly': job 'test' is not partitioned"),
@@ -966,8 +966,9 @@ fn result_of(summary: &serde_json::Value, name: &str) -> serde_json::Value {
         .clone()
 }
 
+/// The message of a config error event, which exits 2.
 fn error_of(output: &std::process::Output) -> String {
-    assert_eq!(output.status.code(), Some(1), "{}", stdout(output));
+    assert_eq!(output.status.code(), Some(2), "{}", stdout(output));
     let event: serde_json::Value = serde_json::from_str(stdout(output).lines().last().unwrap())
         .unwrap_or_else(|_| panic!("{}", stdout(output)));
     assert_eq!(event["type"], "error", "{event}");
