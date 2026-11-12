@@ -1846,6 +1846,39 @@ fn documented_status_example_matches_the_status_event() {
     );
 }
 
+/// Text-mode status puts each field on its own line, while control
+/// characters in values read from the Sprite stay escaped.
+#[test]
+fn status_text_breaks_lines_and_escapes_sprite_values() {
+    let fake = Fake::new(PLAIN);
+    let output = fake.run(&["run", "--sprite", "T-1", "--json"]);
+    assert!(output.status.success(), "{}", text(&output));
+    let run = run_id(&events(&output));
+    let mut record = fake.record(&run);
+    record["workflow"] = Value::from("wf\x1b[2J\r\n\0\u{9b}x");
+    let path = fake.run_dir(&run).join("record.json");
+    std::fs::write(path, serde_json::to_vec(&record).unwrap()).unwrap();
+    let output = fake.run(&["sprite", "status", "T-1"]);
+    assert!(output.status.success(), "{}", text(&output));
+    let text = stdout(&output);
+    let lines: Vec<&str> = text.lines().collect();
+    assert!(
+        lines[0].starts_with("Sprite gft-") && lines[0].ends_with(" (identity T-1)"),
+        "{text}"
+    );
+    let phase = record["phase"].as_str().unwrap();
+    assert_eq!(
+        lines[1..],
+        [
+            "  prepared: yes",
+            "  active run: none",
+            &format!(r"  {run}  {phase}  wf\u{{1b}}[2J\r\n\u{{0}}\u{{9b}}x"),
+        ],
+        "{text}"
+    );
+    assert!(!text.contains(['\x1b', '\r', '\0', '\u{9b}']), "{text:?}");
+}
+
 #[test]
 fn nested_config_and_profile_workdirs_map_into_the_snapshot() {
     let fake = Fake::new(PLAIN);

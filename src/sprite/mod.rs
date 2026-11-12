@@ -1719,7 +1719,11 @@ async fn command_inner(
                     emit(
                         output,
                         json!({"type": "sprite_status", "identity": identity, "sprite": sprite.name, "state": "unreachable"}),
-                        format!("Sprite {} is unreachable or unowned: {error:#}", sprite.name),
+                        format!(
+                            "Sprite {} is unreachable or unowned: {}",
+                            sprite.name,
+                            crate::output::visible(&format!("{error:#}"))
+                        ),
                     )
                     .await;
                     Ok(3)
@@ -1809,15 +1813,21 @@ async fn command_inner(
     }
 }
 
+/// Multi-line status text. Values come from the Sprite, so each is escaped
+/// and the only newlines left are line breaks (see `sprite_status` in
+/// src/output.rs).
 fn status_text(identity: &str, name: &str, status: &Value) -> String {
+    use crate::output::visible;
     let mut text = format!(
-        "Sprite {name} (identity {identity})\n  prepared: {}\n  active run: {}",
+        "Sprite {} (identity {})\n  prepared: {}\n  active run: {}",
+        visible(name),
+        visible(identity),
         if status["prepared"].is_null() {
             "no"
         } else {
             "yes"
         },
-        status["active_run_id"].as_str().unwrap_or("none")
+        visible(status["active_run_id"].as_str().unwrap_or("none"))
     );
     if status["degraded"] == true {
         text.push_str("\n  admission blocked: wake hold renewal failed");
@@ -1828,9 +1838,9 @@ fn status_text(identity: &str, name: &str, status: &Value) -> String {
     for run in status["runs"].as_array().into_iter().flatten() {
         text.push_str(&format!(
             "\n  {}  {}  {}",
-            run["run_id"].as_str().unwrap_or_default(),
-            run["phase"].as_str().unwrap_or_default(),
-            run["workflow"].as_str().unwrap_or("default")
+            visible(run["run_id"].as_str().unwrap_or_default()),
+            visible(run["phase"].as_str().unwrap_or_default()),
+            visible(run["workflow"].as_str().unwrap_or("default"))
         ));
     }
     text
@@ -2404,6 +2414,20 @@ partitions = 2
         assert_eq!(
             error,
             "[sprite] pass_env variable GF_SPRITE_TEST_UNSET_X is not set"
+        );
+    }
+
+    #[test]
+    fn status_text_escapes_every_sprite_value_and_breaks_lines() {
+        let bad = "x\x1b[2J\r\n\0\u{9b}y";
+        let status = json!({"prepared": {}, "active_run_id": bad, "runs": [
+            {"run_id": bad, "phase": bad, "workflow": bad}]});
+        let esc = r"x\u{1b}[2J\r\n\u{0}\u{9b}y";
+        assert_eq!(
+            status_text(bad, bad, &status),
+            format!(
+                "Sprite {esc} (identity {esc})\n  prepared: yes\n  active run: {esc}\n  {esc}  {esc}  {esc}"
+            )
         );
     }
 }
