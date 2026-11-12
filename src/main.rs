@@ -228,6 +228,12 @@ enum Commands {
         #[command(subcommand)]
         command: SkillsCommand,
     },
+    /// Print the guide for coding agents: exit codes, error codes, reading a failure, detached runs and JSON fields
+    #[command(after_help = "Examples:
+  goodflows agents                   # print the guide for this goodflows version
+  goodflows last                     # then show the last run's failures again
+  goodflows run --failed             # and rerun only the jobs that failed")]
+    Agents,
     /// Serve goodflows to coding agents as an MCP server on stdin and stdout
     #[command(after_help = "Examples:
   goodflows mcp                      # serve the run, wait, status, cancel, list, validate and last tools
@@ -297,7 +303,7 @@ enum HistoryCommand {
 }
 
 /// Global flags that only `run` uses; `init`, `reports upload`, `history`,
-/// `last`, `status`, `wait`, `cancel`, `sprite`, `skills install` and `mcp` commands
+/// `last`, `status`, `wait`, `cancel`, `sprite`, `skills install`, `agents` and `mcp` commands
 /// reject them. `validate`
 /// and `list` resolve all of them except `--log-dir` into their settings.
 const RUN_ONLY_FLAGS: [&str; 12] = [
@@ -371,6 +377,8 @@ impl Cli {
                 let configless = |s| plain_json(configless(s), ONE_EVENT);
                 configless(s).mut_subcommands(configless)
             })
+            // `agents` prints one fixed text.
+            .mut_subcommand("agents", |agents| hide(configless(agents), &["json"]))
             // `mcp` speaks MCP on stdout; `--config` is its tools' default.
             .mut_subcommand("mcp", |mcp| hide(run_only(mcp), &["json"]))
     }
@@ -470,6 +478,7 @@ impl Cli {
                 | Commands::Cancel { .. }
                 | Commands::Sprite { .. }
                 | Commands::Skills { .. }
+                | Commands::Agents
                 | Commands::Mcp
                 | Commands::SpriteAgent { .. },
             )
@@ -585,6 +594,9 @@ async fn main() -> ExitCode {
     ExitCode::from(code)
 }
 
+/// What `goodflows agents` prints after its version line.
+const AGENTS_GUIDE: &str = include_str!("agents_guide.md");
+
 /// A command line that parsed but asks for something goodflows does not do.
 fn usage(message: impl Into<String>) -> anyhow::Error {
     ConfigError::new("usage", message).into()
@@ -658,6 +670,23 @@ async fn run(cli: &Cli, output: &mut Output, cancel: watch::Receiver<Option<i32>
             return Err(usage(format!("{flag} cannot be used with skills install")));
         }
         return skills::install(*harness, output).await;
+    }
+    if let Some(Commands::Agents) = &cli.command {
+        let rejected = [
+            (cli.config.is_some(), "--config"),
+            (cli.json.is_some(), "--json"),
+        ];
+        let flag = rejected
+            .into_iter()
+            .find_map(|(set, flag)| set.then_some(flag));
+        if let Some(flag) = flag.or_else(|| cli.run_only_flag()) {
+            return Err(usage(format!("{flag} cannot be used with agents")));
+        }
+        print!(
+            "goodflows {}: running checks and reading a failure\n\n{AGENTS_GUIDE}",
+            env!("CARGO_PKG_VERSION")
+        );
+        return Ok(0);
     }
     if let Some(Commands::Mcp) = &cli.command {
         let json = cli.json.is_some().then_some("--json");

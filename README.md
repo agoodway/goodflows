@@ -577,13 +577,13 @@ Ampcode snapshots the disk after setup succeeds. After you change `.agents/setup
 
 ## Agent skills
 
-[`create-ci-skill`](skills/create-ci-skill/SKILL.md) reads a repository's GoodFlows config and writes a project-local `run-ci-<app>` skill for the next agent. The generated skill runs those jobs with `goodflows`. A repository with neither `goodflows.toml` nor `.goodflows.toml` gets no skill.
+[`create-ci-skill`](skills/create-ci-skill/SKILL.md) reads a repository's GoodFlows config and writes a project-local `run-ci-<app>` skill for the next agent. The generated skill runs those jobs with `goodflows`. It holds only what is specific to the repository: the workflows, the jobs, and which command to run for which scenario. For how the CLI reports a failure it points at `goodflows agents`. A repository with neither `goodflows.toml` nor `.goodflows.toml` gets no skill.
 
 ```bash
 npx skills add agoodway/goodflows --skill create-ci-skill
 ```
 
-[`maintain-ci-skill`](skills/maintain-ci-skill/SKILL.md) updates that `run-ci-<app>` skill when the GoodFlows config changes. It keeps the scenario answers already in the skill and asks again only about a new, renamed, or removed workflow. It does not write a skill when none exists.
+[`maintain-ci-skill`](skills/maintain-ci-skill/SKILL.md) updates that `run-ci-<app>` skill when the GoodFlows config changes. It keeps the scenario answers already in the skill and asks again only about a new, renamed, or removed workflow. In a skill written by an older `create-ci-skill`, it replaces the exit codes, error codes, and JSON fields copied into it with the pointer to `goodflows agents`. It does not write a skill when none exists.
 
 ```bash
 npx skills add agoodway/goodflows --skill maintain-ci-skill
@@ -608,6 +608,14 @@ goodflows skills install --harness claude
 | `t3` | `.agents/skills` | `T3CODE_PROJECT_ROOT` or `T3CODE_WORKTREE_PATH` |
 
 A variable counts only when it is set and not empty. `--harness` skips detection. With no harness detected, the skills go in `.agents/skills`. When the environment names harnesses that load different directories, such as `CLAUDECODE` together with `AGENT=amp`, the command writes nothing and exits 2 with `ambiguous_harness`; pass `--harness`. Harnesses that share a directory, such as T3 Code running Codex, are not ambiguous. With `--json` it prints one `skills_installed` event with `directory`, `harnesses`, `source` (`flag`, `environment`, or `default`), and `files`.
+
+### Agent guide
+
+`goodflows agents` prints a guide for coding agents: the exit codes and error codes, how to read the report's `Failures` section, `last`, `run --failed`, detached runs, and the JSON events and fields. It is built into the binary, so it matches the goodflows that prints it. Generated `run-ci-<app>` skills point at it instead of copying those details.
+
+```bash
+goodflows agents
+```
 
 ## MCP server
 
