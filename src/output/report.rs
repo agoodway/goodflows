@@ -365,11 +365,42 @@ fn failure(result: &Value, logs: Option<&[String; 2]>, out: &mut impl Write) -> 
     if let Some(error) = result["error"].as_str() {
         writeln!(out, "  error: {}", visible(error))?;
     }
-    if let Some(paths) = logs {
-        for (stream, path) in ["stdout", "stderr"].iter().zip(paths) {
+    let log_lines = |out: &mut dyn Write| -> std::io::Result<()> {
+        for (stream, path) in ["stdout", "stderr"].iter().zip(logs.into_iter().flatten()) {
             writeln!(out, "  {stream} log: {}", visible(path))?;
         }
+        Ok(())
+    };
+    // Output longer than a stream's tail shows both streams together, in the
+    // order they were written: the start, where errors printed first are,
+    // then the end, with the log paths for the full output under it.
+    let long = ["stdout_truncated", "stderr_truncated", "output_truncated"]
+        .iter()
+        .any(|key| result[*key] == true);
+    if let (true, Some(head)) = (long, result["output_head"].as_str()) {
+        let tail = text(result, "output_tail");
+        writeln!(out, "  stdout and stderr:")?;
+        if result["output_truncated"] == true {
+            for line in head.lines() {
+                writeln!(out, "    {}", visible(line))?;
+            }
+            match result["output_omitted_bytes"].as_u64() {
+                Some(bytes) => writeln!(out, "    … {bytes} bytes omitted …")?,
+                None => writeln!(out, "    … output omitted …")?,
+            }
+            // A cut just before a line break would print an empty line.
+            for line in tail.strip_prefix('\n').unwrap_or(tail).lines() {
+                writeln!(out, "    {}", visible(line))?;
+            }
+        } else {
+            for line in format!("{head}{tail}").lines() {
+                writeln!(out, "    {}", visible(line))?;
+            }
+        }
+        log_lines(out)?;
+        return Ok(());
     }
+    log_lines(out)?;
     for stream in ["stdout", "stderr"] {
         let Some(tail) = result[format!("{stream}_tail")]
             .as_str()
@@ -809,6 +840,34 @@ mod tests {
         let report = report_of(vec![failed(1, "boom-1\n")]);
         assert!(!report.contains(" log: "), "{report}");
         assert!(report.contains("  stderr:\n    boom-1\n"), "{report}");
+
+        // A stream longer than its tail shows both streams together. Uncut,
+        // head and tail join mid-line into the whole output.
+        let combined = |truncated: bool, omitted: Option<u64>| {
+            let r = with(failed(2, "end\n"), "output_head", json!("first err"));
+            let r = with(r, "output_tail", json!("or\nend\n"));
+            let r = with(r, "output_truncated", json!(truncated));
+            let r = match omitted {
+                Some(n) => with(r, "output_omitted_bytes", json!(n)),
+                None => r,
+            };
+            let mut event = summary(vec![r]);
+            event["log_dir"] = json!("logs/run");
+            let report = rendered(event);
+            let entry = &report[report.find("  error: ").unwrap()..];
+            entry[..entry.find("\n\n").unwrap() + 1].to_owned()
+        };
+        let logs = "  stdout log: logs/run/001-test.p02.stdout.log\n  stderr log: logs/run/001-test.p02.stderr.log\n";
+        assert_eq!(
+            combined(false, Some(0)),
+            format!("  error: exited with 1\n  stdout and stderr:\n    first error\n    end\n{logs}")
+        );
+        assert_eq!(
+            combined(true, Some(1234)),
+            format!("  error: exited with 1\n  stdout and stderr:\n    first err\n    … 1234 bytes omitted …\n    or\n    end\n{logs}")
+        );
+        // A summary from before `output_omitted_bytes` has no count.
+        assert!(combined(true, None).contains("\n    … output omitted …\n"));
 
         // A failed step names the step; its command is the step's.
         let stepped = with(
