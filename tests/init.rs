@@ -161,6 +161,7 @@ fn json_init_without_terminal_refuses_existing_config_and_names_force() {
     assert_eq!(p.read("goodflows.toml"), "keep");
     let event: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(event["type"], "error");
+    assert_eq!(event["code"], "config_exists");
     assert_eq!(
         event["message"],
         "goodflows.toml already exists; pass --force to overwrite it"

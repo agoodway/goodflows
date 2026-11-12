@@ -2242,7 +2242,7 @@ async fn exec_workflow(args: &[String]) -> Result<u8> {
         Ok(code) => Ok(code),
         Err(error) => {
             let _ = output
-                .emit(json!({"type":"error", "message": format!("{error:#}")}))
+                .emit(json!({"type":"error", "code":"runtime", "message": format!("{error:#}")}))
                 .await;
             Ok(cancel.borrow().map(|s| (128 + s) as u8).unwrap_or(1))
         }

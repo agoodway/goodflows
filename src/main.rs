@@ -321,11 +321,24 @@ impl Cli {
             })
         }
         let run_only = |command| hide(command, &RUN_ONLY_FLAGS);
+        // A command that runs no jobs has no run events to choose between,
+        // so its `--json` takes no value.
+        fn plain_json(command: clap::Command, help: &'static str) -> clap::Command {
+            // `mut_args` keeps the built command's argument order.
+            command.mut_args(|arg| match arg.get_id().as_str() {
+                "json" => arg.num_args(0).help(help),
+                // Not "see a summary with '-h'": no summary is in sight.
+                "help" => arg.help("Print help").long_help(clap::builder::Resettable::<clap::builder::StyledStr>::Reset),
+                _ => arg,
+            })
+        }
+        const ONE_EVENT: &str = "Print the result as a JSON event";
+        let single = |command| plain_json(run_only(command), ONE_EVENT);
         // `reports upload` and `skills install` reject `--config` too.
         let configless = |command| hide(run_only(command), &["config"]);
         let unlogged = |command| hide(command, &["log_dir"]);
         command
-            .mut_subcommand("init", run_only)
+            .mut_subcommand("init", single)
             .mut_subcommand("validate", unlogged)
             .mut_subcommand("list", unlogged)
             .mut_subcommand("reports", |r| configless(r).mut_subcommands(configless))
@@ -335,10 +348,16 @@ impl Cli {
             .mut_subcommand("history", |history| {
                 run_only(history).mut_subcommands(run_only)
             })
-            .mut_subcommand("last", run_only)
-            .mut_subcommand("status", run_only)
+            .mut_subcommand("last", |last| {
+                // A run that called workflows has a summary for each.
+                plain_json(run_only(last), "Print the result as JSON events")
+            })
+            .mut_subcommand("status", single)
             .mut_subcommand("wait", run_only)
-            .mut_subcommand("skills", |s| configless(s).mut_subcommands(configless))
+            .mut_subcommand("skills", |s| {
+                let configless = |s| plain_json(configless(s), ONE_EVENT);
+                configless(s).mut_subcommands(configless)
+            })
             // `mcp` speaks MCP on stdout; `--config` is its tools' default.
             .mut_subcommand("mcp", |mcp| hide(run_only(mcp), &["json"]))
     }
@@ -1805,6 +1824,40 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn commands_that_run_no_jobs_take_a_plain_json_flag() {
+        for path in [&["init"][..], &["skills", "install"], &["last"], &["status"]] {
+            let args = std::iter::once("goodflows")
+                .chain(path.iter().copied())
+                .chain(["--help"]);
+            let error = Cli::parser().try_get_matches_from(args).err().unwrap();
+            let help = error.render().to_string();
+            assert!(help.contains("      --json\n"), "{path:?}:\n{help}");
+            // `last`'s examples may name the summary events it prints.
+            let (options, _) = help.split_once("\nExamples:").unwrap();
+            assert!(!options.contains("summary"), "{path:?}:\n{help}");
+        }
+        let run_id = "fb7d2711-6b67-4f5a-9104-492032a9e1e5";
+        for args in [&["init"][..], &["skills", "install"], &["last"], &["status", run_id]] {
+            let json = parse(&[args, &["--json"]].concat()).unwrap().json;
+            assert_eq!(json, Some(output::Json::All), "{args:?}");
+            let error = parse(&[args, &["--json=summary"]].concat()).err();
+            assert!(error.is_some(), "{args:?}");
+        }
+        // A run, and `wait`, which replays one, still choose their events.
+        assert_eq!(
+            parse(&["wait", run_id, "--json=summary"]).unwrap().json,
+            Some(output::Json::Summary)
+        );
+        let help = Cli::parser()
+            .try_get_matches_from(["goodflows", "run", "--help"])
+            .err()
+            .unwrap()
+            .render()
+            .to_string();
+        assert!(help.contains("--json=summary"), "{help}");
     }
 
     #[test]

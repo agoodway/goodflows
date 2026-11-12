@@ -117,7 +117,7 @@ goodflows --config ./goodflows.toml
 | 130 | Interrupted by SIGINT | |
 | 143 | Interrupted by SIGTERM | |
 
-With `--json`, a run that cannot start ends with one `error` event. Its `code` is stable, so a script can branch on it instead of the message:
+With `--json`, a run or other command that cannot do what it was asked ends with one `error` event. Its `code` is stable, so a script can branch on it instead of the message:
 
 | `code` | Exit | Meaning |
 |---|---|---|
@@ -132,6 +132,7 @@ With `--json`, a run that cannot start ends with one `error` event. Its `code` i
 | `no_last_run` | 2 | [`last` or `run --failed`](#last-run-and-rerunning-failures) found no previous local run, or `run --failed` named a different workflow or environment |
 | `no_failed_jobs` | 2 | `run --failed` found nothing to rerun: the last run had no failed or timed-out job |
 | `unknown_run` | 2 | [`status` or `wait`](#detached-runs) found no detached run with that id for the config |
+| `config_exists` | 2 | `init` would overwrite an existing config; pass `--force` |
 | `runtime` | 1 | Anything else that stopped goodflows, including `history` and `reports upload` request errors and the `--sprite` and `sprite` command checks |
 
 `message` is the same text that text mode prints after `Error:`. An unknown workflow, job, or environment message lists the names that exist. An optional `hint` suggests a fix, such as `did you mean 'test'?` for a close match. Text mode prints it on a `Hint:` line.
@@ -334,7 +335,7 @@ Settings precedence is CLI flags, then the profile, then the workflow, then `[se
 
 The run ends with a report: one row per job, then counts, then a `Failures` section when something failed or timed out. In both modes each `Failures` entry shows the instance's output and the paths of its log files when `--log-dir` is set. Short output is shown whole, in a `stdout:` and a `stderr:` block. Longer output is one `stdout and stderr:` block in the order goodflows read it: the first 4 KiB, a `… N bytes omitted …` line, then the last 4 KiB, with the log paths under it. The last line of a failed root run is `Rerun failed:` and a `goodflows run` command for the failed jobs and the jobs skipped because a dependency did not pass.
 
-`--json` prints JSON Lines on stdout. Every event has `schema_version` 1. The last event of a finished run has `"type":"summary"`. Its `success` field is true when every selected job passed or was skipped. `--json=summary` leaves out the events in between, such as one `job_output` event per output chunk. A run then prints only `run_started`, any `error` event, and the `summary`, plus `sprite_unresolved` when a Sprite run cannot report one. Other commands print the same events as with `--json`.
+`--json` prints JSON Lines on stdout. Every event has `schema_version` 1. The last event of a finished run has `"type":"summary"`. Its `success` field is true when every selected job passed or was skipped. `--json=summary` leaves out the events in between, such as one `job_output` event per output chunk. A run then prints only `run_started`, any `error` event, and the `summary`, plus `sprite_unresolved` when a Sprite run cannot report one. Other commands print the same events as with `--json`. Commands that only report a result, such as `init`, `skills install`, `last`, and `status`, take a plain `--json` with no value.
 
 Each failed or timed-out job in the summary has:
 
