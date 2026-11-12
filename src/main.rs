@@ -430,23 +430,34 @@ async fn run(cli: &Cli, output: &mut Output, cancel: watch::Receiver<Option<i32>
                 "--jobs requires an explicit workflow for aggregate validation",
             ));
         }
+        // Every workflow and profile that does not resolve, reported together.
+        let mut problems = Vec::new();
         if aggregate_validation && profile.is_none() {
             // Without --env, check that every profile resolves for every
             // workflow, so `validate` passes only if each `run <workflow>
             // --env <profile>` would get past configuration.
             for environment in document.environments.keys() {
                 for name in document.workflow_names() {
-                    document.workflow(Some(&name), Some(environment))?;
+                    if let Err(error) = document.workflow(Some(&name), Some(environment)) {
+                        problems.push(error);
+                    }
                 }
             }
         }
         let mut workflows = Vec::new();
         let mut total = 0;
         for name in document.workflow_names() {
-            let (_, config) = document.workflow(Some(&name), profile)?;
+            let config = match document.workflow(Some(&name), profile) {
+                Ok((_, config)) => config,
+                Err(error) => {
+                    problems.push(error);
+                    continue;
+                }
+            };
             total += config.jobs.len();
             workflows.push(json!({"name":name, "jobs":config.jobs.len(), "selected_jobs":config.jobs.iter().map(|j| &j.name).collect::<Vec<_>>(), "requested_jobs":[], "total_defined_jobs":config.jobs.len(), "settings":config.settings.resolve(cli.parallelism, fail_fast_override, &history_cli)?}));
         }
+        ConfigError::check(problems)?;
         output.emit(if list_workflows {
             json!({"type":"workflows", "workflows":workflows, "default_workflow":document.default_workflow()})
         } else {

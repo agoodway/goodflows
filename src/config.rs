@@ -35,10 +35,18 @@ impl ConfigError {
 
     /// One `config_invalid` error naming every problem, or `Ok` when there
     /// are none.
-    fn check(problems: Vec<anyhow::Error>) -> Result<()> {
-        let problems: Vec<String> = problems.iter().map(|p| format!("{p:#}")).collect();
+    pub(crate) fn check(problems: Vec<anyhow::Error>) -> Result<()> {
+        if problems.is_empty() {
+            return Ok(());
+        }
+        Err(Self::invalid(
+            problems.iter().map(|p| format!("{p:#}")).collect(),
+        ))
+    }
+
+    /// A `config_invalid` error naming each of `problems`, which is not empty.
+    fn invalid(problems: Vec<String>) -> anyhow::Error {
         let message = match problems.as_slice() {
-            [] => return Ok(()),
             [problem] => problem.clone(),
             all => format!(
                 "{} config problems:\n{}",
@@ -49,11 +57,11 @@ impl ConfigError {
                     .join("\n")
             ),
         };
-        Err(Self {
+        Self {
             problems,
             ..Self::new("config_invalid", message)
         }
-        .into())
+        .into()
     }
 }
 
@@ -1191,13 +1199,9 @@ impl Config {
                     } else {
                         format!("workflow '{name}'")
                     };
-                    return Err(ConfigError::new(
-                        "config_invalid",
-                        format!(
-                            "environment '{profile}': {workflow}: job '{job_name}' is not partitioned"
-                        ),
-                    )
-                    .into());
+                    return Err(ConfigError::invalid(vec![format!(
+                        "environment '{profile}': {workflow}: job '{job_name}' is not partitioned"
+                    )]));
                 };
                 // Defensive: `Config::validate` already rejected out-of-range
                 // counts, so this conversion cannot fail for a validated config.

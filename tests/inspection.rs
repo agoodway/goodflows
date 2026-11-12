@@ -654,6 +654,36 @@ fn validate_reports_every_problem_in_one_pass() {
         text.contains("  - job 'b' depends on unknown job 'missing'"),
         "{text}"
     );
+    // A profile that does not resolve for two workflows reports both.
+    let p = Project::new(
+        "[[workflows.a.jobs]]\nname='test'\ncommand='true'\n\
+         [[workflows.b.jobs]]\nname='test'\ncommand='true'\n\
+         [[workflows.c.jobs]]\nname='test'\ncommand='true'\npartitions=2\n\
+         [environments.local.partitions]\ntest = 3\n",
+    );
+    let not_partitioned = |workflow: &str| {
+        format!("environment 'local': workflow '{workflow}': job 'test' is not partitioned")
+    };
+    for args in [
+        &["validate", "--json"][..],
+        &["validate", "--env", "local", "--json"],
+    ] {
+        let output = p.run(args);
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        let event: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(event["code"], "config_invalid", "{args:?}");
+        assert_eq!(
+            event["problems"],
+            serde_json::json!([not_partitioned("a"), not_partitioned("b")]),
+            "{args:?}"
+        );
+    }
+    // One workflow: one problem, still listed.
+    let output = p.run(&["run", "a", "--env", "local", "--json"]);
+    assert_eq!(output.status.code(), Some(2));
+    let event: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(event["message"], not_partitioned("a"));
+    assert_eq!(event["problems"], serde_json::json!([not_partitioned("a")]));
 }
 
 #[test]
