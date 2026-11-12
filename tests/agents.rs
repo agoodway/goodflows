@@ -377,6 +377,24 @@ fn mcp_detached_run_polled_with_wait_gives_the_blocking_result() {
 }
 
 #[test]
+fn mcp_detached_run_of_a_named_workflow_starts_it() {
+    // The tool passes the workflow after `--`.
+    let p = Project::new(CALLS);
+    let mut client = Client::start(&p);
+    let (texts, error) = client.call("run", json!({"workflow":"ok", "detach":true}));
+    assert!(!error, "{texts:?}");
+    let id = serde_json::from_str::<Value>(&texts[1]).unwrap()["run_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let (texts, error) = client.call("wait", json!({"run_id":id, "timeout":30}));
+    assert!(!error, "{texts:?}");
+    assert_eq!(texts[0], "GoodFlows checks passed.");
+    let diagnostics: Value = serde_json::from_str(&texts[1]).unwrap();
+    assert_eq!(diagnostics["workflow"], "ok");
+}
+
+#[test]
 fn mcp_cancel_stops_a_detached_run() {
     let p = Project::new(SLOW);
     let mut client = Client::start(&p);

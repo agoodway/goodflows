@@ -128,11 +128,17 @@ pub async fn start(
     let file = |name: &str| create(&dir.join(name));
     // Every event, for `status`, whatever `--json` the caller asked for.
     // `--json` takes its value only after `=`, so no other argument goes.
-    let mut args: Vec<_> = std::env::args_os()
-        .skip(1)
-        .filter(|arg| arg != "--json" && !arg.to_string_lossy().starts_with("--json="))
-        .collect();
+    let mut args: Vec<_> = std::env::args_os().skip(1).collect();
+    // Only options before a `--` separator; after it every word is a
+    // positional, such as a workflow name.
+    let options = args
+        .iter()
+        .position(|arg| arg == "--")
+        .unwrap_or(args.len());
+    let positionals = args.split_off(options);
+    args.retain(|arg| arg != "--json" && !arg.to_string_lossy().starts_with("--json="));
     args.extend(["--json".into(), "--detached-run".into(), dir.clone().into()]);
+    args.extend(positionals);
     let mut command = Command::new(std::env::current_exe().context("locate goodflows")?);
     command
         .args(args)
