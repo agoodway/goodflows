@@ -3027,10 +3027,17 @@ fn incompatible_or_unpublished_runners_fail_before_hooks_without_latest() {
     )
     .unwrap();
     std::fs::set_permissions(&uname, std::fs::Permissions::from_mode(0o755)).unwrap();
-    std::fs::write(fake.root.join("arch"), "aarch64\n").unwrap();
+    // The Sprite's architecture differs from the controller's, so the local
+    // executable cannot run there and the release runner must be downloaded.
+    let (arch, other_arch) = if std::env::consts::ARCH == "aarch64" {
+        ("x86_64", "aarch64")
+    } else {
+        ("aarch64", "x86_64")
+    };
+    std::fs::write(fake.root.join("arch"), format!("{arch}\n")).unwrap();
     let (url, routes, requests) = release_server();
     let version = env!("CARGO_PKG_VERSION");
-    let archive_path = format!("/v{version}/goodflows-v{version}-aarch64-unknown-linux-gnu.tar.gz");
+    let archive_path = format!("/v{version}/goodflows-v{version}-{arch}-unknown-linux-gnu.tar.gz");
     let publish = |archive: Option<Vec<u8>>, checksum: Option<String>| {
         // A real release never changes; this test republishes the same
         // version, so the controller's verified-runner cache is cleared too.
@@ -3050,7 +3057,7 @@ fn incompatible_or_unpublished_runners_fail_before_hooks_without_latest() {
     let runner = |hello: &str| {
         let script = format!("#!/bin/sh\necho '{hello}'\n");
         tar_gz(&[(
-            &format!("goodflows-v{version}-aarch64-unknown-linux-gnu/goodflows"),
+            &format!("goodflows-v{version}-{arch}-unknown-linux-gnu/goodflows"),
             script.as_bytes(),
             0o755,
         )])
@@ -3080,19 +3087,19 @@ fn incompatible_or_unpublished_runners_fail_before_hooks_without_latest() {
     // Missing unpublished platform artifact.
     publish(None, None);
     attempt(&format!(
-        "no published Linux aarch64 runner for goodflows v{version}"
+        "no published Linux {arch} runner for goodflows v{version}"
     ));
     // Checksum mismatch.
     publish(
-        Some(runner(&hello(version, 1, "aarch64"))),
+        Some(runner(&hello(version, 1, arch))),
         Some(sha256(b"tampered")),
     );
     attempt("does not match its published checksum");
     // Version, protocol and architecture mismatches of the installed runner.
     for reply in [
-        hello("0.0.1", 1, "aarch64"),
-        hello(version, 99, "aarch64"),
-        hello(version, 1, "x86_64"),
+        hello("0.0.1", 1, arch),
+        hello(version, 99, arch),
+        hello(version, 1, other_arch),
     ] {
         publish(Some(runner(&reply)), None);
         attempt("does not match this goodflows");
