@@ -96,7 +96,12 @@ pub mod mock {
 
     pub enum Reply {
         Status(u16, Vec<(String, String)>, String),
+        /// A binary body, such as an archive.
+        Bytes(u16, Vec<u8>),
         Hang(Duration),
+        /// A 200 announcing the whole body that sends only its first half,
+        /// then stalls for the duration.
+        Stall(Vec<u8>, Duration),
         Close,
     }
 
@@ -141,7 +146,25 @@ pub mod mock {
                                 }
                                 let _ = write!(stream, "{head}\r\n{body}");
                             }
+                            Reply::Bytes(code, body) => {
+                                let _ = write!(
+                                    stream,
+                                    "HTTP/1.1 {code} Mock\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                    body.len()
+                                );
+                                let _ = stream.write_all(&body);
+                            }
                             Reply::Hang(duration) => std::thread::sleep(duration),
+                            Reply::Stall(body, duration) => {
+                                let _ = write!(
+                                    stream,
+                                    "HTTP/1.1 200 Mock\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                    body.len()
+                                );
+                                let _ = stream.write_all(&body[..body.len() / 2]);
+                                let _ = stream.flush();
+                                std::thread::sleep(duration);
+                            }
                             Reply::Close => {}
                         }
                     });

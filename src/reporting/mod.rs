@@ -1562,6 +1562,7 @@ mod tests {
             queued_ms: 0,
             commands: Vec::new(),
             fail_fast_skip: false,
+            caches: Vec::new(),
         };
 
         let (_tx, cancel) = watch::channel(None);

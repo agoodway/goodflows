@@ -20,8 +20,18 @@ const MAX_DEPTH: usize = 64;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Reference {
     Env(String),
-    Needs { job: String, key: String },
-    Step { step: String, key: String },
+    Needs {
+        job: String,
+        key: String,
+    },
+    Step {
+        step: String,
+        key: String,
+    },
+    /// `caches.NAME.hit`: whether the job's cache NAME was an exact hit.
+    Cache {
+        name: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -337,7 +347,7 @@ impl Parser<'_> {
                     "true" => Value::Bool(true),
                     "false" => Value::Bool(false),
                     "null" => Value::Null,
-                    "env" | "needs" | "steps" => return self.reference(&root),
+                    "env" | "needs" | "steps" | "caches" => return self.reference(&root),
                     _ => bail!("unknown expression name or namespace {root:?}"),
                 }
             }
@@ -396,7 +406,8 @@ impl Parser<'_> {
             ("steps", [step, outputs, key]) if outputs == "outputs" => {
                 Reference::Step { step: step.clone(), key: key.clone() }
             }
-            _ => bail!("invalid {root} reference: expected env.NAME, needs.JOB.outputs.KEY, or steps.ID.outputs.KEY"),
+            ("caches", [name, hit]) if hit == "hit" => Reference::Cache { name: name.clone() },
+            _ => bail!("invalid {root} reference: expected env.NAME, needs.JOB.outputs.KEY, steps.ID.outputs.KEY, or caches.NAME.hit"),
         };
         let index = self.references.len();
         self.references.push(reference);
@@ -742,5 +753,36 @@ mod tests {
             .collect::<Vec<_>>()
             .join("??");
         assert!(Expression::parse(&long_chain).is_err());
+    }
+
+    #[test]
+    fn cache_hit_references_parse() {
+        let expression = Expression::parse("!caches.deps.hit && caches['my-cache'].hit").unwrap();
+        assert_eq!(
+            expression.references(),
+            [
+                &Reference::Cache {
+                    name: "deps".into()
+                },
+                &Reference::Cache {
+                    name: "my-cache".into()
+                }
+            ]
+        );
+        let value = expression
+            .evaluate(&|reference| match reference {
+                Reference::Cache { name } => Ok(Value::Bool(name == "my-cache")),
+                _ => bail!("unexpected"),
+            })
+            .unwrap();
+        assert_eq!(value, json!(true));
+        for source in [
+            "caches.deps",
+            "caches.deps.miss",
+            "caches.deps.hit.x",
+            "caches",
+        ] {
+            assert!(Expression::parse(source).is_err(), "{source}");
+        }
     }
 }

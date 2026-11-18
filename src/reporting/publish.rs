@@ -118,13 +118,24 @@ impl Target {
             .expect("a validated origin joins an absolute path")
     }
 
-    pub(super) fn key(&self) -> &str {
+    /// An API URL on this target's origin.
+    pub(crate) fn api(&self, path: &str) -> Url {
+        self.origin
+            .join(path)
+            .expect("a validated origin joins an absolute path")
+    }
+
+    pub(crate) fn project(&self) -> &str {
+        &self.project
+    }
+
+    pub(crate) fn key(&self) -> &str {
         &self.key
     }
 
     /// An HTTP client for this target: no redirects, the contract User-Agent,
     /// and never a proxy for plaintext loopback traffic (and its key).
-    pub(super) fn client(&self, connect: Duration) -> reqwest::Result<reqwest::Client> {
+    pub(crate) fn client(&self, connect: Duration) -> reqwest::Result<reqwest::Client> {
         let mut builder = reqwest::Client::builder()
             .redirect(redirect::Policy::none())
             .connect_timeout(connect)

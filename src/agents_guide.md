@@ -122,8 +122,8 @@ run keeps the newest 10 finished runs of that config and removes older ones.
 
 `--json` prints JSON Lines on stdout; every event has `schema_version` 1.
 `--json=summary` on a run prints only `run_started`, any `error`,
-`sprite_unresolved` when a Sprite run cannot report, and the `summary`, which
-is last. A run that called workflows prints each called workflow's `summary`,
+`sprite_unresolved` when a Sprite run cannot report, the cache events, and
+the `summary`, which is last. A run that called workflows prints each called workflow's `summary`,
 with `parent_run_id` and `caller_job`, before the root's.
 
 The `summary` event:
@@ -140,8 +140,23 @@ The `summary` event:
   `output_omitted_bytes` says how much. `stdout_tail` and `stderr_tail` are the
   last 4 KiB of each stream, with `stdout_truncated` and `stderr_truncated`.
 - With `--log-dir`, each job that ran has `stdout_log` and `stderr_log`.
+- A job with caches has `caches`: each cache's `name`, `result`, `tier`, and
+  `saved` (the stores written) or `skipped` (the reason).
 - A failed root run has `rerun_command`, the command of its `Rerun failed:` or
   `Rerun workflow:` line. A called workflow's summary has none.
+
+Cache events never change a job's status or the exit code:
+
+- `cache_restored`: `job`, `partition`, `cache`, `result` (`exact`,
+  `fallback`, `present` or `miss`), `tier` (`local`, `remote`, `workdir` or
+  null), `bytes` and `duration_ms`. A `present` or `miss` result means the job
+  rebuilt or reused what was already in the tree.
+- `cache_saved` with `tiers`, or `cache_save_skipped` with `reason` (`hit`,
+  `exists`, `not_passed`, `read_only`, `no_scope`, `too_large`, `quota` or
+  `error`).
+- `cache_warning` with `message`: a restore or save failed and the job ran as
+  on a miss. `cache_remote_unavailable` with `reason`: the run uses only the
+  local store.
 
 The `run_status` event from `status`, `cancel`, and a `wait` that timed out
 has `state` (`running`, `finished` or `lost`), `exit_code` once finished,

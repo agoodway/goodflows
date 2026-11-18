@@ -228,7 +228,7 @@ Each cache of a job that runs SHALL produce one `cache_restored` event with the 
 - **THEN** the output has one `cache_restored` event with `result` `miss` and `tier` null for that job and cache
 
 ### Requirement: Save events
-Each saved cache SHALL produce one `cache_saved` event, and each cache not saved one `cache_save_skipped` event with a reason (`hit`, `exists`, `not_passed`, `read_only`, `no_scope`, `too_large`, `quota` or `error`). Text mode SHALL print one line per save. Run-history records SHALL include each job's cache results.
+Each saved cache SHALL produce one `cache_saved` event, and each cache not saved one `cache_save_skipped` event with a reason (`hit`, `exists`, `not_passed`, `read_only`, `no_scope`, `too_large`, `quota` or `error`). Text mode SHALL print one line per save. Run-history records SHALL include each job's cache results. This applies to the local history record; the run record uploaded to the server carries them once the server's run-record contract accepts them.
 
 #### Scenario: Save after a miss
 - **WHEN** a job with one cache passes after a miss, with `--json=summary`
