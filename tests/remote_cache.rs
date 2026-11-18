@@ -45,6 +45,8 @@ struct State {
     stall: bool,
     /// Never answer an upload.
     stall_put: bool,
+    /// Never answer a lookup.
+    stall_lookup: bool,
 }
 
 struct Fake {
@@ -152,6 +154,9 @@ fn handle(state: &Mutex<State>, request: &Request) -> Reply {
     let scope = query.get("scope").cloned();
     match (request.method.as_str(), rest) {
         ("GET", rest) if rest.starts_with("entries") => {
+            if state.stall_lookup {
+                return Reply::Hang(std::time::Duration::from_secs(30));
+            }
             if let Some(code) = state.lookup {
                 return status(code, json!({}));
             }
@@ -734,6 +739,69 @@ fn a_stalled_download_is_abandoned_at_the_caches_timeout_and_the_job_runs_as_a_m
     assert!(temporaries(&p.dir.join(".goodflows")).is_empty());
     let summary = of_type(&output, "summary").pop().unwrap();
     assert_eq!(summary["outcome"], "passed", "{summary}");
+}
+
+#[test]
+fn a_stalled_lookup_is_abandoned_at_the_caches_timeout_and_keeps_the_remote_store() {
+    let fake = Fake::start();
+    seed(&fake, "main");
+    fake.set(|s| s.stall_lookup = true);
+    let machine = Machine::new();
+    let config = format!(
+        "[reporting]\nproject = '{PROJECT}'\n[cache]\nremote = 'goodflows'\n\
+         [[jobs]]\nname = 'deps'\ncommand = 'touch ran'\n{ONE}timeout_secs = 1\n"
+    );
+    let p = checkout(&config, "main", "v1");
+    let started = std::time::Instant::now();
+    let output = machine.run(&p, &fake.mock.url, &["--json"], &[]);
+    success(&output);
+    // The restore and the save each stop at their 1 s bound, not at the
+    // API client's 30 s request timeout.
+    assert!(started.elapsed() < std::time::Duration::from_secs(20));
+    assert_eq!(restored(&output), ("miss".into(), Value::Null));
+    let warnings = of_type(&output, "cache_warning");
+    assert!(!warnings.is_empty(), "{}", stdout(&output));
+    for warning in &warnings {
+        assert!(
+            warning["message"]
+                .as_str()
+                .unwrap()
+                .contains("timeout_secs"),
+            "{warning}"
+        );
+    }
+    // A request the bound stopped is not an outage.
+    assert!(
+        of_type(&output, "cache_remote_unavailable").is_empty(),
+        "{}",
+        stdout(&output)
+    );
+    assert!(p.dir.join("ran").exists());
+    let summary = of_type(&output, "summary").pop().unwrap();
+    assert_eq!(summary["outcome"], "passed", "{summary}");
+}
+
+#[test]
+fn jobs_never_see_the_cache_key() {
+    for token_env in ["GOODFLOWS_CACHE_KEY", "MY_CACHE_KEY"] {
+        let fake = Fake::start();
+        let machine = Machine::new();
+        // The job's command and its condition both look for the key.
+        let config = format!(
+            "[reporting]\nproject = '{PROJECT}'\n[cache]\nremote = 'goodflows'\ntoken_env = '{token_env}'\n\
+             [[jobs]]\nname = 'deps'\ncondition = {{ expression = \"(env.{token_env} ?? 'gone') == 'gone'\" }}\ncommand = 'env > seen'\n{ONE}"
+        );
+        let p = checkout(&config, "main", "v1");
+        // The harness always sets GOODFLOWS_CACHE_KEY; with a custom
+        // token_env it is not a credential, so clear it.
+        let vars = [("GOODFLOWS_CACHE_KEY", ""), (token_env, TOKEN)];
+        let output = machine.run(&p, &fake.mock.url, &["--json"], &vars);
+        success(&output);
+        // The key still reached the cache server.
+        assert_eq!(fake.scopes(), ["main"], "{}", stdout(&output));
+        let seen = std::fs::read_to_string(p.dir.join("seen")).unwrap();
+        assert!(!seen.contains(TOKEN), "{token_env}: {seen}");
+    }
 }
 
 #[test]

@@ -1325,10 +1325,17 @@ async fn invocation(
         workdir: settings.workdir,
         log_dir: None,
         output: output.clone(),
-        reporting: session
-            .as_ref()
-            .map(reporting::Session::runner_env)
-            .unwrap_or_default(),
+        reporting: {
+            let mut env = session
+                .as_ref()
+                .map(reporting::Session::runner_env)
+                .unwrap_or_default();
+            // The cache key is a credential too: no command or expression sees it.
+            if let Some(cache) = &config.cache {
+                env.scrub.push(cache.token_env.clone());
+            }
+            Arc::new(env)
+        },
         environment: run.profile.clone(),
         settings_env: settings.env,
         sprite_state: run.sprite_state.clone(),

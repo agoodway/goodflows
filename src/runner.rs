@@ -278,8 +278,9 @@ pub struct ReportingEnv {
     /// every command and expression (even when inherited from the CLI's own
     /// environment) and set only for report-producing jobs with a spool.
     pub active: bool,
-    /// The publisher's credential variable, removed from every child and expression.
-    pub scrub: Option<String>,
+    /// Credential variables (the publisher's and the cache's), removed from
+    /// every child and expression.
+    pub scrub: Vec<String>,
     /// Reserved variables injected into report-producing jobs, keyed by job
     /// name and partition (`None` for an unpartitioned job).
     pub jobs: HashMap<ReportingKey, Vec<(String, String)>>,
@@ -299,7 +300,7 @@ impl ReportingEnv {
     /// Remove the token and the reserved names. Conditions see only this view:
     /// they decide whether the job runs, so they are not report producers.
     fn scrub(&self, env: &mut HashMap<String, String>) {
-        if let Some(token) = &self.scrub {
+        for token in &self.scrub {
             env.remove(token);
         }
         if self.active {
@@ -1577,7 +1578,7 @@ impl JobExecution<'_> {
         }
         // .envs() only adds to the inherited CLI environment, so the token and any
         // inherited reserved values (from an enclosing goodflows run) must be removed.
-        if let Some(token) = &self.reporting.scrub {
+        for token in &self.reporting.scrub {
             command.env_remove(token);
         }
         if self.reporting.active {

@@ -29,7 +29,6 @@ pub use source::{Origin, Source};
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use tokio::sync::watch;
 
 pub const MANIFEST: &str = "manifest.json";
@@ -471,16 +470,16 @@ impl Session {
         self.source.as_ref()
     }
 
-    pub fn runner_env(&self) -> Arc<ReportingEnv> {
-        Arc::new(ReportingEnv {
+    pub fn runner_env(&self) -> ReportingEnv {
+        ReportingEnv {
             active: true,
-            scrub: Some(self.token_env.clone()),
+            scrub: vec![self.token_env.clone()],
             jobs: self
                 .run
                 .as_ref()
                 .map(|run| run.env.clone())
                 .unwrap_or_default(),
-        })
+        }
     }
 
     pub async fn announce(&self, output: &Output) {
@@ -1082,6 +1081,7 @@ pub async fn deliver(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     #[test]
     fn job_status_covers_every_result_and_unknown() {

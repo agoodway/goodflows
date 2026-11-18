@@ -480,7 +480,7 @@ write = false
 
 Workflows (`[workflows.NAME.cache]`) and profiles (`[environments.NAME.cache]`) can override `write`, `local` and `local_bytes`, with the precedence of other settings.
 
-The remote store needs a `[reporting]` block and uses its project and `url_env`. Entries are scoped by branch. The scope is the Git branch, or `[cache] scope`, an expression over `env.*` for detached checkouts. A scope that evaluates to null or an empty string falls back to the Git branch. In GitHub Actions, `GITHUB_HEAD_REF` names a pull request's branch and is empty on pushes, which then use the Git branch:
+The remote store needs a `[reporting]` block and uses its project and `url_env`. Like the API key, the variable named by `[cache] token_env` is removed from every command and expression, so jobs never receive the cache key. Entries are scoped by branch. The scope is the Git branch, or `[cache] scope`, an expression over `env.*` for detached checkouts. A scope that evaluates to null or an empty string falls back to the Git branch. In GitHub Actions, `GITHUB_HEAD_REF` names a pull request's branch and is empty on pushes, which then use the Git branch:
 
 ```yaml
 - run: goodflows --env ci

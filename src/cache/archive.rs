@@ -884,6 +884,8 @@ fn swap(
     // handled is skipped.
     let mut staged: Vec<(PathBuf, PathBuf)> = Vec::new();
     let mut live: Vec<PathBuf> = Vec::new();
+    // Each target with the root it must stay under.
+    let mut rooted: Vec<(PathBuf, PathBuf)> = Vec::new();
     for path in declared.paths {
         let (stage, live_base, rels): (&Path, &Path, Vec<PathBuf>) =
             if let Some(parts) = home_parts(path) {
@@ -901,6 +903,7 @@ fn swap(
         if rels.is_empty() {
             continue;
         }
+        let first = live.len();
         if path.starts_with("~/") {
             live.extend(rels.iter().map(|rel| live_base.join(rel)));
         } else {
@@ -910,10 +913,22 @@ fn swap(
                     .map(|rel| live_base.join(rel)),
             );
         }
+        rooted.extend(
+            live[first..]
+                .iter()
+                .cloned()
+                .chain(rels.iter().map(|rel| live_base.join(rel)))
+                .map(|target| (live_base.to_path_buf(), target)),
+        );
         staged.extend(
             rels.into_iter()
                 .map(|rel| (stage.join(&rel), live_base.join(rel))),
         );
+    }
+    // Before anything moves: a symlinked ancestor would carry the swap
+    // outside the declared root.
+    for (root, target) in &rooted {
+        check_ancestors(root, target)?;
     }
     let depth = |path: &Path| path.components().count();
     live.sort_by_key(|target| depth(target));
@@ -935,6 +950,30 @@ fn swap(
         std::fs::rename(&from, &target)
             .with_context(|| format!("cannot move {} into place", target.display()))?;
         placed.push(target);
+    }
+    Ok(())
+}
+
+/// Refuse `target` when a directory between `root` and it is a symlink:
+/// moving it aside or renaming into it would replace a path outside `root`.
+/// A missing ancestor is fine, as `create_dir_all` makes real directories.
+fn check_ancestors(root: &Path, target: &Path) -> Result<()> {
+    let rel = target
+        .strip_prefix(root)
+        .with_context(|| format!("{} is outside its root", target.display()))?;
+    let parts: Vec<_> = rel.components().collect();
+    let mut at = root.to_path_buf();
+    for part in &parts[..parts.len().saturating_sub(1)] {
+        at.push(part);
+        match std::fs::symlink_metadata(&at) {
+            Ok(meta) if meta.file_type().is_symlink() => bail!(
+                "cannot restore {}: {} is a symlink",
+                target.display(),
+                at.display()
+            ),
+            Ok(_) => {}
+            Err(_) => break,
+        }
     }
     Ok(())
 }
@@ -1410,6 +1449,49 @@ mod tests {
         };
         assert_eq!(mode("deps/tool"), 0o755);
         assert_eq!(mode("deps/dir"), 0o775);
+    }
+
+    #[test]
+    fn a_restore_never_swaps_through_a_symlinked_destination_ancestor() {
+        let (src, out, dest, outside) = (
+            tempfile::tempdir().unwrap(),
+            tempfile::tempdir().unwrap(),
+            tempfile::tempdir().unwrap(),
+            tempfile::tempdir().unwrap(),
+        );
+        std::fs::create_dir_all(src.path().join("deps/lib")).unwrap();
+        std::fs::write(src.path().join("deps/lib/f"), "cached").unwrap();
+        std::fs::create_dir_all(src.path().join("other")).unwrap();
+        std::fs::write(src.path().join("other/g"), "cached").unwrap();
+        let paths = vec!["deps/lib".to_owned(), "other".to_owned()];
+        let archive = out.path().join("x");
+        let written = save(src.path(), src.path(), &paths, &archive).unwrap();
+        // `deps` points outside the workdir; `other` is missing, so a
+        // restore runs.
+        std::fs::create_dir_all(outside.path().join("lib")).unwrap();
+        std::fs::write(outside.path().join("lib/keep"), "external").unwrap();
+        std::os::unix::fs::symlink(outside.path(), dest.path().join("deps")).unwrap();
+        let error = extract(
+            &archive,
+            written.bytes,
+            &written.sha256,
+            &declared(dest.path(), dest.path(), &paths),
+            &AtomicBool::new(false),
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("is a symlink"), "{error:#}");
+        let names: Vec<_> = std::fs::read_dir(outside.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().into_string().unwrap())
+            .collect();
+        assert_eq!(names, ["lib"]);
+        assert_eq!(
+            std::fs::read_to_string(outside.path().join("lib/keep")).unwrap(),
+            "external"
+        );
+        assert!(!outside.path().join("lib/f").exists());
+        assert!(!dest.path().join("other").exists());
     }
 
     #[test]

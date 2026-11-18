@@ -839,8 +839,8 @@ impl Invocation {
                 continue;
             };
             let entry = match exact {
-                true => remote.lookup(Some(key), None, events).await,
-                false => remote.lookup(None, Some(partial), events).await,
+                true => remote.lookup(Some(key), None, events, abort).await?,
+                false => remote.lookup(None, Some(partial), events, abort).await?,
             };
             let Some(entry) = entry else { continue };
             let temp = match self.store() {
@@ -1079,7 +1079,11 @@ impl Invocation {
             return Ok(skipped("exists"));
         }
         if let Some(remote) = &self.session.remote {
-            if remote.lookup(Some(key), None, events).await.is_some() {
+            if remote
+                .lookup(Some(key), None, events, abort)
+                .await?
+                .is_some()
+            {
                 return Ok(skipped("exists"));
             }
         }

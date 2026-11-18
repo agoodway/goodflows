@@ -64,6 +64,9 @@ enum Reply {
     Status(StatusCode, Option<Value>),
     /// A connection failure or a timeout.
     Down,
+    /// The cache's bound or a cancellation stopped the request; the remote
+    /// store stays enabled.
+    Aborted,
 }
 
 /// A URL a presigned request may use: https, or http on loopback.
@@ -203,6 +206,7 @@ impl Remote {
         path: &str,
         query: &[(&str, &str)],
         body: Option<Value>,
+        abort: &AtomicBool,
     ) -> Reply {
         let mut url = self.target.api(path);
         if !query.is_empty() {
@@ -232,25 +236,28 @@ impl Remote {
             }
             Ok::<_, reqwest::Error>((status, Some(bytes)))
         };
-        match tokio::time::timeout(REQUEST_TIMEOUT, exchange).await {
-            Ok(Ok((status, bytes))) => {
+        match abortable(abort, tokio::time::timeout(REQUEST_TIMEOUT, exchange)).await {
+            Ok(Ok(Ok((status, bytes)))) => {
                 Reply::Status(status, bytes.and_then(|b| serde_json::from_slice(&b).ok()))
             }
-            _ => Reply::Down,
+            Ok(_) => Reply::Down,
+            Err(_) => Reply::Aborted,
         }
     }
 
     /// Look up an exact key (`partial` is `None`) or the newest entry with a
-    /// partial digest. Misses, refusals and outages all return `None`.
+    /// partial digest. Misses, refusals and outages all return `None`; only
+    /// `abort` fails it, with [`archive::Aborted`].
     pub async fn lookup(
         &self,
         key: Option<&str>,
         partial: Option<&str>,
         events: &Events<'_>,
-    ) -> Option<Entry> {
+        abort: &AtomicBool,
+    ) -> Result<Option<Entry>> {
         loop {
             if self.disabled() {
-                return None;
+                return Ok(None);
             }
             let scope = match self.state().scope_dropped {
                 true => None,
@@ -267,7 +274,8 @@ impl Remote {
             if let Some(scope) = &scope {
                 query.push(("scope", scope));
             }
-            match self.send(Method::GET, &path, &query, None).await {
+            match self.send(Method::GET, &path, &query, None, abort).await {
+                Reply::Aborted => return Err(archive::Aborted.into()),
                 Reply::Status(StatusCode::OK, body) => {
                     let found = body.as_ref().and_then(|b| entry(b, key, partial));
                     if found.is_none() {
@@ -275,9 +283,9 @@ impl Remote {
                             .warning("the cache server returned an invalid lookup response")
                             .await;
                     }
-                    return found;
+                    return Ok(found);
                 }
-                Reply::Status(StatusCode::NOT_FOUND, _) => return None,
+                Reply::Status(StatusCode::NOT_FOUND, _) => return Ok(None),
                 Reply::Status(StatusCode::FORBIDDEN, _) if scope.is_some() => {
                     self.state().scope_dropped = true;
                     events
@@ -288,21 +296,21 @@ impl Remote {
                 }
                 Reply::Status(StatusCode::SERVICE_UNAVAILABLE, _) | Reply::Down => {
                     self.disable(events, "server_unavailable").await;
-                    return None;
+                    return Ok(None);
                 }
                 Reply::Status(StatusCode::UNAUTHORIZED, _) => {
                     self.disable(events, "unauthorized").await;
-                    return None;
+                    return Ok(None);
                 }
                 Reply::Status(StatusCode::FORBIDDEN, _) => {
                     self.disable(events, "forbidden").await;
-                    return None;
+                    return Ok(None);
                 }
                 Reply::Status(status, _) => {
                     events
                         .warning(&format!("cache lookup failed (HTTP {})", status.as_u16()))
                         .await;
-                    return None;
+                    return Ok(None);
                 }
             }
         }
@@ -378,9 +386,12 @@ impl Remote {
                 &self.path(&format!("entries/{key}")),
                 &[],
                 Some(body),
+                abort,
             )
             .await
         {
+            // The cache's own bound reports the abandoned save.
+            Reply::Aborted => return Saved::Unavailable,
             Reply::Status(StatusCode::CREATED, Some(body)) => body,
             Reply::Status(StatusCode::CONFLICT, _) => return Saved::Stored,
             Reply::Status(StatusCode::FORBIDDEN, _) => {
@@ -477,9 +488,11 @@ impl Remote {
                 &self.path(&format!("uploads/{upload_id}/commit")),
                 &[],
                 None,
+                abort,
             )
             .await
         {
+            Reply::Aborted => Saved::Unavailable,
             Reply::Status(StatusCode::OK, _) => Saved::Stored,
             Reply::Status(StatusCode::UNPROCESSABLE_ENTITY, _) => Saved::Failed(
                 "the cache server rejected the upload: the stored object does not match".into(),
