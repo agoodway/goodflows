@@ -1111,6 +1111,14 @@ impl Invocation {
                 dir.join(format!(".tmp{}", uuid::Uuid::new_v4().simple()))
             }
         };
+        // Part MD5s are only needed for a multipart upload to the remote
+        // store; local-only runs skip the work.
+        let parts = self
+            .session
+            .remote
+            .as_ref()
+            .filter(|r| !r.disabled() && r.refusal().is_none())
+            .map(|_| remote::part_bytes());
         let written = {
             let (temp, workdir, home, paths, key, partial, abort) = (
                 temp.clone(),
@@ -1132,6 +1140,7 @@ impl Invocation {
                     &key,
                     &partial,
                     archive::MAX_ENTRY_BYTES,
+                    parts,
                     &abort,
                 )
             })

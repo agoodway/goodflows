@@ -23,7 +23,7 @@ For an archive of at least 64 MiB, the reserve body SHALL include `parts`: `{"si
 - **THEN** the reserve body has `parts.size` 16777216 and seven MD5s, the last one covering the final 4 MiB
 
 ### Requirement: Multipart part uploads
-When a reservation returns `upload_parts`, goodflows SHALL `PUT` each part's bytes to its `url` with exactly its `headers` and no `Authorization` header, with at most 8 parts in flight, then commit. A part SHALL be tried up to 3 times. A part that still fails SHALL fail the save with a `cache_warning`, without a commit, and the local entry SHALL be kept.
+When a reservation returns `upload_parts`, goodflows SHALL `PUT` each part's bytes to its `url` with exactly its `headers` and no `Authorization` header, with at most 8 parts in flight, then commit. A part SHALL be tried up to 3 times, with a short wait that grows with each retry. A part that still fails SHALL fail the save with a `cache_warning`, without a commit, and the local entry SHALL be kept.
 
 #### Scenario: Parts cover the archive
 - **WHEN** a 100 MiB archive is uploaded in parts
@@ -38,18 +38,18 @@ When a reservation returns `upload_parts`, goodflows SHALL `PUT` each part's byt
 - **THEN** that part is sent 3 times, no commit is sent, goodflows reports a `cache_warning`, and the local entry is kept
 
 ### Requirement: Invalid multipart reservations
-goodflows SHALL treat a reservation as invalid, and fail the save with a `cache_warning` before uploading anything, when `upload_parts` does not list each requested part once in order, a part's `content-length` or `content-md5` differs from that part, a part URL is not a presigned URL on the first part's host and scheme, or a part asks for an `Authorization` header.
+goodflows SHALL treat a reservation as invalid, and fail the save with a `cache_warning` before uploading anything, when `upload_parts` does not list each requested part once in order, a part's `content-length` or `content-md5` differs from that part, a part URL is not a presigned URL on the first part's host, port and scheme, or a part asks for an `Authorization` header.
 
 #### Scenario: Wrong part count
 - **WHEN** a reservation for seven parts returns six `upload_parts`
 - **THEN** no part is uploaded, no commit is sent, and goodflows reports a `cache_warning`
 
 ### Requirement: Multipart compatibility
-When a reserve that sent `parts` gets a `422` whose errors name `parts`, goodflows SHALL reserve once more without `parts` and upload with one `PUT`. When a reservation that was sent `parts` returns `upload_url` and no `upload_parts`, goodflows SHALL upload with one `PUT`.
+When a reserve that sent `parts` gets a `422` whose errors name `parts`, goodflows SHALL reserve once more without `parts` and upload with one `PUT`, and SHALL report the refusal with one `cache_warning` per run. When a reservation that was sent `parts` returns `upload_url` and no `upload_parts`, goodflows SHALL upload with one `PUT`.
 
 #### Scenario: Older server
 - **WHEN** the server answers a reserve with `parts` with `422` and `{"errors": {"parts": ["is not allowed"]}}`
-- **THEN** goodflows reserves again without `parts`, uploads one `PUT`, commits, and reports `cache_saved`
+- **THEN** goodflows reserves again without `parts`, uploads one `PUT`, commits, reports `cache_saved`, and reports one `cache_warning` naming the refused multipart upload, however many saves of the run fall back
 
 #### Scenario: Server without multipart storage
 - **WHEN** a reserve with `parts` returns `upload_url` and `upload_headers`

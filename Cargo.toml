@@ -13,9 +13,12 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
+base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
 colored = "2"
 flate2 = "1"
+futures-util = { version = "0.3", default-features = false }
+md-5 = "0.10"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "rustls-tls-native-roots", "stream"] }
 # The official MCP SDK (modelcontextprotocol/rust-sdk), for `goodflows mcp`:
 # stdio server transport and the tool macros only.
@@ -38,4 +41,8 @@ libc = "0.2"
 # Debug builds hash the (large) debug executable when they provision a Sprite
 # runner; an unoptimized SHA-256 makes every Sprite test spend seconds on it.
 [profile.dev.package.sha2]
+opt-level = 3
+
+# The part MD5s of a large cache archive are computed while it is written.
+[profile.dev.package.md-5]
 opt-level = 3
