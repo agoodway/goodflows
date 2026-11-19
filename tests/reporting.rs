@@ -1350,18 +1350,15 @@ fn invalid_origins_skip_delivery_without_requests() {
 
 #[test]
 fn offline_and_transient_failures_retry_then_stay_pending() {
-    // A bound-then-dropped port refuses connections.
-    let port = std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
+    // Every connection is dropped unanswered, so each attempt is a transport
+    // error. A bound-then-dropped port could be reused by a parallel test.
+    let offline = Mock::start(|_, _| Reply::Close);
     let p = project(&format!(
         "[[jobs]]\nname = \"test\"\ncommand = '{}'\nreports = [\"test-timings\"]\n",
         copy(&["r1"])
     ));
     let start = Instant::now();
-    let output = run_with(&p, &["--json"], Some(&format!("http://127.0.0.1:{port}")));
+    let output = run_with(&p, &["--json"], Some(&offline.url));
     success(&output);
     assert!(start.elapsed() < Duration::from_secs(20));
     let first = events(&output);
@@ -4067,13 +4064,11 @@ fn upload_summary(output: &std::process::Output) -> Value {
 
 #[test]
 fn replay_sends_a_pending_run_record_after_the_reports_and_only_once() {
-    // A bound-then-dropped port refuses connections: the run is offline.
-    let port = std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
-    let (p, dir, run) = saved_history_run(&format!("http://127.0.0.1:{port}"));
+    // Every connection is dropped unanswered: the run is offline. A
+    // bound-then-dropped port would not do, since a parallel test's mock can
+    // be given that port and acknowledge the report.
+    let offline = Mock::start(|_, _| Reply::Close);
+    let (p, dir, run) = saved_history_run(&offline.url);
     let pending = by_type(&run, "run_upload_pending");
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0]["reason"], "transport_error");
