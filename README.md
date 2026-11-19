@@ -374,13 +374,138 @@ Those three commands match the file above, which has a default workflow and no w
 
 Settings precedence is CLI flags, then the profile, then the workflow, then `[settings]`, then the built-in defaults. The same order merges `env` by key. CLI flags do not include an env map. A profile's `settings` take the same fields as a workflow's. `env` values are literal strings with no interpolation, and an empty string sets the variable to empty.
 
+### Caches
+
+A job can declare caches: directories that goodflows restores before the job's command or first step, and saves after the job. A cache only makes a job faster. A failed restore or save prints a `cache_warning`, and the job runs as if the cache missed. It never changes a job's status or the exit code.
+
+```toml
+[[jobs]]
+name = "dialyzer"
+depends_on = ["versions"]
+command = "mix dialyzer"
+
+[[jobs.caches]]
+name = "plts"
+paths = ["priv/plts"]
+key.files = ["**/mix.lock"]
+key.values = ["needs.versions.outputs.otp", "needs.versions.outputs.elixir"]
+fallback = true      # default
+save = "passed"      # or "always"
+timeout_secs = 300   # default; bounds the restore and the save separately
+```
+
+- `name` follows the job name rule and is unique within the job. Jobs that use the same name, values and files share entries, so a `deps` job and a `test` job can share `_build`.
+- `paths` are globs relative to the job's workdir that stay inside it, or directories under `~/` (the home directory of the user running the job), such as `~/.cargo/registry` or `~/.npm`. A `~/` path names one directory below home, and cannot be or contain `.ssh`, `.aws` or `.gnupg`. A restore follows your own symlinks under `~/`, such as `~/.cargo` pointing to another disk, and copies the cache onto that disk. In the workdir, a restore refuses a path whose parent directory is a symlink, because a checkout could plant one.
+- `key.files` are globs relative to the workdir. goodflows hashes the sorted matching paths and their contents. No match is not an error.
+- `key.values` and `key.unique` are expressions over `env.*` and `needs.JOB.outputs.KEY`, under the rules of job conditions. Each must be a scalar. A value that fails to evaluate makes that cache miss with a warning.
+- The operating system and CPU architecture are always part of the key. Other matrix dimensions, such as the Node or Rust version, belong in `key.values`. Change a value such as `"'v2'"` to start a cache over.
+- Caches work on command jobs, step jobs and partitioned jobs (each instance restores and saves on its own). Workflow-call jobs cannot declare them.
+
+#### Keys, restores and saves
+
+goodflows builds a partial digest from the format version, the cache name, the platform and `key.values`, and the key from the partial digest, the `key.files` digest and `key.unique`. After the job's condition passes, it checks the declared paths:
+
+- When every path exists, goodflows keeps the tree and looks nothing up. A key stamp in `.goodflows/cache-stamps/` records which key the tree was built for. A matching stamp reports `exact` from `workdir`; anything else reports `present`.
+- When a path is missing, goodflows tries the exact key in the local store, then in the remote store, then (with `fallback`) the newest entry with the same partial digest, locally and then remotely. A restore replaces every declared path, and reports `exact`, `fallback` or `miss`.
+
+After the job ends, goodflows saves a cache when it was not an exact hit, its key is not stored yet (`exists` otherwise), writes are enabled, and the job's status matches `save`: `passed`, or with `"always"` also `failed`. A job that timed out, was cancelled or was skipped never saves. The stamp is set to the key whenever the status matches `save`. Saves run in the job's slot after its status is final. Dependents can start meanwhile, and the run ends after every save. Jobs share the workdir, so a save archives only while no job of the run is executing, and archives again when one started meanwhile. While it waits it frees its slot, so other jobs can start, and it takes a slot back to archive. The wait does not count against the cache's `timeout_secs`; the archive attempts share it. In a called workflow, the call job ends once the child's jobs have results, so its dependents start while the child's saves finish; the child's summary still lists them and comes before the caller's. Ctrl-C or SIGTERM abandons restores and saves at once: a restore counts as a miss and the job is cancelled. Restore and save time does not count against the job's `timeout_secs`. A restore or save that runs past the cache's own `timeout_secs` is abandoned with a `cache_warning`: the restore counts as a miss and leaves no partial path, and the save is skipped. An archive larger than 5,000,000,000 bytes compressed is not saved (`too_large`). Archives are staged on disk and uploaded by streaming the file, so a large cache needs that much free disk space, not memory. With `local = false`, a save needs the remote store; when it is unavailable, each save is skipped with reason `error` and one `cache_warning` names the cause.
+
+Steps and `outputs` can read `caches.NAME.hit`, true for an exact restore or a matching stamp:
+
+```toml
+[[jobs]]
+name = "test"
+steps = [
+  { id = "deps", command = "mix deps.get", condition = { expression = "!caches.deps.hit" } },
+  { id = "test", command = "mix test" },
+]
+
+[[jobs.caches]]
+name = "deps"
+paths = ["deps", "_build"]
+key.files = ["mix.lock"]
+```
+
+The job's own `condition` cannot read `caches.*`, because it runs before the restore.
+
+A rolling cache saves a new entry for every commit and restores the previous one as a fallback:
+
+```toml
+[[jobs.caches]]
+name = "ccache"
+paths = ["~/.cache/ccache"]
+key.unique = ["env.GITHUB_SHA"]
+```
+
+More examples:
+
+```toml
+# Elixir: Dialyzer PLTs
+[[jobs.caches]]
+name = "plts"
+paths = ["priv/plts"]
+key.files = [".tool-versions", "mix.lock"]
+
+# Cargo
+[[jobs.caches]]
+name = "cargo"
+paths = ["~/.cargo/registry", "~/.cargo/git", "target"]
+key.files = ["Cargo.lock", "rust-toolchain.toml"]
+
+# npm
+[[jobs.caches]]
+name = "npm"
+paths = ["~/.npm"]
+key.files = ["package-lock.json"]
+```
+
+Archives are not scanned for secrets: a declared directory that holds a token is saved with it. Some tools record absolute paths in their output (Cargo's `target/`, possibly PLTs), so a restore into a checkout or toolchain at another path can still rebuild. Install toolchains at the same path everywhere, or put the install path in `key.values`. While a job runs, its cached paths belong to goodflows, like any build directory.
+
+#### Stores and settings
+
+Every run has a local store at `$XDG_CACHE_HOME/goodflows/` (`~/.cache/goodflows/`, or `~/Library/Caches/goodflows/` on macOS), private to the user. All checkouts and worktrees with the same Git remote URL share one store. Without a remote, the repository path identifies the store, and outside Git the config file's directory does. On a Sprite the store is `$GOODFLOWS_SPRITE_STATE_DIR/caches`. Least recently used entries are deleted once the store passes `local_bytes`.
+
+```toml
+[cache]                              # optional
+remote = "goodflows"                 # use the [reporting] server as a shared store
+token_env = "GOODFLOWS_CACHE_KEY"    # default; the reporting key when unset or empty
+scope = "env.GITHUB_HEAD_REF ?? env.GITHUB_REF_NAME"  # default: the Git branch
+write = true                         # false: restore only
+local = true                         # false: no local store
+local_bytes = 5_368_709_120          # default 5 GiB
+
+[environments.pr.cache]
+write = false
+```
+
+Workflows (`[workflows.NAME.cache]`) and profiles (`[environments.NAME.cache]`) can override `write`, `local` and `local_bytes`, with the precedence of other settings.
+
+The remote store needs a `[reporting]` block and uses its project and `url_env`. Like the API key, the variable named by `[cache] token_env` is removed from every command and expression, so jobs never receive the cache key. Entries are scoped by branch. The scope is the Git branch, or `[cache] scope`, an expression over `env.*` for detached checkouts. A scope that evaluates to null or an empty string falls back to the Git branch. In GitHub Actions, `GITHUB_HEAD_REF` names a pull request's branch and is empty on pushes, which then use the Git branch:
+
+```yaml
+- run: goodflows --env ci
+  env:
+    GOODFLOWS_URL: ${{ vars.GOODFLOWS_URL }}
+    GOODFLOWS_CACHE_KEY: ${{ secrets.GOODFLOWS_CACHE_KEY }}
+```
+
+A run reads its own scope and then the default branch's. A run without a scope (a detached HEAD with no `scope`) reads only the default branch and saves only locally (`no_scope`). The server's key decides what a run may write: a read-only `ck_` key makes remote saves `read_only` after one warning, and a key bound to another branch reads only the default branch. Use a long-lived read-only `ck_` key bound to the default branch on laptops and orbs, and let CI on the default branch write. Without a key or URL the run uses only the local store (`cache_remote_unavailable`). Sprite runs get a short-lived key from the controller; see [docs/sprites.md](docs/sprites.md).
+
+#### Cache events
+
+- `cache_restored`: `job`, `partition`, `cache`, `result` (`exact`, `fallback`, `present` or `miss`), `tier` (`local`, `remote`, `workdir` or null), `bytes`, `duration_ms`.
+- `cache_saved` with `tiers`, or `cache_save_skipped` with `reason` (`hit`, `exists`, `not_passed`, `read_only`, `no_scope`, `too_large`, `quota` or `error`).
+- `cache_warning` with `message`, and `cache_remote_unavailable` with `reason`.
+
+Text mode prints one line per cache, such as `dialyzer cache plts: restored (exact, local, 182 MiB, 3.1s)`. The summary and the local run history file list each job's cache results. Uploaded run records do not carry them yet. `goodflows list` shows each job's caches with their paths and key inputs.
+
 ### Text and JSON output
 
 `--output` picks how much a run prints in text mode. `--output=failures` prints one status line per job and no job output while the run goes. `--output=stream` also prints step lines, and writes each output chunk as `[job stream]` followed by the chunk. `stream` is `stdout` or `stderr`. A step is `[job/step stream]`. Without the flag, a run uses `failures` when stdout is not a terminal, such as when it is piped to a file, or when a coding agent variable is set (`CLAUDECODE`, `CODEX_*` other than `CODEX_HOME`, `AGENT`, `AI_AGENT`, `CURSOR_AGENT`, `GEMINI_CLI`, or `OPENCODE`). Otherwise it uses `stream`. `--json` ignores `--output`.
 
 The run ends with a report: one row per job, then counts, then a `Failures` section when something failed or timed out. In both modes each `Failures` entry shows the instance's output and the paths of its log files when `--log-dir` is set. Short output is shown whole, in a `stdout:` and a `stderr:` block. Longer output is one `stdout and stderr:` block in the order goodflows read it: the first 4 KiB, a `… N bytes omitted …` line, then the last 4 KiB, with the log paths under it. The last line of a failed root run is `Rerun failed:` and a `goodflows run` command for the failed jobs and the jobs skipped because a dependency did not pass.
 
-`--json` prints JSON Lines on stdout. Every event has `schema_version` 1. The last event of a finished run has `"type":"summary"`. Its `success` field is true when every selected job passed or was skipped. `--json=summary` leaves out the events in between, such as one `job_output` event per output chunk. A run then prints only `run_started`, any `error` event, and the `summary`, plus `sprite_unresolved` when a Sprite run cannot report one. Other commands print the same events as with `--json`. Commands that only report a result, such as `init`, `skills install`, `last`, and `status`, take a plain `--json` with no value.
+`--json` prints JSON Lines on stdout. Every event has `schema_version` 1. The last event of a finished run has `"type":"summary"`. Its `success` field is true when every selected job passed or was skipped. `--json=summary` leaves out the events in between, such as one `job_output` event per output chunk. A run then prints only `run_started`, any `error` event, the cache events (see [Caches](#caches)), and the `summary`, plus `sprite_unresolved` when a Sprite run cannot report one. Other commands print the same events as with `--json`. Commands that only report a result, such as `init`, `skills install`, `last`, and `status`, take a plain `--json` with no value.
 
 Each failed or timed-out job in the summary has:
 
@@ -578,7 +703,7 @@ command = "cargo test --locked"
 
 `sprite_prefix` is 1 to 20 characters: lowercase ASCII letters, digits, or hyphens, starting with a letter or digit. Set it only in the top-level `[settings]`. `[sprite]` is top-level only. `setup` and `resume` are required for a remote run. They are nonempty shell commands. `true` is a deliberate no-op. goodflows does not look for `.agents/setup` and does not install toolchains for you. `pass_env` lists caller variables to forward. A name that is unset fails before anything remote runs. An empty value counts as set. The default is to forward nothing.
 
-`SPRITE_TOKEN`, `SPRITES_TOKEN`, and the reporting API key stay on the controller. `pass_env` cannot name them.
+`SPRITE_TOKEN`, `SPRITES_TOKEN`, and the reporting API key stay on the controller. `pass_env` cannot name them. Declared [caches](#caches) live in the Sprite's state directory between runs. With a remote cache store, the controller mints a short-lived `ck_` key for each run, so `pass_env` cannot name `[cache] token_env` either.
 
 ```bash
 goodflows run --sprite "$THREAD_ID"

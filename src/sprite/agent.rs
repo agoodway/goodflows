@@ -687,6 +687,11 @@ fn submit(root: &Root, scope: &Scope) -> Result<u8> {
     // Values stay in memory only; never written to disk or argv.
     let env: BTreeMap<String, String> =
         serde_json::from_slice(&read_frame(&mut stdin, 64 * 1024 * 1024)?).context("env")?;
+    if env.contains_key(crate::cache::SPRITE_CACHE_ENV) {
+        // Same-user jobs must not read the minted cache key from this
+        // process's memory.
+        crate::reporting::protect_process();
+    }
     run_id(&header.run_id)?;
     if header.protocol != PROTOCOL {
         bail!(
@@ -1140,6 +1145,10 @@ fn serve_one(root: &Root, info: &SupervisorInfo, stream: UnixStream) -> Result<(
     let mut line = String::new();
     reader.read_line(&mut line)?;
     let request: Value = serde_json::from_str(&line)?;
+    if request["env"].get(crate::cache::SPRITE_CACHE_ENV).is_some() {
+        // The supervisor now holds a minted cache key.
+        crate::reporting::protect_process();
+    }
     let reply = match request["op"].as_str() {
         Some("ping") => json!({"protocol": info.protocol, "generation": info.generation,
             "runner": info.runner, "version": env!("CARGO_PKG_VERSION")}),
@@ -1562,6 +1571,14 @@ struct Worker<'a> {
 }
 
 impl Worker<'_> {
+    /// The forwarded values hooks and the workflow process get: everything
+    /// but the minted cache key, which only the runner's cache client reads.
+    fn user_env(&self) -> impl Iterator<Item = (&String, &String)> {
+        self.env
+            .iter()
+            .filter(|(name, _)| name.as_str() != crate::cache::SPRITE_CACHE_ENV)
+    }
+
     fn cancel_requested(&self) -> bool {
         self.run.join("cancel").exists() || self.hold_failed.load(Ordering::SeqCst)
     }
@@ -1701,6 +1718,10 @@ fn worker(root: &Root, run_id: &str, generation: &str, lock_fd: &str) -> Result<
     std::io::stdin().read_line(&mut line)?;
     let env: BTreeMap<String, String> = serde_json::from_str(&line).context("env payload")?;
     line.clear();
+    if env.contains_key(crate::cache::SPRITE_CACHE_ENV) {
+        // The worker outlives every job of the run; keep the key from them.
+        crate::reporting::protect_process();
+    }
     let mut record = {
         let _guard = record_lock(&run)?;
         let mut record: Record = read_json(&run.join("record.json"))?;
@@ -1911,7 +1932,7 @@ fn execute(worker: &mut Worker, header: &Header) -> Result<(Phase, Terminal)> {
             .current_dir(&workdir)
             .env_clear()
             .envs(base_env())
-            .envs(&worker.env)
+            .envs(worker.user_env())
             .env(crate::config::SPRITE_STATE_ENV, &state)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -2020,9 +2041,11 @@ fn execute(worker: &mut Worker, header: &Header) -> Result<(Phase, Terminal)> {
             .current_dir(&run)
             .env_clear()
             .envs(base_env())
-            .envs(&worker.env)
+            .envs(worker.user_env())
             .env(crate::config::SPRITE_STATE_ENV, &state)
-            .stdin(Stdio::null())
+            // The minted cache key, if any, travels on stdin: never in an
+            // environment a job could read through /proc.
+            .stdin(Stdio::piped())
             .stdout(create("workflow.jsonl")?)
             .stderr(create("workflow.stderr")?)
             .pre_exec(move || {
@@ -2050,6 +2073,16 @@ fn execute(worker: &mut Worker, header: &Header) -> Result<(Phase, Terminal)> {
             ))
         }
     };
+    if let Some(mut stdin) = child.stdin.take() {
+        let cache = worker
+            .env
+            .get(crate::cache::SPRITE_CACHE_ENV)
+            .cloned()
+            .unwrap_or_default();
+        // Small enough for the pipe buffer; a runner that died early just
+        // gets a broken pipe.
+        let _ = stdin.write_all(cache.as_bytes());
+    }
     super::testhook::pause("spawned-workflow");
     worker.register_child("workflow", child.id())?;
     let outcome = worker.supervise(&mut child, false, WORKFLOW_GRACE)?;
@@ -2189,6 +2222,18 @@ async fn exec_workflow(args: &[String]) -> Result<u8> {
     // Never derived from this process's env, which includes forwarded values.
     let run = PathBuf::from(args.get(2).context("run directory")?);
     let header: Header = read_json(&run.join("header.json"))?;
+    // The worker writes the minted cache key (or nothing) and closes stdin.
+    let mut cache = String::new();
+    std::io::stdin()
+        .lock()
+        .take(64 * 1024)
+        .read_to_string(&mut cache)
+        .context("read the cache key")?;
+    let cache_forwarded: Option<crate::cache::Forwarded> = serde_json::from_str(&cache).ok();
+    drop(cache);
+    if cache_forwarded.is_some() {
+        crate::reporting::protect_process();
+    }
     let (_signals, cancel) = crate::cancellation()?;
     let output = crate::output::Output::new(true, crate::output::Mode::Stream, cancel.clone())?;
     let results = run.join("results");
@@ -2230,6 +2275,9 @@ async fn exec_workflow(args: &[String]) -> Result<u8> {
             sprite_state: std::env::var(crate::config::SPRITE_STATE_ENV).ok(),
             provenance: source(&header.provenance),
             last_run: None,
+            config_dir: None,
+            caches: Default::default(),
+            cache_forwarded,
         };
         crate::execute(
             run,

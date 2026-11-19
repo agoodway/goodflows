@@ -259,9 +259,29 @@ for migrations, or destroy and recreate an idle Sprite. If either hook fails,
 no job starts (exit 1).
 
 Hooks and jobs get `GOODFLOWS_SPRITE_STATE_DIR`, an absolute directory outside
-the per-run source that persists for the identity. Your scripts own caches
-and toolchains there and link them into each fresh source tree. GoodFlows
-never discovers, mounts or copies caches. GoodFlows kills every process a hook
+the per-run source that persists for the identity. Caches that jobs declare
+(`[[jobs.caches]]`, see the README's Caches section) live in its `caches/`
+directory, so each fresh source tree restores them with no remote store and no
+credentials on the Sprite. Hand-wired state still works: your scripts can keep
+other caches and toolchains there and link them into each fresh source tree.
+GoodFlows does not discover, mount or copy anything a job did not declare.
+
+When the selected run uses the remote cache store (`[cache] remote =
+"goodflows"`), the controller mints a cache key for the run with its own `sk_`
+reporting key before the remote run starts. The key starts with `ck_`, is
+`read_write` and bound to the run's scope (which the controller resolves from
+its own environment: `[cache] scope`, else the snapshot's branch), or `read`
+when writes are off or there is no scope, and expires within 24 hours. It
+travels only in the private forwarded-value frame; the remote runner's cache
+client reads it, and it never reaches argv, files, events, bundles, the
+receipt, hooks or job environments. The controller revokes it after
+collection or cancellation, or, when the attached run ended unresolved, at a
+later `sprite collect`, `sprite cancel` or a `sprite status` that finds the
+identity idle. When minting fails, the run continues with the Sprite's local
+store and one `cache_remote_unavailable` event. Do not configure a cache key
+for Sprites: `pass_env` and configured env cannot name `[cache] token_env`.
+
+GoodFlows kills every process a hook
 starts when the hook ends, so a hook cannot leave a server running for the
 jobs. Start long-lived services with `sprite-env services` (they outlive the
 run, and you own their lifecycle) or inside the job that needs them. The

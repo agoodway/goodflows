@@ -41,13 +41,23 @@ pub enum Mode {
 pub enum Json {
     /// Every event (the default for a bare `--json`)
     All,
-    /// For a run, only `run_started`, `error`, `sprite_unresolved` and `summary`
+    /// For a run, only `run_started`, `error`, `sprite_unresolved`, cache events and `summary`
     Summary,
 }
 
 /// The events a summary-only run prints: how it started, why it could not
-/// finish, and its result.
-const SUMMARY_EVENTS: [&str; 4] = ["run_started", "error", "sprite_unresolved", "summary"];
+/// finish, its caches, and its result.
+const SUMMARY_EVENTS: [&str; 9] = [
+    "run_started",
+    "error",
+    "sprite_unresolved",
+    "summary",
+    "cache_restored",
+    "cache_saved",
+    "cache_save_skipped",
+    "cache_remote_unavailable",
+    "cache_warning",
+];
 
 /// Variables that coding agents set in the commands they run. Any `CODEX_*`
 /// variable also counts, except `CODEX_HOME`, which users set themselves.
@@ -504,6 +514,21 @@ fn render(
                     if job.get("reports").is_some() {
                         writeln!(out, "    reports: {}", names(&job["reports"]))?;
                     }
+                    for cache in job["caches"].as_array().into_iter().flatten() {
+                        let key = &cache["key"];
+                        writeln!(
+                            out,
+                            "    cache {}: paths: {}\n      key.files: {}  key.values: {}  key.unique: {}\n      fallback={} save={} timeout_secs={}",
+                            visible(text(cache, "name")),
+                            visible(&names(&cache["paths"])),
+                            visible(&names(&key["files"])),
+                            visible(&names(&key["values"])),
+                            visible(&names(&key["unique"])),
+                            cache["fallback"],
+                            text(cache, "save"),
+                            cache["timeout_secs"]
+                        )?;
+                    }
                     for step in job["steps"].as_array().into_iter().flatten() {
                         let shell = step["shell"]
                             .as_bool()
@@ -696,6 +721,16 @@ fn render(
             "sprite_status" => {
                 for line in text(&event, "message").split('\n') {
                     writeln!(out, "{}", visible(line))?;
+                }
+            }
+            kind if kind.starts_with("cache_") => {
+                let job = instance_of(&event, "job");
+                let label = match event["invocation_id"].as_str() {
+                    Some(_) => format!("{} {job}", invocation_label(&event)),
+                    None => job,
+                };
+                if let Some(line) = crate::cache::text_line(&event, &label) {
+                    writeln!(out, "{line}")?;
                 }
             }
             kind if kind.starts_with("sprite_") => {

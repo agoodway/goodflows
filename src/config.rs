@@ -141,6 +141,131 @@ pub struct Config {
     /// by `run --sprite`; local runs ignore it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sprite: Option<SpriteConfig>,
+    /// `[cache]`: the remote store and cache settings. A resolved workflow
+    /// copy carries the workflow and profile overrides applied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache: Option<CacheConfig>,
+}
+
+/// The only remote cache backend.
+pub const CACHE_REMOTE_GOODFLOWS: &str = "goodflows";
+/// `[cache] token_env` when unset.
+pub const DEFAULT_CACHE_TOKEN_ENV: &str = "GOODFLOWS_CACHE_KEY";
+/// `[cache] local_bytes` when unset: 5 GiB.
+pub const DEFAULT_CACHE_LOCAL_BYTES: u64 = 5_368_709_120;
+/// A cache's `timeout_secs` when unset.
+pub const DEFAULT_CACHE_TIMEOUT_SECS: i64 = 300;
+/// The longest a server scope may be, in UTF-8 bytes.
+pub const MAX_CACHE_SCOPE_BYTES: usize = 256;
+
+/// `[cache]`: top-level only. Without it, caches use only the local store
+/// with writes enabled.
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+#[serde(deny_unknown_fields)]
+pub struct CacheConfig {
+    /// `goodflows` enables the remote store on the `[reporting]` server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote: Option<String>,
+    /// Variable holding the cache key; the reporting key is used when it is
+    /// unset or empty.
+    #[serde(default = "default_cache_token_env")]
+    pub token_env: String,
+    /// Expression over `env.*` naming the remote scope; the Git branch when
+    /// unset, null or empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+    #[serde(flatten)]
+    pub overrides: CacheOverrides,
+}
+
+fn default_cache_token_env() -> String {
+    DEFAULT_CACHE_TOKEN_ENV.into()
+}
+
+/// `write`, `local` and `local_bytes`: set in `[cache]`, and overridden by
+/// `[workflows.NAME.cache]` and `[environments.NAME.cache]`.
+#[derive(Debug, Deserialize, Serialize, Clone, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CacheOverrides {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub write: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_bytes: Option<u64>,
+}
+
+impl CacheOverrides {
+    pub fn is_empty(&self) -> bool {
+        self == &Self::default()
+    }
+
+    fn apply(&self, lower: &Self) -> Self {
+        Self {
+            write: self.write.or(lower.write),
+            local: self.local.or(lower.local),
+            local_bytes: self.local_bytes.or(lower.local_bytes),
+        }
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.local_bytes == Some(0) {
+            bail!("local_bytes must be at least 1");
+        }
+        Ok(())
+    }
+}
+
+/// Resolved cache settings for one invocation.
+#[derive(Debug, Clone, Serialize)]
+pub struct EffectiveCache {
+    pub write: bool,
+    pub local: bool,
+    pub local_bytes: u64,
+}
+
+impl CacheConfig {
+    pub fn remote_enabled(&self) -> bool {
+        self.remote.as_deref() == Some(CACHE_REMOTE_GOODFLOWS)
+    }
+
+    pub fn effective(config: Option<&Self>) -> EffectiveCache {
+        let overrides = config.map(|c| c.overrides.clone()).unwrap_or_default();
+        EffectiveCache {
+            write: overrides.write.unwrap_or(true),
+            local: overrides.local.unwrap_or(true),
+            local_bytes: overrides.local_bytes.unwrap_or(DEFAULT_CACHE_LOCAL_BYTES),
+        }
+    }
+
+    fn validate(&self, reporting: Option<&Reporting>) -> Result<()> {
+        if let Some(remote) = &self.remote {
+            if remote != CACHE_REMOTE_GOODFLOWS {
+                bail!(
+                    "remote '{}' is not supported (supported: {CACHE_REMOTE_GOODFLOWS})",
+                    remote.escape_debug()
+                );
+            }
+            if reporting.is_none() {
+                bail!("remote requires a top-level [reporting] block, whose project and url_env it uses");
+            }
+        }
+        validate_credential_env_name("cache", "token_env", &self.token_env)?;
+        if reporting.is_some_and(|r| r.url_env == self.token_env) {
+            bail!("token_env must not name the reporting url_env");
+        }
+        if let Some(scope) = &self.scope {
+            let expression = Expression::parse(scope).context("invalid scope expression")?;
+            if expression
+                .references()
+                .iter()
+                .any(|r| !matches!(r, Reference::Env(_)))
+            {
+                bail!("scope may read only env.*");
+            }
+        }
+        self.overrides.validate()
+    }
 }
 
 /// Directory exposed to remote hooks and jobs for script-managed persistent
@@ -298,19 +423,28 @@ impl Reporting {
 /// by replay, which reads the names back from a saved manifest.
 pub fn validate_credential_env_names(url_env: &str, token_env: &str) -> Result<()> {
     for (field, name) in [("url_env", url_env), ("token_env", token_env)] {
-        if !valid_env_name(name) {
-            bail!("reporting {field} must be an environment variable name matching [A-Za-z_][A-Za-z0-9_]*");
-        }
-        if RESERVED_ENV.contains(&name)
-            || PARTITION_ENV.contains(&name)
-            || name == ENVIRONMENT_ENV
-            || name == OUTPUT_ENV
-        {
-            bail!("reporting {field} must not name a reserved goodflows variable");
-        }
+        validate_credential_env_name("reporting", field, name)?;
     }
     if url_env == token_env {
         bail!("reporting url_env and token_env must name different variables");
+    }
+    Ok(())
+}
+
+/// One credential variable name: a valid name that is not reserved.
+fn validate_credential_env_name(block: &str, field: &str, name: &str) -> Result<()> {
+    if !valid_env_name(name) {
+        bail!(
+            "{block} {field} must be an environment variable name matching [A-Za-z_][A-Za-z0-9_]*"
+        );
+    }
+    if RESERVED_ENV.contains(&name)
+        || PARTITION_ENV.contains(&name)
+        || name == ENVIRONMENT_ENV
+        || name == OUTPUT_ENV
+        || name == SPRITE_STATE_ENV
+    {
+        bail!("{block} {field} must not name a reserved goodflows variable");
     }
     Ok(())
 }
@@ -512,6 +646,228 @@ pub struct Job {
     /// unpartitioned jobs. Serialized under the `partitions` key.
     #[serde(skip_deserializing, skip_serializing_if = "Option::is_none")]
     pub partitions: Option<Partitions>,
+    /// `[[jobs.caches]]`: restored before the job's command or first step
+    /// and saved after it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub caches: Vec<Cache>,
+}
+
+/// One `[[jobs.caches]]` entry. `save` and `timeout_secs` keep their raw
+/// form until validation, so a bad value gets an error naming the job and
+/// the cache.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct Cache {
+    pub name: String,
+    /// Globs relative to the workdir, or directories under `~/`.
+    #[serde(default)]
+    pub paths: Vec<String>,
+    #[serde(default)]
+    pub key: CacheKey,
+    #[serde(default = "default_true")]
+    pub fallback: bool,
+    #[serde(default = "default_cache_save")]
+    pub save: String,
+    #[serde(default = "default_cache_timeout")]
+    pub timeout_secs: i64,
+}
+
+/// The inputs of a cache key.
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+#[serde(deny_unknown_fields)]
+pub struct CacheKey {
+    /// Globs relative to the workdir whose paths and contents are hashed.
+    #[serde(default)]
+    pub files: Vec<String>,
+    /// Expressions in the partial digest, in order.
+    #[serde(default)]
+    pub values: Vec<String>,
+    /// Expressions in the key but not the partial digest.
+    #[serde(default)]
+    pub unique: Vec<String>,
+}
+
+fn default_cache_save() -> String {
+    "passed".into()
+}
+
+fn default_cache_timeout() -> i64 {
+    DEFAULT_CACHE_TIMEOUT_SECS
+}
+
+impl Cache {
+    /// Whether the cache saves after a job that ended with `failed`.
+    pub fn saves_failed(&self) -> bool {
+        self.save == "always"
+    }
+
+    pub fn timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.timeout_secs.max(1) as u64)
+    }
+}
+
+/// Paths a cache may never hold under `~/`.
+const SENSITIVE_HOME: [&str; 3] = [".ssh", ".aws", ".gnupg"];
+
+/// The normal components of `path`, or an error when it is absolute or
+/// climbs above where it starts.
+fn relative_components<'a>(path: &'a str, what: &str) -> Result<Vec<&'a str>> {
+    if path.is_empty() {
+        bail!("{what} must not be empty");
+    }
+    if path.starts_with('/') || path.starts_with('\\') || Path::new(path).is_absolute() {
+        bail!("{what} '{}' must be relative", path.escape_debug());
+    }
+    if path.contains('\0') {
+        bail!("{what} contains invalid control characters");
+    }
+    let mut parts: Vec<&str> = Vec::new();
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                if parts.pop().is_none() {
+                    bail!(
+                        "{what} '{}' climbs out of its directory",
+                        path.escape_debug()
+                    );
+                }
+            }
+            part => parts.push(part),
+        }
+    }
+    Ok(parts)
+}
+
+fn has_glob(text: &str) -> bool {
+    text.contains(['*', '?', '['])
+}
+
+fn validate_cache_path(path: &str) -> Result<()> {
+    if let Some(rest) = path.strip_prefix("~/") {
+        if path.split('/').any(|part| part == "..") {
+            bail!(
+                "path '{}' must not climb out of the home directory",
+                path.escape_debug()
+            );
+        }
+        let parts = match rest {
+            "" => Vec::new(),
+            rest => relative_components(rest, "path").map_err(|_| {
+                anyhow!(
+                    "path '{}' must name a directory below the home directory",
+                    path.escape_debug()
+                )
+            })?,
+        };
+        if parts.is_empty() {
+            bail!(
+                "path '{}' must name a directory below the home directory, not ~/ itself",
+                path.escape_debug()
+            );
+        }
+        if has_glob(rest) {
+            bail!(
+                "path '{}' must name one directory; globs are allowed only in workdir paths",
+                path.escape_debug()
+            );
+        }
+        if let Some(part) = parts.iter().find(|part| SENSITIVE_HOME.contains(part)) {
+            bail!(
+                "path '{}' must not be or contain {part}",
+                path.escape_debug()
+            );
+        }
+        return Ok(());
+    }
+    if path == "~" || path.starts_with('~') {
+        bail!(
+            "path '{}' must be relative to the workdir or start with ~/",
+            path.escape_debug()
+        );
+    }
+    if path.split('/').any(|part| part == "..") {
+        bail!(
+            "path '{}' must stay inside the workdir",
+            path.escape_debug()
+        );
+    }
+    let parts = relative_components(path, "path")?;
+    if parts.is_empty() {
+        bail!(
+            "path '{}' must name a path below the workdir, not the workdir itself",
+            path.escape_debug()
+        );
+    }
+    Ok(())
+}
+
+fn validate_cache(
+    cache: &Cache,
+    depends_on: &[String],
+    no_outputs: &NoOutputs,
+) -> Vec<anyhow::Error> {
+    let mut problems = Vec::new();
+    note(&mut problems, validate_name(&cache.name, "cache"));
+    if cache.paths.is_empty() {
+        problems.push(anyhow!("paths must not be empty"));
+    }
+    for path in &cache.paths {
+        note(&mut problems, validate_cache_path(path));
+    }
+    for file in &cache.key.files {
+        if file.split('/').any(|part| part == "..") || file.starts_with('~') {
+            problems.push(anyhow!(
+                "key.files '{}' must stay inside the workdir",
+                file.escape_debug()
+            ));
+            continue;
+        }
+        note(
+            &mut problems,
+            relative_components(file, "key.files").map(|_| ()),
+        );
+    }
+    if !matches!(cache.save.as_str(), "passed" | "always") {
+        problems.push(anyhow!(
+            "save '{}' is not supported (supported: passed, always)",
+            cache.save.escape_debug()
+        ));
+    }
+    if cache.timeout_secs <= 0 {
+        problems.push(anyhow!("timeout_secs must be a positive integer"));
+    }
+    for (field, sources) in [
+        ("key.values", &cache.key.values),
+        ("key.unique", &cache.key.unique),
+    ] {
+        for source in sources {
+            note(
+                &mut problems,
+                validate_key_value(source, depends_on, no_outputs)
+                    .with_context(|| format!("{field} '{}'", source.escape_debug())),
+            );
+        }
+    }
+    problems
+        .into_iter()
+        .map(|problem| problem.context(format!("cache '{}'", cache.name)))
+        .collect()
+}
+
+/// A key value reads `env.*` and declared dependency outputs only.
+fn validate_key_value(source: &str, depends_on: &[String], no_outputs: &NoOutputs) -> Result<()> {
+    let expression = Expression::parse(source)?;
+    for reference in expression.references() {
+        match reference {
+            Reference::Step { .. } => {
+                bail!("key expressions must not read steps.*, which have not run yet")
+            }
+            Reference::Cache { .. } => bail!("key expressions must not read caches.*"),
+            _ => {}
+        }
+    }
+    validate_expression(source, depends_on, &[], no_outputs, None)
 }
 
 impl Job {
@@ -672,6 +1028,9 @@ pub struct Step {
 pub struct Workflow {
     #[serde(default, skip_serializing_if = "SettingsOverrides::is_empty")]
     pub settings: SettingsOverrides,
+    /// `[workflows.NAME.cache]`: `write`, `local` and `local_bytes`.
+    #[serde(default, skip_serializing_if = "CacheOverrides::is_empty")]
+    pub cache: CacheOverrides,
     #[serde(default)]
     pub jobs: Vec<Job>,
 }
@@ -681,6 +1040,9 @@ pub struct Workflow {
 pub struct Environment {
     #[serde(default, skip_serializing_if = "SettingsOverrides::is_empty")]
     pub settings: SettingsOverrides,
+    /// `[environments.NAME.cache]`: `write`, `local` and `local_bytes`.
+    #[serde(default, skip_serializing_if = "CacheOverrides::is_empty")]
+    pub cache: CacheOverrides,
     /// Partition count per job name, replacing the declared count of a
     /// partitioned job when this profile is selected. Kept as `i64` until
     /// `Config::validate` so every out-of-range count gets one message.
@@ -940,6 +1302,30 @@ impl Config {
         if let Some(sprite) = &self.sprite {
             note(&mut problems, sprite.validate().context("sprite"));
         }
+        if let Some(cache) = &self.cache {
+            note(
+                &mut problems,
+                cache.validate(self.reporting.as_ref()).context("cache"),
+            );
+        }
+        for (name, workflow) in &self.workflows {
+            note(
+                &mut problems,
+                workflow
+                    .cache
+                    .validate()
+                    .with_context(|| format!("workflow '{name}' cache")),
+            );
+        }
+        for (name, environment) in &self.environments {
+            note(
+                &mut problems,
+                environment
+                    .cache
+                    .validate()
+                    .with_context(|| format!("environment '{name}' cache")),
+            );
+        }
         let reporting = self.reporting.as_ref();
         // Validate every authored settings map, including unselected workflows and
         // profiles and entries a later scope overrides.
@@ -1179,6 +1565,11 @@ impl Config {
         let name = requested.or_else(|| self.default_workflow()).ok_or_else(|| {
             ConfigError::new("no_default_workflow", format!("no default workflow; choose a workflow with 'goodflows run <workflow>' (available: {available})"))
         })?;
+        let mut cache_overrides = self
+            .cache
+            .as_ref()
+            .map(|c| c.overrides.clone())
+            .unwrap_or_default();
         let (settings, mut jobs) = if name == "default" && !self.jobs.is_empty() {
             (self.settings.clone(), self.jobs.clone())
         } else {
@@ -1189,6 +1580,7 @@ impl Config {
                 )
                 .with_hint(did_you_mean(name, names.iter().map(String::as_str)))
             })?;
+            cache_overrides = workflow.cache.apply(&cache_overrides);
             (
                 workflow.settings.apply(&self.settings),
                 workflow.jobs.clone(),
@@ -1196,6 +1588,16 @@ impl Config {
         };
         // The environment exists exactly when a profile name was supplied.
         let selected = profile.zip(environment);
+        if let Some((_, environment)) = selected {
+            cache_overrides = environment.cache.apply(&cache_overrides);
+        }
+        let cache = match (&self.cache, cache_overrides.is_empty()) {
+            (None, true) => None,
+            (cache, _) => Some(CacheConfig {
+                overrides: cache_overrides,
+                ..cache.clone().unwrap_or_default()
+            }),
+        };
         if let Some((profile, environment)) = selected {
             for (job_name, &count) in &environment.partitions {
                 // A name absent from this workflow is unused here.
@@ -1234,6 +1636,7 @@ impl Config {
                 environments: BTreeMap::new(),
                 reporting: self.reporting.clone(),
                 sprite: self.sprite.clone(),
+                cache,
             },
         ))
     }
@@ -1491,15 +1894,27 @@ fn validate_settings_env(
 /// partitioned jobs and workflow-call jobs.
 type NoOutputs<'a> = HashMap<&'a str, &'static str>;
 
+/// `caches` names the caches an expression may read, or is `None` where
+/// `caches.*` is never available (job conditions and key values).
 fn validate_expression(
     source: &str,
     needs: &[String],
     steps: &[String],
     no_outputs: &NoOutputs,
+    caches: Option<&[&str]>,
 ) -> Result<()> {
     let expression = Expression::parse(source)?;
     for reference in expression.references() {
         match reference {
+            Reference::Cache { name } => match caches {
+                None => bail!(
+                    "caches.{name}.hit is not available here; a job condition runs before caches restore"
+                ),
+                Some(caches) if !caches.contains(&name.as_str()) => {
+                    bail!("caches.{name}.hit names a cache the job does not declare")
+                }
+                Some(_) => {}
+            },
             Reference::Needs { job, .. } if !needs.contains(job) => {
                 bail!("output reference requires declared dependency '{job}'");
             }
@@ -1523,10 +1938,11 @@ fn validate_condition(
     needs: &[String],
     steps: &[String],
     no_outputs: &NoOutputs,
+    caches: Option<&[&str]>,
 ) -> Result<()> {
     match condition {
         Some(Condition::Expression { expression }) => {
-            validate_expression(expression, needs, steps, no_outputs)
+            validate_expression(expression, needs, steps, no_outputs, caches)
                 .context("invalid condition expression")?;
         }
         Some(Condition::LegacyShell(shell) | Condition::Shell { shell })
@@ -1588,11 +2004,32 @@ fn validate_job(
     no_outputs: &NoOutputs,
 ) -> (Option<Partitions>, Vec<anyhow::Error>) {
     let mut problems = Vec::new();
-    let condition = validate_condition(job.condition.as_ref(), &job.depends_on, &[], no_outputs);
+    let condition = validate_condition(
+        job.condition.as_ref(),
+        &job.depends_on,
+        &[],
+        no_outputs,
+        None,
+    );
     if job.workflow.is_some() {
         note(&mut problems, validate_call(job));
         note(&mut problems, condition);
+        for cache in &job.caches {
+            problems.push(anyhow!(
+                "cache '{}': workflow-call jobs do not support caches",
+                cache.name
+            ));
+        }
         return (None, problems);
+    }
+    let mut cache_names: Vec<&str> = Vec::new();
+    for cache in &job.caches {
+        if cache_names.contains(&cache.name.as_str()) {
+            problems.push(anyhow!("cache '{}': duplicate cache name", cache.name));
+        } else {
+            cache_names.push(&cache.name);
+        }
+        problems.extend(validate_cache(cache, &job.depends_on, no_outputs));
     }
     let partitions = note(&mut problems, validate_partitions(job)).flatten();
     note(&mut problems, validate_reports(job, reporting.is_some()));
@@ -1624,7 +2061,13 @@ fn validate_job(
             duplicate,
             validate_command(&step.command, step.shell.unwrap_or(job.shell)),
             validate_env(&step.env, reporting),
-            validate_condition(step.condition.as_ref(), &job.depends_on, &steps, no_outputs),
+            validate_condition(
+                step.condition.as_ref(),
+                &job.depends_on,
+                &steps,
+                no_outputs,
+                Some(&cache_names),
+            ),
         ] {
             note(
                 &mut problems,
@@ -1637,8 +2080,14 @@ fn validate_job(
         note(&mut problems, validate_name(key, "output"));
         note(
             &mut problems,
-            validate_expression(source, &job.depends_on, &steps, no_outputs)
-                .with_context(|| format!("output '{key}'")),
+            validate_expression(
+                source,
+                &job.depends_on,
+                &steps,
+                no_outputs,
+                Some(&cache_names),
+            )
+            .with_context(|| format!("output '{key}'")),
         );
     }
     (partitions, problems)
@@ -2464,5 +2913,269 @@ mod tests {
             error.contains("\n  - workflow 'ci' settings env:"),
             "{error}"
         );
+    }
+
+    const CACHE_JOB: &str = "[[jobs]]\nname = 'dialyzer'\ncommand = 'true'\n";
+
+    fn cache_error(extra: &str) -> String {
+        validate(&format!(
+            "[[jobs]]\nname = 'versions'\ncommand = 'true'\n{CACHE_JOB}{extra}"
+        ))
+        .unwrap_err()
+    }
+
+    #[test]
+    fn a_valid_cache_is_accepted() {
+        let config = validate(
+            "[reporting]\nproject = 'p'\n[cache]\nremote = 'goodflows'\nscope = 'env.GITHUB_HEAD_REF ?? env.GITHUB_REF_NAME'\nlocal_bytes = 1000\n\
+             [[jobs]]\nname = 'versions'\ncommand = 'true'\n\
+             [[jobs]]\nname = 'dialyzer'\ndepends_on = ['versions']\nsteps = [{ id = 'get', command = 'true', condition = { expression = '!caches.plts.hit' } }]\noutputs = { hit = 'caches.plts.hit' }\n\
+             [[jobs.caches]]\nname = 'plts'\npaths = ['priv/plts', '~/.cargo/registry', '_build/*/lib']\nkey.files = ['**/mix.lock']\nkey.values = ['env.OTP', \"'v2'\"]\nkey.unique = ['env.GITHUB_SHA']\nsave = 'always'\ntimeout_secs = 60\n"
+        )
+        .unwrap();
+        let cache = &config.jobs[1].caches[0];
+        assert_eq!(cache.paths.len(), 3);
+        assert!(cache.fallback && cache.saves_failed());
+        assert!(config.cache.unwrap().remote_enabled());
+        // Defaults.
+        let config = validate(&format!(
+            "{CACHE_JOB}[[jobs.caches]]\nname = 'deps'\npaths = ['deps']\n"
+        ))
+        .unwrap();
+        let cache = &config.jobs[0].caches[0];
+        assert_eq!(
+            (cache.save.as_str(), cache.timeout_secs, cache.fallback),
+            ("passed", 300, true)
+        );
+        let effective = CacheConfig::effective(config.cache.as_ref());
+        assert!(effective.write && effective.local);
+        assert_eq!(effective.local_bytes, DEFAULT_CACHE_LOCAL_BYTES);
+    }
+
+    #[test]
+    fn cache_rejections_name_the_job_and_the_cache() {
+        for (cache, message) in [
+            ("name = 'plts'\npaths = []\n", "paths must not be empty"),
+            ("name = 'plts'\n", "paths must not be empty"),
+            ("name = ''\npaths = ['x']\n", "cache name must be nonempty"),
+            ("name = 'plts'\npaths = ['/tmp/plts']\n", "must be relative"),
+            (
+                "name = 'plts'\npaths = ['../plts']\n",
+                "must stay inside the workdir",
+            ),
+            (
+                "name = 'plts'\npaths = ['a/../../plts']\n",
+                "must stay inside the workdir",
+            ),
+            ("name = 'plts'\npaths = ['.']\n", "not the workdir itself"),
+            ("name = 'plts'\npaths = ['~/']\n", "not ~/ itself"),
+            ("name = 'plts'\npaths = ['~']\n", "start with ~/"),
+            (
+                "name = 'plts'\npaths = ['~/../x']\n",
+                "climb out of the home directory",
+            ),
+            (
+                "name = 'plts'\npaths = ['~/.ssh']\n",
+                "must not be or contain .ssh",
+            ),
+            (
+                "name = 'plts'\npaths = ['~/.config/.aws']\n",
+                "must not be or contain .aws",
+            ),
+            (
+                "name = 'plts'\npaths = ['~/.gnupg/x']\n",
+                "must not be or contain .gnupg",
+            ),
+            (
+                "name = 'plts'\npaths = ['~/.cache/*']\n",
+                "globs are allowed only in workdir paths",
+            ),
+            (
+                "name = 'plts'\npaths = ['x']\nsave = 'never'\n",
+                "save 'never' is not supported",
+            ),
+            (
+                "name = 'plts'\npaths = ['x']\ntimeout_secs = 0\n",
+                "timeout_secs must be a positive integer",
+            ),
+            (
+                "name = 'plts'\npaths = ['x']\ntimeout_secs = -5\n",
+                "timeout_secs must be a positive integer",
+            ),
+            (
+                "name = 'plts'\npaths = ['x']\nkey.files = ['../mix.lock']\n",
+                "key.files '../mix.lock' must stay inside the workdir",
+            ),
+            (
+                "name = 'plts'\npaths = ['x']\nkey.values = ['steps.a.outputs.b']\n",
+                "must not read steps.*",
+            ),
+            (
+                "name = 'plts'\npaths = ['x']\nkey.values = ['caches.plts.hit']\n",
+                "must not read caches.*",
+            ),
+            (
+                "name = 'plts'\npaths = ['x']\nkey.unique = ['caches.plts.hit']\n",
+                "must not read caches.*",
+            ),
+            (
+                "name = 'plts'\npaths = ['x']\nkey.values = ['needs.other.outputs.x']\n",
+                "requires declared dependency 'other'",
+            ),
+            (
+                "name = 'plts'\npaths = ['x']\nkey.values = ['env.']\n",
+                "key.values 'env.'",
+            ),
+        ] {
+            let error = cache_error(&format!("[[jobs.caches]]\n{cache}"));
+            assert!(error.contains(message), "{cache}: {error}");
+            assert!(error.contains("job 'dialyzer'"), "{cache}: {error}");
+            if !cache.starts_with("name = ''") {
+                assert!(error.contains("cache 'plts'"), "{cache}: {error}");
+            }
+        }
+        let error = cache_error(
+            "[[jobs.caches]]\nname = 'plts'\npaths = ['a']\n[[jobs.caches]]\nname = 'plts'\npaths = ['b']\n",
+        );
+        assert!(
+            error.contains("job 'dialyzer': cache 'plts': duplicate cache name"),
+            "{error}"
+        );
+        // Unknown keys are rejected by deny_unknown_fields.
+        let error = parse(&format!(
+            "{CACHE_JOB}[[jobs.caches]]\nname = 'p'\npaths = ['x']\nrestore_keys = []\n"
+        ))
+        .unwrap_err();
+        assert!(error.contains("unknown field"), "{error}");
+    }
+
+    #[test]
+    fn caches_are_checked_in_every_workflow_and_never_on_calls() {
+        let error = validate(
+            "[[workflows.a.jobs]]\nname = 'x'\ncommand = 'true'\n[[workflows.b.jobs]]\nname = 'call'\nworkflow = 'a'\n[[workflows.b.jobs.caches]]\nname = 'deps'\npaths = ['deps']\n",
+        )
+        .unwrap_err();
+        assert!(
+            error.contains(
+                "workflow 'b': job 'call': cache 'deps': workflow-call jobs do not support caches"
+            ),
+            "{error}"
+        );
+        let error = validate(
+            "[[workflows.a.jobs]]\nname = 'x'\ncommand = 'true'\n[[workflows.a.jobs.caches]]\nname = 'deps'\npaths = []\n[[workflows.b.jobs]]\nname = 'y'\ncommand = 'true'\n",
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("workflow 'a': job 'x': cache 'deps': paths must not be empty"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn cache_hit_references_are_checked() {
+        // A job condition runs before the restore.
+        let error = cache_error(
+            "condition = { expression = 'caches.plts.hit' }\n[[jobs.caches]]\nname = 'plts'\npaths = ['x']\n",
+        );
+        assert!(
+            error.contains("job condition runs before caches restore"),
+            "{error}"
+        );
+        // A step may read only a declared cache.
+        let steps = |cache: &str| {
+            format!(
+                "[[jobs]]\nname = 'j'\nsteps = [{{ id = 's', command = 'true', condition = {{ expression = '!caches.{cache}.hit' }} }}]\n[[jobs.caches]]\nname = 'deps'\npaths = ['deps']\n"
+            )
+        };
+        assert!(validate(&steps("deps")).is_ok());
+        let error = validate(&steps("other")).unwrap_err();
+        assert!(
+            error.contains("caches.other.hit names a cache the job does not declare"),
+            "{error}"
+        );
+        let error = validate(
+            "[[jobs]]\nname = 'j'\nsteps = [{ id = 's', command = 'true' }]\noutputs = { hit = 'caches.nope.hit' }\n",
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("output 'hit'") && error.contains("does not declare"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn cache_settings_are_validated() {
+        let error = validate(&format!("[cache]\nremote = 'goodflows'\n{CACHE_JOB}")).unwrap_err();
+        assert!(
+            error.contains("cache: remote requires a top-level [reporting] block"),
+            "{error}"
+        );
+        let error = validate(&format!("[cache]\nremote = 's3'\n{CACHE_JOB}")).unwrap_err();
+        assert!(error.contains("remote 's3' is not supported"), "{error}");
+        for (token, message) in [
+            (
+                "'1BAD'",
+                "cache token_env must be an environment variable name",
+            ),
+            (
+                "'GOODFLOWS_RUN_ID'",
+                "must not name a reserved goodflows variable",
+            ),
+            (
+                "'GOODFLOWS_URL'",
+                "token_env must not name the reporting url_env",
+            ),
+        ] {
+            let error = validate(&format!(
+                "[reporting]\nproject = 'p'\n[cache]\ntoken_env = {token}\n{CACHE_JOB}"
+            ))
+            .unwrap_err();
+            assert!(error.contains(message), "{token}: {error}");
+        }
+        // The reporting token_env is allowed.
+        validate(&format!(
+            "[reporting]\nproject = 'p'\n[cache]\ntoken_env = 'GOODFLOWS_API_KEY'\n{CACHE_JOB}"
+        ))
+        .unwrap();
+        let error = validate(&format!(
+            "[cache]\nscope = 'needs.build.outputs.branch'\n{CACHE_JOB}"
+        ))
+        .unwrap_err();
+        assert!(error.contains("scope may read only env.*"), "{error}");
+        let error = validate(&format!("[cache]\nscope = 'env.'\n{CACHE_JOB}")).unwrap_err();
+        assert!(error.contains("invalid scope expression"), "{error}");
+        let error = validate(&format!("[cache]\nlocal_bytes = 0\n{CACHE_JOB}")).unwrap_err();
+        assert!(error.contains("local_bytes must be at least 1"), "{error}");
+        let error = parse(&format!("[cache]\nwirte = false\n{CACHE_JOB}")).unwrap_err();
+        assert!(error.contains("unknown field"), "{error}");
+        let error =
+            validate(&format!("{JOB}[environments.pr.cache]\nlocal_bytes = 0\n")).unwrap_err();
+        assert!(
+            error.contains("environment 'pr' cache: local_bytes must be at least 1"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn cache_overrides_follow_shared_workflow_profile_precedence() {
+        let config = validate(&format!(
+            "{JOB}[cache]\nlocal_bytes = 10\n[workflows.ci.cache]\nwrite = false\nlocal = false\n[environments.pr.cache]\nwrite = true\n[environments.orb.cache]\nlocal_bytes = 7\n"
+        ))
+        .unwrap();
+        let effective = |workflow: &str, profile: Option<&str>| {
+            let (_, selected) = config.workflow(Some(workflow), profile).unwrap();
+            let e = CacheConfig::effective(selected.cache.as_ref());
+            (e.write, e.local, e.local_bytes)
+        };
+        assert_eq!(effective("ci", None), (false, false, 10));
+        assert_eq!(effective("ci", Some("pr")), (true, false, 10));
+        assert_eq!(effective("other", None), (true, true, 10));
+        assert_eq!(effective("other", Some("orb")), (true, true, 7));
+        // A profile override applies without a [cache] block too.
+        let config = validate(&format!("{JOB}[environments.pr.cache]\nwrite = false\n")).unwrap();
+        let (_, selected) = config.workflow(Some("ci"), Some("pr")).unwrap();
+        assert!(!CacheConfig::effective(selected.cache.as_ref()).write);
+        let (_, selected) = config.workflow(Some("ci"), None).unwrap();
+        assert!(selected.cache.is_none());
     }
 }

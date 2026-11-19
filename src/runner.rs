@@ -1,5 +1,6 @@
 use crate::tail::{Excerpt, SharedTails, Tails};
 use crate::{
+    cache,
     config::{self, Condition, Job, Partition},
     expression::{Expression, Reference},
     output::Output,
@@ -88,6 +89,10 @@ pub struct JobResult {
     /// `FAIL_FAST_SKIP` as its error. Never serialized.
     #[serde(skip)]
     pub fail_fast_skip: bool,
+    /// Each cache's restore and save result, once its save finished.
+    /// Summary and history only.
+    #[serde(skip)]
+    pub caches: Vec<cache::Report>,
 }
 
 /// What a spawned process was for.
@@ -131,6 +136,8 @@ pub struct SummaryResult<'a> {
     pub result: &'a JobResult,
     #[serde(flatten)]
     pub scheduling: Scheduling<'a>,
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    pub caches: &'a [cache::Report],
 }
 
 impl JobResult {
@@ -147,6 +154,7 @@ impl JobResult {
         SummaryResult {
             result: self,
             scheduling: self.scheduling(),
+            caches: &self.caches,
         }
     }
 
@@ -190,6 +198,7 @@ impl JobResult {
             queued_ms: 0,
             commands: Vec::new(),
             fail_fast_skip: false,
+            caches: Vec::new(),
         }
     }
 
@@ -252,7 +261,15 @@ pub struct Options {
     /// `GOODFLOWS_SPRITE_STATE_DIR` for a remote Sprite run. `None` for local
     /// runs, which never inherit an ambient value.
     pub sprite_state: Option<String>,
+    /// This invocation's caches; `None` when no job declares one.
+    pub caches: Option<Arc<cache::Invocation>>,
+    /// Called once with every result when they are all recorded but cache
+    /// saves are still running, so a caller need not wait for the saves.
+    pub done: Mutex<Option<ResultsFinal>>,
 }
+
+/// See [`Options::done`].
+pub type ResultsFinal = Box<dyn FnOnce(&[JobResult]) + Send>;
 
 /// Environment adjustments for reporting. Applied after job/step overrides.
 #[derive(Debug, Default)]
@@ -261,8 +278,9 @@ pub struct ReportingEnv {
     /// every command and expression (even when inherited from the CLI's own
     /// environment) and set only for report-producing jobs with a spool.
     pub active: bool,
-    /// The publisher's credential variable, removed from every child and expression.
-    pub scrub: Option<String>,
+    /// Credential variables (the publisher's and the cache's), removed from
+    /// every child and expression.
+    pub scrub: Vec<String>,
     /// Reserved variables injected into report-producing jobs, keyed by job
     /// name and partition (`None` for an unpartitioned job).
     pub jobs: HashMap<ReportingKey, Vec<(String, String)>>,
@@ -282,7 +300,7 @@ impl ReportingEnv {
     /// Remove the token and the reserved names. Conditions see only this view:
     /// they decide whether the job runs, so they are not report producers.
     fn scrub(&self, env: &mut HashMap<String, String>) {
-        if let Some(token) = &self.scrub {
+        for token in &self.scrub {
             env.remove(token);
         }
         if self.active {
@@ -336,6 +354,8 @@ pub type Activate =
 pub struct Tree {
     lock: Mutex<()>,
     released: watch::Sender<u64>,
+    /// Units that have entered execution anywhere in the tree, for saves.
+    entered: std::sync::atomic::AtomicU64,
     rss: Arc<RssMonitor>,
     _rss_task: RssTask,
 }
@@ -366,6 +386,7 @@ impl Scope {
         let tree = Arc::new(Tree {
             lock: Mutex::new(()),
             released: watch::channel(0).0,
+            entered: std::sync::atomic::AtomicU64::new(0),
             rss,
             _rss_task: rss_task,
         });
@@ -428,6 +449,9 @@ impl Scope {
             let inside = scope.inside.fetch_add(1, Ordering::SeqCst) + 1;
             scope.max.fetch_max(inside, Ordering::SeqCst);
         }
+        // After the count, so a save that saw no executing unit and the
+        // old value notices this one.
+        self.tree.entered.fetch_add(1, Ordering::SeqCst);
         Inside(self.clone())
     }
 
@@ -443,6 +467,34 @@ impl Scope {
     pub fn stopped(&self) -> bool {
         self.chain()
             .any(|scope| scope.fail_fast && scope.failed.load(Ordering::SeqCst))
+    }
+}
+
+/// The whole run tree's activity: units executing in the root scope's
+/// subtree, wherever the save's own invocation sits.
+impl cache::Activity for Arc<Scope> {
+    fn entered(&self) -> u64 {
+        self.tree.entered.load(Ordering::SeqCst)
+    }
+
+    fn executing(&self) -> usize {
+        let root = self.chain().last().expect("a scope chain is never empty");
+        root.inside.load(Ordering::SeqCst)
+    }
+
+    /// A slot of this invocation, waiting for one to free like the scheduler.
+    fn slot(&self) -> Pin<Box<dyn Future<Output = cache::Slot> + Send + '_>> {
+        Box::pin(async move {
+            let mut released = self.tree.released.subscribe();
+            loop {
+                released.borrow_and_update();
+                if let Some(slot) = self.try_acquire() {
+                    return Box::new(slot) as cache::Slot;
+                }
+                // The sender lives as long as `self`.
+                let _ = released.changed().await;
+            }
+        })
     }
 }
 
@@ -490,6 +542,7 @@ struct Shared {
     settings_env: BTreeMap<String, String>,
     sprite_state: Option<String>,
     rss: Arc<RssMonitor>,
+    caches: Option<Arc<cache::Invocation>>,
 }
 
 async fn record(
@@ -615,14 +668,24 @@ pub async fn execute(
         sprite_state: options.sprite_state.clone(),
         // One sampler serves the whole run tree.
         rss: scope.tree.rss.clone(),
+        caches: options.caches.clone(),
     });
+    // Cache saves run after their job's result is recorded, in its slot.
+    let mut saves: JoinSet<(usize, Vec<cache::Report>)> = JoinSet::new();
 
     loop {
         // Consume completed jobs before deciding whether to launch queued work.
         while let Some(completed) = running.try_join_next() {
-            let (index, mut result, slot): (usize, JobResult, Option<Slot>) = completed?;
+            let (index, mut result, slot, pending): Done = completed?;
             (result.blocked_ms, result.queued_ms) = launch_waits[index];
+            let slot = spawn_save(&mut saves, index, &result, pending, slot, scope);
             finish(scope, &mut results, index, result, slot, &options.output).await?;
+        }
+        while let Some(saved) = saves.try_join_next() {
+            let (index, reports) = saved?;
+            if let Some(result) = &mut results[index] {
+                result.caches = reports;
+            }
         }
         // Whether every dependency of each configured job passed. Only the
         // skips recorded below change results before the launch loop, and a
@@ -782,22 +845,36 @@ pub async fn execute(
             running.spawn(async move {
                 // The slot returns with the result, so it frees only after
                 // the scheduler records the result and any failure.
-                let (result, slot) = if job.workflow.is_some() {
-                    run_call(unit.job, &job, &shared, cancel, needs, slot, calls, &scope).await
+                let (result, slot, pending) = if job.workflow.is_some() {
+                    let (result, slot) =
+                        run_call(unit.job, &job, &shared, cancel, needs, slot, calls, &scope).await;
+                    (result, slot, None)
                 } else {
                     let inside = scope.enter();
-                    let result =
+                    let (result, pending) =
                         run_job(unit.job, unit.partition, &job, &shared, cancel, needs).await;
                     drop(inside);
-                    (result, slot)
+                    (result, slot, pending)
                 };
-                (index, result, slot)
+                (index, result, slot, pending)
             });
         }
         if results.iter().all(Option::is_some) {
-            break;
+            if saves.is_empty() {
+                break;
+            }
+            // Every result is final; only saves remain.
+            let done = options
+                .done
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take();
+            if let Some(done) = done {
+                let finished: Vec<JobResult> = results.iter().flatten().cloned().collect();
+                done(&finished);
+            }
         }
-        if running.is_empty() && !waiting {
+        if running.is_empty() && saves.is_empty() && !waiting {
             // Cancellation or another invocation's failure can arrive during
             // the launch loop; classify pending work next iteration.
             if cancel.borrow().is_some() || scope.stopped() {
@@ -809,9 +886,16 @@ pub async fn execute(
             biased;
             changed = cancel.changed(), if !cancelled => { changed.context("signal monitor stopped")?; }
             completed = running.join_next(), if !running.is_empty() => {
-                let (index, mut result, slot) = completed.context("job scheduler stopped")??;
+                let (index, mut result, slot, pending) = completed.context("job scheduler stopped")??;
                 (result.blocked_ms, result.queued_ms) = launch_waits[index];
+                let slot = spawn_save(&mut saves, index, &result, pending, slot, scope);
                 finish(scope, &mut results, index, result, slot, &options.output).await?;
+            }
+            saved = saves.join_next(), if !saves.is_empty() => {
+                let (index, reports) = saved.context("cache saves stopped")??;
+                if let Some(result) = &mut results[index] {
+                    result.caches = reports;
+                }
             }
             // Another invocation freed a slot (the sender lives as long as `scope`).
             _ = released.changed(), if waiting => {}
@@ -821,6 +905,35 @@ pub async fn execute(
         results: results.into_iter().flatten().collect(),
         max_in_flight: scope.max.load(Ordering::SeqCst),
     })
+}
+
+/// A finished unit: its index, result, slot and caches waiting to save.
+type Done = (usize, JobResult, Option<Slot>, Option<cache::Pending>);
+
+/// Start saving a unit's caches once its result is final; the scheduler
+/// records the result meanwhile, so dependents may start. The save takes
+/// the unit's slot and frees it only while it waits for the run to go quiet
+/// (see `cache::Pending::save`). Returns the slot when there is nothing to
+/// save.
+fn spawn_save(
+    saves: &mut JoinSet<(usize, Vec<cache::Report>)>,
+    index: usize,
+    result: &JobResult,
+    pending: Option<cache::Pending>,
+    slot: Option<Slot>,
+    scope: &Arc<Scope>,
+) -> Option<Slot> {
+    let Some(pending) = pending else {
+        return slot;
+    };
+    let status = result.status;
+    let activity: Arc<dyn cache::Activity> = Arc::new(scope.clone());
+    let slot = slot.map(|slot| Box::new(slot) as cache::Slot);
+    saves.spawn(async move {
+        let reports = pending.save(status, Some(activity), slot).await;
+        (index, reports)
+    });
+    None
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -990,6 +1103,7 @@ async fn run_call(
             commands: &commands,
             deadline: None,
             rss: shared.rss.clone(),
+            caches: HashMap::new(),
         };
         execution
             .condition(job.condition.as_ref(), &env, &[], None)
@@ -1041,8 +1155,9 @@ async fn run_job(
     shared: &Shared,
     cancel: watch::Receiver<Option<i32>>,
     needs: DependencyOutputs,
-) -> JobResult {
+) -> (JobResult, Option<cache::Pending>) {
     let (workdir, log_dir, output) = (&shared.workdir, shared.log_dir.as_deref(), &shared.output);
+    let mut pending: Option<cache::Pending> = None;
     let reporting = &*shared.reporting;
     let start = Instant::now();
     let tails = Arc::new(Mutex::new(Tails::default()));
@@ -1070,6 +1185,7 @@ async fn run_job(
                 tokio::time::Instant::now().checked_add(Duration::from_secs(secs))
             }),
             rss: shared.rss.clone(),
+            caches: HashMap::new(),
         };
         output
             .emit(Partition::tag(
@@ -1084,6 +1200,46 @@ async fn run_job(
         if condition.status != Status::Passed {
             result.finish(condition);
             return Ok(());
+        }
+        if let (Some(caches), false) = (&shared.caches, job.caches.is_empty()) {
+            let restore_start = tokio::time::Instant::now();
+            // Key values see what the job condition sees: no step has run.
+            let evaluate = |sources: &[String]| -> std::result::Result<Vec<Value>, String> {
+                sources
+                    .iter()
+                    .map(|source| {
+                        execution
+                            .evaluate(source, &env, &[])
+                            .map_err(|error| format!("'{}': {error:#}", source.escape_debug()))
+                    })
+                    .collect()
+            };
+            let requests = job
+                .caches
+                .iter()
+                .map(|cache| cache::Request {
+                    cache: cache.clone(),
+                    values: evaluate(&cache.key.values)
+                        .and_then(|values| Ok((values, evaluate(&cache.key.unique)?))),
+                })
+                .collect();
+            let home = env.get("HOME").filter(|h| !h.is_empty()).map(PathBuf::from);
+            let restored = caches
+                .restore(
+                    output,
+                    &job.name,
+                    partition,
+                    workdir,
+                    home,
+                    requests,
+                    &execution.cancel,
+                )
+                .await;
+            execution.caches = restored.hits();
+            pending = Some(restored);
+            // Restore time never counts against the job's timeout_secs.
+            let spent = restore_start.elapsed();
+            execution.deadline = execution.deadline.map(|deadline| deadline + spent);
         }
         let job_env = reporting.inject(&job.name, partition, &env);
         if let Some(command) = &job.command {
@@ -1204,7 +1360,7 @@ async fn run_job(
         result.stderr_truncated = Some(stderr_truncated);
         result.output = Some(snapshot.output);
     }
-    result
+    (result, pending)
 }
 
 struct JobExecution<'a> {
@@ -1222,6 +1378,8 @@ struct JobExecution<'a> {
     commands: &'a Mutex<Vec<CommandCost>>,
     deadline: Option<tokio::time::Instant>,
     rss: Arc<RssMonitor>,
+    /// `caches.NAME.hit` for each of the job's caches, once restored.
+    caches: HashMap<String, bool>,
 }
 
 impl JobExecution<'_> {
@@ -1279,6 +1437,9 @@ impl JobExecution<'_> {
                 .and_then(|result| result.outcome.outputs.get(key))
                 .cloned()
                 .with_context(|| format!("missing output steps.{step}.outputs.{key}")),
+            Reference::Cache { name } => {
+                Ok(Value::Bool(self.caches.get(name).copied().unwrap_or(false)))
+            }
         }
     }
 
@@ -1417,7 +1578,7 @@ impl JobExecution<'_> {
         }
         // .envs() only adds to the inherited CLI environment, so the token and any
         // inherited reserved values (from an enclosing goodflows run) must be removed.
-        if let Some(token) = &self.reporting.scrub {
+        for token in &self.reporting.scrub {
             command.env_remove(token);
         }
         if self.reporting.active {

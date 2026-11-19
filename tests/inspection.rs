@@ -726,3 +726,66 @@ fn usage_and_config_errors_have_stable_codes_and_exit_2() {
     assert_eq!(p.run(&[]).status.code(), Some(1));
     assert!(!p.dir.join("ran").exists());
 }
+
+#[test]
+fn list_shows_each_jobs_caches_without_restoring_them() {
+    let p = Project::new(
+        r#"
+[[jobs]]
+name = "versions"
+command = "true"
+[[jobs]]
+name = "dialyzer"
+command = "mix dialyzer"
+depends_on = ["versions"]
+[[jobs.caches]]
+name = "plts"
+paths = ["priv/plts", "~/.hex"]
+key.files = ["mix.lock"]
+key.values = ["needs.versions.outputs.otp"]
+key.unique = ["env.GITHUB_SHA"]
+"#,
+    );
+    let output = p.run(&["list", "--json"]);
+    success(&output);
+    let event: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let cache = &event["jobs"][1]["caches"][0];
+    assert_eq!(cache["name"], "plts");
+    assert_eq!(cache["paths"], serde_json::json!(["priv/plts", "~/.hex"]));
+    assert_eq!(cache["key"]["files"], serde_json::json!(["mix.lock"]));
+    assert_eq!(
+        cache["key"]["values"],
+        serde_json::json!(["needs.versions.outputs.otp"])
+    );
+    assert_eq!(
+        cache["key"]["unique"],
+        serde_json::json!(["env.GITHUB_SHA"])
+    );
+    assert_eq!(cache["save"], "passed");
+    assert_eq!(cache["fallback"], true);
+    assert_eq!(cache["timeout_secs"], 300);
+    // A job without caches keeps its shape.
+    assert!(event["jobs"][0].get("caches").is_none());
+    let output = p.run(&["list"]);
+    success(&output);
+    let text = stdout(&output);
+    for field in [
+        "cache plts: paths: priv/plts, ~/.hex",
+        "key.files: mix.lock",
+        "key.values: needs.versions.outputs.otp",
+        "key.unique: env.GITHUB_SHA",
+        "fallback=true save=passed timeout_secs=300",
+    ] {
+        assert!(text.contains(field), "missing {field}: {text}");
+    }
+    success(&p.run(&["validate"]));
+    assert!(!p.dir.join(".goodflows/cache-stamps").exists());
+}
+
+#[test]
+fn invalid_caches_fail_validation_naming_the_job_and_cache() {
+    assert_rejected(
+        "[[workflows.other.jobs]]\nname='a'\ncommand='true'\n[[workflows.other.jobs.caches]]\nname='deps'\npaths=['../deps']\n[[jobs]]\nname='b'\ncommand='true'\n",
+        "workflow 'other': job 'a': cache 'deps': path '../deps' must stay inside the workdir",
+    );
+}

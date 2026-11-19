@@ -328,6 +328,10 @@ struct Instance<'a> {
     /// same struct as each `summary.results` entry.
     #[serde(flatten)]
     scheduling: Scheduling<'a>,
+    /// Each cache's restore and save result, in the history file only: the
+    /// server's run-record contract has no `caches` key yet.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    caches: Option<&'a [crate::cache::Report]>,
 }
 
 /// Cut to at most `MAX_TEXT_BYTES` on a character boundary.
@@ -487,6 +491,9 @@ pub fn record<'a>(
                     .map(|error| truncate(&redact(error, target.workdir, target.log_dir))),
                 duration_ms: result.duration_ms,
                 scheduling: result.scheduling(),
+                // Only an uploaded record carries the graph.
+                caches: Some(result.caches.as_slice())
+                    .filter(|caches| !caches.is_empty() && upload.graph.is_none()),
             })
             .collect(),
         graph: upload.graph.map(GraphDocument::truncated),
@@ -783,6 +790,7 @@ mod tests {
             queued_ms: 0,
             commands: Vec::new(),
             fail_fast_skip: false,
+            caches: Vec::new(),
         }
     }
 

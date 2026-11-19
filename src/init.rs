@@ -104,12 +104,14 @@ pub async fn generate(
         environments: Default::default(),
         reporting: None,
         sprite: None,
+        cache: None,
     };
     if let Some(name) = workflow {
         config.workflows.insert(
             name.into(),
             Workflow {
                 settings: SettingsOverrides::default(),
+                cache: Default::default(),
                 jobs: std::mem::take(&mut config.jobs),
             },
         );
@@ -184,6 +186,7 @@ fn job(name: &str, command: &str, deps: &[&str]) -> Job {
         reports: Vec::new(),
         partitions_input: None,
         partitions: None,
+        caches: Vec::new(),
     }
 }
 

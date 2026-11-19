@@ -6106,3 +6106,264 @@ fn a_detached_runs_record_is_published_by_reports_upload() {
         fake.record(&run)["provenance"]["commit"]
     );
 }
+
+const MINTED: &str = "ck_minted-run-key-5d1e8a";
+const CONTROLLER_KEY: &str = "sk_controller-key-9b2c71";
+
+/// A fake GoodFlows server for cache-key minting and the cache routes.
+/// `mint` is the status minting answers with.
+fn cache_server(mint: u16) -> common::mock::Mock {
+    use common::mock::{Mock, Reply};
+    let base = Arc::new(Mutex::new(String::new()));
+    let url = base.clone();
+    let mock = Mock::start(move |request, _| {
+        let path = request.path.split('?').next().unwrap_or_default();
+        let reply = |code: u16, body: Value| Reply::Status(code, vec![], body.to_string());
+        match (request.method.as_str(), path) {
+            ("POST", "/api/v1/projects/app/cache-keys") if mint == 201 => reply(
+                201,
+                serde_json::json!({"data": {"id": "key-1", "token": MINTED, "access": "read_write",
+                    "scope": request.json()["scope"], "expires_at": "2026-11-19T00:00:00Z"}}),
+            ),
+            ("POST", "/api/v1/projects/app/cache-keys") => reply(mint, serde_json::json!({})),
+            ("DELETE", "/api/v1/projects/app/cache-keys/key-1") => {
+                Reply::Status(204, vec![], String::new())
+            }
+            ("GET", p) if p.starts_with("/api/v1/projects/app/caches/entries") => {
+                reply(404, serde_json::json!({}))
+            }
+            ("POST", p) if p.starts_with("/api/v1/projects/app/caches/entries/") => {
+                let body = request.json();
+                reply(
+                    201,
+                    serde_json::json!({"data": {"upload_id": "u1",
+                        "upload_url": format!("{}/objects/u1", url.lock().unwrap()),
+                        "upload_headers": {"content-length": body["size"].to_string(),
+                            "content-type": "application/gzip", "x-amz-checksum-sha256": "c"},
+                        "upload_url_expires_at": "x", "expires_at": "x"}}),
+                )
+            }
+            ("PUT", "/objects/u1") => reply(200, serde_json::json!({})),
+            ("POST", "/api/v1/projects/app/caches/uploads/u1/commit") => {
+                reply(200, serde_json::json!({"data": {}}))
+            }
+            _ => reply(404, serde_json::json!({})),
+        }
+    });
+    *base.lock().unwrap() = mock.url.clone();
+    mock
+}
+
+const CACHED: &str = r#"
+[settings]
+sprite_prefix = "gft"
+[reporting]
+project = "app"
+[cache]
+remote = "goodflows"
+[sprite]
+setup = "env > \"$GOODFLOWS_SPRITE_STATE_DIR/../hook-env-dump\""
+resume = "env > \"$GOODFLOWS_SPRITE_STATE_DIR/../hook-env-dump\""
+[[jobs]]
+name = "deps"
+command = "env > \"$GOODFLOWS_SPRITE_STATE_DIR/../job-env-dump\"; tr '\\0' '\\n' < /proc/$PPID/environ >> \"$GOODFLOWS_SPRITE_STATE_DIR/../job-env-dump\" 2>/dev/null; mkdir -p deps && echo x > deps/f && sleep 0"
+[[jobs.caches]]
+name = "deps"
+paths = ["deps"]
+"#;
+
+fn branch(project: &Path) -> String {
+    let output = Command::new("git")
+        .args(["symbolic-ref", "--short", "HEAD"])
+        .current_dir(project)
+        .output()
+        .unwrap();
+    String::from_utf8(output.stdout).unwrap().trim().to_owned()
+}
+
+#[test]
+fn a_minted_cache_key_reaches_only_the_runners_cache_client_and_is_revoked() {
+    let fake = Fake::new(CACHED);
+    let server = cache_server(201);
+    let output = fake.env_run(
+        &["run", "--sprite", "T-1", "--json"],
+        &[
+            ("GOODFLOWS_URL", &server.url),
+            ("GOODFLOWS_API_KEY", CONTROLLER_KEY),
+        ],
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+    let all = events(&output);
+    let saved = of_type(&all, "cache_saved");
+    assert_eq!(
+        saved[0]["tiers"],
+        serde_json::json!(["local", "remote"]),
+        "{}",
+        text(&output)
+    );
+    let requests = server.requests();
+    let bearer = |r: &common::mock::Request| r.headers.get("authorization").cloned();
+    // Minted with the controller's key, bound to the branch, read-write.
+    let mint = &requests[0];
+    assert_eq!(mint.path, "/api/v1/projects/app/cache-keys");
+    assert_eq!(bearer(mint), Some(format!("Bearer {CONTROLLER_KEY}")));
+    let body = mint.json();
+    let scope = branch(&fake.project);
+    assert_eq!(body["access"], "read_write");
+    assert_eq!(body["scope"], scope.as_str());
+    assert!(body["ttl_seconds"].as_u64().unwrap() <= 86_400);
+    // The Sprite's cache requests use the minted key and the run's scope.
+    let reserve = requests
+        .iter()
+        .find(|r| r.method == "POST" && r.path.contains("/caches/entries/"))
+        .expect("a reservation");
+    assert_eq!(bearer(reserve), Some(format!("Bearer {MINTED}")));
+    assert_eq!(reserve.json()["scope"], scope.as_str());
+    let put = requests.iter().find(|r| r.method == "PUT").unwrap();
+    assert!(bearer(put).is_none());
+    // Revoked after collection, with the controller's key.
+    let revoke = requests.last().unwrap();
+    assert_eq!(
+        (revoke.method.as_str(), revoke.path.as_str()),
+        ("DELETE", "/api/v1/projects/app/cache-keys/key-1")
+    );
+    assert_eq!(bearer(revoke), Some(format!("Bearer {CONTROLLER_KEY}")));
+    // The Sprite's local store is in its state directory.
+    let goodflows = fake.home().join(".goodflows");
+    let mut stored = Vec::new();
+    files_under(&goodflows.join("state/caches"), &[], &mut stored);
+    assert!(
+        stored
+            .iter()
+            .any(|f| f.extension().is_some_and(|e| e == "tgz")),
+        "{stored:?}"
+    );
+    // Neither key reaches hooks or jobs.
+    for dump in ["hook-env-dump", "job-env-dump"] {
+        let env = std::fs::read_to_string(goodflows.join(dump)).unwrap();
+        assert!(
+            !env.contains(MINTED) && !env.contains(CONTROLLER_KEY),
+            "{dump}"
+        );
+        assert!(!env.contains("GOODFLOWS_SPRITE_CACHE"), "{dump}");
+    }
+    // Nor argv, events, the Sprite's files, bundles or the receipt.
+    assert!(!fake.argv_log().contains(MINTED));
+    assert!(!text(&output).contains(MINTED));
+    let mut files = Vec::new();
+    files_under(&fake.home(), &["runners"], &mut files);
+    files_under(&fake.project.join(".goodflows"), &[], &mut files);
+    assert!(files.iter().any(|f| f.ends_with("receipt.json")));
+    for file in &files {
+        let bytes = String::from_utf8_lossy(&std::fs::read(file).unwrap()).into_owned();
+        assert!(!bytes.contains(MINTED), "{}", file.display());
+        assert!(!bytes.contains(CONTROLLER_KEY), "{}", file.display());
+    }
+    // The revoked key's id file is gone.
+    assert!(!files.iter().any(|f| f.ends_with("cache-key.json")));
+}
+
+#[test]
+fn a_refused_mint_falls_back_to_the_sprites_local_store() {
+    let fake = Fake::new(CACHED);
+    let server = cache_server(403);
+    let output = fake.env_run(
+        &["run", "--sprite", "T-1", "--json"],
+        &[
+            ("GOODFLOWS_URL", &server.url),
+            ("GOODFLOWS_API_KEY", "pk_public"),
+        ],
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+    let all = events(&output);
+    let unavailable = of_type(&all, "cache_remote_unavailable");
+    assert_eq!(unavailable.len(), 1, "{}", text(&output));
+    assert_eq!(unavailable[0]["reason"], "mint_failed");
+    assert_eq!(
+        of_type(&all, "cache_saved")[0]["tiers"],
+        serde_json::json!(["local"])
+    );
+    let requests = server.requests();
+    assert_eq!(requests.len(), 1, "only the mint: {requests:?}");
+}
+
+#[test]
+fn a_minted_cache_key_is_revoked_after_cancellation() {
+    let fake = Fake::new(&CACHED.replace("sleep 0", "sleep 300"));
+    let server = cache_server(201);
+    let controller = spawn_args(
+        &fake,
+        &["run", "--sprite", "T-1", "--json"],
+        &[
+            ("GOODFLOWS_URL", &server.url),
+            ("GOODFLOWS_API_KEY", CONTROLLER_KEY),
+        ],
+    );
+    wait_running(&fake);
+    unsafe {
+        libc::kill(controller.id() as i32, libc::SIGINT);
+    }
+    let output = controller.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(130), "{}", text(&output));
+    let requests = server.requests();
+    assert!(
+        requests
+            .iter()
+            .any(|r| r.method == "DELETE" && r.path.ends_with("/cache-keys/key-1")),
+        "{requests:?}"
+    );
+}
+
+#[test]
+fn recovery_commands_revoke_an_unresolved_runs_minted_cache_key() {
+    let server = cache_server(201);
+    let env = [
+        ("GOODFLOWS_URL", server.url.as_str()),
+        ("GOODFLOWS_API_KEY", CONTROLLER_KEY),
+    ];
+    let key_files = |fake: &Fake| {
+        let mut files = Vec::new();
+        files_under(&fake.project.join(".goodflows/sprites"), &[], &mut files);
+        files.retain(|f| f.ends_with("cache-key.json"));
+        files
+    };
+    let revokes = || {
+        server
+            .requests()
+            .iter()
+            .filter(|r| r.method == "DELETE" && r.path.ends_with("/cache-keys/key-1"))
+            .count()
+    };
+    for (index, verb) in ["collect", "cancel", "status"].into_iter().enumerate() {
+        let fake = Fake::new(CACHED);
+        // The controller loses the run's stream: the run stays unresolved
+        // and keeps its key for a recovery command.
+        let mut unresolved = env.to_vec();
+        unresolved.push(("FAKE_SPRITE_FAIL_OPS", "follow"));
+        let output = fake.env_run(&["run", "--sprite", "T-1", "--json"], &unresolved);
+        assert_eq!(output.status.code(), Some(3), "{verb}: {}", text(&output));
+        let run = run_id(&events(&output));
+        assert_eq!(key_files(&fake).len(), 1, "{verb}");
+        assert_eq!(revokes(), index, "{verb}: not revoked by the run");
+        wait_for("remote completion", Duration::from_secs(30), || {
+            fake.record(&run)["phase"] == "completed"
+        });
+        let args: Vec<&str> = match verb {
+            "status" => vec!["sprite", "status", "T-1", "--json"],
+            _ => vec!["sprite", verb, "T-1", "--run", &run, "--json"],
+        };
+        let output = fake.env_run(&args, &env);
+        assert_eq!(output.status.code(), Some(0), "{verb}: {}", text(&output));
+        assert_eq!(revokes(), index + 1, "{verb}: {}", text(&output));
+        let revoke = server
+            .requests()
+            .into_iter()
+            .rfind(|r| r.method == "DELETE")
+            .unwrap();
+        assert_eq!(
+            revoke.headers.get("authorization"),
+            Some(&format!("Bearer {CONTROLLER_KEY}"))
+        );
+        assert!(key_files(&fake).is_empty(), "{verb}");
+    }
+}

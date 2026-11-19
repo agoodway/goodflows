@@ -1,3 +1,4 @@
+mod cache;
 mod config;
 mod detach;
 mod expression;
@@ -934,6 +935,9 @@ async fn run(cli: &Cli, output: &mut Output, cancel: watch::Receiver<Option<i32>
         sprite_state: None,
         provenance: None,
         last_run: Some(last_run),
+        config_dir: config_file.parent().map(PathBuf::from),
+        caches: Default::default(),
+        cache_forwarded: None,
     };
     execute(run, name, identity).await
 }
@@ -986,6 +990,13 @@ pub(crate) struct Run {
     /// Collects every invocation's summary for the last-run record; `None`
     /// on a Sprite, whose local run is the controller's.
     pub last_run: Option<last::Recorder>,
+    /// The config file's directory, which names the local cache store
+    /// outside Git; `None` on a Sprite, whose store is in its state directory.
+    pub config_dir: Option<PathBuf>,
+    /// The run's cache session, started by the first invocation with caches.
+    pub caches: tokio::sync::OnceCell<Arc<cache::Session>>,
+    /// A remote Sprite run's minted cache key from its controller.
+    pub cache_forwarded: Option<cache::Forwarded>,
 }
 
 /// The invocation that activated a child, and the call job that did it.
@@ -993,6 +1004,68 @@ struct Parent {
     run_id: String,
     caller_job: String,
     scope: Arc<runner::Scope>,
+    /// Ends the call job early, once the child's results are final.
+    early: tokio::sync::oneshot::Sender<runner::ChildEnd>,
+    /// Set when `early` fired.
+    fired: Arc<std::sync::atomic::AtomicBool>,
+    /// Where a child that already ended its call job reports a later error,
+    /// for the parent invocation to fail with.
+    late: Late,
+}
+
+/// Errors of children after their call jobs ended early.
+type Late = Arc<std::sync::Mutex<Vec<String>>>;
+
+/// How many child invocations of one invocation are still finishing (cache
+/// saves, reporting, summary) after their call jobs ended. The invocation
+/// waits for none to remain before its own reporting and summary.
+type Children = Arc<watch::Sender<usize>>;
+
+/// Counts one finishing child until dropped.
+struct Child(Children);
+
+impl Drop for Child {
+    fn drop(&mut self) {
+        self.0.send_modify(|n| *n -= 1);
+    }
+}
+
+/// Ends a call job as soon as its child's results are final, while the
+/// child's cache saves still run: saves never hold back dependents, and the
+/// child keeps the snapshot that decided the call for its own summary.
+struct Early {
+    sender: Option<tokio::sync::oneshot::Sender<runner::ChildEnd>>,
+    fired: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// The signal snapshot the call's status was decided from.
+    signal: Option<Option<i32>>,
+    target: String,
+    run_id: String,
+}
+
+impl Early {
+    fn fire(&mut self, results: &[runner::JobResult], signal: Option<i32>) {
+        let Some(sender) = self.sender.take() else {
+            return;
+        };
+        self.signal = Some(signal);
+        if let Some(fired) = &self.fired {
+            fired.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        let outcome = history::outcome(results, signal.is_some());
+        let finished = Finished {
+            outcome,
+            success: results
+                .iter()
+                .all(|r| matches!(r.status, Status::Passed | Status::Skipped)),
+            signal,
+            interrupted: interrupted(outcome, results.iter().map(|r| r.fail_fast_skip)),
+        };
+        let _ = sender.send(child_end(
+            &self.target,
+            self.run_id.clone(),
+            Ok(Some(finished)),
+        ));
+    }
 }
 
 /// How one invocation ended, after its reporting, history and summary.
@@ -1019,27 +1092,65 @@ async fn invoke(
     identity: retention::RunIdentity,
 ) -> (String, Result<Option<Finished>>) {
     let id = identity.id.clone();
-    (id, invocation(&run, &name, parent, identity).await)
+    let late = parent.as_ref().map(|p| (p.fired.clone(), p.late.clone()));
+    let result = invocation(&run, &name, parent, identity).await;
+    if let (Err(error), Some((fired, late))) = (&result, late) {
+        // The call job already ended with the child's results; the error
+        // still fails the run, through the parent, as it would at the root.
+        if fired.load(std::sync::atomic::Ordering::SeqCst) {
+            late.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(format!("workflow '{name}': {error:#}"));
+        }
+    }
+    (id, result)
 }
 
-/// The activation callback for the call jobs of the invocation `run_id`.
-fn activator(run: Arc<Run>, run_id: String) -> runner::Activate {
+/// The activation callback for the call jobs of the invocation `run_id`,
+/// whose finishing children `children` counts.
+fn activator(run: Arc<Run>, run_id: String, children: Children, late: Late) -> runner::Activate {
     Arc::new(move |activation: runner::Activation| {
+        let (early, ended) = tokio::sync::oneshot::channel();
         let parent = Parent {
             run_id: run_id.clone(),
             caller_job: activation.caller_job,
             scope: activation.scope,
+            early,
+            fired: Default::default(),
+            late: late.clone(),
         };
         let (run, target) = (run.clone(), activation.target);
+        children.send_modify(|n| *n += 1);
+        let child = Child(children.clone());
         Box::pin(async move {
-            let (run_id, finished) = invoke(
-                run,
-                target.clone(),
-                Some(parent),
-                retention::RunIdentity::new(),
-            )
-            .await;
-            child_end(&target, run_id, finished)
+            let identity = retention::RunIdentity::new();
+            let id = identity.id.clone();
+            let name = target.clone();
+            let mut task = tokio::spawn(async move {
+                let _child = child;
+                invoke(run, name, Some(parent), identity).await
+            });
+            let joined = move |joined: Result<(String, Result<Option<Finished>>), _>| match joined {
+                Ok((run_id, finished)) => (run_id, finished),
+                Err(error) => (id.clone(), Err(anyhow::anyhow!("{error}"))),
+            };
+            tokio::select! {
+                done = &mut task => {
+                    let (run_id, finished) = joined(done);
+                    child_end(&target, run_id, finished)
+                }
+                Ok(end) = ended => {
+                    // The child finishes on its own; its parent waits for it.
+                    tokio::spawn(async move {
+                        // Errors reach the parent through `late`; only a
+                        // panicked child is left to report here.
+                        if let Err(error) = task.await {
+                            eprintln!("goodflows: warning: workflow '{target}': {error}");
+                        }
+                    });
+                    end
+                }
+            }
         })
     })
 }
@@ -1109,7 +1220,7 @@ fn child_end(target: &str, run_id: String, finished: Result<Option<Finished>>) -
 async fn invocation(
     run: &Arc<Run>,
     name: &str,
-    parent: Option<Parent>,
+    mut parent: Option<Parent>,
     identity: retention::RunIdentity,
 ) -> Result<Option<Finished>> {
     let config = match &parent {
@@ -1180,25 +1291,85 @@ async fn invocation(
             dir.join(config::path_component(name))
         }
     });
+    let children: Children = Arc::new(watch::channel(0).0);
+    let late: Late = Default::default();
+    let early = Arc::new(std::sync::Mutex::new(Early {
+        sender: parent
+            .as_mut()
+            .map(|p| std::mem::replace(&mut p.early, tokio::sync::oneshot::channel().0)),
+        fired: parent.as_ref().map(|p| p.fired.clone()),
+        signal: None,
+        target: name.to_owned(),
+        run_id: identity.id.clone(),
+    }));
+    let fire = {
+        let (early, cancel) = (early.clone(), cancel.clone());
+        move |results: &[runner::JobResult]| {
+            let signal = *cancel.borrow();
+            early
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .fire(results, signal);
+        }
+    };
     let mut options = Options {
         scope: scope.clone(),
-        calls: run
-            .calls
-            .then(|| activator(run.clone(), identity.id.clone())),
+        calls: run.calls.then(|| {
+            activator(
+                run.clone(),
+                identity.id.clone(),
+                children.clone(),
+                late.clone(),
+            )
+        }),
         workdir: settings.workdir,
         log_dir: None,
         output: output.clone(),
-        reporting: session
-            .as_ref()
-            .map(reporting::Session::runner_env)
-            .unwrap_or_default(),
+        reporting: {
+            let mut env = session
+                .as_ref()
+                .map(reporting::Session::runner_env)
+                .unwrap_or_default();
+            // The cache key is a credential too: no command or expression sees it.
+            if let Some(cache) = &config.cache {
+                env.scrub.push(cache.token_env.clone());
+            }
+            Arc::new(env)
+        },
         environment: run.profile.clone(),
         settings_env: settings.env,
         sprite_state: run.sprite_state.clone(),
+        caches: None,
+        // Only cache saves still running end a call job early.
+        done: std::sync::Mutex::new(Some(Box::new(fire.clone()))),
     };
     output.emit(json!({"type":"run_started", "parallelism":parallelism, "fail_fast":fail_fast, "jobs":config.jobs.iter().map(config::Job::instances).sum::<usize>(), "workdir":options.workdir})).await?;
     if let Some(session) = &session {
         session.announce(output).await;
+    }
+    if config.jobs.iter().any(|job| !job.caches.is_empty()) {
+        // One session per run, so run-wide warnings and a disabled remote
+        // store hold across called workflows.
+        let caches = run
+            .caches
+            .get_or_init(|| {
+                cache::Session::start(
+                    cache::Start {
+                        cache: run.root.cache.as_ref(),
+                        reporting: run.root.reporting.as_ref(),
+                        workdir: &options.workdir,
+                        config_dir: run.config_dir.as_deref(),
+                        sprite_state: run.sprite_state.as_deref(),
+                        forwarded: run.cache_forwarded.as_ref(),
+                    },
+                    output,
+                )
+            })
+            .await;
+        options.caches = Some(Arc::new(cache::Invocation::new(
+            caches.clone(),
+            config::CacheConfig::effective(config.cache.as_ref()),
+        )));
     }
     // Held until this function returns, so a concurrent prune skips this run.
     let _log_run = match &log_base {
@@ -1233,6 +1404,13 @@ async fn invocation(
     };
     let execute_ms = run_start.elapsed().as_millis() as u64;
     let results = execution.results;
+    // Children whose call jobs ended early still finish their saves and
+    // summaries, which come before this invocation's.
+    let mut finishing = children.subscribe();
+    if *finishing.borrow() != 0 {
+        fire(&results);
+        let _ = finishing.wait_for(|n| *n == 0).await;
+    }
     // Reporting runs after every job finished and before the summary, which stays last.
     if let Some(session) = &mut session {
         session.finish(&results, cancel.clone(), output).await;
@@ -1252,7 +1430,8 @@ async fn invocation(
     // One snapshot decides the outcome in the run record, the history file
     // and the summary, the report header and a calling job's status. A
     // signal after it cancels only the run record upload.
-    let signal = *cancel.borrow();
+    let early_signal = early.lock().unwrap_or_else(|e| e.into_inner()).signal;
+    let signal = early_signal.unwrap_or(*cancel.borrow());
     let fields = history::RunFields {
         run_id: identity.id.clone(),
         started_at: identity.started_at.clone(),
@@ -1350,6 +1529,11 @@ async fn invocation(
     output
         .emit_summary(summary, config_path, None, signal.is_some())
         .await?;
+    // A child that failed after its call job had ended fails this
+    // invocation like an error in its own reporting or summary.
+    if let Some(error) = late.lock().unwrap_or_else(|e| e.into_inner()).first() {
+        anyhow::bail!("{error}");
+    }
     // A signal during the run record upload leaves the outcome as
     // snapshotted but still decides the exit code.
     let exit_signal = *cancel.borrow();
@@ -1527,6 +1711,9 @@ mod tests {
             sprite_state: None,
             provenance: None,
             last_run: None,
+            config_dir: None,
+            caches: Default::default(),
+            cache_forwarded: None,
         };
         let started = root.join("started");
         let signaller = tokio::spawn(async move {

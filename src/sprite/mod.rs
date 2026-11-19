@@ -41,6 +41,13 @@ pub const RUNNER_OWNED: [&str; 7] = [
     config::SPRITE_STATE_ENV,
 ];
 pub(crate) const UPLOAD_TIMEOUT_SECS: u64 = 600;
+/// A minted per-run cache key lives this long: the server's cap for
+/// read-write keys. A remote run's length has no fixed bound (jobs without
+/// `timeout_secs`, hooks, cache transfers, reconnects), and a key that
+/// expired mid-run would silently turn the remote store off. The controller
+/// revokes it when the run ends, or at the recovery command that resolves
+/// an unresolved run, so its exposure is normally far shorter.
+const MINTED_TTL_SECS: u64 = 86_400;
 /// Reconnect backoff for an attached run's follow stream.
 const FOLLOW_BACKOFF_MIN: std::time::Duration = std::time::Duration::from_secs(1);
 const FOLLOW_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(15);
@@ -122,11 +129,16 @@ pub struct RunInput {
 // ---------------------------------------------------------------------------
 // Local preflight
 
-fn denied_reason(name: &str, token_env: Option<&str>) -> Option<&'static str> {
+fn denied_reason(name: &str, tokens: (Option<&str>, Option<&str>)) -> Option<&'static str> {
+    let (token_env, cache_token_env) = tokens;
     if CONTROLLER_CREDENTIALS.contains(&name) {
         Some("Sprite credentials stay on the controller")
     } else if token_env == Some(name) {
         Some("the reporting token stays on the controller")
+    } else if cache_token_env == Some(name) {
+        Some("the controller mints a cache key for each Sprite run")
+    } else if name == crate::cache::SPRITE_CACHE_ENV {
+        Some("the controller forwards the run's cache key itself")
     } else if RUNNER_OWNED.contains(&name) {
         Some("the remote runner sets it itself")
     } else {
@@ -137,7 +149,10 @@ fn denied_reason(name: &str, token_env: Option<&str>) -> Option<&'static str> {
 /// Remote-only rules for forwarding and every configured env layer,
 /// including unselected workflows and profiles. Names only, never values.
 pub fn check_remote_env(document: &Config, sprite: &SpriteConfig) -> Result<()> {
-    let token = document.reporting.as_ref().map(|r| r.token_env.as_str());
+    let token = (
+        document.reporting.as_ref().map(|r| r.token_env.as_str()),
+        document.cache.as_ref().map(|c| c.token_env.as_str()),
+    );
     for name in &sprite.pass_env {
         if let Some(reason) = denied_reason(name, token) {
             bail!("[sprite] pass_env must not forward {name}: {reason}");
@@ -223,6 +238,9 @@ fn controller_secrets(document: &Config) -> Vec<String> {
     let mut names: Vec<&str> = CONTROLLER_CREDENTIALS.to_vec();
     if let Some(reporting) = &document.reporting {
         names.push(&reporting.token_env);
+    }
+    if let Some(cache) = &document.cache {
+        names.push(&cache.token_env);
     }
     names
         .into_iter()
@@ -856,10 +874,170 @@ fn busy(identity: &str, active: &str, reason: &str) -> anyhow::Error {
 // ---------------------------------------------------------------------------
 // Remote run
 
+/// A per-run cache key the controller minted, and the private file that
+/// names it (its id only) until it is revoked.
+struct MintedKey {
+    target: crate::reporting::publish::Target,
+    id: String,
+    file: PathBuf,
+}
+
+/// The file naming a run's minted cache key in its controller-side bundle.
+const CACHE_KEY_FILE: &str = "cache-key.json";
+
 pub async fn run(
     input: RunInput,
     output: &mut Output,
     cancel: watch::Receiver<Option<i32>>,
+) -> Result<u8> {
+    let mut minted = None;
+    let result = run_inner(input, output, cancel, &mut minted).await;
+    // An unresolved run (exit 3) may still be running remotely; its key is
+    // revoked once the run is collected, cancelled or reconciled.
+    if let Some(minted) = minted {
+        if !matches!(result, Ok(3)) {
+            revoke_key(&minted.target, &minted.id, &minted.file, output).await;
+        }
+    }
+    result
+}
+
+/// The controller's reporting target, from its own environment.
+fn controller_target(document: &Config) -> Option<crate::reporting::publish::Target> {
+    let reporting = document.reporting.as_ref()?;
+    let read = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
+    match crate::reporting::publish::resolve(
+        read(&reporting.url_env).as_deref(),
+        read(&reporting.token_env).as_deref(),
+        &reporting.project,
+    ) {
+        crate::reporting::publish::Credentials::Ready(target) => Some(target),
+        _ => None,
+    }
+}
+
+/// Mint the run's `ck_` key when the selected run uses the remote cache
+/// store. Returns the key and the forwarded value; on any failure the run
+/// continues with the Sprite's local store and one `cache_remote_unavailable`.
+async fn mint_cache_key(
+    selected: &Config,
+    branch: Option<String>,
+    base: &Path,
+    output: &Output,
+) -> Option<(MintedKey, String)> {
+    use crate::reporting::publish::{resolve, Credentials};
+    let cache = selected.cache.as_ref().filter(|c| c.remote_enabled())?;
+    let reporting = selected.reporting.as_ref()?;
+    let unavailable =
+        |reason: &str| output.emit(json!({"type": "cache_remote_unavailable", "reason": reason}));
+    let read = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
+    let url = read(&reporting.url_env);
+    let key = read(&reporting.token_env);
+    if key.is_some() {
+        crate::reporting::protect_process();
+    }
+    let target = match resolve(url.as_deref(), key.as_deref(), &reporting.project) {
+        Credentials::Ready(target) => target,
+        other => {
+            let _ = unavailable(other.unavailable().unwrap_or("credentials_unavailable")).await;
+            return None;
+        }
+    };
+    // The controller resolves the scope from its own environment.
+    let (scope, warning) = crate::cache::resolve_scope(Some(cache), branch);
+    if let Some(warning) = warning {
+        let _ = output
+            .emit(json!({"type": "cache_warning", "message": warning}))
+            .await;
+    }
+    let write = config::CacheConfig::effective(Some(cache)).write;
+    let access = if write && scope.is_some() {
+        "read_write"
+    } else {
+        "read"
+    };
+    let minted = match crate::cache::remote::mint(
+        &target,
+        access,
+        scope.as_deref(),
+        MINTED_TTL_SECS,
+    )
+    .await
+    {
+        Ok(minted) => minted,
+        Err(_) => {
+            let _ = unavailable("mint_failed").await;
+            return None;
+        }
+    };
+    let file = base.join(CACHE_KEY_FILE);
+    // Only the id: the token never reaches a file.
+    let _ = control::write_json(&file, &json!({"id": minted.id}));
+    let forwarded = serde_json::to_string(&crate::cache::Forwarded {
+        url: url.unwrap_or_default(),
+        token: minted.token,
+        scope,
+    })
+    .ok()?;
+    Some((
+        MintedKey {
+            target,
+            id: minted.id,
+            file,
+        },
+        forwarded,
+    ))
+}
+
+/// Revoke a minted key and forget its file; on failure keep the file for a
+/// later recovery command (the key also expires on its own).
+async fn revoke_key(
+    target: &crate::reporting::publish::Target,
+    id: &str,
+    file: &Path,
+    output: &Output,
+) {
+    match crate::cache::remote::revoke(target, id).await {
+        Ok(()) => {
+            let _ = std::fs::remove_file(file);
+        }
+        Err(error) => {
+            let _ = output
+                .emit(json!({"type": "cache_warning",
+                    "message": format!("revoking the run's cache key failed ({error:#}); it expires on its own")}))
+                .await;
+        }
+    }
+}
+
+/// Revoke the minted keys named by `files`, as recovery commands do.
+async fn revoke_files(document: &Config, files: Vec<PathBuf>, output: &Output) {
+    let files: Vec<_> = files.into_iter().filter(|f| f.is_file()).collect();
+    if files.is_empty() {
+        return;
+    }
+    let Some(target) = controller_target(document) else {
+        return;
+    };
+    for file in files {
+        let id: Option<String> = std::fs::read(&file)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+            .and_then(|v| v["id"].as_str().map(str::to_owned));
+        match id {
+            Some(id) => revoke_key(&target, &id, &file, output).await,
+            None => {
+                let _ = std::fs::remove_file(&file);
+            }
+        }
+    }
+}
+
+async fn run_inner(
+    input: RunInput,
+    output: &mut Output,
+    cancel: watch::Receiver<Option<i32>>,
+    minted: &mut Option<MintedKey>,
 ) -> Result<u8> {
     let RunInput {
         document,
@@ -882,7 +1060,7 @@ pub async fn run(
         "Sprite runs require [sprite] resume (use `true` for a deliberate no-op); resume scripts are never discovered",
     )?;
     check_remote_env(&document, &sprite_config)?;
-    let forwarded = resolve_pass_env(&sprite_config.pass_env)?;
+    let mut forwarded = resolve_pass_env(&sprite_config.pass_env)?;
     let cli = sprite_cli()?;
     let config_dir = config_file
         .parent()
@@ -949,7 +1127,7 @@ pub async fn run(
         identity: identity.clone(),
     };
     let run_id = uuid::Uuid::new_v4().hyphenated().to_string();
-    let sprite = Sprite {
+    let mut sprite = Sprite {
         cli,
         org,
         name: scope.sprite_name(),
@@ -1009,6 +1187,15 @@ pub async fn run(
         Err(error) => return unresolved(output, &identity, None, format!("{error:#}")).await,
     }
     let provision_ms = provision_start.elapsed().as_millis() as u64;
+    let branch = snap.source.as_ref().and_then(|s| s.branch.clone());
+    if let Some((key, value)) = mint_cache_key(&selected, branch, &base, output).await {
+        if let Ok(forwarded_value) = serde_json::from_str::<crate::cache::Forwarded>(&value) {
+            sprite.secrets.push(forwarded_value.token);
+        }
+        forwarded.insert(crate::cache::SPRITE_CACHE_ENV.into(), value);
+        *minted = Some(key);
+    }
+    stop_unsubmitted(&cancel)?;
     let header = Header {
         protocol: PROTOCOL,
         run_id: run_id.clone(),
@@ -1707,12 +1894,22 @@ async fn command_inner(
                     event["type"] = json!("sprite_status");
                     event["identity"] = json!(identity);
                     event["sprite"] = json!(sprite.name);
-                    event["state"] = json!(if event["busy"] == true {
-                        "active"
-                    } else {
-                        "idle"
-                    });
+                    let idle = event["busy"] != true;
+                    event["state"] = json!(if idle { "idle" } else { "active" });
                     emit(output, event, message).await;
+                    // Reconciled and idle: no run can still use a minted key.
+                    if idle {
+                        let dir = std::env::current_dir()?
+                            .join(".goodflows/sprites")
+                            .join(scope.digest());
+                        let files = std::fs::read_dir(&dir)
+                            .into_iter()
+                            .flatten()
+                            .flatten()
+                            .map(|run| run.path().join(CACHE_KEY_FILE))
+                            .collect();
+                        revoke_files(&document, files, output).await;
+                    }
                     Ok(0)
                 }
                 Err(error) => {
@@ -1766,6 +1963,10 @@ async fn command_inner(
             let base = bundle_base(&scope, run, target.as_deref())?;
             match collect_run(&sprite, "current", &scope_hex, run, &base).await {
                 Ok(collected) => {
+                    if collected.complete {
+                        let file = bundle_base(&scope, run, None)?.join(CACHE_KEY_FILE);
+                        revoke_files(&document, vec![file], output).await;
+                    }
                     emit(
                         output,
                         json!({"type": "sprite_collected", "run_id": run, "bundle": collected.dir,
@@ -1791,6 +1992,8 @@ async fn command_inner(
                 .and_then(|c| agent_json(&c, &sprite, "cancel"));
             match reply {
                 Ok(reply) => {
+                    let file = bundle_base(&scope, run, None)?.join(CACHE_KEY_FILE);
+                    revoke_files(&document, vec![file], output).await;
                     let status = reply["status"].as_str().unwrap_or_default().to_owned();
                     emit(
                         output,
@@ -2259,6 +2462,31 @@ command = "true"
             "{base}\n[[jobs]]\nname = \"b\"\ncommand = \"true\"\nenv = {{ GOODFLOWS_OUTPUT = \"f\" }}"
         ));
         assert!(check_remote_env(&job, &SpriteConfig::default()).is_err());
+    }
+
+    #[test]
+    fn remote_env_rules_deny_the_cache_key_variables() {
+        let cached = document(
+            "[reporting]\nproject = \"p\"\n[cache]\nremote = \"goodflows\"\n[[jobs]]\nname = \"a\"\ncommand = \"true\"\n",
+        );
+        for name in ["GOODFLOWS_CACHE_KEY", crate::cache::SPRITE_CACHE_ENV] {
+            let sprite = SpriteConfig {
+                pass_env: vec![name.into()],
+                ..Default::default()
+            };
+            let error = check_remote_env(&cached, &sprite).unwrap_err().to_string();
+            assert!(error.contains(name), "{error}");
+        }
+        let job = document(
+            "[cache]\ntoken_env = \"ORB_CACHE\"\n[[jobs]]\nname = \"a\"\ncommand = \"true\"\nenv = { ORB_CACHE = \"x\" }\n",
+        );
+        let error = check_remote_env(&job, &SpriteConfig::default())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("ORB_CACHE") && error.contains("mints a cache key"),
+            "{error}"
+        );
     }
 
     fn spool(dir: &Path, edit: impl FnOnce(&mut crate::reporting::Manifest)) {
