@@ -98,6 +98,8 @@ pub mod mock {
         Status(u16, Vec<(String, String)>, String),
         /// A binary body, such as an archive.
         Bytes(u16, Vec<u8>),
+        /// A binary body with extra headers, such as a `206` part.
+        BytesWith(u16, Vec<(String, String)>, Vec<u8>),
         Hang(Duration),
         /// A 200 announcing the whole body that sends only its first half,
         /// then stalls for the duration.
@@ -152,6 +154,17 @@ pub mod mock {
                                     "HTTP/1.1 {code} Mock\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                                     body.len()
                                 );
+                                let _ = stream.write_all(&body);
+                            }
+                            Reply::BytesWith(code, headers, body) => {
+                                let mut head = format!(
+                                    "HTTP/1.1 {code} Mock\r\nContent-Length: {}\r\nConnection: close\r\n",
+                                    body.len()
+                                );
+                                for (k, v) in headers {
+                                    head.push_str(&format!("{k}: {v}\r\n"));
+                                }
+                                let _ = write!(stream, "{head}\r\n");
                                 let _ = stream.write_all(&body);
                             }
                             Reply::Hang(duration) => std::thread::sleep(duration),

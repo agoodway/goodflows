@@ -59,6 +59,10 @@ goodflows SHALL look up an exact key with `GET entries/:key` and a fallback with
 - **WHEN** a downloaded archive's sha256 differs from the metadata
 - **THEN** goodflows discards it, reports a `cache_warning`, stores nothing locally, and treats the cache as a miss
 
+#### Scenario: Large archive
+- **WHEN** an entry is at least 64 MiB
+- **THEN** goodflows downloads it as concurrent 16 MiB `Range` requests (at most 8 at once), retries a failed part up to twice, and checks each part's `Content-Range` and length; if the store answers the first range with the whole object, goodflows streams that response instead
+
 #### Scenario: Presigned URL
 - **WHEN** goodflows downloads or uploads through a presigned URL
 - **THEN** the request carries no `Authorization` header and no cache key

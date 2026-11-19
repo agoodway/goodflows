@@ -47,6 +47,11 @@ struct State {
     stall_put: bool,
     /// Never answer a lookup.
     stall_lookup: bool,
+    /// Answer `Range` requests with the whole object, like a store without
+    /// range support.
+    ignore_range: bool,
+    /// Fail this many ranged downloads after the first one with a `503`.
+    flaky_ranges: usize,
 }
 
 struct Fake {
@@ -141,6 +146,25 @@ fn handle(state: &Mutex<State>, request: &Request) -> Reply {
         }
         if state.stall {
             return Reply::Stall(bytes, std::time::Duration::from_secs(30));
+        }
+        let range = request.headers.get("range").cloned();
+        if let Some(range) = range.filter(|_| !state.ignore_range) {
+            let (start, end) = range
+                .strip_prefix("bytes=")
+                .and_then(|r| r.split_once('-'))
+                .map(|(s, e)| (s.parse::<usize>().unwrap(), e.parse::<usize>().unwrap()))
+                .unwrap();
+            if start > 0 && state.flaky_ranges > 0 {
+                state.flaky_ranges -= 1;
+                return status(503, json!({}));
+            }
+            let end = end.min(bytes.len() - 1);
+            let content_range = format!("bytes {start}-{end}/{}", bytes.len());
+            return Reply::BytesWith(
+                206,
+                vec![("Content-Range".into(), content_range)],
+                bytes[start..=end].to_vec(),
+            );
         }
         return Reply::Bytes(200, bytes);
     }
@@ -455,6 +479,103 @@ fn a_tampered_download_is_discarded() {
     assert!(warning.as_str().unwrap().contains("sha256"), "{warning}");
     assert!(machine.entries().is_empty());
     assert!(!p.dir.join("deps/x").exists());
+}
+
+/// Parts of 16 bytes, so a test archive downloads in ranges.
+const SMALL_PARTS: (&str, &str) = ("GOODFLOWS_TEST_CACHE_PART_BYTES", "16");
+
+/// The size of the one stored archive.
+fn object_size(fake: &Fake) -> usize {
+    let state = fake.state.lock().unwrap();
+    assert_eq!(state.objects.len(), 1);
+    state.objects.values().next().unwrap().len()
+}
+
+/// The `Range` header of each object download after the first `skip`
+/// requests.
+fn object_gets(fake: &Fake, skip: usize) -> Vec<Option<String>> {
+    fake.requests()[skip..]
+        .iter()
+        .filter(|r| r.method == "GET" && r.path.starts_with("/objects/"))
+        .inspect(|r| assert!(!r.headers.contains_key("authorization")))
+        .map(|r| r.headers.get("range").cloned())
+        .collect()
+}
+
+#[test]
+fn a_large_archive_downloads_in_concurrent_ranges_and_retries_a_failed_part() {
+    let fake = Fake::start();
+    seed(&fake, "main");
+    let size = object_size(&fake);
+    assert!(
+        size >= 4 * 16,
+        "the archive must span the ranged minimum: {size}"
+    );
+    fake.set(|s| s.flaky_ranges = 2);
+    let skip = fake.requests().len();
+    let machine = Machine::new();
+    let p = checkout(&config("", ONE), "feat-x", "v1");
+    let output = machine.run(&p, &fake.mock.url, &["--json"], &[SMALL_PARTS]);
+    success(&output);
+    assert_eq!(restored(&output), ("exact".into(), json!("remote")));
+    assert_eq!(p.read("deps/built"), "v1");
+    let gets = object_gets(&fake, skip);
+    let parts = size.div_ceil(16);
+    // Every part once, plus the two that failed and were fetched again.
+    assert_eq!(gets.len(), parts + 2, "{gets:?}");
+    let mut ranges: Vec<(usize, usize)> = gets
+        .iter()
+        .map(|r| {
+            let (s, e) = r.as_deref().unwrap()["bytes=".len()..]
+                .split_once('-')
+                .unwrap();
+            (s.parse().unwrap(), e.parse().unwrap())
+        })
+        .collect();
+    ranges.sort();
+    ranges.dedup();
+    let mut next = 0;
+    for (start, end) in ranges {
+        assert_eq!(start, next);
+        assert_eq!(end, (start + 15).min(size - 1));
+        next = end + 1;
+    }
+    assert_eq!(next, size);
+}
+
+#[test]
+fn a_store_without_range_support_serves_the_whole_archive_in_one_request() {
+    let fake = Fake::start();
+    seed(&fake, "main");
+    fake.set(|s| s.ignore_range = true);
+    let skip = fake.requests().len();
+    let p = checkout(&config("", ONE), "feat-x", "v1");
+    let output = Machine::new().run(&p, &fake.mock.url, &["--json"], &[SMALL_PARTS]);
+    success(&output);
+    assert_eq!(restored(&output), ("exact".into(), json!("remote")));
+    assert_eq!(p.read("deps/built"), "v1");
+    assert_eq!(object_gets(&fake, skip).len(), 1);
+}
+
+#[test]
+fn a_tampered_ranged_download_is_discarded() {
+    let fake = Fake::start();
+    seed(&fake, "main");
+    fake.set(|s| s.tamper = true);
+    let machine = Machine::new();
+    let p = checkout(&config("", ONE), "main", "v1");
+    let output = machine.run(
+        &p,
+        &fake.mock.url,
+        &["--json", "--env", "ro"],
+        &[SMALL_PARTS],
+    );
+    success(&output);
+    assert!(object_gets(&fake, 0).iter().any(Option::is_some));
+    assert_eq!(restored(&output), ("miss".into(), Value::Null));
+    let warning = &of_type(&output, "cache_warning")[0]["message"];
+    assert!(warning.as_str().unwrap().contains("sha256"), "{warning}");
+    assert!(machine.entries().is_empty());
 }
 
 #[test]

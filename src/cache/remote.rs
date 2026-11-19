@@ -154,6 +154,190 @@ fn entry(body: &Value, key: Option<&str>, partial: Option<&str>) -> Option<Entry
     Some(entry)
 }
 
+/// Size of one ranged download request.
+const PART_BYTES: u64 = 16 * 1024 * 1024;
+/// Archives of at least this many parts download in ranges; a smaller one
+/// gains little over one connection.
+const RANGED_MIN_PARTS: u64 = 4;
+/// Ranged requests in flight at once for one archive.
+const RANGED_CONNECTIONS: u64 = 8;
+/// Tries per part before the download fails.
+const PART_ATTEMPTS: u32 = 3;
+
+/// [`PART_BYTES`]; tests may shrink it (debug builds:
+/// `GOODFLOWS_TEST_CACHE_PART_BYTES`).
+fn part_bytes() -> u64 {
+    #[cfg(debug_assertions)]
+    if let Some(bytes) = std::env::var("GOODFLOWS_TEST_CACHE_PART_BYTES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|b| *b > 0)
+    {
+        return bytes;
+    }
+    PART_BYTES
+}
+
+/// The `Range` header for `len` bytes from `start`.
+fn range(start: u64, len: u64) -> String {
+    format!("bytes={start}-{}", start + len - 1)
+}
+
+async fn create_new(dest: &Path) -> std::io::Result<tokio::fs::File> {
+    tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(dest)
+        .await
+}
+
+/// Write a whole-object response into the new file `dest`, checking its
+/// size and sha256.
+async fn stream_whole(
+    mut response: reqwest::Response,
+    entry: &Entry,
+    dest: &Path,
+    abort: &AtomicBool,
+) -> Result<()> {
+    use sha2::Digest;
+    use tokio::io::AsyncWriteExt;
+    let mut file = create_new(dest).await?;
+    let mut hasher = sha2::Sha256::new();
+    let mut received: u64 = 0;
+    while let Some(chunk) = abortable(abort, response.chunk())
+        .await?
+        .map_err(|_| anyhow!("the cache download was interrupted"))?
+    {
+        received += chunk.len() as u64;
+        if received > entry.size {
+            bail!("the downloaded archive is larger than its metadata says");
+        }
+        hasher.update(&chunk);
+        file.write_all(&chunk).await?;
+    }
+    file.flush().await?;
+    file.sync_all().await?;
+    if received != entry.size || super::key_hex(hasher.finalize()) != entry.sha256 {
+        bail!("the downloaded archive does not match its size and sha256");
+    }
+    Ok(())
+}
+
+/// Fetch every part of `entry` into `dest`, which already has its full
+/// length, over up to [`RANGED_CONNECTIONS`] connections. `first` is the
+/// `206` for part 0.
+async fn download_parts(
+    client: reqwest::Client,
+    entry: &Entry,
+    dest: &Path,
+    part: u64,
+    first: reqwest::Response,
+    abort: &AtomicBool,
+) -> Result<()> {
+    use std::sync::atomic::AtomicU64;
+    use std::sync::Arc;
+    let size = entry.size;
+    let parts = size.div_ceil(part);
+    let next = Arc::new(AtomicU64::new(1));
+    let mut first = Some(first);
+    // Dropping the set on an error or an abort cancels the other parts.
+    let mut workers = tokio::task::JoinSet::new();
+    for _ in 0..parts.min(RANGED_CONNECTIONS) {
+        let (client, url, dest, next) = (
+            client.clone(),
+            entry.download_url.clone(),
+            dest.to_path_buf(),
+            next.clone(),
+        );
+        let mut response = first.take();
+        workers.spawn(async move {
+            let mut index = match response {
+                Some(_) => 0,
+                None => next.fetch_add(1, Ordering::Relaxed),
+            };
+            while index < parts {
+                let start = index * part;
+                let len = part.min(size - start);
+                let mut attempt = 0;
+                loop {
+                    attempt += 1;
+                    match fetch_part(&client, &url, &dest, size, start, len, response.take()).await
+                    {
+                        Ok(()) => break,
+                        Err(_) if attempt < PART_ATTEMPTS => continue,
+                        Err(error) => return Err(error),
+                    }
+                }
+                index = next.fetch_add(1, Ordering::Relaxed);
+            }
+            Ok::<_, anyhow::Error>(())
+        });
+    }
+    while let Some(done) = abortable(abort, workers.join_next()).await? {
+        done.map_err(|_| anyhow!("the cache download failed"))??;
+    }
+    let file = tokio::fs::OpenOptions::new().write(true).open(dest).await?;
+    file.sync_all().await?;
+    Ok(())
+}
+
+/// Fetch `len` bytes from `start` (reusing `response` when given) and write
+/// them at that offset of `dest`.
+async fn fetch_part(
+    client: &reqwest::Client,
+    url: &Url,
+    dest: &Path,
+    size: u64,
+    start: u64,
+    len: u64,
+    response: Option<reqwest::Response>,
+) -> Result<()> {
+    use tokio::io::{AsyncSeekExt, AsyncWriteExt};
+    let mut response = match response {
+        Some(response) => response,
+        None => client
+            .get(url.clone())
+            .header(header::RANGE, range(start, len))
+            .send()
+            .await
+            .map_err(|_| anyhow!("the cache download failed: could not reach the object store"))?,
+    };
+    if response.status() != StatusCode::PARTIAL_CONTENT {
+        bail!(
+            "the cache download failed (HTTP {})",
+            response.status().as_u16()
+        );
+    }
+    let expected = format!("bytes {start}-{}/{size}", start + len - 1);
+    if response
+        .headers()
+        .get(header::CONTENT_RANGE)
+        .and_then(|v| v.to_str().ok())
+        != Some(expected.as_str())
+    {
+        bail!("the object store returned a different range than requested");
+    }
+    let mut file = tokio::fs::OpenOptions::new().write(true).open(dest).await?;
+    file.seek(std::io::SeekFrom::Start(start)).await?;
+    let mut received: u64 = 0;
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|_| anyhow!("the cache download was interrupted"))?
+    {
+        received += chunk.len() as u64;
+        if received > len {
+            bail!("the downloaded archive is larger than its metadata says");
+        }
+        file.write_all(&chunk).await?;
+    }
+    if received != len {
+        bail!("the cache download was interrupted");
+    }
+    file.flush().await?;
+    Ok(())
+}
+
 impl Remote {
     pub fn new(target: Target, scope: Option<String>) -> Result<Self> {
         let client = target.client(CONNECT_TIMEOUT)?;
@@ -316,45 +500,35 @@ impl Remote {
         }
     }
 
-    /// Download `entry` into the new file `dest`, checking its size and
-    /// sha256. No `Authorization` is sent.
+    /// Download `entry` into the new file `dest`. No `Authorization` is sent.
+    ///
+    /// An archive of at least [`RANGED_MIN_PARTS`] parts is fetched as
+    /// concurrent `Range` requests, each part checked against its
+    /// `Content-Range` and length; [`archive::extract`] then checks the
+    /// whole file's size and sha256. A store that ignores `Range` answers
+    /// the first request with the whole object, which is streamed instead.
+    /// A smaller archive is streamed, checking its size and sha256 here.
     pub async fn download(&self, entry: &Entry, dest: &Path, abort: &AtomicBool) -> Result<()> {
-        use sha2::Digest;
-        use tokio::io::AsyncWriteExt;
         let client = presigned_client(&entry.download_url)?;
-        let mut response = abortable(abort, client.get(entry.download_url.clone()).send())
+        let part = part_bytes();
+        let ranged = entry.size >= part.saturating_mul(RANGED_MIN_PARTS);
+        let mut request = client.get(entry.download_url.clone());
+        if ranged {
+            request = request.header(header::RANGE, range(0, part.min(entry.size)));
+        }
+        let response = abortable(abort, request.send())
             .await?
             .map_err(|_| anyhow!("the cache download failed: could not reach the object store"))?;
-        if response.status() != StatusCode::OK {
-            bail!(
-                "the cache download failed (HTTP {})",
-                response.status().as_u16()
-            );
-        }
-        let mut file = tokio::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(dest)
-            .await?;
-        let mut hasher = sha2::Sha256::new();
-        let mut received: u64 = 0;
-        while let Some(chunk) = abortable(abort, response.chunk())
-            .await?
-            .map_err(|_| anyhow!("the cache download was interrupted"))?
-        {
-            received += chunk.len() as u64;
-            if received > entry.size {
-                bail!("the downloaded archive is larger than its metadata says");
+        match response.status() {
+            StatusCode::PARTIAL_CONTENT if ranged => {
+                let file = create_new(dest).await?;
+                file.set_len(entry.size).await?;
+                drop(file);
+                download_parts(client, entry, dest, part, response, abort).await
             }
-            hasher.update(&chunk);
-            file.write_all(&chunk).await?;
+            StatusCode::OK => stream_whole(response, entry, dest, abort).await,
+            status => bail!("the cache download failed (HTTP {})", status.as_u16()),
         }
-        file.flush().await?;
-        file.sync_all().await?;
-        if received != entry.size || super::key_hex(hasher.finalize()) != entry.sha256 {
-            bail!("the downloaded archive does not match its size and sha256");
-        }
-        Ok(())
     }
 
     /// Reserve, upload and commit the archive at `path`.
