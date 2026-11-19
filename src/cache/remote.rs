@@ -97,20 +97,39 @@ fn follows(previous: &[Url], next: &Url) -> bool {
         && first.map(Url::scheme) == Some(next.scheme())
 }
 
+/// How long a download may deliver nothing (debug builds:
+/// `GOODFLOWS_TEST_CACHE_READ_TIMEOUT_SECS`).
+fn read_timeout() -> Duration {
+    #[cfg(debug_assertions)]
+    if let Some(secs) = std::env::var("GOODFLOWS_TEST_CACHE_READ_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
+        return Duration::from_secs(secs);
+    }
+    REQUEST_TIMEOUT
+}
+
 /// A client for presigned URLs: redirects only within the same host, and
 /// no proxy for loopback targets.
-fn presigned_client(url: &Url) -> Result<reqwest::Client> {
-    let mut builder = reqwest::Client::builder()
-        .connect_timeout(CONNECT_TIMEOUT)
-        // A stalled transfer ends; the cache's own bound covers the rest.
-        .read_timeout(REQUEST_TIMEOUT)
-        .redirect(redirect::Policy::custom(|attempt| {
-            if follows(attempt.previous(), attempt.url()) {
-                attempt.follow()
-            } else {
-                attempt.stop()
-            }
-        }));
+///
+/// Only downloads get a read timeout. reqwest starts it when the request
+/// is sent and it covers the wait for response headers, which a store
+/// sends only after the whole upload body, so it would fail any upload
+/// slower than the timeout. A stalled upload ends at the cache's own bound.
+fn presigned_client(url: &Url, upload: bool) -> Result<reqwest::Client> {
+    let mut builder = reqwest::Client::builder().connect_timeout(CONNECT_TIMEOUT);
+    if !upload {
+        // A stalled download ends; the cache's own bound covers the rest.
+        builder = builder.read_timeout(read_timeout());
+    }
+    builder = builder.redirect(redirect::Policy::custom(|attempt| {
+        if follows(attempt.previous(), attempt.url()) {
+            attempt.follow()
+        } else {
+            attempt.stop()
+        }
+    }));
     if loopback(url) {
         builder = builder.no_proxy();
     }
@@ -509,7 +528,7 @@ impl Remote {
     /// the first request with the whole object, which is streamed instead.
     /// A smaller archive is streamed, checking its size and sha256 here.
     pub async fn download(&self, entry: &Entry, dest: &Path, abort: &AtomicBool) -> Result<()> {
-        let client = presigned_client(&entry.download_url)?;
+        let client = presigned_client(&entry.download_url, false)?;
         let part = part_bytes();
         let ranged = entry.size >= part.saturating_mul(RANGED_MIN_PARTS);
         let mut request = client.get(entry.download_url.clone());
@@ -632,7 +651,7 @@ impl Remote {
                 bail!("the cache archive changed before its upload");
             }
             map.insert(header::CONTENT_LENGTH, header::HeaderValue::from(length));
-            let request = presigned_client(&upload_url)?
+            let request = presigned_client(&upload_url, true)?
                 .put(upload_url.clone())
                 .headers(map)
                 .body(reqwest::Body::from(file))

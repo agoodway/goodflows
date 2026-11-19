@@ -52,6 +52,9 @@ struct State {
     ignore_range: bool,
     /// Fail this many ranged downloads after the first one with a `503`.
     flaky_ranges: usize,
+    /// Answer an upload two seconds after its body, like a store finishing
+    /// a long upload.
+    slow_put: bool,
 }
 
 struct Fake {
@@ -138,6 +141,10 @@ fn handle(state: &Mutex<State>, request: &Request) -> Reply {
             state
                 .objects
                 .insert(object.to_owned(), request.body.clone());
+            if state.slow_put {
+                drop(state);
+                std::thread::sleep(std::time::Duration::from_secs(2));
+            }
             return status(200, json!({}));
         }
         let mut bytes = state.objects[object].clone();
@@ -576,6 +583,27 @@ fn a_tampered_ranged_download_is_discarded() {
     let warning = &of_type(&output, "cache_warning")[0]["message"];
     assert!(warning.as_str().unwrap().contains("sha256"), "{warning}");
     assert!(machine.entries().is_empty());
+}
+
+#[test]
+fn an_upload_slower_than_the_download_read_timeout_is_saved() {
+    let fake = Fake::start();
+    fake.set(|s| s.slow_put = true);
+    let p = checkout(&config("", ONE), "main", "v1");
+    let output = Machine::new().run(
+        &p,
+        &fake.mock.url,
+        &["--json"],
+        &[("GOODFLOWS_TEST_CACHE_READ_TIMEOUT_SECS", "1")],
+    );
+    success(&output);
+    assert_eq!(
+        of_type(&output, "cache_saved")[0]["tiers"],
+        json!(["local", "remote"]),
+        "{}",
+        stdout(&output)
+    );
+    assert_eq!(fake.scopes(), ["main"]);
 }
 
 #[test]
