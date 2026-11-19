@@ -55,6 +55,25 @@ struct State {
     /// Answer an upload two seconds after its body, like a store finishing
     /// a long upload.
     slow_put: bool,
+    /// upload id -> (length, base64 MD5) of each part, for a multipart
+    /// reservation.
+    multipart: HashMap<String, Vec<(u64, String)>>,
+    /// (upload id, part number) -> the part's stored bytes.
+    part_bodies: HashMap<(String, usize), Vec<u8>>,
+    /// Part `PUT`s being answered now, and the most at once.
+    parts_in_flight: usize,
+    max_parts_in_flight: usize,
+    /// Reject `parts` on reserve like a server without multipart support.
+    no_multipart: bool,
+    /// Ignore `parts` and return a single `upload_url`.
+    single_url: bool,
+    /// Fail this many part uploads with a `503`.
+    flaky_parts: usize,
+    /// Flip one received byte of this part number, so its MD5 never
+    /// matches.
+    corrupt_part: Option<usize>,
+    /// Return one part fewer than requested.
+    short_parts: bool,
 }
 
 struct Fake {
@@ -110,6 +129,61 @@ fn status(code: u16, body: Value) -> Reply {
     Reply::Status(code, vec![], body.to_string())
 }
 
+fn md5_base64(bytes: &[u8]) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(md5::Md5::digest(bytes))
+}
+
+/// A part `PUT`, enforced like a part URL presigned with its
+/// `content-length` and `content-md5`.
+fn put_part(state: &mut State, id: &str, number: usize, request: &Request) -> Reply {
+    if state.flaky_parts > 0 {
+        state.flaky_parts -= 1;
+        return status(503, json!({}));
+    }
+    let Some((len, md5)) = state
+        .multipart
+        .get(id)
+        .and_then(|parts| parts.get(number.wrapping_sub(1)))
+        .cloned()
+    else {
+        return status(404, json!({}));
+    };
+    // A missing or different signed header fails the signature.
+    if request.headers.get("content-length") != Some(&len.to_string())
+        || request.headers.get("content-md5") != Some(&md5)
+    {
+        return status(403, json!({}));
+    }
+    let mut body = request.body.clone();
+    if state.corrupt_part == Some(number) {
+        body[0] ^= 1;
+    }
+    if body.len() as u64 != len || md5_base64(&body) != md5 {
+        return status(400, json!({"Code": "BadDigest"}));
+    }
+    state.part_bodies.insert((id.to_owned(), number), body);
+    status(200, json!({}))
+}
+
+/// [`handle`], recording how many part `PUT`s are answered at once; each
+/// takes 50 ms so concurrent ones overlap.
+fn serve(state: &Mutex<State>, request: &Request) -> Reply {
+    let part = request.method == "PUT" && request.path.contains("/parts/");
+    if part {
+        let mut s = state.lock().unwrap();
+        s.parts_in_flight += 1;
+        s.max_parts_in_flight = s.max_parts_in_flight.max(s.parts_in_flight);
+        drop(s);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let reply = handle(state, request);
+    if part {
+        state.lock().unwrap().parts_in_flight -= 1;
+    }
+    reply
+}
+
 fn hit(state: &State, entry: &Stored) -> Value {
     let bytes = &state.objects[&entry.object];
     json!({"data": {"key": entry.key, "partial": entry.partial, "name": "deps", "scope": entry.scope,
@@ -129,6 +203,9 @@ fn handle(state: &Mutex<State>, request: &Request) -> Reply {
             }
             if let Some(code) = state.put {
                 return status(code, json!({}));
+            }
+            if let Some((id, number)) = object.split_once("/parts/") {
+                return put_part(&mut state, id, number.parse().unwrap(), request);
             }
             let (body, _, header) = state.uploads[object].clone();
             let sha = hex(Sha256::digest(&request.body));
@@ -218,10 +295,15 @@ fn handle(state: &Mutex<State>, request: &Request) -> Reply {
         }
         ("POST", rest) if rest.starts_with("entries/") => {
             if let Some(code) = state.reserve {
-                return status(code, json!({}));
+                return status(code, json!({"errors": {"scope": ["is invalid"]}}));
             }
             let key = rest.strip_prefix("entries/").unwrap().to_owned();
             let body = request.json();
+            let parts = body.get("parts").filter(|p| !p.is_null()).cloned();
+            if parts.is_some() && state.no_multipart {
+                // goodflows_web without multipart support refuses unknown keys.
+                return status(422, json!({"errors": {"parts": ["is not allowed"]}}));
+            }
             if state
                 .entries
                 .iter()
@@ -235,6 +317,43 @@ fn handle(state: &Mutex<State>, request: &Request) -> Reply {
             state
                 .uploads
                 .insert(id.clone(), (body.clone(), key, header.clone()));
+            if let Some(parts) = parts.filter(|_| !state.single_url) {
+                let size = body["size"].as_u64().unwrap();
+                let part = parts["size"].as_u64().unwrap();
+                let md5s: Vec<String> = parts["md5"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|m| m.as_str().unwrap().to_owned())
+                    .collect();
+                let count = size.div_ceil(part);
+                if md5s.len() as u64 != count {
+                    return status(
+                        422,
+                        json!({"errors": {"parts": [format!("md5 must have {count} entries")]}}),
+                    );
+                }
+                let lengths = (0..count).map(|i| part.min(size - i * part));
+                let declared: Vec<(u64, String)> = lengths.zip(md5s).collect();
+                let mut listed: Vec<Value> = declared
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (len, md5))| {
+                        json!({"number": i + 1,
+                            "url": format!("{}/objects/{id}/parts/{}?X-Amz-Signature=sig", state.base, i + 1),
+                            "headers": {"content-length": len.to_string(), "content-md5": md5}})
+                    })
+                    .collect();
+                if state.short_parts {
+                    listed.pop();
+                }
+                state.multipart.insert(id.clone(), declared);
+                return status(
+                    201,
+                    json!({"data": {"upload_id": id, "upload_parts": listed,
+                        "upload_url_expires_at": "x", "expires_at": "x"}}),
+                );
+            }
             status(
                 201,
                 json!({"data": {"upload_id": id, "upload_url": format!("{}/objects/{id}?X-Amz-Signature=sig", state.base),
@@ -254,6 +373,22 @@ fn handle(state: &Mutex<State>, request: &Request) -> Reply {
                 .unwrap()
                 .to_owned();
             let (body, key, _) = state.uploads[&id].clone();
+            if let Some(parts) = state.multipart.get(&id).cloned() {
+                // Every part, joined, must be the reserved archive.
+                let mut joined = Vec::new();
+                for number in 1..=parts.len() {
+                    match state.part_bodies.get(&(id.clone(), number)) {
+                        Some(bytes) => joined.extend_from_slice(bytes),
+                        None => return status(422, json!({})),
+                    }
+                }
+                if joined.len() as u64 != body["size"]
+                    || hex(Sha256::digest(&joined)) != body["sha256"]
+                {
+                    return status(422, json!({}));
+                }
+                state.objects.insert(id.clone(), joined);
+            }
             if !state.objects.contains_key(&id) {
                 return status(422, json!({}));
             }
@@ -277,7 +412,7 @@ impl Fake {
     fn start() -> Self {
         let state = Arc::new(Mutex::new(State::default()));
         let shared = state.clone();
-        let mock = Mock::start(move |request, _| handle(&shared, request));
+        let mock = Mock::start(move |request, _| serve(&shared, request));
         state.lock().unwrap().base = mock.url.clone();
         Self { mock, state }
     }
@@ -292,6 +427,19 @@ impl Fake {
             .requests()
             .into_iter()
             .filter(|r| r.path.contains("/caches/") || r.path.starts_with("/objects/"))
+            .collect()
+    }
+
+    /// Part `PUT`s, in order, as (upload id, part number, request).
+    fn part_puts(&self) -> Vec<(String, usize, Request)> {
+        self.requests()
+            .into_iter()
+            .filter(|r| r.method == "PUT")
+            .filter_map(|r| {
+                let (path, _) = split(&r);
+                let (id, number) = path.strip_prefix("/objects/")?.split_once("/parts/")?;
+                Some((id.to_owned(), number.parse().unwrap(), r))
+            })
             .collect()
     }
 
@@ -1156,4 +1304,404 @@ fn a_signal_during_an_upload_keeps_the_local_entry_and_names_the_cancellation() 
     assert!(message.contains("the run was cancelled"), "{message}");
     assert!(!message.contains("timeout_secs"), "{message}");
     assert_eq!(machine.entries().len(), 1);
+}
+
+/// The bodies of the reserve requests, in order.
+fn reserves(fake: &Fake) -> Vec<Value> {
+    fake.requests()
+        .iter()
+        .filter(|r| r.method == "POST" && r.path.contains("/caches/entries/"))
+        .map(Request::json)
+        .collect()
+}
+
+fn commits(fake: &Fake) -> usize {
+    fake.requests()
+        .iter()
+        .filter(|r| r.method == "POST" && r.path.contains("/caches/uploads/"))
+        .count()
+}
+
+/// Single `PUT`s, not part uploads.
+fn single_puts(fake: &Fake) -> usize {
+    fake.requests()
+        .iter()
+        .filter(|r| r.method == "PUT" && !r.path.contains("/parts/"))
+        .count()
+}
+
+/// Save one entry on `main` in 16-byte parts from a machine of its own.
+fn save_in_parts(fake: &Fake, vars: &[(&str, &str)]) -> (Machine, Output) {
+    let machine = Machine::new();
+    let p = checkout(&config("", ONE), "main", "v1");
+    let mut all = vec![SMALL_PARTS];
+    all.extend_from_slice(vars);
+    let output = machine.run(&p, &fake.mock.url, &["--json"], &all);
+    success(&output);
+    (machine, output)
+}
+
+fn saved_tiers(output: &Output) -> Value {
+    of_type(output, "cache_saved")[0]["tiers"].clone()
+}
+
+#[test]
+fn a_small_archive_is_reserved_without_parts() {
+    let fake = Fake::start();
+    seed(&fake, "main");
+    let reserves = reserves(&fake);
+    assert_eq!(reserves.len(), 1);
+    assert!(reserves[0].get("parts").is_none(), "{}", reserves[0]);
+    assert_eq!(single_puts(&fake), 1);
+    assert!(fake.part_puts().is_empty());
+}
+
+#[test]
+fn a_large_archive_uploads_in_parallel_parts_that_restore_on_another_machine() {
+    let fake = Fake::start();
+    let (_, output) = save_in_parts(&fake, &[]);
+    assert_eq!(
+        saved_tiers(&output),
+        json!(["local", "remote"]),
+        "{}",
+        stdout(&output)
+    );
+    let size = object_size(&fake);
+    let count = size.div_ceil(16);
+    assert!(count >= 4, "{size}");
+    let reserve = &reserves(&fake)[0];
+    assert_eq!(reserve["parts"]["size"], 16);
+    assert_eq!(reserve["parts"]["md5"].as_array().unwrap().len(), count);
+    assert_eq!(single_puts(&fake), 0);
+    let puts = fake.part_puts();
+    assert_eq!(puts.len(), count);
+    let mut numbers: Vec<usize> = puts.iter().map(|(_, n, _)| *n).collect();
+    numbers.sort();
+    assert_eq!(numbers, (1..=count).collect::<Vec<_>>());
+    // The part bodies, in order, are the archive byte for byte.
+    let mut sorted: Vec<_> = puts.iter().collect();
+    sorted.sort_by_key(|(_, n, _)| *n);
+    let joined: Vec<u8> = sorted.iter().flat_map(|(_, _, r)| r.body.clone()).collect();
+    let stored = fake
+        .state
+        .lock()
+        .unwrap()
+        .objects
+        .values()
+        .next()
+        .unwrap()
+        .clone();
+    assert_eq!(joined, stored);
+    for (_, _, request) in &puts {
+        assert!(!request.headers.contains_key("authorization"));
+        assert!(!request.headers.contains_key("transfer-encoding"));
+        assert!(!format!("{:?}", request.headers).contains(TOKEN));
+    }
+    let most = fake.state.lock().unwrap().max_parts_in_flight;
+    assert!((2..=8).contains(&most), "{most}");
+    assert_eq!(commits(&fake), 1);
+
+    let machine = Machine::new();
+    let p = checkout(&config("", ONE), "feat-x", "v1");
+    let output = machine.run(&p, &fake.mock.url, &["--json"], &[]);
+    success(&output);
+    assert_eq!(restored(&output), ("exact".into(), json!("remote")));
+    assert_eq!(p.read("deps/built"), "v1");
+}
+
+#[test]
+fn a_reservation_with_missing_parts_uploads_nothing_and_warns() {
+    let fake = Fake::start();
+    fake.set(|s| s.short_parts = true);
+    let (machine, output) = save_in_parts(&fake, &[]);
+    assert!(fake.requests().iter().all(|r| r.method != "PUT"));
+    assert_eq!(commits(&fake), 0);
+    let warnings = of_type(&output, "cache_warning");
+    assert_eq!(warnings.len(), 1, "{}", stdout(&output));
+    assert!(warnings[0]["message"]
+        .as_str()
+        .unwrap()
+        .contains("invalid reservation"));
+    assert_eq!(saved_tiers(&output), json!(["local"]));
+    assert_eq!(machine.entries().len(), 1);
+}
+
+#[test]
+fn a_server_without_multipart_storage_gets_one_put() {
+    let fake = Fake::start();
+    fake.set(|s| s.single_url = true);
+    let (_, output) = save_in_parts(&fake, &[]);
+    assert_eq!(
+        saved_tiers(&output),
+        json!(["local", "remote"]),
+        "{}",
+        stdout(&output)
+    );
+    let reserves = reserves(&fake);
+    assert_eq!(reserves.len(), 1);
+    assert!(reserves[0]["parts"].is_object());
+    assert_eq!(single_puts(&fake), 1);
+    assert!(fake.part_puts().is_empty());
+    assert_eq!(fake.scopes(), ["main"]);
+}
+
+#[test]
+fn an_archive_over_10000_parts_is_reserved_without_parts() {
+    let fake = Fake::start();
+    let config = format!(
+        "[reporting]\nproject = '{PROJECT}'\n[cache]\nremote = 'goodflows'\n\
+         [[jobs]]\nname = 'deps'\ncommand = 'mkdir -p deps && head -c 200000 /dev/urandom > deps/big'\n{ONE}"
+    );
+    let p = checkout(&config, "main", "v1");
+    let output = Machine::new().run(&p, &fake.mock.url, &["--json"], &[SMALL_PARTS]);
+    success(&output);
+    assert_eq!(
+        saved_tiers(&output),
+        json!(["local", "remote"]),
+        "{}",
+        stdout(&output)
+    );
+    assert!(object_size(&fake).div_ceil(16) > 10_000);
+    let reserves = reserves(&fake);
+    assert_eq!(reserves.len(), 1);
+    assert!(reserves[0].get("parts").is_none());
+    assert_eq!(single_puts(&fake), 1);
+}
+
+#[test]
+fn a_part_that_fails_once_is_sent_again() {
+    let fake = Fake::start();
+    fake.set(|s| s.flaky_parts = 1);
+    let (_, output) = save_in_parts(&fake, &[]);
+    assert_eq!(
+        saved_tiers(&output),
+        json!(["local", "remote"]),
+        "{}",
+        stdout(&output)
+    );
+    assert!(of_type(&output, "cache_warning").is_empty());
+    let count = object_size(&fake).div_ceil(16);
+    assert_eq!(fake.part_puts().len(), count + 1);
+    assert_eq!(fake.scopes(), ["main"]);
+}
+
+#[test]
+fn a_part_rejected_by_its_md5_fails_the_save_without_a_commit() {
+    let fake = Fake::start();
+    fake.set(|s| s.corrupt_part = Some(2));
+    let (machine, output) = save_in_parts(&fake, &[]);
+    let tries = fake.part_puts().iter().filter(|(_, n, _)| *n == 2).count();
+    assert_eq!(tries, 3);
+    assert_eq!(commits(&fake), 0);
+    let warnings = of_type(&output, "cache_warning");
+    assert_eq!(warnings.len(), 1, "{}", stdout(&output));
+    assert!(warnings[0]["message"]
+        .as_str()
+        .unwrap()
+        .contains("HTTP 400"));
+    assert_eq!(saved_tiers(&output), json!(["local"]));
+    assert_eq!(machine.entries().len(), 1);
+    assert!(fake.scopes().is_empty());
+}
+
+const REFUSED_MULTIPART: &str =
+    "the cache server refused a multipart upload; uploading archives in one request";
+
+#[test]
+fn an_older_server_that_refuses_parts_gets_a_second_reserve_and_one_put() {
+    let fake = Fake::start();
+    fake.set(|s| s.no_multipart = true);
+    let (_, output) = save_in_parts(&fake, &[]);
+    assert_eq!(
+        saved_tiers(&output),
+        json!(["local", "remote"]),
+        "{}",
+        stdout(&output)
+    );
+    let warnings = of_type(&output, "cache_warning");
+    assert_eq!(warnings.len(), 1, "{}", stdout(&output));
+    assert_eq!(warnings[0]["message"], REFUSED_MULTIPART);
+    let sent = reserves(&fake);
+    assert_eq!(sent.len(), 2);
+    assert!(sent[0]["parts"].is_object());
+    assert!(sent[1].get("parts").is_none(), "{}", sent[1]);
+    assert_eq!(single_puts(&fake), 1);
+    assert_eq!(commits(&fake), 1);
+
+    // Two saves in one run fall back twice but warn once.
+    let fake = Fake::start();
+    fake.set(|s| s.no_multipart = true);
+    let caches = "[[jobs.caches]]\nname = 'a'\npaths = ['deps']\n[[jobs.caches]]\nname = 'b'\npaths = ['mix.lock']\n";
+    let p = checkout(&config("", caches), "main", "v1");
+    let output = Machine::new().run(&p, &fake.mock.url, &["--json"], &[SMALL_PARTS]);
+    success(&output);
+    let saved = of_type(&output, "cache_saved");
+    assert_eq!(saved.len(), 2, "{}", stdout(&output));
+    assert!(saved
+        .iter()
+        .all(|e| e["tiers"] == json!(["local", "remote"])));
+    let all = reserves(&fake);
+    assert_eq!(all.len(), 4);
+    assert_eq!(all.iter().filter(|r| r["parts"].is_object()).count(), 2);
+    let warnings = of_type(&output, "cache_warning");
+    assert_eq!(warnings.len(), 1, "{}", stdout(&output));
+    assert_eq!(warnings[0]["message"], REFUSED_MULTIPART);
+    assert_eq!(fake.scopes(), ["main", "main"]);
+}
+
+#[test]
+fn another_422_on_a_multipart_reserve_still_fails_the_save() {
+    let fake = Fake::start();
+    fake.set(|s| s.reserve = Some(422));
+    let (_, output) = save_in_parts(&fake, &[]);
+    assert_eq!(reserves(&fake).len(), 1);
+    let warnings = of_type(&output, "cache_warning");
+    assert_eq!(warnings.len(), 1, "{}", stdout(&output));
+    assert_eq!(
+        warnings[0]["message"],
+        "the cache reservation failed (HTTP 422)"
+    );
+    assert_eq!(saved_tiers(&output), json!(["local"]));
+}
+
+#[test]
+fn a_stalled_multipart_upload_is_abandoned_at_the_bound_and_keeps_the_local_entry() {
+    let fake = Fake::start();
+    fake.set(|s| s.stall_put = true);
+    let machine = Machine::new();
+    let p = checkout(
+        &config("", &format!("{ONE}timeout_secs = 1\n")),
+        "main",
+        "v1",
+    );
+    let started = std::time::Instant::now();
+    let output = machine.run(&p, &fake.mock.url, &["--json"], &[SMALL_PARTS]);
+    success(&output);
+    assert!(started.elapsed() < std::time::Duration::from_secs(20));
+    assert!(!fake.part_puts().is_empty());
+    assert_eq!(single_puts(&fake), 0);
+    assert_eq!(commits(&fake), 0);
+    assert_eq!(
+        saved_tiers(&output),
+        json!(["local"]),
+        "{}",
+        stdout(&output)
+    );
+    let skipped = of_type(&output, "cache_save_skipped");
+    assert_eq!(skipped.len(), 1);
+    assert_eq!(
+        (&skipped[0]["reason"], &skipped[0]["tier"]),
+        (&json!("error"), &json!("remote"))
+    );
+    let warnings = of_type(&output, "cache_warning");
+    assert_eq!(warnings.len(), 1, "{}", stdout(&output));
+    assert!(warnings[0]["message"]
+        .as_str()
+        .unwrap()
+        .contains("timeout_secs"));
+    assert_eq!(machine.entries().len(), 1);
+}
+
+#[test]
+fn a_signal_during_a_multipart_upload_names_the_cancellation() {
+    let fake = Fake::start();
+    fake.set(|s| s.stall_put = true);
+    let machine = Machine::new();
+    let p = checkout(&config("", ONE), "main", "v1");
+    let child = machine
+        .command(&p, &fake.mock.url, &["--json"], &[SMALL_PARTS])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let waited = std::time::Instant::now();
+    while fake.part_puts().is_empty() {
+        assert!(waited.elapsed() < std::time::Duration::from_secs(20));
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    let signalled = std::time::Instant::now();
+    // SAFETY: signalling our own child process.
+    unsafe {
+        libc::kill(child.id() as i32, libc::SIGINT);
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(signalled.elapsed() < std::time::Duration::from_secs(10));
+    assert_eq!(output.status.code(), Some(130), "{}", stdout(&output));
+    assert_eq!(
+        saved_tiers(&output),
+        json!(["local"]),
+        "{}",
+        stdout(&output)
+    );
+    let warnings = of_type(&output, "cache_warning");
+    assert_eq!(warnings.len(), 1, "{}", stdout(&output));
+    let message = warnings[0]["message"].as_str().unwrap();
+    assert!(message.contains("the run was cancelled"), "{message}");
+    assert_eq!(commits(&fake), 0);
+    assert_eq!(machine.entries().len(), 1);
+}
+
+#[test]
+fn a_multipart_entry_changed_after_its_commit_is_discarded_on_restore() {
+    let fake = Fake::start();
+    save_in_parts(&fake, &[]);
+    assert!(!fake.part_puts().is_empty());
+    fake.set(|s| {
+        for bytes in s.objects.values_mut() {
+            let last = bytes.len() - 1;
+            bytes[last] ^= 1;
+        }
+    });
+    let machine = Machine::new();
+    let p = checkout(&config("", ONE), "main", "v1");
+    let output = machine.run(&p, &fake.mock.url, &["--json", "--env", "ro"], &[]);
+    success(&output);
+    assert_eq!(restored(&output), ("miss".into(), Value::Null));
+    let warnings = of_type(&output, "cache_warning");
+    assert_eq!(warnings.len(), 1, "{}", stdout(&output));
+    assert!(warnings[0]["message"].as_str().unwrap().contains("sha256"));
+    assert!(machine.entries().is_empty());
+    // The job ran as a miss and built the path itself.
+    assert_eq!(p.read("deps/built"), "v1");
+}
+
+#[test]
+fn parts_start_at_four_whole_parts() {
+    // A first save measures the archive; the same checkout archives the
+    // same bytes again, so later saves can size the parts around it.
+    let p = checkout(&config("", ONE), "main", "v1");
+    let fake = Fake::start();
+    success(&Machine::new().run(&p, &fake.mock.url, &["--json"], &[]));
+    let size = object_size(&fake) as u64;
+    assert!(size >= 8, "{size}");
+    for (part, expected) in [(size / 4, true), (size / 4 + 1, false)] {
+        // Without the stamp the path is not current, so the job saves again.
+        std::fs::remove_dir_all(p.dir.join(".goodflows/cache-stamps")).unwrap();
+        let fake = Fake::start();
+        let part_env = part.to_string();
+        let output = Machine::new().run(
+            &p,
+            &fake.mock.url,
+            &["--json"],
+            &[("GOODFLOWS_TEST_CACHE_PART_BYTES", &part_env)],
+        );
+        success(&output);
+        assert_eq!(object_size(&fake) as u64, size, "the archive changed");
+        assert_eq!(saved_tiers(&output), json!(["local", "remote"]));
+        let reserve = &reserves(&fake)[0];
+        assert_eq!(
+            reserve["parts"].is_object(),
+            expected,
+            "part size {part} of {size}: {reserve}"
+        );
+        if expected {
+            assert_eq!(reserve["parts"]["size"], part);
+            let md5s = reserve["parts"]["md5"].as_array().unwrap().len() as u64;
+            assert_eq!(md5s, size.div_ceil(part));
+            assert_eq!(fake.part_puts().len() as u64, md5s);
+        } else {
+            assert_eq!(single_puts(&fake), 1);
+        }
+    }
 }

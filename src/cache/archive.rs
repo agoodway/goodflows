@@ -44,6 +44,9 @@ struct Header {
 pub struct Written {
     pub bytes: u64,
     pub sha256: String,
+    /// When parts were requested: the part size and the base64 MD5 of each
+    /// part-sized slice of the archive, in order, the last one shorter.
+    pub part_md5: Option<(u64, Vec<String>)>,
 }
 
 /// The archive grew past its cap; nothing usable was written.
@@ -157,10 +160,59 @@ fn os_parts(path: &Path) -> Vec<OsString> {
         .collect()
 }
 
+/// The MD5 of each `size`-byte slice of a stream, for multipart uploads.
+struct PartMd5 {
+    size: u64,
+    current: md5::Md5,
+    /// Bytes fed to `current`.
+    filled: u64,
+    done: Vec<String>,
+}
+
+impl PartMd5 {
+    fn new(size: u64) -> Self {
+        Self {
+            size,
+            current: md5::Md5::new(),
+            filled: 0,
+            done: Vec::new(),
+        }
+    }
+
+    fn update(&mut self, mut bytes: &[u8]) {
+        while !bytes.is_empty() {
+            let take = (self.size - self.filled).min(bytes.len() as u64) as usize;
+            self.current.update(&bytes[..take]);
+            self.filled += take as u64;
+            bytes = &bytes[take..];
+            if self.filled == self.size {
+                self.close();
+            }
+        }
+    }
+
+    fn close(&mut self) {
+        use base64::Engine;
+        let digest = std::mem::take(&mut self.current).finalize();
+        self.done
+            .push(base64::engine::general_purpose::STANDARD.encode(digest));
+        self.filled = 0;
+    }
+
+    /// The part size and the digests, finishing a short last part.
+    fn finish(mut self) -> (u64, Vec<String>) {
+        if self.filled > 0 {
+            self.close();
+        }
+        (self.size, self.done)
+    }
+}
+
 /// Counts and hashes the compressed bytes, failing past the cap.
 struct Counting<W> {
     inner: W,
     hasher: Sha256,
+    parts: Option<PartMd5>,
     count: u64,
     cap: u64,
     over: Arc<AtomicBool>,
@@ -178,6 +230,9 @@ impl<W: Write> Write for Counting<W> {
         }
         let written = self.inner.write(buf)?;
         self.hasher.update(&buf[..written]);
+        if let Some(parts) = &mut self.parts {
+            parts.update(&buf[..written]);
+        }
         self.count += written as u64;
         Ok(written)
     }
@@ -347,13 +402,15 @@ fn items(declared: &Declared, abort: &AtomicBool) -> Result<(Vec<Item>, u64)> {
 
 /// Archive the declared paths into the new file `dest`. Fails with
 /// [`TooLarge`] past `cap` compressed bytes and with [`Aborted`] when
-/// `abort` is set.
+/// `abort` is set. With `parts`, it also computes the MD5 of each
+/// `parts`-byte slice of the archive in the same pass.
 pub fn write(
     dest: &Path,
     declared: &Declared,
     key: &str,
     partial: &str,
     cap: u64,
+    parts: Option<u64>,
     abort: &Arc<AtomicBool>,
 ) -> Result<Written> {
     let (items, uncompressed) = items(declared, abort)?;
@@ -370,6 +427,7 @@ pub fn write(
     let counting = Counting {
         inner: std::io::BufWriter::new(file),
         hasher: Sha256::new(),
+        parts: parts.filter(|size| *size > 0).map(PartMd5::new),
         count: 0,
         cap,
         over: over.clone(),
@@ -458,6 +516,7 @@ pub fn write(
             Ok(Written {
                 bytes: counting.count,
                 sha256: super::key_hex(counting.hasher.finalize()),
+                part_md5: counting.parts.map(PartMd5::finish),
             })
         }
         Err(_) if over.load(Ordering::Relaxed) => Err(TooLarge.into()),
@@ -1106,6 +1165,7 @@ mod tests {
             &"k".repeat(64),
             &"p".repeat(64),
             MAX_ENTRY_BYTES,
+            None,
             &abort(),
         )
     }
@@ -1214,6 +1274,7 @@ mod tests {
             "k",
             "p",
             100,
+            None,
             &abort(),
         )
         .unwrap_err();
@@ -1719,6 +1780,62 @@ mod tests {
             .filter(|n| n != ".goodflows")
             .collect();
         assert_eq!(names.len(), 2, "{names:?}");
+    }
+
+    #[test]
+    fn part_md5s_match_the_slices_on_disk() {
+        use base64::Engine;
+        let (src, home, out) = (
+            tempfile::tempdir().unwrap(),
+            tempfile::tempdir().unwrap(),
+            tempfile::tempdir().unwrap(),
+        );
+        // Incompressible bytes, so the archive spans many write calls.
+        let mut state: u64 = 1;
+        let noise: Vec<u8> = (0..200_000)
+            .map(|_| {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                (state >> 56) as u8
+            })
+            .collect();
+        std::fs::create_dir_all(src.path().join("deps")).unwrap();
+        std::fs::write(src.path().join("deps/noise"), &noise).unwrap();
+        let paths = vec!["deps".to_owned()];
+        let archive = |name: &str, parts| {
+            let path = out.path().join(name);
+            let written = write(
+                &path,
+                &declared(src.path(), home.path(), &paths),
+                &"k".repeat(64),
+                &"p".repeat(64),
+                MAX_ENTRY_BYTES,
+                parts,
+                &abort(),
+            )
+            .unwrap();
+            (written, std::fs::read(&path).unwrap())
+        };
+        let (plain, _) = archive("none", None);
+        assert!(plain.part_md5.is_none());
+        let n = plain.bytes;
+        assert!(n > 100_000, "{n}");
+        // Exact division (1 and n), a short last part (4096, n - 1) and a
+        // part larger than the archive (n + 1).
+        for size in [1, n, 4096, n - 1, n + 1] {
+            let (written, bytes) = archive(&format!("p{size}"), Some(size));
+            assert_eq!(written.bytes, n);
+            assert_eq!(written.sha256, plain.sha256);
+            let (part, md5s) = written.part_md5.unwrap();
+            assert_eq!(part, size);
+            let expected: Vec<String> = bytes
+                .chunks(size as usize)
+                .map(|slice| {
+                    base64::engine::general_purpose::STANDARD.encode(md5::Md5::digest(slice))
+                })
+                .collect();
+            assert_eq!(md5s.len() as u64, n.div_ceil(size), "part size {size}");
+            assert_eq!(md5s, expected, "part size {size}");
+        }
     }
 
     #[test]

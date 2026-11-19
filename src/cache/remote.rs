@@ -59,7 +59,8 @@ pub struct Remote {
     state: Mutex<State>,
 }
 
-/// One API response: its status and, for a success, the JSON body.
+/// One API response: its status and, for a success or a `422`, the JSON
+/// body.
 enum Reply {
     Status(StatusCode, Option<Value>),
     /// A connection failure or a timeout.
@@ -173,19 +174,24 @@ fn entry(body: &Value, key: Option<&str>, partial: Option<&str>) -> Option<Entry
     Some(entry)
 }
 
-/// Size of one ranged download request.
+/// Size of one part: one ranged download request, or one multipart upload
+/// part.
 const PART_BYTES: u64 = 16 * 1024 * 1024;
-/// Archives of at least this many parts download in ranges; a smaller one
-/// gains little over one connection.
-const RANGED_MIN_PARTS: u64 = 4;
-/// Ranged requests in flight at once for one archive.
-const RANGED_CONNECTIONS: u64 = 8;
-/// Tries per part before the download fails.
+/// Archives of at least this many parts download in ranges and upload in
+/// parts; a smaller one gains little over one connection.
+const PARTED_MIN_PARTS: u64 = 4;
+/// Part requests (downloads or uploads) in flight at once for one archive.
+const PART_CONNECTIONS: u64 = 8;
+/// Tries per part before the download or upload fails.
 const PART_ATTEMPTS: u32 = 3;
+/// The wait before a part's next try, times the tries so far, so the tries
+/// do not all land in one throttling window. Dropping the workers on an
+/// abort ends the wait.
+const PART_BACKOFF: Duration = Duration::from_millis(250);
 
 /// [`PART_BYTES`]; tests may shrink it (debug builds:
 /// `GOODFLOWS_TEST_CACHE_PART_BYTES`).
-fn part_bytes() -> u64 {
+pub fn part_bytes() -> u64 {
     #[cfg(debug_assertions)]
     if let Some(bytes) = std::env::var("GOODFLOWS_TEST_CACHE_PART_BYTES")
         .ok()
@@ -243,7 +249,7 @@ async fn stream_whole(
 }
 
 /// Fetch every part of `entry` into `dest`, which already has its full
-/// length, over up to [`RANGED_CONNECTIONS`] connections. `first` is the
+/// length, over up to [`PART_CONNECTIONS`] connections. `first` is the
 /// `206` for part 0.
 async fn download_parts(
     client: reqwest::Client,
@@ -261,7 +267,7 @@ async fn download_parts(
     let mut first = Some(first);
     // Dropping the set on an error or an abort cancels the other parts.
     let mut workers = tokio::task::JoinSet::new();
-    for _ in 0..parts.min(RANGED_CONNECTIONS) {
+    for _ in 0..parts.min(PART_CONNECTIONS) {
         let (client, url, dest, next) = (
             client.clone(),
             entry.download_url.clone(),
@@ -283,7 +289,9 @@ async fn download_parts(
                     match fetch_part(&client, &url, &dest, size, start, len, response.take()).await
                     {
                         Ok(()) => break,
-                        Err(_) if attempt < PART_ATTEMPTS => continue,
+                        Err(_) if attempt < PART_ATTEMPTS => {
+                            tokio::time::sleep(PART_BACKOFF * attempt).await
+                        }
                         Err(error) => return Err(error),
                     }
                 }
@@ -411,6 +419,21 @@ impl Remote {
         body: Option<Value>,
         abort: &AtomicBool,
     ) -> Reply {
+        self.send_within(method, path, query, body, REQUEST_TIMEOUT, abort)
+            .await
+    }
+
+    /// [`Remote::send`] with its own time bound. The body of a 2xx or a
+    /// `422` is kept.
+    async fn send_within(
+        &self,
+        method: Method,
+        path: &str,
+        query: &[(&str, &str)],
+        body: Option<Value>,
+        timeout: Duration,
+        abort: &AtomicBool,
+    ) -> Reply {
         let mut url = self.target.api(path);
         if !query.is_empty() {
             url.query_pairs_mut().extend_pairs(query);
@@ -429,7 +452,8 @@ impl Remote {
             let mut response = request.send().await?;
             let status = response.status();
             let mut bytes = Vec::new();
-            if status.is_success() {
+            // A `422` body names the rejected fields.
+            if status.is_success() || status == StatusCode::UNPROCESSABLE_ENTITY {
                 while let Some(chunk) = response.chunk().await? {
                     if bytes.len() + chunk.len() > MAX_RESPONSE_BYTES {
                         return Ok((status, None));
@@ -439,7 +463,7 @@ impl Remote {
             }
             Ok::<_, reqwest::Error>((status, Some(bytes)))
         };
-        match abortable(abort, tokio::time::timeout(REQUEST_TIMEOUT, exchange)).await {
+        match abortable(abort, tokio::time::timeout(timeout, exchange)).await {
             Ok(Ok(Ok((status, bytes)))) => {
                 Reply::Status(status, bytes.and_then(|b| serde_json::from_slice(&b).ok()))
             }
@@ -521,7 +545,7 @@ impl Remote {
 
     /// Download `entry` into the new file `dest`. No `Authorization` is sent.
     ///
-    /// An archive of at least [`RANGED_MIN_PARTS`] parts is fetched as
+    /// An archive of at least [`PARTED_MIN_PARTS`] parts is fetched as
     /// concurrent `Range` requests, each part checked against its
     /// `Content-Range` and length; [`archive::extract`] then checks the
     /// whole file's size and sha256. A store that ignores `Range` answers
@@ -530,7 +554,7 @@ impl Remote {
     pub async fn download(&self, entry: &Entry, dest: &Path, abort: &AtomicBool) -> Result<()> {
         let client = presigned_client(&entry.download_url, false)?;
         let part = part_bytes();
-        let ranged = entry.size >= part.saturating_mul(RANGED_MIN_PARTS);
+        let ranged = entry.size >= part.saturating_mul(PARTED_MIN_PARTS);
         let mut request = client.get(entry.download_url.clone());
         if ranged {
             request = request.header(header::RANGE, range(0, part.min(entry.size)));
@@ -551,6 +575,10 @@ impl Remote {
     }
 
     /// Reserve, upload and commit the archive at `path`.
+    ///
+    /// An archive of at least [`PARTED_MIN_PARTS`] parts is reserved with
+    /// its part MD5s; when the server returns `upload_parts`, the parts are
+    /// uploaded in parallel, otherwise the archive goes up as one `PUT`.
     #[allow(clippy::too_many_arguments)]
     pub async fn save(
         &self,
@@ -571,99 +599,131 @@ impl Remote {
         let Some(scope) = &self.scope else {
             return Saved::Skipped("no_scope");
         };
-        let body = json!({"name": name, "partial": partial, "scope": scope,
+        let mut body = json!({"name": name, "partial": partial, "scope": scope,
             "size": written.bytes, "sha256": written.sha256});
-        let reservation = match self
-            .send(
-                Method::POST,
-                &self.path(&format!("entries/{key}")),
-                &[],
-                Some(body),
-                abort,
-            )
-            .await
-        {
-            // The cache's own bound reports the abandoned save.
-            Reply::Aborted => return Saved::Unavailable,
-            Reply::Status(StatusCode::CREATED, Some(body)) => body,
-            Reply::Status(StatusCode::CONFLICT, _) => return Saved::Stored,
-            Reply::Status(StatusCode::FORBIDDEN, _) => {
-                let first = !std::mem::replace(&mut self.state().read_only, true);
-                if first {
+        let mut parts = multipart(written, part_bytes());
+        let reservation = loop {
+            if let Some((size, md5s)) = parts {
+                body["parts"] = json!({"size": size, "md5": md5s});
+            } else if let Some(body) = body.as_object_mut() {
+                body.remove("parts");
+            }
+            match self
+                .send(
+                    Method::POST,
+                    &self.path(&format!("entries/{key}")),
+                    &[],
+                    Some(body.clone()),
+                    abort,
+                )
+                .await
+            {
+                // The cache's own bound reports the abandoned save.
+                Reply::Aborted => return Saved::Unavailable,
+                Reply::Status(StatusCode::CREATED, Some(body)) => break body,
+                Reply::Status(StatusCode::CONFLICT, _) => return Saved::Stored,
+                // A server without multipart support refuses `parts` by
+                // name: reserve once more for a single upload.
+                Reply::Status(StatusCode::UNPROCESSABLE_ENTITY, Some(errors))
+                    if parts.is_some() && errors["errors"].get("parts").is_some() =>
+                {
                     events
-                        .run_warning("the cache key is read-only; no further remote saves this run")
+                        .run_warning(
+                            "the cache server refused a multipart upload; uploading archives in one request",
+                        )
                         .await;
+                    parts = None;
                 }
-                return Saved::Skipped("read_only");
-            }
-            Reply::Status(StatusCode::PAYLOAD_TOO_LARGE, _) => return Saved::Skipped("too_large"),
-            Reply::Status(StatusCode::INSUFFICIENT_STORAGE, _) => return Saved::Skipped("quota"),
-            Reply::Status(StatusCode::SERVICE_UNAVAILABLE, _) | Reply::Down => {
-                self.disable(events, "server_unavailable").await;
-                return Saved::Unavailable;
-            }
-            Reply::Status(StatusCode::UNAUTHORIZED, _) => {
-                self.disable(events, "unauthorized").await;
-                return Saved::Unavailable;
-            }
-            Reply::Status(status, _) => {
-                return Saved::Failed(format!(
-                    "the cache reservation failed (HTTP {})",
-                    status.as_u16()
-                ))
+                Reply::Status(StatusCode::FORBIDDEN, _) => {
+                    let first = !std::mem::replace(&mut self.state().read_only, true);
+                    if first {
+                        events
+                            .run_warning(
+                                "the cache key is read-only; no further remote saves this run",
+                            )
+                            .await;
+                    }
+                    return Saved::Skipped("read_only");
+                }
+                Reply::Status(StatusCode::PAYLOAD_TOO_LARGE, _) => {
+                    return Saved::Skipped("too_large")
+                }
+                Reply::Status(StatusCode::INSUFFICIENT_STORAGE, _) => {
+                    return Saved::Skipped("quota")
+                }
+                Reply::Status(StatusCode::SERVICE_UNAVAILABLE, _) | Reply::Down => {
+                    self.disable(events, "server_unavailable").await;
+                    return Saved::Unavailable;
+                }
+                Reply::Status(StatusCode::UNAUTHORIZED, _) => {
+                    self.disable(events, "unauthorized").await;
+                    return Saved::Unavailable;
+                }
+                Reply::Status(status, _) => {
+                    return Saved::Failed(format!(
+                        "the cache reservation failed (HTTP {})",
+                        status.as_u16()
+                    ))
+                }
             }
         };
         let data = &reservation["data"];
-        let (Some(upload_id), Some(upload_url), Some(headers)) = (
-            data["upload_id"].as_str().filter(|id| {
-                !id.is_empty()
-                    && id
-                        .bytes()
-                        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-            }),
-            presigned(&data["upload_url"]),
-            data["upload_headers"].as_object(),
-        ) else {
+        let Some(upload_id) = data["upload_id"].as_str().filter(|id| {
+            !id.is_empty()
+                && id
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        }) else {
             return Saved::Failed("the cache server returned an invalid reservation".into());
         };
-        let mut map = header::HeaderMap::new();
-        for (name, value) in headers {
-            let (Ok(name), Some(Ok(value))) = (
-                header::HeaderName::from_bytes(name.as_bytes()),
-                value.as_str().map(header::HeaderValue::from_str),
-            ) else {
-                return Saved::Failed("the cache server returned invalid upload headers".into());
-            };
-            if name == header::AUTHORIZATION {
-                return Saved::Failed(
-                    "the cache server asked for an Authorization header on a presigned upload"
-                        .into(),
-                );
+        let upload = match (&data["upload_parts"], parts) {
+            (Value::Null, _) => match single_upload(data) {
+                Ok(upload) => upload,
+                Err(error) => return Saved::Failed(error.into()),
+            },
+            (listed, Some((size, md5s))) => {
+                match upload_parts(listed, written.bytes, *size, md5s) {
+                    Ok(upload) => upload,
+                    Err(error) => return Saved::Failed(error.into()),
+                }
             }
-            map.insert(name, value);
-        }
+            // Parts this client never asked for.
+            (_, None) => {
+                return Saved::Failed("the cache server returned an invalid reservation".into())
+            }
+        };
+        let multipart = matches!(upload, Upload::Parts(_));
         let uploaded = async {
             // Streamed from the file: an archive of up to 5 GB is never held
-            // in memory. An explicit length keeps the body unchunked.
+            // in memory. An explicit length keeps every body unchunked.
             let file = tokio::fs::File::open(path).await?;
             let length = file.metadata().await?.len();
             if length != written.bytes {
                 bail!("the cache archive changed before its upload");
             }
-            map.insert(header::CONTENT_LENGTH, header::HeaderValue::from(length));
-            let request = presigned_client(&upload_url, true)?
-                .put(upload_url.clone())
-                .headers(map)
-                .body(reqwest::Body::from(file))
-                .send();
-            let response = abortable(abort, request).await?.map_err(|_| {
-                anyhow!("the cache upload failed: could not reach the object store")
-            })?;
-            if !response.status().is_success() {
-                bail!(
-                    "the cache upload failed (HTTP {})",
-                    response.status().as_u16()
-                );
+            match upload {
+                Upload::Single(url, mut map) => {
+                    map.insert(header::CONTENT_LENGTH, header::HeaderValue::from(length));
+                    let request = presigned_client(&url, true)?
+                        .put(url)
+                        .headers(map)
+                        .body(reqwest::Body::from(file))
+                        .send();
+                    let response = abortable(abort, request).await?.map_err(|_| {
+                        anyhow!("the cache upload failed: could not reach the object store")
+                    })?;
+                    if !response.status().is_success() {
+                        bail!(
+                            "the cache upload failed (HTTP {})",
+                            response.status().as_u16()
+                        );
+                    }
+                }
+                Upload::Parts(parts) => {
+                    // Parts read this one open file at their offsets, so
+                    // nothing reopens the staged archive by path.
+                    put_parts(file.into_std().await, parts, abort).await?;
+                }
             }
             Ok::<_, anyhow::Error>(())
         }
@@ -675,12 +735,19 @@ impl Remote {
             }
             return Saved::Failed(format!("{error:#}"));
         }
+        // The server completes a multipart upload during the commit, which
+        // it allows up to two minutes.
+        let timeout = match multipart {
+            true => MULTIPART_COMMIT_TIMEOUT,
+            false => REQUEST_TIMEOUT,
+        };
         match self
-            .send(
+            .send_within(
                 Method::POST,
                 &self.path(&format!("uploads/{upload_id}/commit")),
                 &[],
                 None,
+                timeout,
                 abort,
             )
             .await
@@ -700,6 +767,200 @@ impl Remote {
             )),
         }
     }
+}
+
+/// The most parts a multipart upload may have.
+const MAX_PARTS: usize = 10_000;
+/// Bytes read from the archive per chunk of a part's body.
+const PART_CHUNK_BYTES: u64 = 256 * 1024;
+
+/// The part size and MD5s to reserve with, when `written` qualifies for a
+/// multipart upload with `part`-byte parts: at least [`PARTED_MIN_PARTS`]
+/// whole parts, and at most [`MAX_PARTS`] parts.
+fn multipart(written: &archive::Written, part: u64) -> Option<&(u64, Vec<String>)> {
+    written.part_md5.as_ref().filter(|(size, md5s)| {
+        *size == part
+            && written.bytes >= part.saturating_mul(PARTED_MIN_PARTS)
+            && md5s.len() <= MAX_PARTS
+    })
+}
+/// A multipart commit, during which the server completes the upload.
+const MULTIPART_COMMIT_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// How a reservation is uploaded.
+enum Upload {
+    /// One `PUT` to this URL with these headers.
+    Single(Url, header::HeaderMap),
+    Parts(Vec<Part>),
+}
+
+/// One part of a multipart upload.
+struct Part {
+    url: Url,
+    headers: header::HeaderMap,
+    start: u64,
+    len: u64,
+}
+
+/// The headers of a presigned request, refusing `Authorization`.
+fn presigned_headers(
+    headers: &serde_json::Map<String, Value>,
+) -> Result<header::HeaderMap, &'static str> {
+    let mut map = header::HeaderMap::new();
+    for (name, value) in headers {
+        let (Ok(name), Some(Ok(value))) = (
+            header::HeaderName::from_bytes(name.as_bytes()),
+            value.as_str().map(header::HeaderValue::from_str),
+        ) else {
+            return Err("the cache server returned invalid upload headers");
+        };
+        if name == header::AUTHORIZATION {
+            return Err("the cache server asked for an Authorization header on a presigned upload");
+        }
+        map.insert(name, value);
+    }
+    Ok(map)
+}
+
+/// A reservation for one `PUT`: `upload_url` and `upload_headers`.
+fn single_upload(data: &Value) -> Result<Upload, &'static str> {
+    let (Some(url), Some(headers)) = (
+        presigned(&data["upload_url"]),
+        data["upload_headers"].as_object(),
+    ) else {
+        return Err("the cache server returned an invalid reservation");
+    };
+    Ok(Upload::Single(url, presigned_headers(headers)?))
+}
+
+/// A reservation's `upload_parts`, checked against the parts requested:
+/// each part once in order, on the first part's host and scheme, with
+/// exactly its length and MD5.
+fn upload_parts(
+    listed: &Value,
+    bytes: u64,
+    size: u64,
+    md5s: &[String],
+) -> Result<Upload, &'static str> {
+    const INVALID: &str = "the cache server returned an invalid reservation";
+    let listed = listed.as_array().ok_or(INVALID)?;
+    if listed.len() != md5s.len() || bytes.div_ceil(size) != md5s.len() as u64 {
+        return Err(INVALID);
+    }
+    let mut parts: Vec<Part> = Vec::with_capacity(listed.len());
+    for (index, (item, md5)) in listed.iter().zip(md5s).enumerate() {
+        let start = index as u64 * size;
+        let len = size.min(bytes - start);
+        if item["number"].as_u64() != Some(index as u64 + 1) {
+            return Err(INVALID);
+        }
+        let url = presigned(&item["url"]).ok_or(INVALID)?;
+        if let Some(first) = parts.first() {
+            if first.url.host_str() != url.host_str()
+                || first.url.scheme() != url.scheme()
+                || first.url.port_or_known_default() != url.port_or_known_default()
+            {
+                return Err(INVALID);
+            }
+        }
+        let headers = presigned_headers(item["headers"].as_object().ok_or(INVALID)?)?;
+        let text = |name: header::HeaderName| headers.get(name).and_then(|v| v.to_str().ok());
+        if text(header::CONTENT_LENGTH) != Some(len.to_string().as_str())
+            || text(header::HeaderName::from_static("content-md5")) != Some(md5.as_str())
+        {
+            return Err(INVALID);
+        }
+        parts.push(Part {
+            url,
+            headers,
+            start,
+            len,
+        });
+    }
+    Ok(Upload::Parts(parts))
+}
+
+/// Upload every part of the archive `file` over up to
+/// [`PART_CONNECTIONS`] connections, each part tried up to
+/// [`PART_ATTEMPTS`] times.
+async fn put_parts(file: std::fs::File, parts: Vec<Part>, abort: &AtomicBool) -> Result<()> {
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::Arc;
+    let client = presigned_client(&parts[0].url, true)?;
+    let file = Arc::new(file);
+    let parts = Arc::new(parts);
+    let next = Arc::new(AtomicUsize::new(0));
+    // Dropping the set on an error or an abort cancels the other parts.
+    let mut workers = tokio::task::JoinSet::new();
+    for _ in 0..(parts.len() as u64).min(PART_CONNECTIONS) {
+        let (client, file, parts, next) =
+            (client.clone(), file.clone(), parts.clone(), next.clone());
+        workers.spawn(async move {
+            loop {
+                let Some(part) = parts.get(next.fetch_add(1, Ordering::Relaxed)) else {
+                    return Ok::<_, anyhow::Error>(());
+                };
+                let mut attempt = 0;
+                loop {
+                    attempt += 1;
+                    match put_part(&client, &file, part).await {
+                        Ok(()) => break,
+                        Err(_) if attempt < PART_ATTEMPTS => {
+                            tokio::time::sleep(PART_BACKOFF * attempt).await
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+            }
+        });
+    }
+    while let Some(done) = abortable(abort, workers.join_next()).await? {
+        done.map_err(|_| anyhow!("the cache upload failed"))??;
+    }
+    Ok(())
+}
+
+/// `PUT` one part, streamed from its offset of `file` with positioned
+/// reads, so concurrent parts and retries never share a file offset and
+/// each try starts again from the part's first byte.
+async fn put_part(
+    client: &reqwest::Client,
+    file: &std::sync::Arc<std::fs::File>,
+    part: &Part,
+) -> Result<()> {
+    let chunks = futures_util::stream::try_unfold(
+        (file.clone(), part.start, part.len),
+        |(file, at, left)| async move {
+            if left == 0 {
+                return Ok(None);
+            }
+            let len = left.min(PART_CHUNK_BYTES);
+            let (file, chunk) = tokio::task::spawn_blocking(move || {
+                use std::os::unix::fs::FileExt;
+                let mut chunk = vec![0; len as usize];
+                file.read_exact_at(&mut chunk, at).map(|()| (file, chunk))
+            })
+            .await
+            .map_err(std::io::Error::other)??;
+            Ok::<_, std::io::Error>(Some((chunk, (file, at + len, left - len))))
+        },
+    );
+    let mut headers = part.headers.clone();
+    headers.insert(header::CONTENT_LENGTH, header::HeaderValue::from(part.len));
+    let response = client
+        .put(part.url.clone())
+        .headers(headers)
+        .body(reqwest::Body::wrap_stream(chunks))
+        .send()
+        .await
+        .map_err(|_| anyhow!("the cache upload failed: could not reach the object store"))?;
+    if !response.status().is_success() {
+        bail!(
+            "the cache upload failed (HTTP {})",
+            response.status().as_u16()
+        );
+    }
+    Ok(())
 }
 
 /// A minted per-run cache key.
@@ -796,6 +1057,130 @@ pub async fn revoke(target: &Target, id: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Three parts of a 40-byte archive in 16-byte parts, as a server
+    /// would list them.
+    fn listed() -> (Value, Vec<String>) {
+        let md5s: Vec<String> = [
+            "AAAAAAAAAAAAAAAAAAAAAA==",
+            "AQEBAQEBAQEBAQEBAQEBAQ==",
+            "AgICAgICAgICAgICAgICAg==",
+        ]
+        .map(String::from)
+        .to_vec();
+        let parts = (0..3)
+            .map(|i| {
+                json!({"number": i + 1, "url": format!("https://bucket.example/o?partNumber={}", i + 1),
+                    "headers": {"content-length": if i < 2 { "16" } else { "8" }, "content-md5": md5s[i]}})
+            })
+            .collect();
+        (Value::Array(parts), md5s)
+    }
+
+    #[test]
+    fn upload_parts_accepts_each_part_once_in_order() {
+        let (parts, md5s) = listed();
+        let Ok(Upload::Parts(parts)) = upload_parts(&parts, 40, 16, &md5s) else {
+            panic!("rejected");
+        };
+        let spans: Vec<(u64, u64)> = parts.iter().map(|p| (p.start, p.len)).collect();
+        assert_eq!(spans, [(0, 16), (16, 16), (32, 8)]);
+    }
+
+    #[test]
+    fn upload_parts_rejects_every_mismatch() {
+        type Change = fn(&mut Value);
+        let cases: Vec<(&str, Change)> = vec![
+            ("one part missing", |p| {
+                p.as_array_mut().unwrap().pop();
+            }),
+            ("numbers swapped", |p| {
+                p[0]["number"] = json!(2);
+                p[1]["number"] = json!(1);
+            }),
+            ("parts swapped", |p| p.as_array_mut().unwrap().swap(0, 1)),
+            ("wrong md5", |p| {
+                p[1]["headers"]["content-md5"] = json!("AwMDAwMDAwMDAwMDAwMDAw==")
+            }),
+            ("md5 missing", |p| {
+                p[1]["headers"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("content-md5");
+            }),
+            ("wrong length", |p| {
+                p[2]["headers"]["content-length"] = json!("16")
+            }),
+            ("length missing", |p| {
+                p[0]["headers"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("content-length");
+            }),
+            ("another host", |p| {
+                p[1]["url"] = json!("https://elsewhere.example/o?partNumber=2")
+            }),
+            ("another port", |p| {
+                p[1]["url"] = json!("https://bucket.example:8443/o?partNumber=2")
+            }),
+            ("http after https", |p| {
+                p[1]["url"] = json!("http://bucket.example/o?partNumber=2")
+            }),
+            ("plain http", |p| {
+                p[0]["url"] = json!("http://bucket.example/o")
+            }),
+            ("http after https on one host and port", |p| {
+                p[0]["url"] = json!("https://localhost/o?partNumber=1");
+                p[1]["url"] = json!("https://localhost/o?partNumber=2");
+                p[2]["url"] = json!("http://localhost:443/o?partNumber=3");
+            }),
+            ("authorization", |p| {
+                p[2]["headers"]["authorization"] = json!("Bearer x")
+            }),
+            ("headers not strings", |p| {
+                p[0]["headers"]["x-extra"] = json!(1)
+            }),
+            ("not a list", |p| *p = json!({})),
+        ];
+        for (name, change) in cases {
+            let (mut parts, md5s) = listed();
+            change(&mut parts);
+            assert!(
+                upload_parts(&parts, 40, 16, &md5s).is_err(),
+                "{name} was accepted"
+            );
+        }
+        // The default port counts as the same port.
+        let (mut parts, md5s) = listed();
+        parts[1]["url"] = json!("https://bucket.example:443/o?partNumber=2");
+        assert!(upload_parts(&parts, 40, 16, &md5s).is_ok());
+    }
+
+    #[test]
+    fn an_archive_of_at_least_four_whole_parts_reserves_parts() {
+        let written = |bytes: u64, part: u64| archive::Written {
+            bytes,
+            sha256: String::new(),
+            part_md5: Some((part, vec![String::new(); bytes.div_ceil(part) as usize])),
+        };
+        let w = written(64, 16);
+        assert!(multipart(&w, 16).is_some());
+        let w = written(63, 16);
+        assert!(multipart(&w, 16).is_none());
+        // MD5s of another part size, or more than 10,000 parts, are not sent.
+        let w = written(64, 16);
+        assert!(multipart(&w, 8).is_none());
+        let w = written(10_001, 1);
+        assert!(multipart(&w, 1).is_none());
+        let w = written(10_000, 1);
+        assert!(multipart(&w, 1).is_some());
+        let none = archive::Written {
+            bytes: 64,
+            sha256: String::new(),
+            part_md5: None,
+        };
+        assert!(multipart(&none, 16).is_none());
+    }
 
     #[test]
     fn presigned_redirects_keep_the_host_and_scheme() {

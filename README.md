@@ -491,6 +491,8 @@ The remote store needs a `[reporting]` block and uses its project and `url_env`.
 
 A run reads its own scope and then the default branch's. A run without a scope (a detached HEAD with no `scope`) reads only the default branch and saves only locally (`no_scope`). The server's key decides what a run may write: a read-only `ck_` key makes remote saves `read_only` after one warning, and a key bound to another branch reads only the default branch. Use a long-lived read-only `ck_` key bound to the default branch on laptops and orbs, and let CI on the default branch write. Without a key or URL the run uses only the local store (`cache_remote_unavailable`). Sprite runs get a short-lived key from the controller; see [docs/sprites.md](docs/sprites.md).
 
+An archive of at least 64 MiB downloads as parallel 16 MiB ranges and, when the server supports it, uploads as parallel 16 MiB parts, up to 8 at a time, each tried up to 3 times with a short wait between tries. Each part carries its MD5, which the object store checks. A server or store without multipart support gets the archive as one upload instead, as do smaller archives; a server that refuses the parts outright also prints one `cache_warning` per run. A part that still fails ends the remote save with a `cache_warning` and no commit; the local entry stays. Every restore from the remote store checks the archive's size and sha256 before it extracts anything; a mismatch is a `cache_warning` and a miss.
+
 #### Cache events
 
 - `cache_restored`: `job`, `partition`, `cache`, `result` (`exact`, `fallback`, `present` or `miss`), `tier` (`local`, `remote`, `workdir` or null), `bytes`, `duration_ms`.
