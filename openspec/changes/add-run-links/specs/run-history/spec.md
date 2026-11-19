@@ -3,7 +3,7 @@
 ## ADDED Requirements
 
 ### Requirement: Runs record their links
-When the history file or the run-record upload is enabled, the record SHALL carry a `links` object with `threads`, a list of agent thread URLs, and `tickets`, a list of ticket IDs. The history file and the uploaded record SHALL hold the same `links` value, placed after `ci` and before `results`. `links` SHALL be omitted when both lists are empty, and each list SHALL be omitted when it is empty. A child invocation SHALL record its root invocation's links. `schema_version` SHALL stay 1.
+When a run writes a history file or sends a run record, the record SHALL carry a `links` object with `threads`, a list of agent thread URLs, and `tickets`, a list of ticket IDs. The history file and the uploaded record SHALL hold the same `links` value, placed after `ci` and before `results`. `links` SHALL be omitted when both lists are empty, and each list SHALL be omitted when it is empty. Every invocation of a run SHALL record the same links. `schema_version` SHALL stay 1.
 
 #### Scenario: File and upload agree
 - **WHEN** local history and upload are both enabled and the run has a ticket and a thread
@@ -17,30 +17,57 @@ When the history file or the run-record upload is enabled, the record SHALL carr
 - **WHEN** a run with ticket `GOO-291` calls workflow `suite`
 - **THEN** the history file for `suite` has `links.tickets` `["GOO-291"]`
 
+#### Scenario: Only the child records
+- **WHEN** the root workflow has history off, it calls workflow `suite` whose settings turn history on, and the run passes `--ticket GOO-291`
+- **THEN** the history file for `suite` has `links.tickets` `["GOO-291"]`
+
 ### Requirement: Thread URLs are normalized and RFC 3986 safe
-A thread URL MUST be `https`, have a host, have no userinfo, query or fragment, contain only RFC 3986 characters, and be at most 2048 bytes. Collection SHALL store it in normalized form: a lowercase host, no explicit `:443`, a nonempty path, and no `.` or `..` segments. Upload validation SHALL reject, rather than rewrite, a thread URL that is not already in normalized form.
+A thread URL MUST be `https`, have a host, have no userinfo, query or fragment, even an empty one, and be at most 2048 bytes. Every path byte MUST be an RFC 3986 `pchar` or `/`, and every `%` MUST start a `%` plus two hex digits. Normalized form SHALL be a lowercase host, no explicit `:443`, a nonempty path, no `.` or `..` segments, and percent triplets kept as written. Collection SHALL store that form, and upload validation SHALL reject, not rewrite, a URL not already in it.
 
 #### Scenario: Characters outside RFC 3986
-- **WHEN** a collected thread URL has `|` in its path
+- **WHEN** a collected thread URL has `|`, `[` or `%zz` in its path, or ends with `%`
 - **THEN** it is not recorded
 
 #### Scenario: Duplicate URL spellings
 - **WHEN** the collected threads are `HTTPS://AmpCode.com/threads/T-<uuid>` and `https://ampcode.com/threads/T-<uuid>`
 - **THEN** `links.threads` holds one entry, `https://ampcode.com/threads/T-<uuid>`
 
+#### Scenario: Percent triplets are kept
+- **WHEN** a collected thread URL is `https://h/a%7Eb`
+- **THEN** it is recorded as `https://h/a%7Eb`, not `https://h/a~b`
+
 #### Scenario: Upload validation
-- **WHEN** a frozen run record's `links.threads[0]` has a query string, or is `https://AmpCode.com:443/threads/T-<uuid>`
-- **THEN** the upload is skipped with `invalid record at links.threads[0]` and no request is sent
+- **WHEN** a run's record has `links.threads[0]` with a query string, or `https://AmpCode.com:443/threads/T-<uuid>`
+- **THEN** the run prints `upload skipped: invalid record at links.threads[0]` and sends no request
 
 ### Requirement: Tickets and link lists are bounded
-A ticket MUST be 1 to 64 bytes of printable ASCII with no whitespace. Each list SHALL hold at most 32 entries without duplicates. Tickets SHALL be compared ignoring ASCII case, and the first spelling SHALL be kept. Upload validation SHALL apply the same rules.
+A ticket MUST be 1 to 64 bytes of printable ASCII other than `,`, so it has no whitespace, control characters or commas. Each list SHALL hold at most 32 entries without duplicates. Tickets SHALL be compared ignoring ASCII case, and the first spelling SHALL be kept. Upload validation SHALL apply the same rules.
 
 #### Scenario: Duplicate ticket in an upload
-- **WHEN** a frozen run record's `links.tickets` is `["GOO-1", "goo-1"]`
-- **THEN** the upload is skipped with `invalid record at links.tickets[1]` and no request is sent
+- **WHEN** a run's record has `links.tickets` `["GOO-1", "goo-1"]`
+- **THEN** the run prints `upload skipped: invalid record at links.tickets[1]` and sends no request
 
-### Requirement: Links are collected in a fixed order
-goodflows SHALL collect links once per root invocation, only when the history file or the upload is enabled. It SHALL merge, in this order: repeatable `--ticket` and `--thread-url` flags; `GOODFLOWS_TICKETS` and `GOODFLOWS_THREAD_URLS` from the caller's process environment, split on commas and whitespace; the agent session; then git. Settings and job `env` MUST NOT supply these values. Once a list holds 32 entries, later values SHALL be dropped.
+#### Scenario: Comma in a ticket flag
+- **WHEN** a run passes `--ticket GOO-1,GOO-2`
+- **THEN** the command exits 2 and no job runs
+
+### Requirement: Links are collected once per run, only when needed
+goodflows SHALL collect links at most once per run, when the first invocation that writes a history file or sends a run record needs them. An upload skipped for missing credentials MUST NOT count as sending. When no invocation records, goodflows MUST NOT run any git command to collect links. Collecting links MUST NOT change `source` and MUST NOT fail the run.
+
+#### Scenario: History off
+- **WHEN** neither the history file nor the upload is enabled, and a job declares `reports`
+- **THEN** goodflows runs no git command to collect links
+
+#### Scenario: Upload without credentials
+- **WHEN** `[reporting] history = true`, the key variable is unset, and the history file is off
+- **THEN** goodflows runs no git command to collect links
+
+#### Scenario: Several child invocations
+- **WHEN** a run with history on calls three workflows
+- **THEN** links are collected once, and all four history files have the same `links`
+
+### Requirement: Links are merged in a fixed order
+goodflows SHALL merge, in this order: repeatable `--ticket` and `--thread-url` flags; `GOODFLOWS_TICKETS` and `GOODFLOWS_THREAD_URLS` from the caller's process environment, split on commas and whitespace with empty pieces ignored; the agent session; then git. Settings and job `env` MUST NOT supply these values. Once a list holds 32 entries, later values SHALL be dropped.
 
 #### Scenario: Flags come first
 - **WHEN** a run passes `--ticket goo-291` and `GOODFLOWS_TICKETS=GOO-291,GOO-300`
@@ -50,45 +77,65 @@ goodflows SHALL collect links once per root invocation, only when the history fi
 - **WHEN** `[settings] env` sets `GOODFLOWS_TICKETS = "GOO-9"` and the caller's environment does not
 - **THEN** the record has no `links.tickets`
 
-#### Scenario: History off
-- **WHEN** neither the history file nor the upload is enabled
-- **THEN** goodflows runs no git command to collect links
+#### Scenario: Cap across sources
+- **WHEN** a run passes 30 `--ticket` flags and `GOODFLOWS_TICKETS` holds 5 other valid tickets
+- **THEN** `links.tickets` holds the 30 flag tickets and the first 2 from the variable
 
 ### Requirement: Invalid link input is handled by source
-An invalid `--ticket` or `--thread-url` value, or more than 32 of either flag, MUST fail as an argument error with exit code 2 before any job runs. An invalid environment entry SHALL be dropped with a stderr warning that names the variable and the entry's position, and MUST NOT print the entry. Invalid values from the agent session or git SHALL be dropped silently.
+An invalid `--ticket` or `--thread-url` value, or more than 32 of either flag, MUST fail as an argument error with exit code 2 before any job runs. An invalid environment entry SHALL be dropped with a stderr warning that names the variable and the entry's position among the non-empty entries, counting from 1, and MUST NOT print the entry. Invalid values from the agent session or git SHALL be dropped silently.
 
 #### Scenario: Invalid flag
 - **WHEN** a run passes `--thread-url 'https://ampcode.com/threads/T-1?token=x'`
 - **THEN** the command exits 2 and no job runs
 
+#### Scenario: Too many flags
+- **WHEN** a run passes 33 `--ticket` flags
+- **THEN** the command exits 2 and no job runs
+
 #### Scenario: Invalid environment entry
-- **WHEN** `GOODFLOWS_TICKETS` is `GOO-1,` followed by a 65-byte entry
+- **WHEN** `GOODFLOWS_TICKETS` is `GOO-1,,` followed by a 65-byte entry
 - **THEN** `links.tickets` is `["GOO-1"]`, stderr warns about entry 2 of `GOODFLOWS_TICKETS` without printing it, and the exit code is unaffected
 
 ### Requirement: The agent session supplies its thread
-When `AMP_THREAD_ID` is `T-` followed by a lowercase UUID, the agent session SHALL add `<AMP_URL>/threads/<AMP_THREAD_ID>`. `AMP_URL` SHALL default to `https://ampcode.com` and MUST be an `https` origin. Otherwise the agent session SHALL add nothing.
+The thread ID SHALL be `AMP_CURRENT_THREAD_ID`, or `AMP_THREAD_ID` when that is unset, and MUST be `T-` followed by a lowercase UUID. The origin SHALL be `AMP_URL`, defaulting to `https://ampcode.com`. It MUST be an `https` URL with a host, no userinfo, query or fragment, and a path of `/` or nothing. The session SHALL add the origin with the path `/threads/<id>`, and SHALL add nothing when a check fails.
 
 #### Scenario: Agent session
-- **WHEN** a run with history enabled starts with `AMP_URL=https://ampcode.com` and `AMP_THREAD_ID=T-3bb6cad7-8c04-413a-b23c-5fca67cd4f7b`
+- **WHEN** a run with history enabled starts with `AMP_URL=https://ampcode.com/` and `AMP_CURRENT_THREAD_ID=T-3bb6cad7-8c04-413a-b23c-5fca67cd4f7b`
 - **THEN** `links.threads` is `["https://ampcode.com/threads/T-3bb6cad7-8c04-413a-b23c-5fca67cd4f7b"]`
 
+#### Scenario: Origin with a path
+- **WHEN** `AMP_URL` is `https://ampcode.com/app` or `http://ampcode.com`
+- **THEN** the agent session adds no thread
+
 #### Scenario: Not an agent session
-- **WHEN** `AMP_THREAD_ID` is unset
+- **WHEN** neither `AMP_CURRENT_THREAD_ID` nor `AMP_THREAD_ID` is set
 - **THEN** the agent session adds no thread
 
 ### Requirement: Git scans only the branch's own commits
-goodflows SHALL read the messages of at most 200 commits reachable from `HEAD` but not from the base, newest first. The base is `refs/remotes/origin/$GITHUB_BASE_REF` when `GITHUB_BASE_REF` is set, otherwise `refs/remotes/origin/HEAD`. When neither resolves or the range is empty, goodflows SHALL read `HEAD` alone. The scan SHALL share the source capture's timeout and SHALL remove the reporting key variable from git's environment.
+goodflows SHALL read the messages of at most 200 commits reachable from `HEAD` but not from the base, newest first. The base is `refs/remotes/origin/$GITHUB_BASE_REF` when `GITHUB_BASE_REF` is set, otherwise `refs/remotes/origin/HEAD`. goodflows SHALL read `HEAD` alone when the checkout is shallow, no base resolves, or the range is empty. The scan SHALL have its own 2-second timeout and SHALL remove the reporting key variable from git's environment.
 
 #### Scenario: Run on main after a squash merge
-- **WHEN** `HEAD` is reachable from the base and its subject is `GOO-291: Fix sprite test (#45)` with no trailer, and `ticket_prefixes = ["GOO"]`
+- **WHEN** `HEAD` is reachable from the base, its subject is `GOO-291: Fix sprite test (#45)`, its body has an `Amp-Thread-ID:` line among the copied commit messages, and `ticket_prefixes = ["GOO"]`
+- **THEN** `links.tickets` is `["GOO-291"]` and `links.threads` holds that line's URL
+
+#### Scenario: Squash message trimmed to the title
+- **WHEN** `HEAD` is reachable from the base and its message is `GOO-291: Fix sprite test (#45)` alone, and `ticket_prefixes = ["GOO"]`
 - **THEN** `links.tickets` is `["GOO-291"]` and there is no `links.threads`
+
+#### Scenario: Shallow checkout
+- **WHEN** the checkout is shallow and `origin/HEAD` resolves
+- **THEN** only `HEAD`'s message is read
 
 #### Scenario: Not a git checkout
 - **WHEN** the workdir is not inside a git checkout
 - **THEN** the run succeeds and only flags, the environment and the agent session supply links
 
+#### Scenario: Slow git
+- **WHEN** the scan does not finish within 2 seconds
+- **THEN** git supplies no links and the record's `source` is the same as without the scan
+
 ### Requirement: Git supplies threads from Amp-Thread-ID lines
-Every scanned message line that starts, after optional whitespace, with `Amp-Thread-ID:` SHALL supply a thread. Its value SHALL be either a valid thread URL as given, or a bare `T-<uuid>` expanded with `AMP_URL` as the agent session expands it.
+Every scanned message line that starts, after optional whitespace, with `Amp-Thread-ID:` SHALL supply a thread, including lines in the body that are not git trailers. Its value SHALL be either a valid thread URL as given, or a bare `T-<uuid>` expanded with the agent session's origin.
 
 #### Scenario: Feature branch with Amp commits
 - **WHEN** `origin/HEAD` points at the base commit and the branch has two commits with different `Amp-Thread-ID` trailers
@@ -121,14 +168,18 @@ Tickets SHALL come only from scanned commit subjects, the checked-out branch nam
 - **THEN** no ticket is recorded
 
 ### Requirement: Sprite runs carry the controller's links
-A Sprite run SHALL collect links on the controller and send them to the remote runner with the provenance. The remote runner's history file and uploaded record SHALL use those links unchanged, and the remote runner MUST NOT collect links itself.
+The Sprite controller SHALL collect links itself when the run it sends can record, and send them in the provenance. The remote runner's history file and uploaded record SHALL use those links unchanged, and the remote runner MUST NOT collect links itself.
 
 #### Scenario: Remote history file
 - **WHEN** a `--sprite` run with history enabled starts in an agent session on a branch with ticket `GOO-291`
 - **THEN** the remote invocation's history file has the controller's `links`
 
+#### Scenario: Nothing records
+- **WHEN** a `--sprite` run has history and the upload off
+- **THEN** the controller runs no git command to collect links and the provenance has no `links`
+
 ### Requirement: Stored runs can be filtered by link
-`goodflows history list` SHALL send `--ticket` as the `ticket` query parameter and `--thread-url` as `thread_url`, alongside the existing filters. Each SHALL take at most one value and follow the link rules. A bad value or a repeated filter MUST exit 2 without a request.
+`goodflows history list` SHALL send `--ticket` as the `ticket` query parameter and `--thread-url` as `thread_url`, alongside the existing filters. Each SHALL take at most one value and follow the link rules. A bad value or a repeated filter MUST exit 2 without a request. `history show` SHALL reject both flags as run flags.
 
 #### Scenario: Filter by ticket
 - **WHEN** the user runs `goodflows history list --ticket GOO-291`
@@ -136,6 +187,10 @@ A Sprite run SHALL collect links on the controller and send them to the remote r
 
 #### Scenario: Repeated link filter
 - **WHEN** the user runs `goodflows history list --ticket GOO-1 --ticket GOO-2`
+- **THEN** no request is sent and the command exits 2
+
+#### Scenario: Show rejects link flags
+- **WHEN** the user runs `goodflows history show <run_id> --ticket GOO-1`
 - **THEN** no request is sent and the command exits 2
 
 ### Requirement: A stored run shows its links
