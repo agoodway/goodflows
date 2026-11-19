@@ -37,7 +37,7 @@ A thread URL MUST be `https`, have a host, have no userinfo, query or fragment, 
 - **THEN** it is recorded as `https://h/a%7Eb`, not `https://h/a~b`
 
 #### Scenario: Upload validation
-- **WHEN** a run's record has `links.threads[0]` with a query string, or `https://AmpCode.com:443/threads/T-<uuid>`
+- **WHEN** a run's record has `links.threads[0]` with a query string, or `https://AmpCode.com:443/threads/T-<uuid>`, or `https://h/a/%2E%2e/b`
 - **THEN** the run prints `upload skipped: invalid record at links.threads[0]` and sends no request
 
 ### Requirement: Tickets and link lists are bounded

@@ -66,7 +66,15 @@ Rules, which `run_contract` and the server share:
 - no `.` or `..` segments
 - percent-encoded triplets kept exactly as written: no decoding (`%7E` stays `%7E`, not `~`) and no change of hex case
 
-Collection stores thread URLs in this form, so `HTTPS://AmpCode.com/...` and `https://ampcode.com/...` deduplicate. The server never rewrites a submitted value, so `run_contract` requires a URL to equal its own normalized form instead of normalizing it. The server's normalized check and its `thread_url` filter must use the same definition, including the rule for percent triplets. The shared fixture pins it with `%7E` and `%2f` cases.
+Collection stores thread URLs in this form, so `HTTPS://AmpCode.com/...` and `https://ampcode.com/...` deduplicate. The server never rewrites a submitted value, so `run_contract` requires a URL to equal its own normalized form instead of normalizing it. Precisely, a URL is normalized when `Url::parse(s)` succeeds and `as_str()` equals `s`. Besides the cases above, that rejects every other input WHATWG rewrites:
+
+- `%2e` dot segments (`/a/%2E%2e/b`)
+- a percent-encoded host (`ex%61mple.com`)
+- non-canonical IPv4 (`127.1`, `0x7f.0.0.1`, `127.0.0.1.`)
+- non-canonical IPv6 (`[0:0:0:0:0:0:0:1]`, `[::FFFF:1.2.3.4]`)
+- ports with leading zeros (`:080`, `:0443`)
+
+goodflows_web's "must be normalized" check rejects the same set. The shared fixture pins the definition with `%7E`, `%2f` and `%2E%2e` cases.
 
 Why lists: one change often spans several threads, such as a plan thread, an implementation thread and a review thread, and it can close more than one ticket.
 
@@ -154,7 +162,7 @@ The controller collects links itself with the same collection function, on its o
 The companion goodflows_web change is `openspec/changes/accept-run-links/` in that repo:
 
 - `POST /workflow-runs` accepts `links` with the rules above, and rejects an empty `links` or unknown keys inside it with 422 and the path, such as `links.tickets[2]`. A thread URL that is not already normalized gets "must be normalized", and a repeated entry gets "must be unique" on the repeat's path.
-- The server stores both lists as written and indexes them for exact lookup. Tickets match ignoring ASCII case. The `thread_url` filter normalizes its value with the same definition before matching.
+- The server stores both lists as written and indexes them for exact lookup. Tickets match ignoring ASCII case. The `thread_url` filter fixes only scheme and host case, an empty or `443` port, and an empty path, then matches exactly; any other non-normalized value gets 422. `%7E` and `%2f` match only as written. The CLI's `--thread-url` filter normalizes with `reqwest::Url` before sending, so it never hits that 422.
 - Because the server stores tickets as written, a retry that differs only in a ticket's case is a 409, not an idempotent 200.
 - `GET /workflow-runs` accepts `ticket` and `thread_url`. Both filter for every key type.
 - `GET /workflow-runs/:id` returns `links` under `data.document.links`, as stored. For a `pk_` key, `links.threads` is null only when the run has threads, and `links.tickets` is unchanged. A tickets-only `links` gets no `threads` key. The list response needs no new fields.
