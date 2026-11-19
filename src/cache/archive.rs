@@ -743,19 +743,27 @@ pub fn extract(
     }
     check(abort)?;
     // Swap: each declared path the archive holds replaces the live one.
-    // Live paths are renamed aside first (next to themselves, so on their
-    // own file system) and put back if any move fails.
-    let mut placed: Vec<PathBuf> = Vec::new();
-    let mut aside: Vec<(PathBuf, PathBuf)> = Vec::new();
+    // Staged paths are first brought next to their targets (copied when a
+    // symlink under `~/` leads to another file system); then live paths are
+    // renamed aside, also next to themselves, and put back if any move fails.
+    let mut moves = Moves::default();
     let swapped = swap(
         declared,
         home,
         work_stage.path(),
         home_stage.as_ref().map(|s| s.path()),
-        &mut placed,
-        &mut aside,
+        &mut moves,
+        abort,
     );
+    let Moves {
+        placed,
+        aside,
+        incoming,
+    } = moves;
     if let Err(error) = swapped {
+        for path in &incoming {
+            let _ = remove_path(path);
+        }
         for path in placed.iter().rev() {
             let _ = remove_path(path);
         }
@@ -797,6 +805,15 @@ fn move_aside(target: &Path) -> Result<Option<PathBuf>> {
     if std::fs::symlink_metadata(target).is_err() {
         return Ok(None);
     }
+    let moved = hidden_sibling(target)?;
+    std::fs::rename(target, &moved)
+        .with_context(|| format!("cannot move {} aside", target.display()))?;
+    Ok(Some(moved))
+}
+
+/// A fresh hidden name next to `target`, in the aside format, so a later
+/// restore prunes it when a killed process left it behind.
+fn hidden_sibling(target: &Path) -> Result<PathBuf> {
     let name = target.file_name().context("a declared path has no name")?;
     let mut hidden = OsString::from(".");
     hidden.push(name);
@@ -806,10 +823,7 @@ fn move_aside(target: &Path) -> Result<Option<PathBuf>> {
         std::process::id(),
         uuid::Uuid::new_v4().simple()
     ));
-    let moved = target.with_file_name(hidden);
-    std::fs::rename(target, &moved)
-        .with_context(|| format!("cannot move {} aside", target.display()))?;
-    Ok(Some(moved))
+    Ok(target.with_file_name(hidden))
 }
 
 /// Whether an aside name's owner is gone. Another host's or container's
@@ -870,14 +884,30 @@ pub fn prune_asides(declared: &Declared) {
     }
 }
 
+/// What a swap moved so far, for its rollback.
+#[derive(Default)]
+struct Moves {
+    /// Targets now holding the restored tree.
+    placed: Vec<PathBuf>,
+    /// Live paths moved aside: (where they went, where they were).
+    aside: Vec<(PathBuf, PathBuf)>,
+    /// Staged paths brought next to their targets, not yet placed.
+    incoming: Vec<PathBuf>,
+}
+
 fn swap(
     declared: &Declared,
     home: Option<&Path>,
     work_stage: &Path,
     home_stage: Option<&Path>,
-    placed: &mut Vec<PathBuf>,
-    aside: &mut Vec<(PathBuf, PathBuf)>,
+    moves: &mut Moves,
+    abort: &AtomicBool,
 ) -> Result<()> {
+    let Moves {
+        placed,
+        aside,
+        incoming,
+    } = moves;
     // Every staged path and every live path it replaces, across all the
     // declared paths: declared paths may nest (`deps` and `deps/sub`), so
     // each is handled once, outermost first, and a path inside one already
@@ -913,26 +943,54 @@ fn swap(
                     .map(|rel| live_base.join(rel)),
             );
         }
-        rooted.extend(
-            live[first..]
-                .iter()
-                .cloned()
-                .chain(rels.iter().map(|rel| live_base.join(rel)))
-                .map(|target| (live_base.to_path_buf(), target)),
-        );
+        // Links under `~/` are the owner's own (a checkout or an archive
+        // cannot make them), so only workdir targets are checked.
+        if !path.starts_with("~/") {
+            rooted.extend(
+                live[first..]
+                    .iter()
+                    .cloned()
+                    .chain(rels.iter().map(|rel| live_base.join(rel)))
+                    .map(|target| (live_base.to_path_buf(), target)),
+            );
+        }
         staged.extend(
             rels.into_iter()
                 .map(|rel| (stage.join(&rel), live_base.join(rel))),
         );
     }
-    // Before anything moves: a symlinked ancestor would carry the swap
-    // outside the declared root.
+    // Before anything moves: a symlinked ancestor in the workdir would
+    // carry the swap outside it.
     for (root, target) in &rooted {
         check_ancestors(root, target)?;
     }
     let depth = |path: &Path| path.components().count();
     live.sort_by_key(|target| depth(target));
     staged.sort_by_key(|(_, target)| depth(target));
+    // Outermost first; a path inside one already kept comes with it.
+    let mut kept: Vec<(PathBuf, PathBuf)> = Vec::new();
+    for (from, target) in staged {
+        if !kept.iter().any(|(_, k)| target.starts_with(k)) {
+            kept.push((from, target));
+        }
+    }
+    // Bring each staged path next to its target first, so the final rename
+    // stays on one file system even when a symlinked directory under `~/`
+    // leads to another disk. A failure here leaves every live path alone.
+    let mut near: Vec<(PathBuf, PathBuf)> = Vec::with_capacity(kept.len());
+    for (from, target) in kept {
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let hop = hidden_sibling(&target)?;
+        let moved = move_across(&from, &hop, abort);
+        if moved.is_err() {
+            let _ = remove_path(&hop);
+        }
+        moved.with_context(|| format!("cannot stage {}", target.display()))?;
+        incoming.push(hop.clone());
+        near.push((hop, target));
+    }
     for target in live {
         if !aside.iter().any(|(_, o)| target.starts_with(o)) {
             if let Some(moved) = move_aside(&target)? {
@@ -940,17 +998,53 @@ fn swap(
             }
         }
     }
-    for (from, target) in staged {
-        if placed.iter().any(|p| target.starts_with(p)) {
-            continue;
-        }
-        if let Some(parent) = target.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::rename(&from, &target)
+    for (hop, target) in near {
+        std::fs::rename(&hop, &target)
             .with_context(|| format!("cannot move {} into place", target.display()))?;
+        incoming.retain(|i| *i != hop);
         placed.push(target);
     }
+    Ok(())
+}
+
+/// Rename `from` to `to`, or, when they are on different file systems,
+/// copy the tree (keeping symlinks, modes and modification times) and
+/// remove `from`.
+fn move_across(from: &Path, to: &Path, abort: &AtomicBool) -> Result<()> {
+    match std::fs::rename(from, to) {
+        Err(error) if error.raw_os_error() == Some(libc::EXDEV) => {
+            copy_tree(from, to, abort)?;
+            let _ = remove_path(from);
+            Ok(())
+        }
+        other => Ok(other?),
+    }
+}
+
+fn copy_tree(from: &Path, to: &Path, abort: &AtomicBool) -> Result<()> {
+    check(abort)?;
+    let meta = std::fs::symlink_metadata(from)?;
+    let kind = meta.file_type();
+    if kind.is_symlink() {
+        std::os::unix::fs::symlink(std::fs::read_link(from)?, to)?;
+        return Ok(());
+    }
+    if kind.is_dir() {
+        std::fs::create_dir(to)?;
+        for entry in std::fs::read_dir(from)? {
+            let entry = entry?;
+            copy_tree(&entry.path(), &to.join(entry.file_name()), abort)?;
+        }
+    } else if kind.is_file() {
+        std::fs::copy(from, to)?;
+    } else {
+        bail!("{} is not a file, directory or symlink", from.display());
+    }
+    // Build tools compare modification times, so keep them; the mode last,
+    // so a read-only directory still fills.
+    let times = std::fs::FileTimes::new().set_modified(meta.modified()?);
+    std::fs::File::open(to)?.set_times(times)?;
+    std::fs::set_permissions(to, meta.permissions())?;
     Ok(())
 }
 
@@ -1492,6 +1586,90 @@ mod tests {
         );
         assert!(!outside.path().join("lib/f").exists());
         assert!(!dest.path().join("other").exists());
+    }
+
+    /// A directory on another file system than the temporary directories,
+    /// when this machine has one.
+    fn other_device() -> Option<tempfile::TempDir> {
+        use std::os::unix::fs::MetadataExt;
+        let here = std::fs::metadata(std::env::temp_dir()).ok()?.dev();
+        ["/dev/shm", "/run/shm"].iter().find_map(|dir| {
+            let meta = std::fs::metadata(dir).ok()?;
+            (meta.dev() != here).then(|| tempfile::tempdir_in(dir).ok())?
+        })
+    }
+
+    #[test]
+    fn a_home_path_restores_through_a_symlink_to_another_disk() {
+        use std::os::unix::fs::MetadataExt;
+        let other = other_device();
+        let same = tempfile::tempdir().unwrap();
+        let mut disks = vec![("same device", same.path().to_path_buf())];
+        match &other {
+            Some(dir) => disks.push(("other device", dir.path().to_path_buf())),
+            None => eprintln!("no second file system here; cross-device case not run"),
+        }
+        for (label, disk) in disks {
+            let (src, out, work, home) = (
+                tempfile::tempdir().unwrap(),
+                tempfile::tempdir().unwrap(),
+                tempfile::tempdir().unwrap(),
+                tempfile::tempdir().unwrap(),
+            );
+            let registry = src.path().join(".cargo/registry");
+            std::fs::create_dir_all(registry.join("bin")).unwrap();
+            std::fs::write(registry.join("bin/tool"), "#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(
+                registry.join("bin/tool"),
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
+            std::os::unix::fs::symlink("bin/tool", registry.join("link")).unwrap();
+            let mtime = std::fs::metadata(registry.join("bin/tool"))
+                .unwrap()
+                .mtime();
+            let paths = vec!["~/.cargo/registry".to_owned()];
+            let archive = out.path().join("x");
+            let written = save(work.path(), src.path(), &paths, &archive).unwrap();
+            // `~/.cargo` lives on `disk`, with a stale registry in it.
+            let cargo = disk.join("cargo");
+            std::fs::create_dir_all(cargo.join("registry")).unwrap();
+            std::fs::write(cargo.join("registry/stale"), "old").unwrap();
+            std::os::unix::fs::symlink(&cargo, home.path().join(".cargo")).unwrap();
+            extract(
+                &archive,
+                written.bytes,
+                &written.sha256,
+                &declared(work.path(), home.path(), &paths),
+                &AtomicBool::new(false),
+            )
+            .unwrap_or_else(|e| panic!("{label}: {e:#}"));
+            let restored = cargo.join("registry");
+            assert_eq!(
+                std::fs::read_to_string(restored.join("bin/tool")).unwrap(),
+                "#!/bin/sh\n",
+                "{label}"
+            );
+            let tool = std::fs::metadata(restored.join("bin/tool")).unwrap();
+            assert_eq!(tool.permissions().mode() & 0o777, 0o755, "{label}");
+            assert_eq!(tool.mtime(), mtime, "{label}");
+            assert_eq!(
+                std::fs::read_link(restored.join("link")).unwrap(),
+                Path::new("bin/tool"),
+                "{label}"
+            );
+            assert!(!restored.join("stale").exists(), "{label}");
+            // Nothing left beside the registry or in the home directory.
+            let names = |dir: &Path| -> Vec<String> {
+                std::fs::read_dir(dir)
+                    .unwrap()
+                    .flatten()
+                    .map(|e| e.file_name().into_string().unwrap())
+                    .collect()
+            };
+            assert_eq!(names(&cargo), ["registry"], "{label}");
+            assert_eq!(names(home.path()), [".cargo"], "{label}");
+        }
     }
 
     #[test]

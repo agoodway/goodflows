@@ -395,7 +395,7 @@ timeout_secs = 300   # default; bounds the restore and the save separately
 ```
 
 - `name` follows the job name rule and is unique within the job. Jobs that use the same name, values and files share entries, so a `deps` job and a `test` job can share `_build`.
-- `paths` are globs relative to the job's workdir that stay inside it, or directories under `~/` (the home directory of the user running the job), such as `~/.cargo/registry` or `~/.npm`. A `~/` path names one directory below home, and cannot be or contain `.ssh`, `.aws` or `.gnupg`.
+- `paths` are globs relative to the job's workdir that stay inside it, or directories under `~/` (the home directory of the user running the job), such as `~/.cargo/registry` or `~/.npm`. A `~/` path names one directory below home, and cannot be or contain `.ssh`, `.aws` or `.gnupg`. A restore follows your own symlinks under `~/`, such as `~/.cargo` pointing to another disk, and copies the cache onto that disk. In the workdir, a restore refuses a path whose parent directory is a symlink, because a checkout could plant one.
 - `key.files` are globs relative to the workdir. goodflows hashes the sorted matching paths and their contents. No match is not an error.
 - `key.values` and `key.unique` are expressions over `env.*` and `needs.JOB.outputs.KEY`, under the rules of job conditions. Each must be a scalar. A value that fails to evaluate makes that cache miss with a warning.
 - The operating system and CPU architecture are always part of the key. Other matrix dimensions, such as the Node or Rust version, belong in `key.values`. Change a value such as `"'v2'"` to start a cache over.
