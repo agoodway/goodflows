@@ -727,11 +727,21 @@ timeout_secs = 1
     );
 }
 
+/// A command that runs until `file` appears, and fails when it has not
+/// appeared within about 20 seconds. A job that runs until another job
+/// starts proves that the other did not wait for it, however slow the
+/// machine is.
+fn wait_for(file: &str) -> String {
+    format!(
+        "i=0; while [ ! -f {file} ] && [ $i -lt 200 ]; do sleep 0.1; i=$((i+1)); done; test -f {file}"
+    )
+}
+
 #[test]
 fn a_save_waiting_for_a_quiet_run_frees_its_slot() {
     let env = Env::new();
     let p = checkout(
-        r#"
+        &r#"
 [[jobs]]
 name = "deps"
 command = "mkdir -p deps && echo x > deps/f"
@@ -740,23 +750,19 @@ name = "deps"
 paths = ["deps"]
 [[jobs]]
 name = "lint"
-command = "sleep 4; date +%s%N > lint-end"
+command = "{lint}"
 [[jobs]]
 name = "test"
 depends_on = ["deps"]
-command = "date +%s%N > test-start; sleep 1"
-"#,
+command = "touch test-start; sleep 1"
+"#
+        .replace("{lint}", &wait_for("test-start")),
         "https://example.com/org/slots",
     );
     let output = env.run(&p, &["--json", "-p", "2"]);
+    // deps's save waits for lint, but test gets deps's slot meanwhile. lint
+    // runs until test starts, so a save that kept the slot fails lint.
     success(&output);
-    let read = |name: &str| p.read(name).trim().parse::<u128>().unwrap();
-    // deps's save waits for lint, but test gets deps's slot meanwhile.
-    let ahead = read("lint-end").saturating_sub(read("test-start")) / 1_000_000;
-    assert!(
-        ahead >= 2_500,
-        "test started only {ahead} ms before lint ended"
-    );
     assert!(
         of_type(&output, "cache_warning").is_empty(),
         "{}",
@@ -769,34 +775,31 @@ command = "date +%s%N > test-start; sleep 1"
 fn a_save_in_a_called_workflow_does_not_hold_back_the_calls_dependents() {
     let env = Env::new();
     let p = checkout(
-        r#"
+        &r#"
 [[workflows.ci.jobs]]
 name = "lint"
-command = "sleep 4; date +%s%N > lint-end"
+command = "{lint}"
 [[workflows.ci.jobs]]
 name = "call"
 workflow = "child"
 [[workflows.ci.jobs]]
 name = "after"
 depends_on = ["call"]
-command = "date +%s%N > after-start"
+command = "touch after-start"
 [[workflows.child.jobs]]
 name = "x"
 command = "mkdir -p x && echo x > x/f"
 [[workflows.child.jobs.caches]]
 name = "x"
 paths = ["x"]
-"#,
+"#
+        .replace("{lint}", &wait_for("after-start")),
         "https://example.com/org/called",
     );
     let output = env.run(&p, &["run", "ci", "--json", "-p", "3"]);
+    // x's save waits for lint, which runs until after starts, so a save
+    // that held back the call's dependents fails lint.
     success(&output);
-    let read = |name: &str| p.read(name).trim().parse::<u128>().unwrap();
-    let ahead = read("lint-end").saturating_sub(read("after-start")) / 1_000_000;
-    assert!(
-        ahead >= 2_500,
-        "after started only {ahead} ms before lint ended"
-    );
     // The child's save still finished, and its summary and the run's list it.
     let saved = of_type(&output, "cache_saved");
     assert_eq!(saved.len(), 1, "{}", stdout(&output));
