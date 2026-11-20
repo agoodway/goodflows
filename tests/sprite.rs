@@ -6367,3 +6367,124 @@ fn recovery_commands_revoke_an_unresolved_runs_minted_cache_key() {
         assert!(key_files(&fake).is_empty(), "{verb}");
     }
 }
+
+const SECRET_VALUE: &str = "sprite-secret-value-91c2";
+
+/// A Sprite config whose `check` job lists a 1Password secret; setup records
+/// its environment.
+const SECRETS: &str = r#"
+[settings]
+sprite_prefix = "gft"
+[sprite]
+setup = "env > \"$GOODFLOWS_SPRITE_STATE_DIR/../setup-env\""
+resume = "true"
+[settings.secrets]
+DATABASE_URL = "op://ci/postgres/url"
+[[jobs]]
+name = "check"
+secrets = ["DATABASE_URL"]
+command = "printf %s \"$DATABASE_URL\" > secret.txt; echo \"url=$DATABASE_URL\""
+"#;
+
+/// A controller command with the fake 1Password CLI (tests/fixtures/fake-op)
+/// first on `PATH`; it logs each call to `op.log` under the fake root.
+fn with_fake_op(fake: &Fake) -> Command {
+    let values = fake.root.join("op-values");
+    std::fs::write(&values, format!("op://ci/postgres/url={SECRET_VALUE}\n")).unwrap();
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-op");
+    let mut command = fake.command();
+    let path = format!(
+        "{}:{}",
+        fixture.display(),
+        command
+            .get_envs()
+            .find(|(key, _)| *key == "PATH")
+            .and_then(|(_, value)| value)
+            .unwrap()
+            .to_string_lossy()
+    );
+    command
+        .env("PATH", path)
+        .env("FAKE_OP_LOG", fake.root.join("op.log"))
+        .env("FAKE_OP_VALUES", values);
+    command
+}
+
+#[test]
+fn secrets_resolve_on_the_controller_and_reach_only_the_remote_job() {
+    let fake = Fake::new(SECRETS);
+    let output = with_fake_op(&fake)
+        .args(["run", "--sprite", "T-1", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+    let all = events(&output);
+    let run = run_id(&all);
+    // One read, on the controller; the remote run never runs `op`.
+    let calls = std::fs::read_to_string(fake.root.join("op.log")).unwrap();
+    assert_eq!(calls, "read --no-newline op://ci/postgres/url\n");
+    // The remote job got the value; its output is masked.
+    assert_eq!(
+        std::fs::read_to_string(fake.run_dir(&run).join("source/secret.txt")).unwrap(),
+        SECRET_VALUE
+    );
+    let job_output: String = of_type(&all, "job_output")
+        .iter()
+        .map(|e| e["data"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(job_output, "url=[redacted]\n");
+    assert!(!stdout(&output).contains(SECRET_VALUE));
+    // Setup saw neither the value nor the private key.
+    let setup = std::fs::read_to_string(fake.home().join(".goodflows/setup-env")).unwrap();
+    assert!(!setup.contains(SECRET_VALUE), "{setup}");
+    assert!(!setup.contains("GOODFLOWS_SPRITE_SECRETS"), "{setup}");
+    // Never in transport argv or durable metadata.
+    assert!(!fake.argv_log().contains(SECRET_VALUE));
+    for name in ["record.json", "header.json", "events.jsonl"] {
+        let text = std::fs::read_to_string(fake.run_dir(&run).join(name)).unwrap();
+        assert!(!text.contains(SECRET_VALUE), "{name}");
+    }
+}
+
+#[test]
+fn a_source_file_that_contains_a_secret_never_reaches_the_sprite() {
+    // Resolved values are checked like forwarded values: the file is
+    // excluded from the snapshot, so the value never leaves the controller.
+    let fake = Fake::new(SECRETS);
+    fake.write("leaked.txt", &format!("url={SECRET_VALUE}\n"));
+    let output = with_fake_op(&fake)
+        .args(["run", "--sprite", "T-1", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+    let all = events(&output);
+    let excluded = &of_type(&all, "sprite_snapshot")[0]["excluded"];
+    assert_eq!(
+        excluded,
+        &serde_json::json!([{"path": "leaked.txt", "reason": "contains a controller or forwarded credential value"}])
+    );
+    let run = run_id(&all);
+    assert!(!fake.run_dir(&run).join("source/leaked.txt").exists());
+    assert!(!stdout(&output).contains(SECRET_VALUE));
+}
+
+#[test]
+fn pass_env_cannot_forward_the_secrets_key() {
+    let fake = Fake::new(&SECRETS.replace(
+        "resume = \"true\"",
+        "resume = \"true\"\npass_env = [\"GOODFLOWS_SPRITE_SECRETS\"]",
+    ));
+    let output = with_fake_op(&fake)
+        .args(["run", "--sprite", "T-1"])
+        .env("GOODFLOWS_SPRITE_SECRETS", "{}")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        stderr(&output).contains("pass_env must not forward GOODFLOWS_SPRITE_SECRETS"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(!fake.root.join("op.log").exists());
+    assert!(!fake.invoked());
+}

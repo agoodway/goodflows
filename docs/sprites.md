@@ -224,7 +224,8 @@ never contents: `.git`, `.amp`, `.sprite`, `.goodflows`, `.env` and `.env.*`,
 `*.p12`, `*.pfx`, `*.jks`, `*.keystore`), anything under `.ssh`, `.aws` or
 `.gnupg`, files containing a recognized private key, and files containing the
 value of a controller credential (`SPRITE_TOKEN`, `SPRITES_TOKEN`, the
-reporting `token_env`) or of a forwarded variable at least 8 bytes long. This
+reporting `token_env`) or of a forwarded variable or resolved secret at least
+8 bytes long. This
 is a conservative heuristic, not a secret scanner. It excludes synthetic test
 keys too.
 
@@ -280,6 +281,20 @@ later `sprite collect`, `sprite cancel` or a `sprite status` that finds the
 identity idle. When minting fails, the run continues with the Sprite's local
 store and one `cache_remote_unavailable` event. Do not configure a cache key
 for Sprites: `pass_env` and configured env cannot name `[cache] token_env`.
+
+Secrets (`[settings.secrets]` and a job's `secrets`) are resolved on the
+controller, after the remote-env checks and before the snapshot, for the same
+selection the Sprite will run. The Sprite never runs `op`. The values travel
+in the private forwarded-value frame under the reserved name
+`GOODFLOWS_SPRITE_SECRETS` (JSON mapping references to values), which
+`pass_env` cannot name. The worker filters it out of what setup, resume and
+the workflow process inherit, and writes `{"cache": ..., "secrets": {...}}` to
+the workflow runner's stdin instead of the bare cache key. The runner sets
+only the listed secrets on the jobs that list them and masks every value in
+job output. Resolved values count as forwarded values: a source file that
+contains one (8 bytes or more) is excluded from the snapshot, and diagnostics
+mask them. Controller and runner must be the same version; a runner that is
+missing a reference it needs fails the run.
 
 GoodFlows kills every process a hook
 starts when the hook ends, so a hook cannot leave a server running for the

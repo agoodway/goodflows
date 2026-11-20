@@ -1,6 +1,10 @@
-# Spec Delta
+# secrets Specification
 
-## ADDED Requirements
+## Purpose
+
+Defines secrets: declaring secret references in settings, requesting them per job, resolving them through the 1Password CLI, delivering them to job commands only, masking their values in everything goodflows prints or stores, and forwarding them to Sprite runs.
+
+## Requirements
 
 ### Requirement: Settings declare secret references
 `[settings]`, a workflow's `settings` and a profile's `settings` SHALL accept a `secrets` table that maps an environment variable name to a secret reference. Layers SHALL merge by key in the order `[settings]`, workflow, profile, like `env`. A profile MUST NOT define a name that neither `[settings]` nor the workflow defines.
@@ -77,7 +81,7 @@ When `op` is not on `PATH`, a read exits nonzero, a read exceeds its timeout (12
 - **THEN** no job starts and the run exits 1 with `secret_unavailable`
 
 ### Requirement: Resolved values are masked
-goodflows SHALL replace every resolved value of at least 4 bytes with `[redacted]` in all job stdout and stderr before it reaches the terminal, `job_output` events, log files, failure output heads and tails, the summary, the last-run record, MCP results and report uploads, and in every string of published job outputs. A value split across reads or lines SHALL still be masked. A value shorter than 4 bytes SHALL be delivered unmasked with one warning that names the secret.
+goodflows SHALL replace every resolved value of at least 4 bytes with `[redacted]` in all job stdout and stderr before it reaches the terminal, `job_output` events, log files, failure output heads and tails, the summary, the last-run record, MCP results and report uploads, and in published job outputs. A value split across reads or lines SHALL still be masked. A value shorter than 4 bytes SHALL be delivered unmasked with one warning that names the secret.
 
 #### Scenario: Value in failure output
 - **WHEN** a job that lists `DATABASE_URL` prints the value and fails
@@ -91,8 +95,34 @@ goodflows SHALL replace every resolved value of at least 4 bytes with `[redacted
 - **WHEN** a job that lists no secret prints a resolved value it read from a file
 - **THEN** its output shows `[redacted]`
 
+### Requirement: Published job outputs are masked
+goodflows SHALL mask resolved values in every key and every string value of a job's published outputs, and SHALL keep the job error for an invalid output file free of resolved values in any form, before any event, expression, summary or last-run record sees them. A number value SHALL be replaced by the string `[redacted]` when the text the job wrote, or its parsed rendering, contains a resolved value. Two keys that mask to the same text SHALL fail the job.
+
+#### Scenario: Numeric output and output key
+- **WHEN** a job that lists `PIN` (value `12345678`) writes `{"pin": 12345678, "12345678": true}` to `GOODFLOWS_OUTPUT`
+- **THEN** the `job_finished` event, the summary and the last-run record show the outputs as `{"pin": "[redacted]", "[redacted]": true}` and never the value
+
+#### Scenario: Number written in a form the parser changes
+- **WHEN** a job writes a resolved value `12345678901234567890123` or `1234.50` as a JSON number output
+- **THEN** the output is `"[redacted]"`
+
+#### Scenario: Keys that collide after masking
+- **WHEN** a job writes two keys that are different resolved values
+- **THEN** the job fails with `output '[redacted]' is duplicated after masking` and neither value appears
+
+#### Scenario: Output file that is a JSON string
+- **WHEN** a job writes a resolved value as a JSON string or number (such as `1234.50`) instead of an object
+- **THEN** the job fails with `expected a JSON object at line 1 column N` and its error contains neither the value nor its parsed form
+
+### Requirement: A run holding secrets is protected from same-user processes
+On Linux, a local run or Sprite controller that needs any secret SHALL make itself non-dumpable before the first read, so that other processes of the same user, including its jobs, cannot read its memory or `/proc/<pid>/environ`. A run that needs no secret SHALL NOT change this.
+
+#### Scenario: A job probes its parent
+- **WHEN** on Linux, as a user without `CAP_SYS_PTRACE`, a job reads `/proc/$PPID/environ` in a run where another job lists `DATABASE_URL`
+- **THEN** the read fails, while in the same run with no job listing a secret it succeeds
+
 ### Requirement: Sprite runs resolve on the controller
-For `run --sprite`, the controller SHALL resolve the run's secrets and send their values in the private environment frame, never in argv or the header. The Sprite MUST NOT run `op`. Setup and resume hooks MUST NOT receive secret values. Resolved values SHALL be treated as forwarded values: a snapshot file that contains one stops the run, and they are masked in diagnostics.
+For `run --sprite`, the controller SHALL resolve the run's secrets and send their values in the private environment frame, never in argv or the header. The Sprite MUST NOT run `op`. Setup and resume hooks MUST NOT receive secret values. Resolved values SHALL be treated as forwarded values: a source file that contains one is excluded from the snapshot, as forwarded values are, and they are masked in diagnostics.
 
 #### Scenario: Remote job gets the secret
 - **WHEN** a Sprite run selects a job that lists `DATABASE_URL`

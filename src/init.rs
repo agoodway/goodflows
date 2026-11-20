@@ -182,6 +182,7 @@ fn job(name: &str, command: &str, deps: &[&str]) -> Job {
         depends_on: deps.iter().map(|s| (*s).into()).collect(),
         timeout_secs: None,
         env: HashMap::new(),
+        secrets: Vec::new(),
         shell: true,
         reports: Vec::new(),
         partitions_input: None,

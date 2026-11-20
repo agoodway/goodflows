@@ -484,6 +484,10 @@ pub struct Settings {
     /// Command environment defaults, layered between the caller's environment and job env.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub env: BTreeMap<String, String>,
+    /// Secret references by environment variable name, delivered only to
+    /// jobs that list the name in `secrets`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub secrets: BTreeMap<String, String>,
     /// Write one run history file per run. Off by default.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub history: bool,
@@ -508,6 +512,7 @@ impl Default for Settings {
             fail_fast: true,
             workdir: None,
             env: BTreeMap::new(),
+            secrets: BTreeMap::new(),
             history: false,
             history_dir: None,
             log_runs: None,
@@ -526,6 +531,9 @@ pub struct EffectiveSettings {
     /// Merged configured env defaults (shared < workflow < selected profile).
     /// Never includes the caller's environment or job/step overrides.
     pub env: BTreeMap<String, String>,
+    /// Merged secret references by name (shared < workflow < selected profile).
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub secrets: BTreeMap<String, String>,
     pub history: bool,
     pub history_dir: PathBuf,
     pub log_runs: u64,
@@ -565,6 +573,7 @@ impl Settings {
                 .clone()
                 .context("config workdir has not been resolved")?,
             env: self.env.clone(),
+            secrets: self.secrets.clone(),
             history: cli.history.unwrap_or(self.history),
             history_dir: cli
                 .history_dir
@@ -633,6 +642,9 @@ pub struct Job {
     pub timeout_secs: Option<u64>,
     #[serde(default)]
     pub env: HashMap<String, String>,
+    /// Names from the merged `settings.secrets` this job's commands receive.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub secrets: Vec<String>,
     #[serde(default = "default_true")]
     pub shell: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1058,6 +1070,8 @@ pub struct SettingsOverrides {
     pub workdir: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub env: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub secrets: BTreeMap<String, String>,
     /// An explicit `false` wins over a lower `true`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub history: Option<bool>,
@@ -1088,6 +1102,7 @@ impl SettingsOverrides {
             && self.fail_fast.is_none()
             && self.workdir.is_none()
             && self.env.is_empty()
+            && self.secrets.is_empty()
             && self.history.is_none()
             && self.history_dir.is_none()
             && self.log_runs.is_none()
@@ -1100,11 +1115,14 @@ impl SettingsOverrides {
         // string is a real override.
         let mut env = shared.env.clone();
         env.extend(self.env.clone());
+        let mut secrets = shared.secrets.clone();
+        secrets.extend(self.secrets.clone());
         Settings {
             parallelism: self.parallelism.or(shared.parallelism),
             fail_fast: self.fail_fast.unwrap_or(shared.fail_fast),
             workdir: self.workdir.clone().or_else(|| shared.workdir.clone()),
             env,
+            secrets,
             history: self.history.unwrap_or(shared.history),
             history_dir: self
                 .history_dir
@@ -1327,11 +1345,22 @@ impl Config {
             );
         }
         let reporting = self.reporting.as_ref();
+        let cache_token_env = self.cache.as_ref().map(|c| c.token_env.as_str());
         // Validate every authored settings map, including unselected workflows and
         // profiles and entries a later scope overrides.
         note(
             &mut problems,
             validate_settings_env(&self.settings.env, reporting).context("settings env"),
+        );
+        problems.extend(
+            validate_settings_secrets(
+                &self.settings.secrets,
+                &self.settings.env,
+                reporting,
+                cache_token_env,
+            )
+            .into_iter()
+            .map(|problem| problem.context("settings secrets")),
         );
         note(
             &mut problems,
@@ -1342,6 +1371,16 @@ impl Config {
                 &mut problems,
                 validate_settings_env(&workflow.settings.env, reporting)
                     .with_context(|| format!("workflow '{name}' settings env")),
+            );
+            problems.extend(
+                validate_settings_secrets(
+                    &workflow.settings.secrets,
+                    &workflow.settings.env,
+                    reporting,
+                    cache_token_env,
+                )
+                .into_iter()
+                .map(|problem| problem.context(format!("workflow '{name}' settings secrets"))),
             );
             note(
                 &mut problems,
@@ -1357,6 +1396,30 @@ impl Config {
                 validate_settings_env(&environment.settings.env, reporting)
                     .with_context(|| format!("environment '{name}' settings env")),
             );
+            problems.extend(
+                validate_settings_secrets(
+                    &environment.settings.secrets,
+                    &environment.settings.env,
+                    reporting,
+                    cache_token_env,
+                )
+                .into_iter()
+                .map(|problem| problem.context(format!("environment '{name}' settings secrets"))),
+            );
+            // A profile points names that exist at other references; it never
+            // adds one, so `validate` can check every job's names without a profile.
+            for secret in environment.settings.secrets.keys() {
+                let defined = self.settings.secrets.contains_key(secret)
+                    || self
+                        .workflows
+                        .values()
+                        .any(|workflow| workflow.settings.secrets.contains_key(secret));
+                if !defined {
+                    problems.push(anyhow!(
+                        "environment '{name}' settings secrets: {secret} is not defined in [settings.secrets] or a workflow's settings.secrets; a profile can only change the reference of an existing name"
+                    ));
+                }
+            }
             note(
                 &mut problems,
                 environment
@@ -1369,13 +1432,22 @@ impl Config {
             if self.workflows.contains_key("default") {
                 problems.push(anyhow!("root jobs conflict with named workflow 'default'"));
             }
-            let (partitions, job_problems) = validate_jobs(&self.jobs, reporting);
+            let secrets: BTreeSet<&str> =
+                self.settings.secrets.keys().map(String::as_str).collect();
+            let (partitions, job_problems) = validate_jobs(&self.jobs, reporting, &secrets);
             problems.extend(job_problems);
             store_partitions(&mut self.jobs, partitions);
         }
         for (name, workflow) in &mut self.workflows {
             note(&mut problems, validate_workflow_name(name));
-            let (partitions, job_problems) = validate_jobs(&workflow.jobs, reporting);
+            let secrets: BTreeSet<&str> = self
+                .settings
+                .secrets
+                .keys()
+                .chain(workflow.settings.secrets.keys())
+                .map(String::as_str)
+                .collect();
+            let (partitions, job_problems) = validate_jobs(&workflow.jobs, reporting, &secrets);
             problems.extend(
                 job_problems
                     .into_iter()
@@ -1727,6 +1799,7 @@ fn store_partitions(jobs: &mut [Job], partitions: Vec<Option<Partitions>>) {
 fn validate_jobs(
     jobs: &[Job],
     reporting: Option<&Reporting>,
+    secrets: &BTreeSet<&str>,
 ) -> (Vec<Option<Partitions>>, Vec<anyhow::Error>) {
     let mut problems = Vec::new();
     if jobs.is_empty() {
@@ -1758,7 +1831,7 @@ fn validate_jobs(
             problems.push(anyhow!("duplicate job name '{}'", job.name));
             graph = false;
         }
-        let (job_partitions, job_problems) = validate_job(job, reporting, &no_outputs);
+        let (job_partitions, job_problems) = validate_job(job, reporting, secrets, &no_outputs);
         partitions.push(job_partitions);
         problems.extend(
             job_problems
@@ -1890,6 +1963,92 @@ fn validate_settings_env(
     validate_env(env, reporting)
 }
 
+/// One settings table's `secrets`: each name follows the env name rules and
+/// is no credential variable, each reference parses, and no name is also in
+/// the same table's `env`. Returns every problem.
+fn validate_settings_secrets(
+    secrets: &BTreeMap<String, String>,
+    env: &BTreeMap<String, String>,
+    reporting: Option<&Reporting>,
+    cache_token_env: Option<&str>,
+) -> Vec<anyhow::Error> {
+    let mut problems = Vec::new();
+    for (name, reference) in secrets {
+        if !valid_env_name(name) {
+            problems.push(anyhow!(
+                "secret name '{}' must be an environment variable name matching [A-Za-z_][A-Za-z0-9_]*",
+                name.escape_debug()
+            ));
+            continue;
+        }
+        let entry = BTreeMap::from([(name.clone(), String::new())]);
+        if let Err(error) = validate_settings_env(&entry, reporting) {
+            problems.push(error);
+        } else if [
+            crate::secrets::SPRITE_SECRETS_ENV,
+            crate::cache::SPRITE_CACHE_ENV,
+        ]
+        .contains(&name.as_str())
+        {
+            problems.push(anyhow!(
+                "secrets must not set reserved variable {name}; goodflows uses it to forward values to a Sprite"
+            ));
+        } else if reporting.is_some_and(|r| r.url_env == *name) {
+            problems.push(anyhow!(
+                "secrets must not set {name}: it is the reporting url_env"
+            ));
+        } else if cache_token_env == Some(name) {
+            problems.push(anyhow!(
+                "secrets must not set {name}: it is the [cache] token_env, which goodflows removes from every command"
+            ));
+        }
+        if let Err(error) = crate::secrets::Reference::parse(reference) {
+            problems.push(error.context(format!("secret {name}")));
+        }
+        if env.contains_key(name) {
+            problems.push(anyhow!("{name} is set in both env and secrets"));
+        }
+    }
+    problems
+}
+
+/// A job's `secrets`: each name once, each defined in `[settings.secrets]` or
+/// its workflow's `settings.secrets`, and none set by job or step `env`.
+fn validate_job_secrets(job: &Job, defined: &BTreeSet<&str>) -> Vec<anyhow::Error> {
+    let mut problems = Vec::new();
+    let mut seen = HashSet::new();
+    for name in &job.secrets {
+        if !seen.insert(name) {
+            problems.push(anyhow!("secrets lists '{name}' more than once"));
+            continue;
+        }
+        if !defined.contains(name.as_str()) {
+            let mut problem = format!(
+                "secret '{}' is not defined in [settings.secrets] or the workflow's settings.secrets",
+                name.escape_debug()
+            );
+            if let Some(hint) = did_you_mean(name, defined.iter().copied()) {
+                problem = format!("{problem}; {hint}");
+            }
+            problems.push(anyhow!(problem));
+        }
+        if job.env.contains_key(name) {
+            problems.push(anyhow!(
+                "env must not set {name}: the job lists it in secrets"
+            ));
+        }
+        for step in &job.steps {
+            if step.env.contains_key(name) {
+                problems.push(anyhow!(
+                    "step '{}': env must not set {name}: the job lists it in secrets",
+                    step.id
+                ));
+            }
+        }
+    }
+    problems
+}
+
 /// Jobs in one workflow that publish no job outputs, with their kind:
 /// partitioned jobs and workflow-call jobs.
 type NoOutputs<'a> = HashMap<&'a str, &'static str>;
@@ -2001,6 +2160,7 @@ fn validate_partitions(job: &Job) -> Result<Option<Partitions>> {
 fn validate_job(
     job: &Job,
     reporting: Option<&Reporting>,
+    secrets: &BTreeSet<&str>,
     no_outputs: &NoOutputs,
 ) -> (Option<Partitions>, Vec<anyhow::Error>) {
     let mut problems = Vec::new();
@@ -2048,6 +2208,7 @@ fn validate_job(
         )),
     }
     note(&mut problems, validate_env(&job.env, reporting));
+    problems.extend(validate_job_secrets(job, secrets));
     note(&mut problems, condition);
     let mut steps = Vec::new();
     for step in &job.steps {
@@ -2107,6 +2268,7 @@ fn validate_call(job: &Job) -> Result<()> {
         (job.timeout_secs.is_some(), "timeout_secs"),
         (job.partitions_input.is_some(), "partitions"),
         (!job.env.is_empty(), "env"),
+        (!job.secrets.is_empty(), "secrets"),
         (!job.outputs.is_empty(), "outputs"),
         (!job.reports.is_empty(), "reports"),
         (!job.shell, "shell = false"),
@@ -3177,5 +3339,192 @@ mod tests {
         assert!(!CacheConfig::effective(selected.cache.as_ref()).write);
         let (_, selected) = config.workflow(Some("ci"), None).unwrap();
         assert!(selected.cache.is_none());
+    }
+
+    const SECRET_JOB: &str =
+        "[[jobs]]\nname = 'db'\ncommand = 'true'\nsecrets = ['DATABASE_URL']\n";
+
+    #[test]
+    fn secrets_merge_by_key_and_jobs_list_names() {
+        let config = validate(&format!(
+            "[settings.secrets]\nDATABASE_URL = 'op://dev/postgres/url'\nNPM_TOKEN = 'op://dev/npm/token'\n\
+             [environments.ci.settings.secrets]\nDATABASE_URL = 'op://ci/postgres/url'\n\
+             [workflows.release.settings.secrets]\nSTRIPE_KEY = 'op://dev/stripe/key?attribute=password'\n\
+             [[workflows.release.jobs]]\nname = 'pay'\nsecrets = ['STRIPE_KEY', 'NPM_TOKEN']\n\
+             [[workflows.release.jobs.steps]]\nid = 's'\ncommand = 'true'\nenv = {{ OTHER = 'x' }}\n\
+             [environments.ci.settings]\nparallelism = 1\n{SECRET_JOB}"
+        ))
+        .unwrap();
+        let (_, ci) = config.workflow(None, Some("ci")).unwrap();
+        assert_eq!(ci.settings.secrets["DATABASE_URL"], "op://ci/postgres/url");
+        assert_eq!(ci.settings.secrets["NPM_TOKEN"], "op://dev/npm/token");
+        assert_eq!(ci.jobs[0].secrets, ["DATABASE_URL"]);
+        let (_, plain) = config.workflow(None, None).unwrap();
+        assert_eq!(
+            plain.settings.secrets["DATABASE_URL"],
+            "op://dev/postgres/url"
+        );
+        let (_, release) = config.workflow(Some("release"), Some("ci")).unwrap();
+        assert_eq!(release.settings.secrets.len(), 3);
+        let overrides: SettingsOverrides =
+            toml::from_str("secrets = { A = 'op://v/i/f' }").unwrap();
+        assert!(!overrides.is_empty());
+    }
+
+    #[test]
+    fn secrets_reject_bad_references_and_names() {
+        let cases = [
+            (
+                "DATABASE_URL = '0p://dev/postgres/url'",
+                "only op:// references are supported",
+            ),
+            (
+                "DATABASE_URL = 'hunter2'",
+                "only op:// references are supported",
+            ),
+            (
+                "DATABASE_URL = 'op://dev/postgres'",
+                "op://vault/item/field",
+            ),
+            (
+                "DATABASE_URL = 'op://dev/github/2fa/one-time password?attribute=otp'",
+                "whitespace",
+            ),
+            (
+                "'1BAD' = 'op://v/i/f'",
+                "secret name '1BAD' must be an environment variable name",
+            ),
+            (
+                "GOODFLOWS_RUN_ID = 'op://v/i/f'",
+                "reserved variable GOODFLOWS_RUN_ID",
+            ),
+            (
+                "GOODFLOWS_PARTITION = 'op://v/i/f'",
+                "reserved variable GOODFLOWS_PARTITION",
+            ),
+            (
+                "GOODFLOWS_OUTPUT = 'op://v/i/f'",
+                "reserved variable GOODFLOWS_OUTPUT",
+            ),
+            (
+                "GOODFLOWS_SPRITE_SECRETS = 'op://v/i/f'",
+                "reserved variable GOODFLOWS_SPRITE_SECRETS",
+            ),
+            (
+                "GOODFLOWS_SPRITE_CACHE = 'op://v/i/f'",
+                "reserved variable GOODFLOWS_SPRITE_CACHE",
+            ),
+            (
+                "GOODFLOWS_API_KEY = 'op://v/i/f'",
+                "it is the reporting token_env",
+            ),
+            (
+                "GOODFLOWS_URL = 'op://v/i/f'",
+                "it is the reporting url_env",
+            ),
+            (
+                "GOODFLOWS_CACHE_KEY = 'op://v/i/f'",
+                "it is the [cache] token_env",
+            ),
+        ];
+        let blocks = "[reporting]\nproject = 'p'\n[cache]\n";
+        for (entry, expected) in cases {
+            for scope in [
+                "settings",
+                "workflows.w.settings",
+                "environments.e.settings",
+            ] {
+                let shared = if scope == "settings" {
+                    ""
+                } else {
+                    "[settings.secrets]\nDATABASE_URL = 'op://dev/postgres/url'\n"
+                };
+                let error = validate(&format!(
+                    "{blocks}{shared}[{scope}.secrets]\n{entry}\n\
+                     [[workflows.w.jobs]]\nname = 'a'\ncommand = 'true'\n"
+                ))
+                .unwrap_err();
+                assert!(error.contains(expected), "{scope} {entry}: {error}");
+                assert!(error.contains("settings secrets"), "{error}");
+            }
+        }
+        let error = validate(&format!(
+            "{SECRET_JOB}[settings.env]\nDATABASE_URL = 'x'\n[settings.secrets]\nDATABASE_URL = 'op://v/i/f'\n"
+        ))
+        .unwrap_err();
+        assert!(
+            error.contains("DATABASE_URL is set in both env and secrets"),
+            "{error}"
+        );
+        // Different tables may set the same name: the secret wins for listing jobs.
+        validate(&format!(
+            "{SECRET_JOB}[settings.secrets]\nDATABASE_URL = 'op://v/i/f'\n[workflows.w.settings.env]\nDATABASE_URL = 'x'\n\
+             [[workflows.w.jobs]]\nname = 'a'\ncommand = 'true'\n"
+        ))
+        .unwrap();
+        validate(
+            "[[jobs]]\nname = 'a'\ncommand = 'true'\n[settings.secrets]\nA = 'op://dev/github/2fa/otp?attribute=otp'\n",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn job_secrets_must_be_defined_once_and_not_set_by_env() {
+        let defined = "[settings.secrets]\nDATABASE_URL = 'op://v/i/f'\n";
+        let cases = [
+            (
+                "[[jobs]]\nname = 'db'\ncommand = 'true'\nsecrets = ['STRIPE_KEY']\n".to_owned(),
+                "job 'db': secret 'STRIPE_KEY' is not defined",
+            ),
+            (
+                "[[jobs]]\nname = 'db'\ncommand = 'true'\nsecrets = ['DATABASE_URL', 'DATABASE_URL']\n".into(),
+                "job 'db': secrets lists 'DATABASE_URL' more than once",
+            ),
+            (
+                "[[jobs]]\nname = 'db'\ncommand = 'true'\nsecrets = ['DATABASE_URL']\nenv = { DATABASE_URL = 'x' }\n".into(),
+                "job 'db': env must not set DATABASE_URL: the job lists it in secrets",
+            ),
+            (
+                "[[jobs]]\nname = 'db'\nsecrets = ['DATABASE_URL']\n[[jobs.steps]]\nid = 's'\ncommand = 'true'\nenv = { DATABASE_URL = 'x' }\n".into(),
+                "step 's': env must not set DATABASE_URL",
+            ),
+            (
+                "[[jobs]]\nname = 'call'\nworkflow = 'w'\nsecrets = ['DATABASE_URL']\n[[workflows.w.jobs]]\nname = 'a'\ncommand = 'true'\n".into(),
+                "workflow-call jobs do not support secrets",
+            ),
+        ];
+        for (jobs, expected) in cases {
+            let error = validate(&format!("{defined}{jobs}")).unwrap_err();
+            assert!(error.contains(expected), "{error}");
+        }
+        // A workflow's own secrets are not visible to another workflow's jobs.
+        let error = validate(
+            "[workflows.a.settings.secrets]\nX = 'op://v/i/f'\n[[workflows.a.jobs]]\nname = 'j'\ncommand = 'true'\nsecrets = ['X']\n\
+             [[workflows.b.jobs]]\nname = 'j'\ncommand = 'true'\nsecrets = ['X']\n",
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("workflow 'b': job 'j': secret 'X' is not defined"),
+            "{error}"
+        );
+        assert!(!error.contains("workflow 'a'"), "{error}");
+    }
+
+    #[test]
+    fn profiles_cannot_add_secret_names() {
+        let error = validate(&format!(
+            "{SECRET_JOB}[settings.secrets]\nDATABASE_URL = 'op://dev/p/u'\n[environments.ci.settings.secrets]\nNPM_TOKEN = 'op://ci/npm/token'\n"
+        ))
+        .unwrap_err();
+        assert!(
+            error.contains("environment 'ci' settings secrets: NPM_TOKEN is not defined"),
+            "{error}"
+        );
+        // A name a workflow defines may be switched by a profile.
+        validate(
+            "[workflows.w.settings.secrets]\nX = 'op://v/i/f'\n[[workflows.w.jobs]]\nname = 'j'\ncommand = 'true'\nsecrets = ['X']\n\
+             [environments.ci.settings.secrets]\nX = 'op://ci/i/f'\n",
+        )
+        .unwrap();
     }
 }
