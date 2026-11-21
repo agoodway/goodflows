@@ -1,0 +1,274 @@
+#!/usr/bin/env bash
+# Launches, inspects, drives, and tears down one isolated goodflows CLI
+# verification instance: this checkout's CLI, built once, against a fresh
+# GoodFlows Web server (goodflows_web's own verify-goodflows launch) with a
+# throwaway project, key and scratch git checkout. See ../SKILL.md.
+#
+#   eval "$(control-goodflows-cli launch)"   # exports RUN_ID, GF_URL, GF_RUN_DIR, GF_CHECKOUT
+#   control-goodflows-cli doctor
+#   control-goodflows-cli cli <name> <goodflows args...>   # in the scratch checkout
+#   control-goodflows-cli git <git args...>               # in the scratch checkout
+#   control-goodflows-cli api <name> <METHOD> <path> [json-body]
+#   control-goodflows-cli record <feature-id> <entry-point> <pass|fail> <artifact>...
+#   control-goodflows-cli finish <pass|fail|partial> [note]
+#   control-goodflows-cli cleanup
+#
+# GOODFLOWS_WEB_DIR names a goodflows_web checkout whose .agents/setup has run
+# (default: ../goodflows_web next to this repository).
+set -euo pipefail
+
+repo=$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel)
+evidence_root="$repo/.verify/goodflows-cli"
+binary="$repo/target/debug/goodflows"
+
+[[ -f "$HOME/.local/share/goodflows/env" ]] && source "$HOME/.local/share/goodflows/env"
+
+die() { echo "control-goodflows-cli: $*" >&2; exit 1; }
+
+# Verify-run evidence needs S3 storage that returns x-amz-checksum-sha256 on
+# HEAD; moto does not, and MinIO no longer publishes binaries. versitygw's
+# posix backend does, so launch runs a pinned release on local disk.
+vgw_version=1.11.0
+vgw_sha256=1f075c9dc92fef232f5b3c7465711ddc5e1b062b2b6df4a3bd246a4be5b35b52
+vgw_cache="${XDG_CACHE_HOME:-$HOME/.cache}/verify-goodflows-cli/versitygw-$vgw_version"
+
+versitygw_binary() {
+  local bin="$vgw_cache/versitygw"
+  if [[ ! -x $bin ]]; then
+    local tgz="$vgw_cache.tar.gz"
+    mkdir -p "$vgw_cache"
+    curl -sSfL -o "$tgz" \
+      "https://github.com/versity/versitygw/releases/download/v$vgw_version/versitygw_v${vgw_version}_Linux_x86_64.tar.gz" ||
+      die "could not download versitygw $vgw_version"
+    echo "$vgw_sha256  $tgz" | sha256sum -c --quiet - || { rm -f "$tgz"; die "versitygw download has the wrong SHA-256"; }
+    tar -xzf "$tgz" -C "$vgw_cache" --strip-components=1 && rm -f "$tgz"
+  fi
+  echo "$bin"
+}
+
+free_port() {
+  local port
+  for port in $(seq "$1" "$2"); do
+    (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null || { echo "$port"; return; }
+  done
+  die "no free port in $1-$2"
+}
+
+load_run() {
+  [[ -n ${RUN_ID:-} ]] || die "RUN_ID is not set; run: eval \"\$(control-goodflows-cli launch)\""
+  run_dir="$evidence_root/$RUN_ID"
+  [[ -f "$run_dir/instance.env" ]] || die "no instance for RUN_ID=$RUN_ID ($run_dir/instance.env missing)"
+  # shellcheck source=/dev/null
+  source "$run_dir/instance.env"
+}
+
+web() { RUN_ID=$WEB_RUN_ID "$WEB_DIR/.agents/skills/verify-goodflows/scripts/control-goodflows" "$@"; }
+
+cmd_launch() {
+  local web_dir=${GOODFLOWS_WEB_DIR:-$repo/../goodflows_web}
+  [[ -x "$web_dir/.agents/skills/verify-goodflows/scripts/control-goodflows" ]] ||
+    die "no goodflows_web checkout with the verify-goodflows skill at $web_dir; set GOODFLOWS_WEB_DIR"
+  web_dir=$(cd "$web_dir" && pwd)
+  command -v jq >/dev/null || die "jq is not installed"
+
+  local stamp sha run_id
+  stamp=$(date -u +%Y%m%dT%H%M%SZ)
+  sha=$(git -C "$repo" rev-parse HEAD)
+  run_id="$stamp-${sha:0:7}"
+  run_dir="$evidence_root/$run_id"
+  mkdir -p "$run_dir"
+  grep -qxF '/.verify/' "$repo/.gitignore" 2>/dev/null || printf '/.verify/\n' >>"$repo/.gitignore"
+
+  local porcelain tree
+  porcelain=$(git -C "$repo" status --porcelain -- . ':!.verify' ':!.gitignore')
+  if [[ -z $porcelain ]]; then tree=clean; else tree=dirty; fi
+
+  echo "control-goodflows-cli: building the CLI" >&2
+  (cd "$repo" && cargo build --quiet) >"$run_dir/cargo-build.log" 2>&1 ||
+    { tail -30 "$run_dir/cargo-build.log" >&2; die "cargo build failed"; }
+
+  # Object storage for verify-run evidence, before the server reads CACHE_S3_*.
+  local s3_port s3_dir s3_bin s3_secret
+  s3_port=$(free_port 4500 4599)
+  s3_dir=$(mktemp -d "/tmp/verify-goodflows-cli-s3-$run_id.XXXX")
+  s3_bin=$(versitygw_binary)
+  s3_secret=$(head -c 18 /dev/urandom | base64 | tr -d '/+=')
+  mkdir -p "$s3_dir/data/verify-artifacts"
+  ROOT_ACCESS_KEY=verify ROOT_SECRET_KEY=$s3_secret setsid "$s3_bin" --port "127.0.0.1:$s3_port" \
+    posix "$s3_dir/data" >"$run_dir/versitygw.log" 2>&1 </dev/null &
+  local s3_pid=$!
+  for _ in $(seq 50); do (exec 3<>"/dev/tcp/127.0.0.1/$s3_port") 2>/dev/null && break; sleep 0.2; done
+  (exec 3<>"/dev/tcp/127.0.0.1/$s3_port") 2>/dev/null || die "versitygw did not start; see $run_dir/versitygw.log"
+  export CACHE_S3_BUCKET=verify-artifacts CACHE_S3_ENDPOINT="http://127.0.0.1:$s3_port" CACHE_S3_REGION=us-east-1 \
+    CACHE_S3_ACCESS_KEY_ID=verify CACHE_S3_SECRET_ACCESS_KEY=$s3_secret
+
+  echo "control-goodflows-cli: launching GoodFlows Web from $web_dir" >&2
+  local web_env
+  web_env=$("$web_dir/.agents/skills/verify-goodflows/scripts/control-goodflows" launch) ||
+    die "goodflows_web launch failed"
+  eval "$web_env" # RUN_ID, GF_URL, GF_RUN_DIR of the web run
+  local web_run_id=$RUN_ID web_url=$GF_URL web_run_dir=$GF_RUN_DIR
+  # shellcheck source=/dev/null
+  source "$web_run_dir/instance.env" # GF_BRANCH_DB
+
+  # Setup, not proof: the key is minted the way the dashboard's API Keys page
+  # does it (Accounts.create_api_key/2), as goodflows_web's CLI smoke does.
+  local key
+  key=$(cd "$web_dir/app" && env -u PHX_HOST BRANCH_DB="$GF_BRANCH_DB" MIX_ENV=dev mix run -e '
+    alias GoodFlows.{Accounts, Repo}
+    user = Accounts.get_user_by_email("user@example.com")
+    account = Repo.get_by!(Accounts.Account, name: "Acme Corp")
+    {:ok, {_key, token}} =
+      Accounts.create_api_key(Accounts.get_account_user(user, account), %{
+        "name" => "verify-goodflows-cli", "type" => "private"})
+    IO.puts("TOKEN=" <> token)' 2>"$run_dir/mint-key.log" | sed -n 's/^TOKEN=//p')
+  [[ $key == sk_* ]] || die "could not mint an sk_ key; see $run_dir/mint-key.log"
+
+  local project="verify-cli-${stamp,,}"
+  project=${project//[^a-z0-9-]/-}
+  local status
+  status=$(curl -sS -o "$run_dir/project.json" -w '%{http_code}' -H "Authorization: Bearer $key" \
+    -H 'content-type: application/json' -H 'accept: application/json' \
+    -d "{\"slug\":\"$project\"}" "$web_url/api/v1/projects")
+  [[ $status == 201 ]] || die "creating project $project returned HTTP $status"
+
+  # A scratch git checkout on feat/verify, one commit ahead of main, with a bare origin.
+  local scratch checkout
+  scratch=$(mktemp -d "/tmp/verify-goodflows-cli-$run_id.XXXX")
+  checkout="$scratch/checkout"
+  git init -q --bare "$scratch/origin.git"
+  git init -q -b main "$checkout"
+  (
+    cd "$checkout"
+    git config user.name verify && git config user.email verify@example.com
+    printf '[reporting]\nproject = "%s"\n\n[[jobs]]\nname = "test"\ncommand = "true"\n' "$project" >goodflows.toml
+    printf '/.goodflows/\n/.verify/\n' >.gitignore
+    mkdir -p lib && printf 'one\n' >lib/base.ex
+    git add -A && git commit -qm base
+    git remote add origin "$scratch/origin.git" && git push -q origin main
+    git checkout -q -b feat/verify
+    printf 'login\n' >lib/login.ex && git add -A && git commit -qm 'add login'
+  )
+
+  cat >"$run_dir/instance.env" <<ENV
+WEB_DIR=$web_dir
+WEB_RUN_ID=$web_run_id
+WEB_RUN_DIR=$web_run_dir
+GF_URL=$web_url
+GF_PROJECT=$project
+GF_SCRATCH=$scratch
+GF_CHECKOUT=$checkout
+GF_SHA=$sha
+GF_S3_PID=$s3_pid
+GF_S3_DIR=$s3_dir
+GF_S3_URL=http://127.0.0.1:$s3_port
+GOODFLOWS_API_KEY=$key
+ENV
+  chmod 600 "$run_dir/instance.env"
+  {
+    echo "# goodflows CLI verification run $run_id"
+    echo
+    echo "- Commit: \`$sha\`"
+    echo "- Branch: \`$(git -C "$repo" branch --show-current || true)\`"
+    echo "- Working tree: $tree"
+    if [[ $tree == dirty ]]; then
+      echo "- Changed files:"
+      printf '%s\n' "$porcelain" | sed 's/^/  - `/; s/$/`/'
+    fi
+    echo "- Started: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "- Server: $web_url, goodflows_web \`$(git -C "$web_dir" rev-parse HEAD)\` (evidence in \`$web_run_dir\`)"
+    echo "- Project: \`$project\`; scratch checkout \`$checkout\` on \`feat/verify\`"
+    echo "- Evidence storage: versitygw $vgw_version at http://127.0.0.1:$s3_port, bucket \`verify-artifacts\` in \`$s3_dir/data\`"
+    echo
+    echo "## Features"
+    echo
+    echo "| Feature | Entry point | Result | Artifacts |"
+    echo "| --- | --- | --- | --- |"
+  } >"$run_dir/run.md"
+  echo "export RUN_ID=$run_id GF_URL=$web_url GF_RUN_DIR=$run_dir GF_CHECKOUT=$checkout"
+  echo "control-goodflows-cli: ready; project $project at $web_url" >&2
+}
+
+cmd_doctor() {
+  load_run
+  local ok=0
+  check() { if "${@:2}"; then echo "ok    $1"; else echo "FAIL  $1"; ok=1; fi; }
+  web doctor | sed 's/^/web: /' || ok=1
+  check "CLI binary is built from this checkout" test "$binary" -nt "$repo/Cargo.toml"
+  check "checkout is still at the launched commit ${GF_SHA:0:7}" \
+    bash -c "[[ \$(git -C '$repo' rev-parse HEAD) == $GF_SHA ]]"
+  check "the key reads project $GF_PROJECT" bash -c "[[ \$(curl -s -o /dev/null -w '%{http_code}' \
+    -H 'Authorization: Bearer $GOODFLOWS_API_KEY' $GF_URL/api/v1/projects/$GF_PROJECT) == 200 ]]"
+  check "scratch checkout $GF_CHECKOUT exists" test -d "$GF_CHECKOUT/.git"
+  check "versitygw $GF_S3_PID serves $GF_S3_URL" bash -c "kill -0 $GF_S3_PID 2>/dev/null && (exec 3<>/dev/tcp/127.0.0.1/${GF_S3_URL##*:})"
+  return $ok
+}
+
+cmd_cli() {
+  load_run
+  [[ $# -ge 1 ]] || die "usage: cli <name> <goodflows args...>"
+  local name=$1 out="$run_dir/cli/$1" code=0
+  shift
+  mkdir -p "$run_dir/cli"
+  printf 'goodflows %s\n' "$*" >"$out.cmd"
+  (cd "$GF_CHECKOUT" && GOODFLOWS_URL=$GF_URL GOODFLOWS_API_KEY=$GOODFLOWS_API_KEY NO_COLOR=1 \
+    "$binary" "$@") >"$out.stdout" 2>"$out.stderr" || code=$?
+  echo "$code" >"$out.exit"
+  echo "exit $code  ($out.stdout)"
+  cat "$out.stdout"
+  [[ -s $out.stderr ]] && sed 's/^/stderr: /' "$out.stderr"
+  return 0
+}
+
+cmd_git() {
+  load_run
+  git -C "$GF_CHECKOUT" "$@"
+}
+
+cmd_api() {
+  load_run
+  [[ $# -ge 3 ]] || die "usage: api <name> <METHOD> <path> [json-body]"
+  local name=$1 method=$2 path=${3//\{project\}/$GF_PROJECT} body=${4:-}
+  local out="$run_dir/api/$name"
+  mkdir -p "$run_dir/api"
+  local args=(-sS -X "$method" -H "Authorization: Bearer $GOODFLOWS_API_KEY" -H 'accept: application/json'
+    -o "$out.json" -w '%{http_code}' "$GF_URL$path")
+  [[ -n $body ]] && args+=(-H 'content-type: application/json' --data "$body")
+  printf '%s %s\n%s\n' "$method" "$path" "$body" >"$out.request"
+  curl "${args[@]}" >"$out.status"
+  echo "HTTP $(cat "$out.status")  ($out.json)"
+  jq -c . "$out.json" 2>/dev/null || cat "$out.json"
+}
+
+cmd_record() {
+  load_run
+  [[ $# -ge 3 ]] || die "usage: record <feature-id> <entry-point> <pass|fail> <artifact>..."
+  local feature=$1 entry=$2 result=$3
+  shift 3
+  echo "| \`$feature\` | $entry | $result | $(printf '`%s` ' "$@")|" >>"$run_dir/run.md"
+}
+
+cmd_finish() {
+  load_run
+  { echo; echo "## Outcome"; echo; echo "- Finished: $(date -u +%Y-%m-%dT%H:%M:%SZ)"; echo "- Outcome: ${1:?pass, fail, or partial}${2:+ — $2}"; } >>"$run_dir/run.md"
+}
+
+cmd_cleanup() {
+  load_run
+  web cleanup || true
+  [[ $GF_SCRATCH == /tmp/verify-goodflows-cli-* ]] && rm -rf "$GF_SCRATCH"
+  # setsid made versitygw its own group leader: stop only that group.
+  [[ -n ${GF_S3_PID:-} ]] && { kill -- "-$GF_S3_PID" 2>/dev/null || true; }
+  [[ ${GF_S3_DIR:-} == /tmp/verify-goodflows-cli-s3-* ]] && rm -rf "$GF_S3_DIR"
+  # The key died with the run database; drop it from the kept evidence anyway.
+  sed -i 's/^GOODFLOWS_API_KEY=.*/GOODFLOWS_API_KEY=/' "$run_dir/instance.env"
+  echo "- Cleaned up: $(date -u +%Y-%m-%dT%H:%M:%SZ) (server and versitygw stopped, database dropped, scratch checkout and bucket removed)" >>"$run_dir/run.md"
+  echo "control-goodflows-cli: cleaned up; evidence kept in $run_dir" >&2
+}
+
+command=${1:-}
+shift || true
+case $command in
+  launch | doctor | cli | git | api | record | finish | cleanup) "cmd_$command" "$@" ;;
+  *) sed -n '2,18p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 2 ;;
+esac

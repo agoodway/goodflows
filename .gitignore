@@ -5,3 +5,4 @@
 .amp/portals/*
 /.goodflows/
 node_modules/
+/.verify/
