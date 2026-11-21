@@ -900,3 +900,276 @@ fn repeated_nested_calls_hash_each_workflow_once() {
     // The deepest command still reaches the root hash.
     assert_ne!(hash(&config("false")), root);
 }
+
+// ---- run links ----
+
+const SESSION: &str = "T-3bb6cad7-8c04-413a-b23c-5fca67cd4f7b";
+const FIRST: &str = "T-0e54fb55-a115-4ac7-80fe-8fde26e76afb";
+const SECOND: &str = "T-7a1c2d3e-4f50-4617-8829-a0b1c2d3e4f5";
+
+fn thread(id: &str) -> String {
+    format!("https://ampcode.com/threads/{id}")
+}
+
+/// git in `dir` with a fixed identity and none of the machine's hooks, which
+/// may add trailers.
+fn git_in(dir: &Path, args: &[&str]) -> String {
+    let output = std::process::Command::new("git")
+        .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+        .args([
+            "-c",
+            "commit.gpgsign=false",
+            "-c",
+            "core.hooksPath=/nonexistent",
+        ])
+        .args(["-c", "init.defaultBranch=main"])
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap().trim().to_owned()
+}
+
+/// The links of the history file a run's summary names.
+fn links_of(output: &std::process::Output) -> Value {
+    success(output);
+    let path = summary_of(output)["history_file"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    record(Path::new(&path))
+        .get("links")
+        .cloned()
+        .unwrap_or(Value::Null)
+}
+
+const FIRST_MESSAGE: &str = "Add the first part\n\nfollow-up to GOO-200";
+const SECOND_MESSAGE: &str = "Add the second part";
+
+#[test]
+fn runs_link_their_session_branch_and_squash_commits() {
+    let p = Project::new(&format!("[settings]\nticket_prefixes = [\"GOO\"]\n{CI}"));
+    git_in(&p.dir, &["init", "-q"]);
+    git_in(&p.dir, &["add", "goodflows.toml"]);
+    git_in(&p.dir, &["commit", "-q", "-m", "Base"]);
+    let base = git_in(&p.dir, &["rev-parse", "HEAD"]);
+    git_in(&p.dir, &["update-ref", "refs/remotes/origin/HEAD", &base]);
+    git_in(&p.dir, &["checkout", "-q", "-b", "goo-291-fix"]);
+    let first = format!("{FIRST_MESSAGE}\n\nAmp-Thread-ID: {}", thread(FIRST));
+    let second = format!("{SECOND_MESSAGE}\n\nAmp-Thread-ID: {}", thread(SECOND));
+    for message in [&first, &second] {
+        git_in(&p.dir, &["commit", "-q", "--allow-empty", "-m", message]);
+    }
+
+    // A feature branch in an agent session, with a flag.
+    let output = p
+        .command()
+        .env("AMP_CURRENT_THREAD_ID", SESSION)
+        .args(["run", "ci", "--json", "--history", "--ticket", "GOO-300"])
+        .output()
+        .unwrap();
+    // The branch names the ticket; the body's GOO-200 is not one.
+    assert_eq!(
+        links_of(&output),
+        serde_json::json!({
+            "threads": [thread(SESSION), thread(SECOND), thread(FIRST)],
+            "tickets": ["GOO-300", "GOO-291"],
+        })
+    );
+
+    // `main` after a squash merge: GitHub's default message copies each
+    // commit's message into the body, where the thread lines survive.
+    git_in(&p.dir, &["checkout", "-q", "main"]);
+    let squash = format!("GOO-291: Fix the thing (#45)\n\n* {first}\n\n* {second}\n");
+    git_in(&p.dir, &["commit", "-q", "--allow-empty", "-m", &squash]);
+    let head = git_in(&p.dir, &["rev-parse", "HEAD"]);
+    git_in(&p.dir, &["update-ref", "refs/remotes/origin/HEAD", &head]);
+    let output = p.run(&["run", "ci", "--json", "--history"]);
+    assert_eq!(
+        links_of(&output),
+        serde_json::json!({
+            "threads": [thread(FIRST), thread(SECOND)],
+            "tickets": ["GOO-291"],
+        })
+    );
+
+    // A squash message trimmed to its title keeps only the ticket.
+    git_in(
+        &p.dir,
+        &[
+            "commit",
+            "-q",
+            "--amend",
+            "--allow-empty",
+            "-m",
+            "GOO-291: Fix the thing (#45)",
+        ],
+    );
+    let head = git_in(&p.dir, &["rev-parse", "HEAD"]);
+    git_in(&p.dir, &["update-ref", "refs/remotes/origin/HEAD", &head]);
+    let output = p.run(&["run", "ci", "--json", "--history"]);
+    assert_eq!(
+        links_of(&output),
+        serde_json::json!({"tickets": ["GOO-291"]})
+    );
+}
+
+#[test]
+fn every_invocation_that_records_has_the_runs_links() {
+    // A called child records the root's links, also when only it records.
+    let p = Project::new(CALLS);
+    let suite = p.dir.join("goodflows-history/suite");
+    for (args, root_records) in [
+        (&["run", "ci", "--json", "--ticket", "GOO-291"][..], false),
+        (
+            &["run", "ci", "--json", "--ticket", "GOO-291", "--history"],
+            true,
+        ),
+    ] {
+        let output = p.run(args);
+        success(&output);
+        let child = record(history_files(&suite).last().unwrap());
+        assert_eq!(child["links"], serde_json::json!({"tickets": ["GOO-291"]}));
+        let root = common::events(&output).pop().unwrap();
+        match root.get("history_file") {
+            Some(path) => {
+                assert!(root_records);
+                let root = record(Path::new(path.as_str().unwrap()));
+                assert_eq!(root["links"], child["links"]);
+            }
+            None => assert!(!root_records),
+        }
+    }
+
+    // Outside a git checkout, flags and the session still supply links.
+    let outside = Project::new(CI);
+    let output = outside
+        .command()
+        .env("GIT_CEILING_DIRECTORIES", outside.dir.parent().unwrap())
+        .env("AMP_CURRENT_THREAD_ID", SESSION)
+        .args(["run", "ci", "--json", "--history", "--ticket", "GOO-1"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        links_of(&output),
+        serde_json::json!({"threads": [thread(SESSION)], "tickets": ["GOO-1"]})
+    );
+
+    // Settings `env` never supplies links: only the caller's environment does.
+    let p = Project::new(&format!(
+        "[settings.env]\nGOODFLOWS_TICKETS = \"GOO-9\"\n\
+         GOODFLOWS_THREAD_URLS = \"{}\"\nAMP_CURRENT_THREAD_ID = \"{SESSION}\"\n{CI}",
+        thread(FIRST)
+    ));
+    let output = p.run(&["run", "ci", "--json", "--history"]);
+    assert_eq!(links_of(&output), Value::Null);
+}
+
+#[test]
+fn links_are_collected_once_and_only_when_a_record_is_built() {
+    let tools = tempfile::tempdir().unwrap();
+    let path = fake_git(tools.path(), None);
+    let reports = "[reporting]\nproject = \"p\"\n\
+         [[jobs]]\nname = \"t\"\ncommand = \"true\"\nreports = [\"test-timings\"]\n";
+    let run = |p: &Project, args: &[&str]| {
+        let output = p.command().env("PATH", &path).args(args).output().unwrap();
+        success(&output);
+        output
+    };
+    // Neither the file nor the upload: reporting captures `source` with git,
+    // but nothing scans for links.
+    let p = Project::new(reports);
+    git_in(&p.dir, &["init", "-q"]);
+    run(&p, &["--json", "--ticket", "GOO-1"]);
+    assert!(std::fs::read_to_string(tools.path().join("git.log"))
+        .unwrap()
+        .contains("rev-parse HEAD"));
+    assert_eq!(link_scans(tools.path()), 0);
+    // An upload skipped for missing credentials sends nothing.
+    let p = Project::new(&reports.replace("\"p\"\n", "\"p\"\nhistory = true\n"));
+    run(&p, &["--json", "--ticket", "GOO-1"]);
+    assert_eq!(link_scans(tools.path()), 0);
+
+    // History on for a run that calls three workflows: one scan.
+    let p = Project::new(
+        "[[workflows.ci.jobs]]\nname = \"one\"\nworkflow = \"a\"\n\
+         [[workflows.ci.jobs]]\nname = \"two\"\nworkflow = \"b\"\n\
+         [[workflows.ci.jobs]]\nname = \"three\"\nworkflow = \"c\"\n\
+         [[workflows.a.jobs]]\nname = \"x\"\ncommand = \"true\"\n\
+         [[workflows.b.jobs]]\nname = \"y\"\ncommand = \"true\"\n\
+         [[workflows.c.jobs]]\nname = \"z\"\ncommand = \"true\"\n",
+    );
+    git_in(&p.dir, &["init", "-q"]);
+    git_in(&p.dir, &["add", "goodflows.toml"]);
+    git_in(&p.dir, &["commit", "-q", "-m", "GOO-5 init"]);
+    let output = run(
+        &p,
+        &["run", "ci", "--json", "--history", "--ticket", "GOO-1"],
+    );
+    assert_eq!(link_scans(tools.path()), 1);
+    let files: Vec<_> = common::events(&output)
+        .iter()
+        .filter_map(|e| e["history_file"].as_str().map(str::to_owned))
+        .collect();
+    assert_eq!(files.len(), 4);
+    for file in files {
+        assert_eq!(
+            record(Path::new(&file))["links"],
+            serde_json::json!({"tickets": ["GOO-1"]})
+        );
+    }
+}
+
+#[test]
+fn a_scan_past_its_timeout_adds_no_git_links_and_keeps_the_source() {
+    let p = Project::new(&format!("[settings]\nticket_prefixes = [\"GOO\"]\n{CI}"));
+    std::fs::write(p.dir.join(".gitignore"), "goodflows-history/\n").unwrap();
+    git_in(&p.dir, &["init", "-q"]);
+    git_in(&p.dir, &["add", "."]);
+    git_in(&p.dir, &["commit", "-q", "-m", "Base"]);
+    let base = git_in(&p.dir, &["rev-parse", "HEAD"]);
+    git_in(&p.dir, &["update-ref", "refs/remotes/origin/HEAD", &base]);
+    // The branch names no ticket, so only the scan supplies git links.
+    git_in(&p.dir, &["checkout", "-q", "-b", "feature"]);
+    let message = format!("GOO-7 part\n\nAmp-Thread-ID: {}", thread(FIRST));
+    git_in(&p.dir, &["commit", "-q", "--allow-empty", "-m", &message]);
+    let args = ["run", "ci", "--json", "--history", "--ticket", "GOO-300"];
+    let history = |output: &std::process::Output| {
+        success(output);
+        let path = summary_of(output)["history_file"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        record(Path::new(&path))
+    };
+
+    // Without the stall, git supplies the branch's links.
+    let scanned = history(&p.run(&args));
+    assert_eq!(
+        scanned["links"],
+        serde_json::json!({"threads": [thread(FIRST)], "tickets": ["GOO-300", "GOO-7"]})
+    );
+
+    // A shallow check that outlasts the 2-second timeout: the run still
+    // succeeds, with the flag's ticket alone and the same `source`.
+    let tools = tempfile::tempdir().unwrap();
+    let path = fake_git(tools.path(), Some(10));
+    let started = std::time::Instant::now();
+    let output = p.command().env("PATH", &path).args(args).output().unwrap();
+    let elapsed = started.elapsed();
+    let stalled = history(&output);
+    assert_eq!(link_scans(tools.path()), 1);
+    assert!(elapsed >= std::time::Duration::from_secs(2), "{elapsed:?}");
+    assert!(elapsed < std::time::Duration::from_secs(10), "{elapsed:?}");
+    assert_eq!(
+        stalled["links"],
+        serde_json::json!({"tickets": ["GOO-300"]})
+    );
+    assert_eq!(stalled["source"], scanned["source"]);
+    assert!(scanned["source"]["commit"].is_string(), "{scanned}");
+}

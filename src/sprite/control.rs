@@ -96,6 +96,10 @@ pub struct Provenance {
     pub branch: Option<String>,
     pub dirty: Option<bool>,
     pub controller_version: String,
+    /// The run's links, collected on the controller when the run can
+    /// record; the remote runner records them unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub links: Option<crate::links::Links>,
 }
 
 /// The workflow invocation the remote runner executes.
@@ -537,6 +541,43 @@ mod tests {
         assert!(process_matches(&identity));
         identity.start_ticks += 1;
         assert!(!process_matches(&identity));
+    }
+
+    #[test]
+    fn provenance_round_trips_with_and_without_links() {
+        let links = crate::links::Links {
+            threads: vec!["https://ampcode.com/threads/T-x".into()],
+            tickets: vec!["GOO-291".into()],
+        };
+        let provenance = Provenance {
+            commit: Some("c".repeat(40)),
+            branch: Some("goo-291-fix".into()),
+            dirty: Some(false),
+            controller_version: "0.8.0".into(),
+            links: Some(links),
+        };
+        let text = serde_json::to_string(&provenance).unwrap();
+        assert!(
+            text.ends_with(
+                r#""links":{"threads":["https://ampcode.com/threads/T-x"],"tickets":["GOO-291"]}}"#
+            ),
+            "{text}"
+        );
+        assert_eq!(
+            serde_json::from_str::<Provenance>(&text).unwrap(),
+            provenance
+        );
+        // Without links the key is left out, so an older runner reads it.
+        let bare = Provenance {
+            links: None,
+            ..provenance
+        };
+        let text = serde_json::to_string(&bare).unwrap();
+        assert!(!text.contains("links"), "{text}");
+        assert_eq!(serde_json::from_str::<Provenance>(&text).unwrap(), bare);
+        // Links are checked strictly, like the rest of the header.
+        let unknown = r#"{"commit":null,"branch":null,"dirty":null,"controller_version":"0.8.0","links":{"prs":[]}}"#;
+        assert!(serde_json::from_str::<Provenance>(unknown).is_err());
     }
 
     #[test]

@@ -6,6 +6,18 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT: AtomicU64 = AtomicU64::new(0);
 
+/// Variables goodflows reads run links from. An Amp session or PR CI sets
+/// some of them, and they must not add `links` to records tests compare.
+pub const LINK_VARIABLES: [&str; 7] = [
+    "AMP_CURRENT_THREAD_ID",
+    "AMP_THREAD_ID",
+    "AMP_URL",
+    "GOODFLOWS_TICKETS",
+    "GOODFLOWS_THREAD_URLS",
+    "GITHUB_HEAD_REF",
+    "GITHUB_BASE_REF",
+];
+
 pub struct Project {
     pub dir: PathBuf,
 }
@@ -34,7 +46,10 @@ impl Project {
             "GOODFLOWS_API_KEY",
             "GOODFLOWS_RUN_ID",
             "GOODFLOWS_REPORT_DIR",
-        ] {
+        ]
+        .into_iter()
+        .chain(LINK_VARIABLES)
+        {
             command.env_remove(name);
         }
         command
@@ -412,4 +427,47 @@ pub fn log_names(dir: &std::path::Path) -> Vec<String> {
         .collect();
     names.sort();
     names
+}
+
+/// A `git` first on `PATH` that appends each call's arguments to `git.log`
+/// in `dir`, then runs the real git. With `stall`, the links scan's shallow
+/// check first sleeps that many seconds, past the scan's timeout. Returns
+/// the `PATH` to run with.
+pub fn fake_git(dir: &std::path::Path, stall: Option<u32>) -> String {
+    let real = Command::new("sh")
+        .args(["-c", "command -v git"])
+        .output()
+        .unwrap();
+    let real = String::from_utf8(real.stdout).unwrap().trim().to_owned();
+    let bin = dir.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    // The sleep holds no pipe, so it never delays the caller's output.
+    let stall = stall.map_or(String::new(), |secs| {
+        format!(
+            "case \"$*\" in *--is-shallow-repository*) \
+             sleep {secs} </dev/null >/dev/null 2>&1;; esac\n"
+        )
+    });
+    let script = bin.join("git");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n{stall}exec '{real}' \"$@\"\n",
+            dir.join("git.log").display()
+        ),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    format!("{}:{}", bin.display(), std::env::var("PATH").unwrap())
+}
+
+/// The scans for links in [`fake_git`]'s log: each starts with the shallow
+/// check.
+pub fn link_scans(dir: &std::path::Path) -> usize {
+    std::fs::read_to_string(dir.join("git.log"))
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| line.contains("--is-shallow-repository"))
+        .count()
 }

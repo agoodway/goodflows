@@ -615,6 +615,37 @@ goodflows-history/** text eol=lf linguist-generated
 
 Or add `goodflows-history/` to `.gitignore`. [`src/history.rs`](src/history.rs) defines the record layout.
 
+#### Linking runs to threads and tickets
+
+A run's history file and its uploaded record carry a `links` object: the agent threads and the tickets behind the change the run tests. Every invocation of a run, including each called workflow, records the same `links`. Each list is left out when it is empty, and `links` is left out when both are.
+
+```json
+"links": {
+  "threads": ["https://ampcode.com/threads/T-3bb6cad7-8c04-413a-b23c-5fca67cd4f7b"],
+  "tickets": ["GOO-291"]
+}
+```
+
+goodflows collects links once per run, and only when a history file is written or a run record is sent. It merges four sources in this order, keeps the first spelling of a duplicate, and stops at 32 entries per list:
+
+1. `--ticket ID` and `--thread-url URL`, each repeatable up to 32 times. Give each flag on one side of the subcommand: all before it or all after it. An invalid value, a 33rd flag, or a flag on both sides exits 2 before any job runs.
+2. `GOODFLOWS_TICKETS` and `GOODFLOWS_THREAD_URLS` in the caller's environment, split on commas and whitespace. Settings and job `env` never supply them. An invalid entry is dropped with a warning that names its position, not its value.
+3. The agent session: `AMP_CURRENT_THREAD_ID`, or `AMP_THREAD_ID`, under `AMP_URL` (default `https://ampcode.com`).
+4. Git: every `Amp-Thread-ID:` line in the messages of the branch's own commits, at most 200 since `origin/$GITHUB_BASE_REF` or `origin/HEAD`, or of `HEAD` alone on the base branch or in a shallow checkout. Tickets come from those commits' subjects, the branch name, and `GITHUB_HEAD_REF`, never from commit bodies.
+
+A ticket is 1 to 64 bytes of printable ASCII with no whitespace or commas, compared ignoring case. A thread URL is `https` with no userinfo, query, or fragment, and is stored in normalized form: a lowercase host, no `:443`, and no `.` or `..` segments.
+
+Git supplies tickets only for the prefixes in `ticket_prefixes`, set in the top-level `[settings]` only. Each prefix is 1 to 16 ASCII letters or digits, starting with a letter. A match is the prefix in any case, `-`, and digits, with no letter or digit next to it, so `tbrewer/goo-291-fix` gives `GOO-291`. Without `ticket_prefixes`, git supplies no tickets, because a general pattern would match `UTF-8` and `SHA-256`.
+
+```toml
+[settings]
+ticket_prefixes = ["GOO"]
+```
+
+On GitHub Actions a pull request's default checkout is shallow, so goodflows reads only GitHub's merge commit, which has no thread lines. Check out with `fetch-depth: 0` to link the threads of every PR commit. GitHub's default squash message copies each commit's message into the squash commit's body, so a run on `main` after a squash merge still finds the thread lines. A repository that trims squash messages to the title loses them, and its `main` runs record only the ticket in the title.
+
+Committed history files will contain thread URLs. The same URLs are already in those commits' messages, but a run started in an agent session that never committed adds its own.
+
 #### Uploading run history
 
 `history = true` inside the [`[reporting]`](#test-timing-reports) block uploads a run record to the GoodFlows server for every invocation: the root run and each called workflow, each under its own run id. No job has to list `reports`. The default is `false`.
@@ -627,7 +658,7 @@ history = true
 
 The upload and the local file are separate settings. The `history` setting in `[settings]`, a workflow, or a profile, and `--history`, `--no-history`, and `--history-dir`, control only the file. A run with `--no-history` writes no file and still uploads.
 
-The record holds the same fields the history file would hold: outcome, timings, host, `source.commit` and `dirty`, and for each job its command text, exit code, and error. It adds three keys that the file never has:
+The record holds the same fields the history file would hold: outcome, timings, host, `source.commit` and `dirty`, [`links`](#linking-runs-to-threads-and-tickets), and for each job its command text, exit code, and error. It adds three keys that the file never has:
 
 - `source.branch`, when git reports a branch. A detached checkout, such as a GitHub Actions pull request, has none.
 - `ci`, when the caller's environment has `GITHUB_ACTIONS=true`. It is built from `GITHUB_EVENT_NAME`, `GITHUB_RUN_ID`, `GITHUB_RUN_ATTEMPT`, `GITHUB_REF`, `RUNNER_NAME`, `GITHUB_SERVER_URL`, and `GITHUB_REPOSITORY`. A value that fails its rule is left out. Settings and job `env` never supply these values.
@@ -637,16 +668,73 @@ The key and URL variables must be set when the run starts. When either is unset,
 
 The upload runs after the test reports, before the final report, and uses what is left of the same 30-second budget. It never changes the exit code. A record that was not stored stays in the spool, and [`reports upload`](#test-timing-reports) sends it again. That includes a record refused with HTTP 422 by a server that does not accept it yet.
 
-`history list` and `history show` read stored runs with the same `[reporting]` project, URL, and key. Text the server redacts for a `pk_` key, such as commands and errors, prints as `-`.
+`history list` and `history show` read stored runs with the same `[reporting]` project, URL, and key. Text the server redacts for a `pk_` key, such as commands and errors, prints as `-`. A `pk_` key also gets thread URLs redacted, so `show` prints one `thread -` row, while tickets stay visible.
 
 ```bash
 goodflows history list
 goodflows history list --workflow ci --branch main
 goodflows history list --outcome failed --limit 20 --json
+goodflows history list --ticket GOO-291
 goodflows history show <run-id>
 ```
 
-`list` prints one row per run, newest first: start, outcome, workflow, environment, commit (12 characters, `*` when dirty), branch, CI event, duration, and run id. When there is another page it ends with `next: --cursor <cursor>`. The filters are `--workflow`, `--environment`, `--outcome` (`passed`, `failed`, or `cancelled`), `--commit` (a full hash), `--branch`, `--event`, `--graph-sha256`, `--limit` (1 to 200), and `--cursor`. `--branch` and `--event` match `source.branch` and `ci.event` exactly. A run uploaded without a branch or CI context prints `-` in the BRANCH or EVENT column and does not match those filters. `show` prints the run's fields, one row per result, and its linked test reports. A bad filter or run id exits 2 without a request. A missing `[reporting]` block, key, or URL, a server error, or an unknown run exits 1. `--json` prints one `history_runs` or `history_run` event. The commands reject run flags such as `--env`, `--jobs`, and the history file flags, and exit 2.
+`list` prints one row per run, newest first: start, outcome, workflow, environment, commit (12 characters, `*` when dirty), branch, CI event, duration, and run id. When there is another page it ends with `next: --cursor <cursor>`. The filters are `--workflow`, `--environment`, `--outcome` (`passed`, `failed`, or `cancelled`), `--commit` (a full hash), `--branch`, `--event`, `--graph-sha256`, `--ticket`, `--thread-url`, `--limit` (1 to 200), and `--cursor`. `--ticket` matches a linked ticket ignoring case, and `--thread-url` a linked thread URL after normalizing it; each takes one value, given only once on the command line, and a `pk_` key can use both. `--branch` and `--event` match `source.branch` and `ci.event` exactly. A run uploaded without a branch or CI context prints `-` in the BRANCH or EVENT column and does not match those filters. `show` prints the run's fields, its `tickets` and `thread` rows after `ci`, one row per result, and its linked test reports. A bad filter or run id exits 2 without a request. A missing `[reporting]` block, key, or URL, a server error, or an unknown run exits 1. `--json` prints one `history_runs` or `history_run` event. The commands reject run flags such as `--env`, `--jobs`, and the history file flags, and exit 2.
+
+#### Run link examples
+
+These examples assume `ticket_prefixes = ["GOO"]` in `[settings]`, and a run that writes a history file or uploads a record. A run that does neither collects no links.
+
+**An agent checks its own work.** An Amp agent on the branch `tbrewer/goo-291-run-links` runs:
+
+```bash
+goodflows --history
+```
+
+The history file links the agent's thread, read from `AMP_CURRENT_THREAD_ID`, and `GOO-291`, read from the branch name. The agent passes no link flags.
+
+**A person links a run to tickets.** Pass the tickets when the branch name has none, or when one run covers two tickets:
+
+```bash
+goodflows run ci --ticket GOO-305 --ticket GOO-306
+```
+
+**A script passes links in the environment.** A ticket automation, or a parent agent that started the run, can set the variables instead of building flags:
+
+```bash
+GOODFLOWS_TICKETS="GOO-291 GOO-302" \
+GOODFLOWS_THREAD_URLS="https://ampcode.com/threads/T-3bb6cad7-8c04-413a-b23c-5fca67cd4f7b" \
+goodflows run ci
+```
+
+goodflows drops an invalid entry and its warning names only the position, so a URL with a `?token=` query never reaches the log.
+
+**A pull request links every agent thread.** Check out the full history so goodflows reads each commit in the pull request:
+
+```yaml
+- uses: actions/checkout@v6
+  with:
+    fetch-depth: 0
+- run: goodflows run ci
+```
+
+Each `Amp-Thread-ID:` line in the pull request's commits adds a thread, and `GITHUB_HEAD_REF` adds the ticket in the branch name. With `history = true` in `[reporting]`, the uploaded record carries both. After a squash merge, the run on `main` finds the same thread lines in the squash commit's body.
+
+**A Sprite run carries the caller's links.** The controller collects links from its own checkout and agent session, and the remote history file records them:
+
+```bash
+goodflows run ci --sprite "$THREAD_ID" --ticket GOO-291
+```
+
+**Find the runs behind a ticket or a thread.** These commands read uploaded runs:
+
+```bash
+goodflows history list --ticket GOO-291
+goodflows history list --ticket goo-291 --outcome failed
+goodflows history list --thread-url https://ampcode.com/threads/T-3bb6cad7-8c04-413a-b23c-5fca67cd4f7b
+goodflows history show <run-id>
+```
+
+`--ticket` ignores case, so both spellings match `GOO-291`. `show` prints the run's `tickets` row and one `thread` row per linked thread.
 
 ### Test timing reports
 

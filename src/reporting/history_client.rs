@@ -47,6 +47,12 @@ pub struct Filters {
     /// Only runs of this job graph (64 lowercase hex characters)
     #[arg(long, value_name = "HASH", value_parser = graph_sha256)]
     pub graph_sha256: Option<String>,
+    /// Only runs linked to this ticket ID, ignoring ASCII case
+    #[arg(long, id = "ticket", value_name = "ID", value_parser = crate::links::ticket_arg)]
+    pub ticket: Option<String>,
+    /// Only runs linked to this agent thread URL
+    #[arg(long = "thread-url", id = "thread_url", value_name = "URL", value_parser = crate::links::thread_url_arg)]
+    pub thread_url: Option<String>,
     /// Runs per page, 1-200 (server default 50)
     #[arg(long, value_name = "N", value_parser = clap::value_parser!(u16).range(1..=200))]
     pub limit: Option<u16>,
@@ -66,6 +72,8 @@ impl Filters {
             ("branch", self.branch.clone()),
             ("event", self.event.clone()),
             ("graph_sha256", self.graph_sha256.clone()),
+            ("ticket", self.ticket.clone()),
+            ("thread_url", self.thread_url.clone()),
             ("limit", self.limit.map(|n| n.to_string())),
             ("cursor", self.cursor.clone()),
         ]
@@ -381,6 +389,8 @@ mod tests {
             workflow: Some("ci".into()),
             branch: Some("main".into()),
             event: Some("push".into()),
+            ticket: Some("GOO-291".into()),
+            thread_url: Some("https://ampcode.com/threads/T-x".into()),
             limit: Some(2),
             ..Filters::default()
         };
@@ -391,6 +401,8 @@ mod tests {
                 ("workflow", "ci".to_owned()),
                 ("branch", "main".to_owned()),
                 ("event", "push".to_owned()),
+                ("ticket", "GOO-291".to_owned()),
+                ("thread_url", "https://ampcode.com/threads/T-x".to_owned()),
                 ("limit", "2".to_owned()),
             ]
         );

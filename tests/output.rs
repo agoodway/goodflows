@@ -1574,6 +1574,58 @@ fn history_show_with_a_public_key_prints_redacted_text_as_absent() {
 }
 
 #[test]
+fn history_show_prints_links_after_ci() {
+    let thread = "https://ampcode.com/threads/T-3bb6cad7-8c04-413a-b23c-5fca67cd4f7b";
+    let other = "https://ampcode.com/threads/T-0e54fb55-a115-4ac7-80fe-8fde26e76afb";
+    let show = |links: Option<serde_json::Value>| {
+        let mut run = shown(false);
+        if let Some(links) = links {
+            run["data"]["document"]["links"] = links;
+        }
+        let output = read_history(run, &["show", RUN_ID]);
+        success(&output);
+        stdout(&output)
+    };
+    let link_rows = |text: &str| -> Vec<String> {
+        text.lines()
+            .filter(|l| l.starts_with("  tickets: ") || l.starts_with("  thread: "))
+            .map(str::to_owned)
+            .collect()
+    };
+    // Every link, after the `ci` rows and before `host`.
+    let text = show(Some(serde_json::json!({
+        "threads": [thread, other], "tickets": ["GOO-291", "eng-7"]})));
+    assert_eq!(
+        link_rows(&text),
+        [
+            "  tickets: GOO-291, eng-7".to_owned(),
+            format!("  thread: {thread}"),
+            format!("  thread: {other}"),
+        ]
+    );
+    let at = |row: &str| text.find(row).unwrap();
+    assert!(at("  ci url: ") < at("  tickets: "), "{text}");
+    assert!(at(&format!("  thread: {other}")) < at("  host: "), "{text}");
+    // A public key: tickets in full, threads redacted to one absent row.
+    let text = show(Some(
+        serde_json::json!({"threads": null, "tickets": ["GOO-291"]}),
+    ));
+    assert_eq!(link_rows(&text), ["  tickets: GOO-291", "  thread: -"]);
+    // A tickets-only run under a public key has no `threads` key.
+    let text = show(Some(serde_json::json!({"tickets": ["GOO-291"]})));
+    assert_eq!(link_rows(&text), ["  tickets: GOO-291"]);
+    // Threads only.
+    let text = show(Some(serde_json::json!({"threads": [thread]})));
+    assert_eq!(link_rows(&text), [format!("  thread: {thread}")]);
+    // No links, no rows.
+    assert!(link_rows(&show(None)).is_empty());
+    // Ticket text is escaped like every server string.
+    let text = show(Some(serde_json::json!({"tickets": ["GOO-1\x1b[2J"]})));
+    assert_eq!(link_rows(&text), ["  tickets: GOO-1\\u{1b}[2J"]);
+    assert!(!text.contains('\x1b'));
+}
+
+#[test]
 fn history_text_escapes_server_strings() {
     let hostile = "ci\x1b[2J\rdone";
     let page = serde_json::json!({"data": [summary(RUN_ID, hostile, serde_json::Value::Null)],

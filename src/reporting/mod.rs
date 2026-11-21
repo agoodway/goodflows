@@ -464,6 +464,12 @@ impl Session {
         self.run_record != RunRecord::Off
     }
 
+    /// Whether this invocation will try to send a run record: not when the
+    /// run record is off or skipped, as it is without credentials.
+    pub fn sends_run_record(&self) -> bool {
+        self.run_record == RunRecord::Upload
+    }
+
     /// The source context captured at start, if report-producing jobs or the
     /// run record made the session capture one.
     pub fn source(&self) -> Option<&Source> {

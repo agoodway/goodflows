@@ -6,6 +6,7 @@ mod fsutil;
 mod history;
 mod init;
 mod last;
+mod links;
 mod mcp;
 mod output;
 mod reporting;
@@ -78,6 +79,12 @@ struct Cli {
     /// Write the run history file under this directory (enables history)
     #[arg(long, global = true, value_name = "DIR")]
     history_dir: Option<PathBuf>,
+    /// Link the run to this ticket ID in its history (repeatable, at most 32)
+    #[arg(long, global = true, value_name = "ID", value_parser = links::ticket_arg)]
+    ticket: Vec<String>,
+    /// Link the run to this agent thread URL in its history (repeatable, at most 32)
+    #[arg(long = "thread-url", global = true, value_name = "URL", value_parser = links::thread_url_arg)]
+    thread_url: Vec<String>,
     /// Log run directories to keep per workflow (default 10)
     #[arg(long, global = true, value_name = "N", value_parser = clap::value_parser!(u64).range(1..))]
     log_runs: Option<u64>,
@@ -87,6 +94,12 @@ struct Cli {
     /// History bytes to keep per workflow (default 10485760)
     #[arg(long, global = true, value_name = "BYTES", value_parser = clap::value_parser!(u64).range(1..))]
     history_bytes: Option<u64>,
+    /// How many times `--ticket` was typed, before any `--`.
+    #[arg(skip)]
+    tickets_typed: usize,
+    /// How many times `--thread-url` was typed, before any `--`.
+    #[arg(skip)]
+    thread_urls_typed: usize,
 }
 
 #[derive(Subcommand)]
@@ -291,7 +304,7 @@ enum HistoryCommand {
   goodflows history list                                     # list stored runs, newest first
   goodflows history list --workflow ci --branch main         # only ci runs on main
   goodflows history list --outcome failed --limit 20 --json  # the 20 newest failed runs as JSON")]
-    List(reporting::history_client::Filters),
+    List(Box<reporting::history_client::Filters>),
     /// Show one stored run with its results and linked test reports
     #[command(after_help = "Examples:
   goodflows history show <RUN_ID>          # the run's results and linked test reports
@@ -308,7 +321,7 @@ enum HistoryCommand {
 /// `last`, `status`, `wait`, `cancel`, `sprite`, `skills install`, `agents` and `mcp` commands
 /// reject them. `validate`
 /// and `list` resolve all of them except `--log-dir` into their settings.
-const RUN_ONLY_FLAGS: [&str; 12] = [
+const RUN_ONLY_FLAGS: [&str; 14] = [
     "env",
     "parallelism",
     "fail_fast",
@@ -318,6 +331,8 @@ const RUN_ONLY_FLAGS: [&str; 12] = [
     "history",
     "no_history",
     "history_dir",
+    "ticket",
+    "thread_url",
     "log_runs",
     "history_runs",
     "history_bytes",
@@ -366,7 +381,20 @@ impl Cli {
                 run_only(sprite).mut_subcommands(run_only)
             })
             .mut_subcommand("history", |history| {
-                run_only(history).mut_subcommands(run_only)
+                // `list` has its own `--ticket` and `--thread-url` filters.
+                run_only(history)
+                    .mut_subcommands(run_only)
+                    .mut_subcommand("list", |list| {
+                        list.mut_args(|arg| {
+                            let filter = !arg.is_global_set()
+                                && ["ticket", "thread_url"].contains(&arg.get_id().as_str());
+                            if filter {
+                                arg.hide(false)
+                            } else {
+                                arg
+                            }
+                        })
+                    })
             })
             .mut_subcommand("last", |last| {
                 // A run that called workflows has a summary for each.
@@ -388,6 +416,11 @@ impl Cli {
     /// The first run-only flag on the command line, as the user typed it, for
     /// commands that reject them all ([`RUN_ONLY_FLAGS`]).
     fn run_only_flag(&self) -> Option<&'static str> {
+        self.run_only_flag_besides(&[])
+    }
+
+    /// [`Cli::run_only_flag`], ignoring the flags in `skip`.
+    fn run_only_flag_besides(&self, skip: &[&str]) -> Option<&'static str> {
         [
             (self.env.is_some(), "--env"),
             (self.parallelism.is_some(), "--parallelism"),
@@ -398,20 +431,36 @@ impl Cli {
             (self.history, "--history"),
             (self.no_history, "--no-history"),
             (self.history_dir.is_some(), "--history-dir"),
+            (!self.ticket.is_empty(), "--ticket"),
+            (!self.thread_url.is_empty(), "--thread-url"),
             (self.log_runs.is_some(), "--log-runs"),
             (self.history_runs.is_some(), "--history-runs"),
             (self.history_bytes.is_some(), "--history-bytes"),
             (self.output.is_some(), "--output"),
         ]
         .into_iter()
-        .find_map(|(set, flag)| set.then_some(flag))
+        .find_map(|(set, flag)| (set && !skip.contains(&flag)).then_some(flag))
     }
 
     fn parse_from(
         args: impl IntoIterator<Item = impl Into<std::ffi::OsString> + Clone>,
     ) -> std::result::Result<Self, clap::Error> {
+        let args: Vec<std::ffi::OsString> = args.into_iter().map(Into::into).collect();
+        let typed = |flag: &str| {
+            let joined = format!("{flag}=");
+            args.iter()
+                .take_while(|arg| *arg != "--")
+                .filter(|arg| *arg == flag || arg.to_string_lossy().starts_with(&joined))
+                .count()
+        };
+        let (tickets_typed, thread_urls_typed) = (typed("--ticket"), typed("--thread-url"));
         let matches = Self::parser().try_get_matches_from(args)?;
-        <Self as clap::FromArgMatches>::from_arg_matches(&matches)
+        let cli = <Self as clap::FromArgMatches>::from_arg_matches(&matches)?;
+        Ok(Self {
+            tickets_typed,
+            thread_urls_typed,
+            ..cli
+        })
     }
 
     /// History and retention flags. `--history-dir` resolves from the
@@ -653,7 +702,22 @@ async fn run(cli: &Cli, output: &mut Output, cancel: watch::Receiver<Option<i32>
         return reporting::replay::upload(run_directory, output, cancel, budget).await;
     }
     if let Some(Commands::History { command }) = &cli.command {
-        if let Some(flag) = cli.run_only_flag() {
+        // `history list`'s `--ticket` and `--thread-url` filters share their
+        // ids with the run flags, and clap merges every occurrence, before
+        // `history` or after `list`, into one value. Typed once, the flag is
+        // the filter; typed more often, it is also a run flag.
+        let mut filters = Vec::new();
+        if let HistoryCommand::List(_) = command {
+            for (typed, flag) in [
+                (cli.tickets_typed, "--ticket"),
+                (cli.thread_urls_typed, "--thread-url"),
+            ] {
+                if typed == 1 {
+                    filters.push(flag);
+                }
+            }
+        }
+        if let Some(flag) = cli.run_only_flag_besides(&filters) {
             return Err(usage(format!(
                 "{flag} cannot be used with history commands"
             )));
@@ -752,6 +816,27 @@ async fn run(cli: &Cli, output: &mut Output, cancel: watch::Receiver<Option<i32>
             return Err(usage(format!("--log-dir cannot be used with {command}")));
         }
     }
+    // clap keeps only the values given on one side of the subcommand.
+    for (typed, values, flag) in [
+        (cli.tickets_typed, &cli.ticket, "--ticket"),
+        (cli.thread_urls_typed, &cli.thread_url, "--thread-url"),
+    ] {
+        if typed != values.len() {
+            return Err(usage(format!(
+                "{flag} must be given on one side of the subcommand"
+            )));
+        }
+        if values.len() > links::MAX_ENTRIES {
+            return Err(usage(format!(
+                "{flag} can be given at most {} times",
+                links::MAX_ENTRIES
+            )));
+        }
+    }
+    let link_flags = links::Links {
+        threads: cli.thread_url.clone(),
+        tickets: cli.ticket.clone(),
+    };
     let rerun_failed = matches!(cli.command, Some(Commands::Run { failed: true, .. }));
     if rerun_failed && !cli.jobs.is_empty() {
         return Err(usage("--jobs cannot be used with run --failed"));
@@ -897,6 +982,7 @@ async fn run(cli: &Cli, output: &mut Output, cancel: watch::Receiver<Option<i32>
                 targets,
                 identity: identity.clone(),
                 request,
+                link_flags,
                 rerun_config: cli
                     .config
                     .as_ref()
@@ -949,6 +1035,8 @@ async fn run(cli: &Cli, output: &mut Output, cancel: watch::Receiver<Option<i32>
         cancel,
         sprite_state: None,
         provenance: None,
+        link_flags,
+        links: Default::default(),
         last_run: Some(last_run),
         config_dir: config_file.parent().map(PathBuf::from),
         caches: Default::default(),
@@ -1003,6 +1091,12 @@ pub(crate) struct Run {
     /// A remote Sprite run's snapshot provenance, the `source` of the root
     /// and every child invocation; `None` locally.
     pub provenance: Option<reporting::Source>,
+    /// `--ticket` and `--thread-url`, the first links collected.
+    pub link_flags: links::Links,
+    /// The run's links, collected by the first invocation that records and
+    /// shared by every invocation; `None` when there are none. A remote
+    /// Sprite run starts with the controller's.
+    pub links: tokio::sync::OnceCell<Option<links::Links>>,
     /// Collects every invocation's summary for the last-run record; `None`
     /// on a Sprite, whose local run is the controller's.
     pub last_run: Option<last::Recorder>,
@@ -1299,6 +1393,33 @@ async fn invocation(
         }
         None => None,
     };
+    // Only an invocation that builds a record needs the run's links; the
+    // first one collects them for every invocation.
+    let records = settings.history
+        || session
+            .as_ref()
+            .is_some_and(reporting::Session::sends_run_record);
+    let links = if records {
+        run.links
+            .get_or_init(|| async {
+                let links = links::collect(
+                    &run.link_flags,
+                    &run.root.settings.ticket_prefixes,
+                    source.as_ref().and_then(|s| s.branch.as_deref()),
+                    &settings.workdir,
+                    config.reporting.as_ref().map(|r| r.token_env.as_str()),
+                    // The caller's own environment, never settings `env`.
+                    &|name| std::env::var(name).ok(),
+                    &mut |warning| eprintln!("goodflows: warning: {warning}"),
+                )
+                .await;
+                Some(links).filter(|links| !links.is_empty())
+            })
+            .await
+            .as_ref()
+    } else {
+        None
+    };
     let remote = origin.remote();
     // Legacy root jobs log flat; every named workflow and every called
     // workflow, `default` included, logs under its own namespace.
@@ -1480,6 +1601,7 @@ async fn invocation(
             .as_ref()
             .map(|p| (p.run_id.as_str(), p.caller_job.as_str())),
         source: source.as_ref(),
+        links,
         stem: &identity.stem,
         runs: settings.history_runs,
         bytes: settings.history_bytes,
@@ -1730,6 +1852,8 @@ mod tests {
             cancel,
             sprite_state: None,
             provenance: None,
+            link_flags: Default::default(),
+            links: Default::default(),
             last_run: None,
             config_dir: None,
             caches: Default::default(),
@@ -2142,9 +2266,55 @@ mod tests {
                 &["history", "list", "--history-bytes", "1"],
                 "--history-bytes",
             ),
+            (
+                &[
+                    "history",
+                    "show",
+                    "fb7d2711-6b67-4f5a-9104-492032a9e1e5",
+                    "--ticket",
+                    "X",
+                ],
+                "--ticket",
+            ),
+            (
+                &[
+                    "--thread-url",
+                    "https://h/x",
+                    "history",
+                    "show",
+                    "fb7d2711-6b67-4f5a-9104-492032a9e1e5",
+                ],
+                "--thread-url",
+            ),
+            (&["last", "--ticket", "X"], "--ticket"),
         ] {
             assert_eq!(parse(args).unwrap().run_only_flag(), Some(flag), "{args:?}");
         }
+        // `history list`'s own filters take the value; clap also copies it
+        // to the run flag of the same id.
+        let cli = parse(&["history", "list", "--ticket", "GOO-1"]).unwrap();
+        let Some(Commands::History {
+            command: HistoryCommand::List(filters),
+        }) = &cli.command
+        else {
+            panic!("not history list");
+        };
+        assert_eq!(filters.ticket.as_deref(), Some("GOO-1"));
+        assert_eq!(cli.ticket, ["GOO-1"]);
+        // Both flags are values, each checked by the link rules.
+        assert!(parse(&["--ticket", "a,b"]).is_err());
+        assert!(parse(&["--thread-url", "https://h/x?token=1"]).is_err());
+        let cli = parse(&[
+            "--ticket",
+            "A",
+            "--ticket",
+            "B",
+            "--thread-url",
+            "HTTPS://H/x",
+        ])
+        .unwrap();
+        assert_eq!(cli.ticket, ["A", "B"]);
+        assert_eq!(cli.thread_url, ["https://h/x"]);
         assert_eq!(
             parse(&["history", "list", "--json"])
                 .unwrap()

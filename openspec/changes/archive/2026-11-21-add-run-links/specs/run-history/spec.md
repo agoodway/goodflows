@@ -32,8 +32,8 @@ A thread URL MUST be `https`, have a host, have no userinfo, query or fragment, 
 A thread URL's host MUST be either a bracketed IPv6 address or made only of RFC 3986 unreserved and sub-delims characters (`A-Z`, `a-z`, `0-9`, `-._~!$&'()*+,;=`). Collection SHALL drop, and upload validation SHALL reject, any other host, including one with `"`, `` ` ``, `{` or `}`, which WHATWG keeps as written and RFC 3986 parsers reject.
 
 #### Scenario: Brace in the host
-- **WHEN** a run's record has `links.threads[0]` `https://a{b.com/x`
-- **THEN** the run prints `upload skipped: invalid record at links.threads[0]` and sends no request
+- **WHEN** upload validation (`run_contract::validate`) checks a record whose `links.threads[0]` is `https://a{b.com/x`
+- **THEN** it rejects the record at path `links.threads[0]`, so the record is not sent
 
 #### Scenario: Duplicate URL spellings
 - **WHEN** the collected threads are `HTTPS://AmpCode.com/threads/T-<uuid>` and `https://ampcode.com/threads/T-<uuid>`
@@ -44,15 +44,15 @@ A thread URL's host MUST be either a bracketed IPv6 address or made only of RFC 
 - **THEN** it is recorded as `https://h/a%7Eb`, not `https://h/a~b`
 
 #### Scenario: Upload validation
-- **WHEN** a run's record has `links.threads[0]` with a query string, or `https://AmpCode.com:443/threads/T-<uuid>`, or `https://h/a/%2E%2e/b`
-- **THEN** the run prints `upload skipped: invalid record at links.threads[0]` and sends no request
+- **WHEN** upload validation (`run_contract::validate`) checks a record whose `links.threads[0]` has a query string, or is `https://AmpCode.com:443/threads/T-<uuid>` or `https://h/a/%2E%2e/b`
+- **THEN** it rejects the record at path `links.threads[0]`, so the record is not sent
 
 ### Requirement: Tickets and link lists are bounded
 A ticket MUST be 1 to 64 bytes of printable ASCII other than `,`, so it has no whitespace, control characters or commas. Each list SHALL hold at most 32 entries without duplicates. Tickets SHALL be compared ignoring ASCII case, and the first spelling SHALL be kept. Upload validation SHALL apply the same rules.
 
 #### Scenario: Duplicate ticket in an upload
-- **WHEN** a run's record has `links.tickets` `["GOO-1", "goo-1"]`
-- **THEN** the run prints `upload skipped: invalid record at links.tickets[1]` and sends no request
+- **WHEN** upload validation (`run_contract::validate`) checks a record whose `links.tickets` is `["GOO-1", "goo-1"]`
+- **THEN** it rejects the record at path `links.tickets[1]`, so the record is not sent
 
 #### Scenario: Comma in a ticket flag
 - **WHEN** a run passes `--ticket GOO-1,GOO-2`
@@ -89,7 +89,7 @@ goodflows SHALL merge, in this order: repeatable `--ticket` and `--thread-url` f
 - **THEN** `links.tickets` holds the 30 flag tickets and the first 2 from the variable
 
 ### Requirement: Invalid link input is handled by source
-An invalid `--ticket` or `--thread-url` value, or more than 32 of either flag, MUST fail as an argument error with exit code 2 before any job runs. An invalid environment entry SHALL be dropped with a stderr warning that names the variable and the entry's position among the non-empty entries, counting from 1, and MUST NOT print the entry. Invalid values from the agent session or git SHALL be dropped silently.
+An invalid `--ticket` or `--thread-url` value, more than 32 of either flag, or either flag given both before and after the subcommand, MUST fail as an argument error with exit code 2 before any job runs. An invalid environment entry SHALL be dropped with a stderr warning that names the variable and the entry's position among the non-empty entries, counting from 1, and MUST NOT print the entry. Invalid values from the agent session or git SHALL be dropped silently.
 
 #### Scenario: Invalid flag
 - **WHEN** a run passes `--thread-url 'https://ampcode.com/threads/T-1?token=x'`
@@ -97,6 +97,10 @@ An invalid `--ticket` or `--thread-url` value, or more than 32 of either flag, M
 
 #### Scenario: Too many flags
 - **WHEN** a run passes 33 `--ticket` flags
+- **THEN** the command exits 2 and no job runs
+
+#### Scenario: Flags on both sides of the subcommand
+- **WHEN** a run passes `--ticket A run --ticket B`
 - **THEN** the command exits 2 and no job runs
 
 #### Scenario: Invalid environment entry
@@ -186,7 +190,7 @@ The Sprite controller SHALL collect links itself when the run it sends can recor
 - **THEN** the controller runs no git command to collect links and the provenance has no `links`
 
 ### Requirement: Stored runs can be filtered by link
-`goodflows history list` SHALL send `--ticket` as the `ticket` query parameter and `--thread-url` as `thread_url`, alongside the existing filters. Each SHALL take at most one value and follow the link rules. A bad value or a repeated filter MUST exit 2 without a request. `history show` SHALL reject both flags as run flags.
+`goodflows history list` SHALL send `--ticket` as the `ticket` query parameter and `--thread-url` as `thread_url`, alongside the existing filters. Each SHALL take at most one value and follow the link rules, and SHALL be the filter only when typed exactly once on the command line. A bad value or a filter typed more than once, on either side of the subcommand, MUST exit 2 without a request. `history show` SHALL reject both flags as run flags.
 
 #### Scenario: Filter by ticket
 - **WHEN** the user runs `goodflows history list --ticket GOO-291`
@@ -194,6 +198,10 @@ The Sprite controller SHALL collect links itself when the run it sends can recor
 
 #### Scenario: Repeated link filter
 - **WHEN** the user runs `goodflows history list --ticket GOO-1 --ticket GOO-2`
+- **THEN** no request is sent and the command exits 2
+
+#### Scenario: Link filter on both sides of the subcommand
+- **WHEN** the user runs `goodflows --ticket GOO-1 history list --ticket GOO-2`
 - **THEN** no request is sent and the command exits 2
 
 #### Scenario: Show rejects link flags

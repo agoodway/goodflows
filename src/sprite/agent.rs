@@ -2304,6 +2304,9 @@ async fn exec_workflow(args: &[String]) -> Result<u8> {
             cancel: cancel.clone(),
             sprite_state: std::env::var(crate::config::SPRITE_STATE_ENV).ok(),
             provenance: source(&header.provenance),
+            // The controller's links; the remote runner never collects its own.
+            link_flags: Default::default(),
+            links: tokio::sync::OnceCell::new_with(Some(header.provenance.links.clone())),
             last_run: None,
             config_dir: None,
             caches: Default::default(),
