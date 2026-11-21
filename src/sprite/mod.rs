@@ -123,6 +123,8 @@ pub struct RunInput {
     pub targets: BTreeMap<String, Config>,
     pub identity: String,
     pub request: Request,
+    /// `--ticket` and `--thread-url`.
+    pub link_flags: crate::links::Links,
     pub rerun_config: Option<String>,
 }
 
@@ -1049,6 +1051,7 @@ async fn run_inner(
         targets,
         identity,
         request,
+        link_flags,
         rerun_config,
     } = input;
     let started = Instant::now();
@@ -1121,6 +1124,28 @@ async fn run_inner(
     })?;
     drop(sensitive);
     let snapshot_ms = started.elapsed().as_millis() as u64;
+    // The run's links come from the controller's checkout and environment,
+    // and only when the run it sends can record: the remote runner never
+    // collects its own.
+    let history = |config: &Config| request.history.unwrap_or(config.settings.history);
+    let records = history(&selected)
+        || targets.values().any(history)
+        || selected.reporting.as_ref().is_some_and(|r| r.history);
+    let links = if records {
+        let links = crate::links::collect(
+            &link_flags,
+            &document.settings.ticket_prefixes,
+            snap.source.as_ref().and_then(|s| s.branch.as_deref()),
+            &hook_workdir,
+            selected.reporting.as_ref().map(|r| r.token_env.as_str()),
+            &|name| std::env::var(name).ok(),
+            &mut |warning| eprintln!("goodflows: warning: {warning}"),
+        )
+        .await;
+        Some(links).filter(|links| !links.is_empty())
+    } else {
+        None
+    };
     testhook::pause("snapshot-taken");
     emit(
         output,
@@ -1241,6 +1266,7 @@ async fn run_inner(
             branch: snap.source.as_ref().and_then(|s| s.branch.clone()),
             dirty: snap.source.as_ref().and_then(|s| s.dirty),
             controller_version: env!("CARGO_PKG_VERSION").into(),
+            links,
         },
         upload_timeout_secs: UPLOAD_TIMEOUT_SECS,
     };

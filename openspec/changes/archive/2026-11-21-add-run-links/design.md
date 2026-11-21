@@ -141,13 +141,17 @@ Without `ticket_prefixes`, git supplies no tickets. A general pattern such as `[
 
 `--ticket` and `--thread-url` are global args with ids `ticket` and `thread_url`, repeatable, next to `--history`. On a run, they record links. They join `run_only_flag()`, so every command that rejects run flags today rejects them too. `validate` and `list` accept and ignore them, as they do `--history`.
 
-`history list` declares its own `#[arg(long, id = "ticket")] ticket: Option<String>` and `#[arg(long = "thread-url", id = "thread_url")] thread_url: Option<String>` in its filters. clap does not propagate a global arg into a subcommand that defines the same id, so:
+`history list` declares its own `#[arg(long, id = "ticket")] ticket: Option<String>` and `#[arg(long = "thread-url", id = "thread_url")] thread_url: Option<String>` in its filters, with the link value parsers. So:
 
-- `history list --ticket GOO-291` fills the filter. A second `--ticket` fails with clap's own "cannot be used multiple times" error and exit 2.
+- `history list --ticket GOO-291` fills the filter. A second `--ticket` after `list` fails with clap's own "cannot be used multiple times" error and exit 2.
 - The value parser applies the link rules, so a bad value exits 2 without a request.
 - `history list --help` documents the filters.
 
-`history list` therefore keeps using `run_only_flag()` unchanged: the global fields stay empty when clap gave the values to the filter. A test pins `goodflows --ticket X history list`, whichever way clap resolves it, to either filtering by `X` or exiting 2, never to a silently dropped value.
+The shared ids do not keep the filter and the run flag apart: clap copies a filter's value into the global `ticket` or `thread_url` field too, and `goodflows --ticket X history list` fills the filter with `X`. `run_only_flag()` alone would then reject every filter. Nor do the parsed values tell how many were typed: for `goodflows --ticket A history list --ticket B`, clap overwrites `A` with `B` in both fields. So `Cli::parse_from` counts the `--ticket`, `--ticket=…`, `--thread-url` and `--thread-url=…` arguments before any `--`, and `history list` checks run flags with `Cli::run_only_flag_besides(skip)`, which skips `--ticket` or `--thread-url` when it was typed exactly once: that one value is the filter's. Typed more than once, anywhere around `history list`, it is also a run flag and exits 2 with "`--ticket cannot be used with history commands`" before any request. No option in `history list` takes a value that starts with `-`, and `history list` takes no positional arguments, so a counted argument is always the flag itself. Every other history command keeps using `run_only_flag()` unchanged. Tests pin `goodflows --ticket X history list` to filtering by `X`, and two `--ticket` or `--thread-url` values, before `history list` or one on each side of it, to exit 2, so a value is never silently dropped.
+
+The same merge hits the commands that accept run flags: for `goodflows --ticket A run --ticket B`, clap keeps only the values given after `run`. So before the 32-entry check, a run, `validate` and `list` exit 2 with "`--ticket must be given on one side of the subcommand`" when the count of typed flags differs from the number of values. Neither flag splits a value, so the two match whenever no value was dropped, and the 32-entry check always sees every value.
+
+`Cli::parser()` hides the run-only flags, by id, in the help of commands that reject them, and that would hide the filters too, since they share the ids. In `history list` the parser therefore sets `hide(false)` on the non-global `ticket` and `thread_url` args, so its help lists the filters while the run flags stay hidden.
 
 Alternative: separate names such as `--filter-ticket`. Rejected because it gives two names for the same value, and `--ticket GOO-291` reads correctly in both places.
 

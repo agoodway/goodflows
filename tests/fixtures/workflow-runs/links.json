@@ -1,0 +1,281 @@
+{
+  "record": {
+    "schema_version": 1,
+    "workflow": "ci",
+    "run_id": "6d2f0b8e-4c1a-4e5b-9a3d-2f7c8e1b0a64",
+    "started_at": "2026-11-20T09:12:44Z",
+    "outcome": "passed",
+    "duration_ms": 1830,
+    "parallelism": 2,
+    "graph_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "max_in_flight": 1,
+    "host": {
+      "os": "linux",
+      "arch": "x86_64",
+      "logical_cpus": 2
+    },
+    "source": {
+      "commit": "5a4a9715f1cd0a9795766bcd9294a77549b5b474",
+      "dirty": false,
+      "branch": "tbrewer/goo-291-fix"
+    },
+    "links": {
+      "threads": [
+        "https://ampcode.com/threads/T-3bb6cad7-8c04-413a-b23c-5fca67cd4f7b",
+        "https://h.example/a%7Eb%2fc"
+      ],
+      "tickets": [
+        "GOO-291",
+        "eng-7"
+      ]
+    },
+    "results": []
+  },
+  "invalid": [
+    {
+      "case": "an empty links object",
+      "links": {},
+      "path": "links"
+    },
+    {
+      "case": "an unknown key in links",
+      "links": {
+        "tickets": [
+          "GOO-291"
+        ],
+        "pull_requests": [
+          45
+        ]
+      },
+      "path": "links"
+    },
+    {
+      "case": "33 tickets",
+      "links": {
+        "tickets": [
+          "GOO-1",
+          "GOO-2",
+          "GOO-3",
+          "GOO-4",
+          "GOO-5",
+          "GOO-6",
+          "GOO-7",
+          "GOO-8",
+          "GOO-9",
+          "GOO-10",
+          "GOO-11",
+          "GOO-12",
+          "GOO-13",
+          "GOO-14",
+          "GOO-15",
+          "GOO-16",
+          "GOO-17",
+          "GOO-18",
+          "GOO-19",
+          "GOO-20",
+          "GOO-21",
+          "GOO-22",
+          "GOO-23",
+          "GOO-24",
+          "GOO-25",
+          "GOO-26",
+          "GOO-27",
+          "GOO-28",
+          "GOO-29",
+          "GOO-30",
+          "GOO-31",
+          "GOO-32",
+          "GOO-33"
+        ]
+      },
+      "path": "links.tickets"
+    },
+    {
+      "case": "a duplicate ticket differing only in case",
+      "links": {
+        "tickets": [
+          "GOO-1",
+          "goo-1"
+        ]
+      },
+      "path": "links.tickets[1]"
+    },
+    {
+      "case": "a comma in a ticket",
+      "links": {
+        "tickets": [
+          "GOO-1,GOO-2"
+        ]
+      },
+      "path": "links.tickets[0]"
+    },
+    {
+      "case": "a thread URL with a query",
+      "links": {
+        "threads": [
+          "https://ampcode.com/threads/T-3bb6cad7-8c04-413a-b23c-5fca67cd4f7b?token=x"
+        ],
+        "tickets": [
+          "GOO-291"
+        ]
+      },
+      "path": "links.threads[0]"
+    },
+    {
+      "case": "a thread URL with a bare ?",
+      "links": {
+        "threads": [
+          "https://ampcode.com/threads/T-3bb6cad7-8c04-413a-b23c-5fca67cd4f7b?"
+        ],
+        "tickets": [
+          "GOO-291"
+        ]
+      },
+      "path": "links.threads[0]"
+    },
+    {
+      "case": "an uppercase host",
+      "links": {
+        "threads": [
+          "https://AmpCode.com/threads/T-3bb6cad7-8c04-413a-b23c-5fca67cd4f7b"
+        ],
+        "tickets": [
+          "GOO-291"
+        ]
+      },
+      "path": "links.threads[0]"
+    },
+    {
+      "case": "an explicit :443",
+      "links": {
+        "threads": [
+          "https://ampcode.com:443/threads/T-3bb6cad7-8c04-413a-b23c-5fca67cd4f7b"
+        ],
+        "tickets": [
+          "GOO-291"
+        ]
+      },
+      "path": "links.threads[0]"
+    },
+    {
+      "case": "a port with a leading zero",
+      "links": {
+        "threads": [
+          "https://h.example:0443/x"
+        ],
+        "tickets": [
+          "GOO-291"
+        ]
+      },
+      "path": "links.threads[0]"
+    },
+    {
+      "case": "percent-encoded dot segments",
+      "links": {
+        "threads": [
+          "https://h.example/a/%2E%2e/b"
+        ],
+        "tickets": [
+          "GOO-291"
+        ]
+      },
+      "path": "links.threads[0]"
+    },
+    {
+      "case": "a percent-encoded host",
+      "links": {
+        "threads": [
+          "https://ex%61mple.com/x"
+        ],
+        "tickets": [
+          "GOO-291"
+        ]
+      },
+      "path": "links.threads[0]"
+    },
+    {
+      "case": "non-canonical IPv4",
+      "links": {
+        "threads": [
+          "https://127.1/x"
+        ],
+        "tickets": [
+          "GOO-291"
+        ]
+      },
+      "path": "links.threads[0]"
+    },
+    {
+      "case": "non-canonical IPv6",
+      "links": {
+        "threads": [
+          "https://[0:0:0:0:0:0:0:1]/x"
+        ],
+        "tickets": [
+          "GOO-291"
+        ]
+      },
+      "path": "links.threads[0]"
+    },
+    {
+      "case": "| in the path",
+      "links": {
+        "threads": [
+          "https://h.example/a|b"
+        ],
+        "tickets": [
+          "GOO-291"
+        ]
+      },
+      "path": "links.threads[0]"
+    },
+    {
+      "case": "[ in the path",
+      "links": {
+        "threads": [
+          "https://h.example/a[b"
+        ],
+        "tickets": [
+          "GOO-291"
+        ]
+      },
+      "path": "links.threads[0]"
+    },
+    {
+      "case": "%zz in the path",
+      "links": {
+        "threads": [
+          "https://h.example/a%zzb"
+        ],
+        "tickets": [
+          "GOO-291"
+        ]
+      },
+      "path": "links.threads[0]"
+    },
+    {
+      "case": "a trailing %",
+      "links": {
+        "threads": [
+          "https://h.example/a%"
+        ],
+        "tickets": [
+          "GOO-291"
+        ]
+      },
+      "path": "links.threads[0]"
+    },
+    {
+      "case": "{ in the host",
+      "links": {
+        "threads": [
+          "https://a{b.com/x"
+        ],
+        "tickets": [
+          "GOO-291"
+        ]
+      },
+      "path": "links.threads[0]"
+    }
+  ]
+}

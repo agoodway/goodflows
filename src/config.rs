@@ -503,6 +503,10 @@ pub struct Settings {
     /// Project-wide Sprite name prefix; only valid in the top-level `[settings]`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sprite_prefix: Option<String>,
+    /// Project-wide ticket ID prefixes that git commit subjects and branch
+    /// names are searched for; only valid in the top-level `[settings]`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ticket_prefixes: Vec<String>,
 }
 
 impl Default for Settings {
@@ -519,6 +523,7 @@ impl Default for Settings {
             history_runs: None,
             history_bytes: None,
             sprite_prefix: None,
+            ticket_prefixes: Vec::new(),
         }
     }
 }
@@ -1086,6 +1091,9 @@ pub struct SettingsOverrides {
     // Present only to reject a workflow/profile prefix override with a clear message.
     #[serde(default, skip_serializing)]
     sprite_prefix: Option<toml::Value>,
+    // Present only to reject a workflow/profile ticket prefix override.
+    #[serde(default, skip_serializing)]
+    ticket_prefixes: Option<toml::Value>,
 }
 
 impl SettingsOverrides {
@@ -1093,6 +1101,9 @@ impl SettingsOverrides {
     fn validate_history(&self) -> Result<()> {
         if self.sprite_prefix.is_some() {
             bail!("sprite_prefix is project-wide; set it only in the top-level [settings]");
+        }
+        if self.ticket_prefixes.is_some() {
+            bail!("ticket_prefixes is project-wide; set it only in the top-level [settings]");
         }
         validate_caps(self.log_runs, self.history_runs, self.history_bytes)
     }
@@ -1132,6 +1143,7 @@ impl SettingsOverrides {
             history_runs: self.history_runs.or(shared.history_runs),
             history_bytes: self.history_bytes.or(shared.history_bytes),
             sprite_prefix: shared.sprite_prefix.clone(),
+            ticket_prefixes: shared.ticket_prefixes.clone(),
         }
     }
 }
@@ -1315,6 +1327,19 @@ impl Config {
         if let Some(prefix) = &self.settings.sprite_prefix {
             if !valid_sprite_prefix(prefix) {
                 problems.push(anyhow!("settings sprite_prefix must be 1-20 bytes of lowercase ASCII letters, digits or hyphens, starting with a letter or digit"));
+            }
+        }
+        let prefixes = &self.settings.ticket_prefixes;
+        for (i, prefix) in prefixes.iter().enumerate() {
+            if !crate::links::valid_prefix(prefix) {
+                problems.push(anyhow!("settings ticket_prefixes entry '{prefix}' must be 1-16 ASCII letters or digits, starting with a letter"));
+            } else if prefixes[..i]
+                .iter()
+                .any(|earlier| earlier.eq_ignore_ascii_case(prefix))
+            {
+                problems.push(anyhow!(
+                    "settings ticket_prefixes lists '{prefix}' more than once (ignoring case)"
+                ));
             }
         }
         if let Some(sprite) = &self.sprite {
@@ -2741,6 +2766,68 @@ mod tests {
                 "sprite_prefix is project-wide",
             ),
             ("[workflows.ci.sprite]\nsetup = 'true'\n", "unknown field"),
+        ] {
+            let error = validate(&format!("{source}{JOB}")).unwrap_err();
+            assert!(error.contains(message), "{source}: {error}");
+        }
+    }
+
+    #[test]
+    fn ticket_prefixes_are_project_wide_and_validated() {
+        let config = validate(&format!(
+            "[settings]\nticket_prefixes = ['GOO', 'eng', 'A1234567890BCDEF']\n{JOB}"
+        ))
+        .unwrap();
+        // Every resolved workflow sees the project's prefixes.
+        let (_, ci) = config.workflow(Some("ci"), None).unwrap();
+        assert_eq!(
+            ci.settings.ticket_prefixes,
+            ["GOO", "eng", "A1234567890BCDEF"]
+        );
+        // Inspection's effective settings leave them out, as `sprite_prefix`.
+        let resolved = Settings {
+            workdir: Some("/w".into()),
+            history_dir: Some("/w/history".into()),
+            ..ci.settings.clone()
+        };
+        let effective = resolved
+            .resolve(None, None, &HistoryOverrides::default())
+            .unwrap();
+        assert!(serde_json::to_value(effective)
+            .unwrap()
+            .get("ticket_prefixes")
+            .is_none());
+        validate(&format!("[settings]\nticket_prefixes = []\n{JOB}")).unwrap();
+        for (source, message) in [
+            (
+                "[settings]\nticket_prefixes = ['']\n",
+                "ticket_prefixes entry '' must be 1-16",
+            ),
+            (
+                "[settings]\nticket_prefixes = ['1GOO']\n",
+                "ticket_prefixes entry '1GOO' must be 1-16",
+            ),
+            (
+                "[settings]\nticket_prefixes = ['GO-O']\n",
+                "ticket_prefixes entry 'GO-O' must be 1-16",
+            ),
+            (
+                "[settings]\nticket_prefixes = ['ABCDEFGHIJKLMNOPQ']\n",
+                "must be 1-16",
+            ),
+            (
+                "[settings]\nticket_prefixes = ['GOO', 'goo']\n",
+                "ticket_prefixes lists 'goo' more than once (ignoring case)",
+            ),
+            ("[settings]\nticket_prefixes = 'GOO'\n", "invalid type"),
+            (
+                "[workflows.ci.settings]\nticket_prefixes = ['GOO']\n",
+                "ticket_prefixes is project-wide",
+            ),
+            (
+                "[environments.e.settings]\nticket_prefixes = ['GOO']\n",
+                "ticket_prefixes is project-wide",
+            ),
         ] {
             let error = validate(&format!("{source}{JOB}")).unwrap_err();
             assert!(error.contains(message), "{source}: {error}");

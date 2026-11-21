@@ -3523,7 +3523,7 @@ const GITHUB: [&str; 8] = [
 /// on GitHub Actions), with credentials when `url` is set.
 fn history_command(p: &Project, args: &[&str], url: Option<&str>) -> std::process::Command {
     let mut command = p.command();
-    for name in GITHUB {
+    for name in GITHUB.into_iter().chain(LINK_VARIABLES) {
         command.env_remove(name);
     }
     command.args(args);
@@ -3830,22 +3830,29 @@ fn run_upload_is_independent_of_the_local_history_file() {
     assert_eq!(requests.len(), 2);
     assert_eq!(requests[1].json()["run_id"], summary["run_id"]);
 
-    // Both on, in a checkout on `main` on GitHub Actions: the upload adds
-    // `source.branch`, `ci` and `graph` to exactly the history file's value.
+    // Both on, in a checkout on `main` on GitHub Actions in an agent
+    // session: the upload adds `source.branch`, `ci` and `graph` to exactly
+    // the history file's value, `links` included.
     let p = project_with(HISTORY, config);
     git_checkout(&p.dir);
-    let output = history_command(&p, &["--json", "--history"], Some(&mock.url))
-        .envs([
-            ("GITHUB_ACTIONS", "true"),
-            ("GITHUB_EVENT_NAME", "push"),
-            ("GITHUB_RUN_ID", "123"),
-            ("GITHUB_RUN_ATTEMPT", "2"),
-            ("RUNNER_NAME", "runner-1"),
-            ("GITHUB_SERVER_URL", "https://github.com"),
-            ("GITHUB_REPOSITORY", "acme/app"),
-        ])
-        .output()
-        .unwrap();
+    let session = "T-3bb6cad7-8c04-413a-b23c-5fca67cd4f7b";
+    let output = history_command(
+        &p,
+        &["--json", "--history", "--ticket", "GOO-291"],
+        Some(&mock.url),
+    )
+    .env("AMP_CURRENT_THREAD_ID", session)
+    .envs([
+        ("GITHUB_ACTIONS", "true"),
+        ("GITHUB_EVENT_NAME", "push"),
+        ("GITHUB_RUN_ID", "123"),
+        ("GITHUB_RUN_ATTEMPT", "2"),
+        ("RUNNER_NAME", "runner-1"),
+        ("GITHUB_SERVER_URL", "https://github.com"),
+        ("GITHUB_REPOSITORY", "acme/app"),
+    ])
+    .output()
+    .unwrap();
     success(&output);
     let summary = events(&output).pop().unwrap();
     let file: Value =
@@ -3855,7 +3862,11 @@ fn run_upload_is_independent_of_the_local_history_file() {
         assert!(file.get(key).is_none(), "{key}");
     }
     assert!(file["source"].get("branch").is_none());
+    let links = json!({"threads": [format!("https://ampcode.com/threads/{session}")],
+        "tickets": ["GOO-291"]});
+    assert_eq!(file["links"], links);
     let mut sent = run_requests(&mock)[2].json();
+    assert_eq!(sent["links"], links);
     assert_eq!(sent["source"]["branch"], "main");
     assert_eq!(
         sent["ci"],
@@ -4512,6 +4523,45 @@ fn history_without_reporting_credentials_or_a_valid_url_sends_nothing() {
 }
 
 #[test]
+fn history_list_filters_by_link() {
+    let mock = reply(200, r#"{"data":[],"next_cursor":null}"#.into());
+    let p = project(JOB);
+    let thread = "https://ampcode.com/threads/T-3bb6cad7-8c04-413a-b23c-5fca67cd4f7b";
+    for (args, query) in [
+        (
+            &["history", "list", "--ticket", "GOO-291"][..],
+            "ticket=GOO-291".to_owned(),
+        ),
+        // The filter sends the normalized form the server matches.
+        (
+            &[
+                "history",
+                "list",
+                "--thread-url",
+                "HTTPS://AmpCode.com:443/threads/T-3bb6cad7-8c04-413a-b23c-5fca67cd4f7b",
+            ],
+            format!(
+                "thread_url={}",
+                thread.replace(':', "%3A").replace('/', "%2F")
+            ),
+        ),
+        // Before the subcommand, the value still reaches the filter.
+        (&["--ticket", "X", "history", "list"], "ticket=X".to_owned()),
+    ] {
+        let before = mock.requests().len();
+        let output = run_with(&p, &[args, &["--json"]].concat(), Some(&mock.url));
+        success(&output);
+        let requests = mock.requests();
+        assert_eq!(requests.len(), before + 1, "{args:?}");
+        assert_eq!(
+            requests[before].path,
+            format!("{RUNS_PATH}?{query}"),
+            "{args:?}"
+        );
+    }
+}
+
+#[test]
 fn history_argument_errors_and_run_only_flags_send_nothing() {
     let mock = Mock::store();
     let p = project(JOB);
@@ -4542,6 +4592,48 @@ fn history_argument_errors_and_run_only_flags_send_nothing() {
             &["--jobs", "a", "history", "list", "--json"],
             2,
             "--jobs cannot be used with history commands",
+        ),
+        (
+            &["history", "list", "--ticket", "GOO-1", "--ticket", "GOO-2"],
+            2,
+            "cannot be used multiple times",
+        ),
+        (&["history", "list", "--ticket", "GOO 1"], 2, "--ticket"),
+        (
+            &["history", "list", "--thread-url", "https://h/x?token=1"],
+            2,
+            "--thread-url",
+        ),
+        (
+            &["history", "show", RUN_ID, "--ticket", "GOO-1"],
+            2,
+            "--ticket cannot be used with history commands",
+        ),
+        (
+            &["--ticket", "GOO-1", "--ticket", "GOO-2", "history", "list"],
+            2,
+            "--ticket cannot be used with history commands",
+        ),
+        (
+            &["--ticket", "GOO-1", "history", "list", "--ticket", "GOO-2"],
+            2,
+            "--ticket cannot be used with history commands",
+        ),
+        (
+            &["--ticket=GOO-1", "history", "list", "--ticket=GOO-2"],
+            2,
+            "--ticket cannot be used with history commands",
+        ),
+        (
+            &[
+                "--thread-url",
+                "https://h/y",
+                "history",
+                "list",
+                "--thread-url=https://h/x",
+            ],
+            2,
+            "--thread-url cannot be used with history commands",
         ),
     ] {
         let output = run_with(&p, args, Some(&mock.url));
@@ -4593,7 +4685,19 @@ fn history_help_hides_run_only_flags() {
         "--graph-sha256",
         "--limit",
         "--cursor",
+        "--ticket",
+        "--thread-url",
     ] {
         assert!(help.contains(filter), "{help}");
     }
+    // The filters, not the run flags of the same names.
+    assert!(
+        help.contains("Only runs linked to this ticket ID"),
+        "{help}"
+    );
+    let help = stdout(&p.run(&["history", "show", "--help"]));
+    assert!(
+        !help.contains("--ticket") && !help.contains("--thread-url"),
+        "{help}"
+    );
 }

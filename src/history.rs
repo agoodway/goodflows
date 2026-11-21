@@ -4,6 +4,7 @@
 
 use crate::config::{Condition, Job, Partition, Partitions};
 use crate::fsutil::Dir;
+use crate::links::Links;
 use crate::reporting::Source;
 use crate::runner::{JobResult, Scheduling, Status};
 use anyhow::{Context, Result};
@@ -241,7 +242,9 @@ pub struct RunFields {
 
 /// The history file, and with `Upload` keys the uploaded run record. Key
 /// order is field order; the allowlist below is the whole contents, so
-/// command output and job outputs can never leak in.
+/// command output and job outputs can never leak in. `links` is the run's,
+/// the same in the file and the upload of every invocation, and left out
+/// when it has no entries.
 #[derive(Serialize)]
 pub struct Record<'a> {
     schema_version: u32,
@@ -267,6 +270,8 @@ pub struct Record<'a> {
     source: Option<RecordSource<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     ci: Option<&'a crate::reporting::ci::Ci>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    links: Option<&'a Links>,
     results: Vec<Instance<'a>>,
     /// Last, because it is the largest key.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -434,6 +439,8 @@ pub struct HistoryTarget<'a> {
     pub parent: Option<(&'a str, &'a str)>,
     /// Source context captured before jobs ran.
     pub source: Option<&'a Source>,
+    /// The run's links, collected once for every invocation.
+    pub links: Option<&'a Links>,
     pub stem: &'a str,
     pub runs: u64,
     pub bytes: u64,
@@ -475,6 +482,7 @@ pub fn record<'a>(
         host: &fields.host,
         source: RecordSource::of(target.source, upload.branch),
         ci: upload.ci,
+        links: target.links.filter(|links| !links.is_empty()),
         results: results
             .iter()
             .map(|result| Instance {
@@ -870,6 +878,7 @@ mod tests {
             requested_jobs: requested,
             parent: Some(("0f0f0f0f-0000-4000-8000-000000000000", "call-ci")),
             source: Some(source),
+            links: None,
             stem: "stem",
             runs: 10,
             bytes: 1 << 20,
@@ -991,6 +1000,89 @@ mod tests {
             serde_json::json!({"commit": "c".repeat(40), "dirty": true})
         );
         assert!(upload.get("ci").is_none() && upload.get("graph").is_none());
+    }
+
+    #[test]
+    fn the_file_and_the_upload_hold_the_same_links() {
+        let (results, source, fields) = (fixed_results(), fixed_source(), fixed_fields());
+        let requested = ["test".to_owned()];
+        let links = Links {
+            threads: vec!["https://ampcode.com/threads/T-x".into()],
+            tickets: vec!["GOO-291".into()],
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let target = HistoryTarget {
+            links: Some(&links),
+            ..fixed_target(dir.path(), &source, &requested)
+        };
+        let written = write(&target, &fields, 1500, &results, false).unwrap();
+        let bytes = std::fs::read_to_string(written.path).unwrap();
+        let at = |key: &str| bytes.find(&format!("\"{key}\":")).unwrap();
+        assert!(
+            at("source") < at("links") && at("links") < at("results"),
+            "{bytes}"
+        );
+        let file: serde_json::Value = serde_json::from_str(&bytes).unwrap();
+        let ci = crate::reporting::ci::capture(|name| {
+            (name == "GITHUB_ACTIONS").then(|| "true".to_owned())
+        })
+        .unwrap();
+        let upload = record(
+            &target,
+            &fields,
+            1500,
+            &results,
+            Upload {
+                branch: true,
+                ci: Some(&ci),
+                graph: None,
+            },
+        );
+        let text = serde_json::to_string(&upload).unwrap();
+        // After `ci`, before `results`.
+        let at = |key: &str| text.find(&format!("\"{key}\":")).unwrap();
+        assert!(
+            at("ci") < at("links") && at("links") < at("results"),
+            "{text}"
+        );
+        let upload = serde_json::to_value(&upload).unwrap();
+        let expected = serde_json::json!({
+            "threads": ["https://ampcode.com/threads/T-x"],
+            "tickets": ["GOO-291"],
+        });
+        assert_eq!(file["links"], expected);
+        assert_eq!(upload["links"], expected);
+
+        // A list without entries is left out, and so is `links` without any.
+        let tickets = Links {
+            threads: Vec::new(),
+            ..links.clone()
+        };
+        let empty = Links::default();
+        for (links, expected) in [
+            (
+                Some(&tickets),
+                Some(serde_json::json!({"tickets": ["GOO-291"]})),
+            ),
+            (Some(&empty), None),
+            (None, None),
+        ] {
+            let target = HistoryTarget {
+                links,
+                ..fixed_target(Path::new("/unused"), &source, &requested)
+            };
+            for upload in [
+                Upload::default(),
+                Upload {
+                    branch: true,
+                    ..Upload::default()
+                },
+            ] {
+                let record = record(&target, &fields, 1500, &results, upload);
+                let record = serde_json::to_value(&record).unwrap();
+                assert_eq!(record.get("links").cloned(), expected);
+            }
+        }
     }
 
     #[test]

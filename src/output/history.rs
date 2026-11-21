@@ -189,6 +189,20 @@ pub(super) fn run(event: &Value, out: &mut impl Write) -> Result<()> {
             header.push(("ci url", field(&ci["url"])));
         }
     }
+    // A public key gets `threads` as null when the run has threads, and no
+    // `threads` key when it has only tickets.
+    let links = &doc["links"];
+    if let Some(tickets) = links["tickets"].as_array() {
+        let tickets: Vec<String> = tickets.iter().map(field).collect();
+        header.push(("tickets", tickets.join(", ")));
+    }
+    match links.get("threads") {
+        Some(Value::Array(threads)) => {
+            header.extend(threads.iter().map(|thread| ("thread", field(thread))));
+        }
+        Some(Value::Null) => header.push(("thread", ABSENT.to_owned())),
+        _ => {}
+    }
     let host = &doc["host"];
     let mut host_line = format!(
         "{} {}, {} CPUs",

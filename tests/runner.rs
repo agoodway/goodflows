@@ -140,6 +140,116 @@ fn validate_and_list_reject_log_dir_which_only_a_run_uses() {
 }
 
 #[test]
+fn invalid_or_too_many_link_flags_fail_before_any_job() {
+    let p = Project::new("[[jobs]]\nname='a'\ncommand='touch ran'");
+    let many = |flag: &'static str, value: fn(usize) -> String| {
+        (1..=33)
+            .flat_map(|n| [flag.to_owned(), value(n)])
+            .collect::<Vec<_>>()
+    };
+    let tickets = many("--ticket", |n| format!("GOO-{n}"));
+    let threads = many("--thread-url", |n| format!("https://h.example/{n}"));
+    for (args, message) in [
+        (
+            vec!["--ticket".to_owned(), "GOO-1,GOO-2".into()],
+            "invalid value",
+        ),
+        (vec!["--ticket".to_owned(), "x".repeat(65)], "invalid value"),
+        (
+            vec![
+                "run".to_owned(),
+                "--thread-url".into(),
+                "https://ampcode.com/threads/T-1?token=x".into(),
+            ],
+            "invalid value",
+        ),
+        (tickets, "--ticket can be given at most 32 times"),
+        (threads, "--thread-url can be given at most 32 times"),
+        (
+            ["--ticket", "A", "run", "--ticket", "B"]
+                .map(String::from)
+                .to_vec(),
+            "--ticket must be given on one side of the subcommand",
+        ),
+        (
+            [
+                "--thread-url=https://h/y",
+                "run",
+                "--thread-url=https://h/x",
+            ]
+            .map(String::from)
+            .to_vec(),
+            "--thread-url must be given on one side of the subcommand",
+        ),
+        (
+            ["--ticket", "A", "validate", "--ticket", "B"]
+                .map(String::from)
+                .to_vec(),
+            "--ticket must be given on one side of the subcommand",
+        ),
+        (
+            ["--ticket", "A", "list", "--ticket", "B"]
+                .map(String::from)
+                .to_vec(),
+            "--ticket must be given on one side of the subcommand",
+        ),
+    ] {
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let output = p.run(&args);
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        assert!(stderr(&output).contains(message), "{}", stderr(&output));
+        assert!(!p.dir.join("ran").exists(), "{args:?}");
+    }
+    // 32 of each is the limit, not an error.
+    let mut args = Vec::new();
+    for n in 1..=32 {
+        args.extend([
+            "--ticket".to_owned(),
+            format!("GOO-{n}"),
+            "--thread-url".to_owned(),
+            format!("https://h.example/{n}"),
+        ]);
+    }
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    success(&p.run(&args));
+    assert!(p.dir.join("ran").exists());
+}
+
+#[test]
+fn link_flags_are_run_flags() {
+    let p = Project::new("[[jobs]]\nname='a'\ncommand='touch ran'\n[reporting]\nproject='p'\n");
+    // `history show` rejects them, like every run flag, before any request.
+    let output = p.run(&[
+        "history",
+        "show",
+        "fb7d2711-6b67-4f5a-9104-492032a9e1e5",
+        "--ticket",
+        "X",
+    ]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        stderr(&output).contains("--ticket cannot be used with history commands"),
+        "{}",
+        stderr(&output)
+    );
+    let output = p.run(&["--thread-url", "https://h/x", "last"]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(stderr(&output).contains("--thread-url cannot be used with last"));
+    // `validate` and `list` accept and ignore them, as they do `--history`.
+    for command in ["validate", "list"] {
+        success(&p.run(&[
+            command,
+            "--ticket",
+            "GOO-1",
+            "--thread-url",
+            "https://h/x",
+            "--history",
+        ]));
+    }
+    assert!(!p.dir.join("ran").exists());
+}
+
+#[test]
 fn direct_exec_preserves_quoted_arguments() {
     let p = Project::new(
         r#"[[jobs]]
