@@ -247,7 +247,8 @@ pub async fn resolve(
         }
         .into());
     };
-    let op = Arc::new(op);
+    // A relative PATH entry must not be resolved again against the workdir.
+    let op = Arc::new(std::path::absolute(&op).unwrap_or(op));
     let mut values = BTreeMap::new();
     let first_timeout = timeout(
         FIRST_READ_TIMEOUT,

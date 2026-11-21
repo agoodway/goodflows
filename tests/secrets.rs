@@ -183,6 +183,30 @@ fn each_distinct_reference_is_read_once_before_the_first_job() {
 }
 
 #[test]
+fn op_found_through_a_relative_path_entry_runs_from_another_workdir() {
+    let p = Op::new(
+        &format!(
+            "[settings]\nworkdir = 'work'\n{}[[jobs]]\nname = 'db'\n\
+             command = 'printf %s \"$DATABASE_URL\" > got'\nsecrets = ['DATABASE_URL']\n",
+            shared_settings()
+        ),
+        &[(DEV, VALUE)],
+    );
+    std::fs::create_dir_all(p.project.dir.join("work")).unwrap();
+    std::fs::create_dir_all(p.project.dir.join("bin")).unwrap();
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-op/op");
+    std::fs::copy(fixture, p.project.dir.join("bin/op")).unwrap();
+    let output = p
+        .command(false)
+        .env("PATH", format!("./bin:{}", path(false)))
+        .arg("run")
+        .output()
+        .unwrap();
+    success(&output);
+    assert_eq!(p.read("work/got"), VALUE);
+}
+
+#[test]
 fn a_run_that_selects_no_secret_never_looks_for_op() {
     let p = Op::new(
         &format!(
