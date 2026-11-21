@@ -133,7 +133,10 @@ impl Fake {
             "GOODFLOWS_URL",
             "GOODFLOWS_API_KEY",
             "GOODFLOWS_SPRITE_STATE_DIR",
-        ] {
+        ]
+        .into_iter()
+        .chain(common::LINK_VARIABLES)
+        {
             command.env_remove(name);
         }
         command
@@ -1610,6 +1613,54 @@ fn a_detached_snapshot_records_no_branch() {
         serde_json::json!({"commit": provenance["commit"], "dirty": false}),
         "{history}"
     );
+}
+
+#[test]
+fn a_remote_history_file_carries_the_controllers_links() {
+    let fake =
+        Fake::new(&PLAIN.replace("[settings]\n", "[settings]\nticket_prefixes = [\"GOO\"]\n"));
+    git(
+        &fake.project,
+        &["checkout", "-q", "-b", "tbrewer/goo-291-fix"],
+    );
+    let id = "T-3bb6cad7-8c04-413a-b23c-5fca67cd4f7b";
+    let tools = tempfile::tempdir().unwrap();
+    let path = common::fake_git(tools.path(), None);
+    let run = |args: &[&str]| {
+        fake.command()
+            .env(
+                "PATH",
+                format!("{}:{path}", fake.root.join("cli").display()),
+            )
+            .env("AMP_CURRENT_THREAD_ID", id)
+            .args(["run", "--sprite", "T-1", "--json", "--ticket", "GOO-300"])
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let output = run(&["--history"]);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert_eq!(common::link_scans(tools.path()), 1);
+    let all = events(&output);
+    let expected = serde_json::json!({
+        "threads": [format!("https://ampcode.com/threads/{id}")],
+        "tickets": ["GOO-300", "GOO-291"],
+    });
+    // Collected on the controller, sent in the provenance, recorded as sent.
+    let provenance = fake.record(&run_id(&all))["provenance"].clone();
+    assert_eq!(provenance["links"], expected, "{provenance}");
+    let path = all.last().unwrap()["history_file"].as_str().unwrap();
+    let history: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    assert_eq!(history["links"], expected, "{history}");
+
+    // A run with nothing recording scans no git for links and sends none.
+    let output = run(&[]);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert_eq!(common::link_scans(tools.path()), 1);
+    let all = events(&output);
+    let provenance = fake.record(&run_id(&all))["provenance"].clone();
+    assert!(provenance.get("links").is_none(), "{provenance}");
+    assert!(all.last().unwrap().get("history_file").is_none());
 }
 
 #[test]

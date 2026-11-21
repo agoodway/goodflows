@@ -83,6 +83,9 @@ pub fn validate(record: &Value, encoded_len: usize) -> Result<(), Violation> {
     if let Some(ci) = doc.get("ci") {
         self::ci(ci, &at("ci"))?;
     }
+    if let Some(links) = doc.get("links") {
+        self::links(links, &at("links"))?;
+    }
     let path = at("results");
     let results = list(&doc["results"], &path, 0, usize::MAX)?;
     for (i, result) in results.iter().enumerate() {
@@ -168,6 +171,7 @@ const DOCUMENT: Fields = &[
     ("host", Required),
     ("source", Optional),
     ("ci", Optional),
+    ("links", Optional),
     ("results", Required),
     ("graph", Optional),
 ];
@@ -192,6 +196,8 @@ const CI: Fields = &[
     ("runner", Optional),
     ("url", Optional),
 ];
+/// At least one of the two, checked by `links`.
+const LINKS: Fields = &[("threads", Optional), ("tickets", Optional)];
 const RESULT: Fields = &[
     ("name", Required),
     ("partition", Optional),
@@ -543,6 +549,53 @@ fn ci(value: &Value, path: &Path) -> Check {
     Ok(())
 }
 
+/// The rules goodflows_web shares: thread URLs already in normalized form
+/// with RFC 3986 host and path characters, tickets unique ignoring ASCII
+/// case, and each list 1 to 32 entries.
+fn links(value: &Value, path: &Path) -> Check {
+    let links = object(value, path, LINKS)?;
+    if links.is_empty() {
+        return Err(path.fail("invalid_field"));
+    }
+    if let Some(threads) = links.get("threads") {
+        let path = Path::Key(path, "threads");
+        let threads = list(threads, &path, 1, crate::links::MAX_ENTRIES)?;
+        for (i, url) in threads.iter().enumerate() {
+            let path = Path::Index(&path, i);
+            let text = string(url, &path)?;
+            if text.len() > MAX_URL_BYTES {
+                return Err(path.fail("field_too_long"));
+            }
+            if !crate::links::normalized_thread_url(text) {
+                return Err(path.fail("invalid_field"));
+            }
+            if threads[..i].contains(url) {
+                return Err(path.fail("duplicate_entry"));
+            }
+        }
+    }
+    if let Some(tickets) = links.get("tickets") {
+        let path = Path::Key(path, "tickets");
+        let tickets = list(tickets, &path, 1, crate::links::MAX_ENTRIES)?;
+        for (i, ticket) in tickets.iter().enumerate() {
+            let path = Path::Index(&path, i);
+            let text = string(ticket, &path)?;
+            if !crate::links::valid_ticket(text) {
+                return Err(path.fail("invalid_field"));
+            }
+            let repeated = tickets[..i].iter().any(|earlier| {
+                earlier
+                    .as_str()
+                    .is_some_and(|e| e.eq_ignore_ascii_case(text))
+            });
+            if repeated {
+                return Err(path.fail("duplicate_entry"));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn result(value: &Value, path: &Path) -> Check {
     let result = object(value, path, RESULT)?;
     let at = |key| Path::Key(path, key);
@@ -768,6 +821,9 @@ mod tests {
         include_str!("../../tests/fixtures/workflow-runs/history-parent-default.json");
     const HISTORY_CHILD: &str =
         include_str!("../../tests/fixtures/workflow-runs/history-child-suite.json");
+    /// A valid record with links and the invalid `links` values, for
+    /// goodflows_web to vendor.
+    const LINKS: &str = include_str!("../../tests/fixtures/workflow-runs/links.json");
 
     fn parse(text: &str) -> Value {
         serde_json::from_str(text).unwrap()
@@ -842,6 +898,120 @@ mod tests {
         let jobs = &full["graph"]["jobs"];
         assert!(jobs[1]["partitions"].is_object() && jobs[1]["steps"][0]["condition"].is_object());
         assert!(jobs[0]["condition"].is_object() && jobs[2]["call"].is_object());
+    }
+
+    #[test]
+    fn the_links_fixture_pins_the_shared_rules() {
+        let fixture = parse(LINKS);
+        let record = &fixture["record"];
+        assert_eq!(check(record), Ok(()));
+        // Percent triplets are valid as written, never decoded.
+        assert_eq!(record["links"]["threads"][1], "https://h.example/a%7Eb%2fc");
+        let cases = fixture["invalid"].as_array().unwrap();
+        assert_eq!(cases.len(), 19);
+        for case in cases {
+            let mut record = record.clone();
+            record["links"] = case["links"].clone();
+            let error = check(&record).unwrap_err();
+            assert_eq!(
+                error.path,
+                case["path"].as_str().unwrap(),
+                "{}",
+                case["case"]
+            );
+        }
+    }
+
+    #[test]
+    fn links_follow_the_shared_rules() {
+        let fixture = parse(LINKS);
+        let with_links = |links: Value| {
+            let mut record = fixture["record"].clone();
+            record["links"] = links;
+            record
+        };
+        let thread = "https://ampcode.com/threads/T-3bb6cad7-8c04-413a-b23c-5fca67cd4f7b";
+        fails(&with_links(json!({})), "links", "invalid_field");
+        fails(&with_links(json!({"x": []})), "links", "unsupported_field");
+        fails(
+            &with_links(json!({"tickets": null})),
+            "links.tickets",
+            "null_field",
+        );
+        fails(
+            &with_links(json!({"tickets": []})),
+            "links.tickets",
+            "empty_list",
+        );
+        fails(
+            &with_links(json!({"threads": []})),
+            "links.threads",
+            "empty_list",
+        );
+        let many: Vec<_> = (1..=33).map(|n| format!("GOO-{n}")).collect();
+        fails(
+            &with_links(json!({"tickets": many})),
+            "links.tickets",
+            "too_many_entries",
+        );
+        assert_eq!(check(&with_links(json!({"tickets": many[..32]}))), Ok(()));
+        fails(
+            &with_links(json!({"tickets": ["GOO-1", "GOO-2", "goo-1"]})),
+            "links.tickets[2]",
+            "duplicate_entry",
+        );
+        fails(
+            &with_links(json!({"threads": [thread, thread]})),
+            "links.threads[1]",
+            "duplicate_entry",
+        );
+        for bad in ["GOO-1,GOO-2", "GOO 1", "", &"x".repeat(65)] {
+            fails(
+                &with_links(json!({"tickets": [bad]})),
+                "links.tickets[0]",
+                "invalid_field",
+            );
+        }
+        fails(
+            &with_links(json!({"tickets": [1]})),
+            "links.tickets[0]",
+            "invalid_field",
+        );
+        let long = format!("https://h/{}", "a".repeat(MAX_URL_BYTES));
+        fails(
+            &with_links(json!({"threads": [long]})),
+            "links.threads[0]",
+            "field_too_long",
+        );
+        // Rejected, not rewritten to its normalized form.
+        fails(
+            &with_links(json!({
+                "threads": ["https://AmpCode.com:443/threads/T-3bb6cad7-8c04-413a-b23c-5fca67cd4f7b"]
+            })),
+            "links.threads[0]",
+            "invalid_field",
+        );
+        // WHATWG keeps these as written, so only the character rules catch
+        // them: RFC 3986 parsers such as goodflows_web's reject them.
+        for kept in [
+            "https://a{b.com/x",
+            "https://h.example/a|b",
+            "https://h.example/a%zzb",
+        ] {
+            assert_eq!(Url::parse(kept).unwrap().as_str(), kept);
+            fails(
+                &with_links(json!({"threads": [kept]})),
+                "links.threads[0]",
+                "invalid_field",
+            );
+        }
+        // Only threads, only tickets, or both.
+        assert_eq!(check(&with_links(json!({"threads": [thread]}))), Ok(()));
+        assert_eq!(check(&with_links(json!({"tickets": ["GOO-1"]}))), Ok(()));
+        assert_eq!(
+            check(&with_links(json!({"threads": ["https://[::1]/x"]}))),
+            Ok(())
+        );
     }
 
     #[test]
