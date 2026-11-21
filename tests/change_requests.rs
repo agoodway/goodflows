@@ -936,6 +936,45 @@ fn runs_upload_retries_a_commit_the_server_cannot_check_yet() {
 }
 
 #[test]
+fn claims_fetch_the_target_into_origin_in_a_single_branch_clone() {
+    let p = checkout();
+    let head = git(&p, &["rev-parse", "HEAD"]);
+    let base = git(&p, &["rev-parse", "main"]);
+    let origin = p.dir.join(".goodflows/origin.git");
+    git(
+        &p,
+        &["clone", "-q", "--bare", ".", origin.to_str().unwrap()],
+    );
+    git(&p, &["remote", "add", "origin", origin.to_str().unwrap()]);
+    // A single-branch clone fetches only its own branch by default, and has
+    // neither main nor origin/main.
+    git(
+        &p,
+        &[
+            "config",
+            "remote.origin.fetch",
+            "+refs/heads/feat/login:refs/remotes/origin/feat/login",
+        ],
+    );
+    git(&p, &["branch", "-q", "-D", "main"]);
+    std::fs::write(
+        p.dir.join("cr.md"),
+        claims_file(&head).replacen("cr: null", "cr: 7", 1),
+    )
+    .unwrap();
+    let mock = server(vec![cr(7, "draft", None)]);
+    let output = run(&p, &mock, &["cr", "claims", "cr.md", "--json"]);
+    success(&output);
+    let facts = mock
+        .requests()
+        .into_iter()
+        .find(|r| r.path.ends_with("/git-facts"))
+        .unwrap()
+        .json();
+    assert_eq!(facts["target"]["merge_base"], base);
+}
+
+#[test]
 fn claims_fetch_the_target_first_and_explain_a_moved_merge_base() {
     let p = checkout();
     let head = git(&p, &["rev-parse", "HEAD"]);

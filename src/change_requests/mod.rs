@@ -1616,7 +1616,7 @@ async fn upload_run(ctx: &Ctx<'_>, folder: &Path, pick: Pick) -> Result<u8> {
         .await?;
     let mut stored = data(body, "runs upload")?;
     if stored["status"] == "uploading" {
-        put_artifacts(folder, &run.artifacts, &stored).await?;
+        put_artifacts(folder, &run.artifacts, &stored, ctx.api.cancel()).await?;
         let body = commit_run(ctx, &run_id).await?;
         stored = data(body, "runs upload")?;
     }
@@ -1693,6 +1693,7 @@ async fn put_artifacts(
     folder: &Path,
     artifacts: &[verify_run::Artifact],
     stored: &Value,
+    mut cancel: watch::Receiver<Option<i32>>,
 ) -> Result<()> {
     const INVALID: &str = "runs upload failed: the server returned invalid upload URLs";
     let uploads = stored["uploads"]
@@ -1727,11 +1728,11 @@ async fn put_artifacts(
         if markdown::sha256_hex(&bytes) != artifact.sha256 {
             bail!("{} changed while it was uploaded", artifact.file.display());
         }
-        let response = request
-            .body(bytes)
-            .send()
-            .await
-            .map_err(|_| anyhow!("runs upload failed: could not reach the object store"))?;
+        let response = tokio::select! {
+            response = request.body(bytes).send() => response
+                .map_err(|_| anyhow!("runs upload failed: could not reach the object store"))?,
+            _ = cancel.wait_for(Option::is_some) => bail!("runs upload interrupted"),
+        };
         if !response.status().is_success() {
             bail!(
                 "runs upload failed: the object store refused {} (HTTP {})",

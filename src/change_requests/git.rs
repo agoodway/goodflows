@@ -141,7 +141,7 @@ impl Git {
         })
     }
 
-    /// Update `origin/<target>` with `git fetch` when there is an `origin`
+    /// Update `refs/remotes/origin/<target>` with `git fetch` when there is an `origin`
     /// remote, so facts use the merge base the server will see.
     pub async fn fetch_target(&self, target: &str) -> Result<()> {
         if self
@@ -151,8 +151,11 @@ impl Git {
         {
             return Ok(());
         }
+        // An explicit destination, because a single-branch clone's refspec
+        // would leave the target only in FETCH_HEAD.
+        let refspec = format!("+refs/heads/{target}:refs/remotes/origin/{target}");
         let output = self
-            .command(&["fetch", "--quiet", "origin", target])
+            .command(&["fetch", "--quiet", "origin", &refspec])
             // Fail instead of waiting at a credential prompt.
             .env("GIT_TERMINAL_PROMPT", "0")
             .output()
