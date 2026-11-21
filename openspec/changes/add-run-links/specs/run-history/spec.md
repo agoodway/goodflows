@@ -28,6 +28,13 @@ A thread URL MUST be `https`, have a host, have no userinfo, query or fragment, 
 - **WHEN** a collected thread URL has `|`, `[` or `%zz` in its path, or ends with `%`
 - **THEN** it is not recorded
 
+### Requirement: Thread URL hosts are RFC 3986 safe
+A thread URL's host MUST be either a bracketed IPv6 address or made only of RFC 3986 unreserved and sub-delims characters (`A-Z`, `a-z`, `0-9`, `-._~!$&'()*+,;=`). Collection SHALL drop, and upload validation SHALL reject, any other host, including one with `"`, `` ` ``, `{` or `}`, which WHATWG keeps as written and RFC 3986 parsers reject.
+
+#### Scenario: Brace in the host
+- **WHEN** a run's record has `links.threads[0]` `https://a{b.com/x`
+- **THEN** the run prints `upload skipped: invalid record at links.threads[0]` and sends no request
+
 #### Scenario: Duplicate URL spellings
 - **WHEN** the collected threads are `HTTPS://AmpCode.com/threads/T-<uuid>` and `https://ampcode.com/threads/T-<uuid>`
 - **THEN** `links.threads` holds one entry, `https://ampcode.com/threads/T-<uuid>`

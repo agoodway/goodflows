@@ -52,11 +52,13 @@ Rules, which `run_contract` and the server share:
 |---|---|
 | `links` | object with only `threads` and `tickets`, at least one present |
 | `threads` | 1 to 32 entries, unique |
-| thread URL | `https`, has a host, no userinfo, no query, no fragment (an empty `?` or `#` counts), path characters as below, already in normalized form, at most `MAX_URL_BYTES` (2048) |
+| thread URL | `https`, has a host, no userinfo, no query, no fragment (an empty `?` or `#` counts), host and path characters as below, already in normalized form, at most `MAX_URL_BYTES` (2048) |
 | `tickets` | 1 to 32 entries, unique ignoring ASCII case |
 | ticket | 1 to 64 bytes of printable ASCII (`!` to `~`) other than `,`, so no whitespace, control characters or commas |
 
 **Path characters.** Every path byte is an RFC 3986 `pchar` (unreserved, sub-delims, `:` or `@`) or `/`, and every `%` starts a `%` plus two hex digits. That excludes `[`, `]`, `|`, `^`, `` ` ``, `{`, `}`, `\` and a bare or malformed `%` (`%zz`, a trailing `%`). `reqwest::Url` follows WHATWG and leaves several of these as written, and goodflows_web parses URLs as RFC 3986 (`URI.new/1`). A URL that passes here therefore can never get a 422 on upload. A 422 leaves the record pending, and `reports upload` retries it forever.
+
+**Host characters.** The host is either a bracketed IPv6 address or made only of RFC 3986 unreserved and sub-delims characters: `A-Z`, `a-z`, `0-9` and `-._~!$&'()*+,;=`. WHATWG keeps `"`, `` ` ``, `{` and `}` in a host as written, so `https://a{b.com/x` equals its own serialization, but `URI.new/1` rejects it. Those four are the only printable ASCII host characters on which the two parsers disagree; `@` parses as userinfo, which both reject. Percent triplets cannot appear, because WHATWG decodes them in a host and the normalized check then fails.
 
 **Normalized form** is the form `reqwest::Url` produces:
 
@@ -181,7 +183,7 @@ After the `ci` lines, `show` prints a `tickets` row with the tickets joined by `
 ## Risks / Trade-offs
 
 - [An older server rejects every record that has links, with 422] → Ship goodflows_web first. Records already in a spool are replayed by `reports upload` once the server accepts them. A CI spool that is thrown away loses them.
-- [The server and CLI disagree on normalized form or path characters, so valid-looking records get 422] → One definition, written above, and a shared fixture that both repos test against, with `[`, `%zz`, a trailing `%`, `%7E`, `%2f`, an uppercase host and `:443`.
+- [The server and CLI disagree on normalized form or path characters, so valid-looking records get 422] → One definition, written above, and a shared fixture that both repos test against, with `[`, `%zz`, a trailing `%`, `%7E`, `%2f`, an uppercase host, `:443` and a `{` in the host.
 - [Wrong links: a long-lived branch accumulates unrelated threads, or a subject names the wrong ticket] → Commits are limited to the branch's own commits since `<base>`, at most 200, shallow checkouts scan only `HEAD`, and lists hold at most 32 entries. Flags let a caller state links explicitly when it matters.
 - [A `main` run links every thread copied into its squash body] → Those are the threads that wrote the change, which is the point.
 - [Thread URLs in committed history files] → The same URLs already appear in those commits' messages. A run started in an agent session that never committed adds its own URL. Projects that commit history files should know that.
