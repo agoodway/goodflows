@@ -798,6 +798,33 @@ module.exports = { reporters: ['default', 'goodflows-jest-reporter'] };
 
 Other runners can write `test-timings/1` themselves. The suite id for the ExUnit reporter is the `:test_timing_suite_id` option, or `TEST_TIMING_SUITE_ID`.
 
+### Change requests
+
+A GoodFlows server can hold change requests in place of pull requests. The server stores the facts and claims a client reports for each head, the QA scenario sets and verify runs that grade it, and the project's review policy, and computes a verdict: `pending`, `blocked`, `needs_review`, or `mergeable`, with one reason per rule that fired. It never talks to the Git host. These commands report facts from the local checkout and read results back with the same `[reporting]` project, URL, and key as `history`. Writes need an `sk_` key.
+
+A change request's description is its claims file, a `change-claims/2` Markdown file that the goodstack `gs-change-request` skill writes to `goodflows cr path` (`.goodflows/change-requests/<branch>/cr.md`, or `.goodflows/change-requests/.detached/<short SHA>/cr.md` on a detached HEAD):
+
+- `goodflows cr open [--claims <file>]` **creates** one while the file's `cr` is null. It reuses the one draft or open change request whose source branch is the current branch, or opens a draft. When the claims file exists, it reports `git-facts/1` for HEAD, writes the number into the file's `cr`, and uploads the claims. Without the file it needs `--title`, and `--openspec-change <id>` links the OpenSpec change, so its intent scenario set can be approved before code.
+- `goodflows cr claims [<file>]` **updates** it once `cr` is set: it reports Git facts for HEAD, then uploads the claims. Claims describe one head, so the file's `head` must be HEAD.
+
+Before computing Git facts, `cr open`, `cr claims`, `cr push`, and `cr lease acquire` without `--base` run `git fetch --quiet origin <target>` when the checkout has an `origin` remote, so the merge base is the one the target branch has now; `--no-fetch` skips it. The server keeps one report per head and target branch: facts for the same head with a different merge base are refused, so make a new commit (or retarget) and report again. Claims are fixed per head in the same way.
+
+```bash
+goodflows cr open --openspec-change add-login --title "Add login"
+goodflows cr scenarios upload openspec/changes/add-login/qa-scenarios.md
+goodflows cr scenarios approve
+goodflows cr push -- -u origin HEAD        # git push, then report Git facts for the new head
+goodflows cr runs upload .verify/web/<run-id>
+goodflows cr open                          # gs-change-request wrote the claims file
+goodflows cr ready
+goodflows cr wait --until mergeable,needs_review
+goodflows cr review                        # what the policy flagged, as Markdown
+```
+
+Commands find the change request of the current branch unless given `--number`. The others are `cr status`, `cr verdict`, `cr draft`, `cr close`, `cr reopen`, `cr scenarios reject` and `diff`, `cr answer`, `cr tasks`, `cr merged`, `cr retarget`, `cr parent`, `cr lease acquire|heartbeat|release`, and `cr defect`; `policy get|set|history|calibration` read and write the review policy as TOML; `features sync` uploads the verify skill's feature files that have `paths` globs; and `events` reads the project's event feed after an event id cursor (`--after <id>`), with `--follow` to keep reading. Events are kept 90 days; when the events after a cursor were deleted, `--follow` continues from the server's `latest_cursor` and notes that events were skipped, and a single read fails naming it. Each command's `--help` has examples, and `--json` prints its result as one JSON event.
+
+`cr scenarios upload` sends the set file byte for byte, because the approved digest covers its raw bytes, with a digest per scenario section: under `## Scenarios`, from a scenario's `### <id>. ` heading (`#### <id>. ` under a group heading) to the next heading at that level or higher. It refuses a diff set whose `revision` ends `+dirty`. `cr runs upload` reads a run folder's `scenarios.md`, whose SHA-256 is the graded set's digest, and the `verify-run-notes/1` YAML front matter of its `run.md`: `format`, `commit`, `branch`, `dirty`, `started_at`, `finished_at`, and `results` (`id`, `result`, `failed_step`, `reason`, and `evidence` paths in the folder), and optionally `set` (`path`, `sha256`, which must match `scenarios.md`), `changed_files`, `features`, `drift`, `run_id`, `merge_result`, `links`, and `workflow_run_id`. It uploads each evidence file to the URL the server returns, then commits the run, retrying up to 5 times while the server answers `503` (waiting its `retry-after`, at most 10 seconds). `policy set` without `--previous-version` writes nothing when the current version already has the same document and note.
+
 ### Sprites
 
 `goodflows run --sprite <identity>` runs one workflow on a [Sprite](https://sprites.dev) kept for that caller identity. The run sends a verified snapshot of the Git working tree that contains the config, runs your `setup` or `resume` command, then runs the same workflow with the same goodflows version. A run without `--sprite` stays on this machine and does not call the Sprite CLI. `--env` still selects a profile.

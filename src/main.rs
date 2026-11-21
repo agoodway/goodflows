@@ -1,4 +1,5 @@
 mod cache;
+mod change_requests;
 mod config;
 mod detach;
 mod expression;
@@ -227,6 +228,37 @@ enum Commands {
         #[command(subcommand)]
         command: HistoryCommand,
     },
+    /// Change requests: create one from a claims file (cr open), update it (cr claims), and report facts, scenario sets and verify runs
+    #[command(after_help = change_requests::CR_EXAMPLES)]
+    Cr {
+        #[command(subcommand)]
+        command: change_requests::CrCommand,
+    },
+    /// Read and write the project's review policy, which decides change request verdicts
+    #[command(after_help = "Examples:
+  goodflows policy get                       # the current policy as TOML, with its version
+  goodflows policy set policy.toml --note Require-ci   # owners and admins write a new version
+  goodflows policy history                   # versions, newest first
+  goodflows policy calibration               # merges and defects by lane, rule and path glob")]
+    Policy {
+        #[command(subcommand)]
+        command: change_requests::PolicyCommand,
+    },
+    /// Sync the verify skill's feature files to the project's feature index
+    #[command(after_help = "Examples:
+  goodflows features sync                    # the one .agents/skills/verify-*/features directory
+  goodflows features sync --dir .claude/skills/verify-web/features   # another directory
+  goodflows features sync --json             # print the version and features as JSON")]
+    Features {
+        #[command(subcommand)]
+        command: change_requests::FeaturesCommand,
+    },
+    /// Read the project's event feed: change request states, verdicts, scenario sets, answers and tasks
+    #[command(after_help = "Examples:
+  goodflows events                           # the oldest kept events
+  goodflows events --after 1042 --wait 30    # wait up to 30 seconds for events after id 1042
+  goodflows events --follow --json           # stream events as JSON lines until interrupted")]
+    Events(change_requests::EventsArgs),
     /// Inspect, recover, cancel or destroy a caller identity's Sprite
     #[command(after_help = "Examples:
   goodflows run ci --sprite T-1              # run the ci workflow on T-1's Sprite
@@ -367,6 +399,13 @@ impl Cli {
                 _ => arg,
             })
         }
+        /// Applies `f` to a command and all its subcommands.
+        fn every(
+            command: clap::Command,
+            f: &dyn Fn(clap::Command) -> clap::Command,
+        ) -> clap::Command {
+            f(command).mut_subcommands(|sub| every(sub, f))
+        }
         const ONE_EVENT: &str = "Print the result as a JSON event";
         let single = |command| plain_json(run_only(command), ONE_EVENT);
         // `reports upload` and `skills install` reject `--config` too.
@@ -395,6 +434,16 @@ impl Cli {
                             }
                         })
                     })
+            })
+            .mut_subcommand("cr", |cr| every(cr, &single))
+            .mut_subcommand("policy", |policy| every(policy, &single))
+            .mut_subcommand("features", |features| every(features, &single))
+            .mut_subcommand("events", |events| {
+                // `--follow` prints one event per page.
+                plain_json(
+                    run_only(events),
+                    "Print each page of events as a JSON event",
+                )
             })
             .mut_subcommand("last", |last| {
                 // A run that called workflows has a summary for each.
@@ -523,6 +572,10 @@ impl Cli {
             Some(
                 Commands::Reports { .. }
                 | Commands::History { .. }
+                | Commands::Cr { .. }
+                | Commands::Policy { .. }
+                | Commands::Features { .. }
+                | Commands::Events(_)
                 | Commands::Last
                 | Commands::Status { .. }
                 | Commands::Wait { .. }
@@ -586,6 +639,10 @@ async fn main() -> ExitCode {
             Commands::Run { .. }
                 | Commands::Reports { .. }
                 | Commands::History { .. }
+                | Commands::Cr { .. }
+                | Commands::Policy { .. }
+                | Commands::Features { .. }
+                | Commands::Events(_)
                 | Commands::Sprite { .. }
                 | Commands::Mcp
         )
@@ -731,6 +788,40 @@ async fn run(cli: &Cli, output: &mut Output, cancel: watch::Receiver<Option<i32>
             HistoryCommand::Show { run_id } => {
                 reporting::history_client::show(reporting, run_id, output, cancel).await
             }
+        };
+    }
+    if let Some(
+        command @ (Commands::Cr { .. }
+        | Commands::Policy { .. }
+        | Commands::Features { .. }
+        | Commands::Events(_)),
+    ) = &cli.command
+    {
+        let name = match command {
+            Commands::Cr { .. } => "cr",
+            Commands::Policy { .. } => "policy",
+            Commands::Features { .. } => "features",
+            _ => "events",
+        };
+        if let Some(flag) = cli.run_only_flag() {
+            return Err(usage(format!("{flag} cannot be used with {name} commands")));
+        }
+        let (document, _) = Config::load(cli.config.as_deref())?;
+        let reporting = document.reporting.as_ref();
+        return match command {
+            Commands::Cr { command } => {
+                change_requests::cr(reporting, command, output, cancel).await
+            }
+            Commands::Policy { command } => {
+                change_requests::policy(reporting, command, output, cancel).await
+            }
+            Commands::Features { command } => {
+                change_requests::features(reporting, command, output, cancel).await
+            }
+            Commands::Events(args) => {
+                change_requests::events(reporting, args, output, cancel).await
+            }
+            _ => unreachable!(),
         };
     }
     if let Some(Commands::Sprite { command }) = &cli.command {

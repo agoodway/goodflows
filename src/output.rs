@@ -1,3 +1,4 @@
+mod change_requests;
 mod history;
 mod report;
 
@@ -398,6 +399,7 @@ fn render(
             "summary" => report::report(&event, out)?,
             "history_runs" => history::runs(&event, out)?,
             "history_run" => history::run(&event, out)?,
+            kind if change_requests::renders(kind) => change_requests::render(&event, out)?,
             "config_valid" => {
                 if let Some(workflows) = event["workflows"].as_array() {
                     writeln!(
