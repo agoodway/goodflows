@@ -251,7 +251,8 @@ fn mcp_validate_and_list_report_and_config_errors_are_tool_errors() {
     let p = Project::new(CALLS);
     std::fs::write(
         p.dir.join("other.toml"),
-        "[[jobs]]\nname = 'solo'\ncommand = 'true'\n",
+        "[settings.secrets]\nTOKEN = 'op://dev/item/token'\n\
+         [[jobs]]\nname = 'solo'\ncommand = 'true'\nsecrets = ['TOKEN']\n",
     )
     .unwrap();
     let mut client = Client::start(&p);
@@ -272,6 +273,9 @@ fn mcp_validate_and_list_report_and_config_errors_are_tool_errors() {
     let (texts, error) = client.call("list", json!({"config":"other.toml"}));
     assert!(!error);
     assert!(texts[0].contains("\"solo\""), "{texts:?}");
+    // Secret names, never resolved: listing does not run `op`.
+    let event: Value = serde_json::from_str(&texts[0]).unwrap();
+    assert_eq!(event["jobs"][0]["secrets"], json!(["TOKEN"]));
 
     let (texts, error) = client.call("run", json!({"config":"missing.toml"}));
     assert!(error);

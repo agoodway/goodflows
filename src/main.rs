@@ -11,6 +11,7 @@ mod output;
 mod reporting;
 mod retention;
 mod runner;
+mod secrets;
 mod skills;
 mod sprite;
 mod tail;
@@ -577,7 +578,16 @@ async fn main() -> ExitCode {
             // A usage or config error exits 2; anything else stopped a run
             // that the caller asked for correctly, and exits 1 like a failure.
             let config = error.downcast_ref::<ConfigError>();
-            let mut event = json!({"type":"error", "code":config.map_or("runtime", |e| e.code), "message":format!("{error:#}")});
+            let secret = error.downcast_ref::<secrets::Unavailable>();
+            let code = match (config, secret) {
+                (Some(config), _) => config.code,
+                (None, Some(_)) => "secret_unavailable",
+                (None, None) => "runtime",
+            };
+            let mut event = json!({"type":"error", "code":code, "message":format!("{error:#}")});
+            if let Some(secret) = secret {
+                event["secret"] = json!(secret.secret);
+            }
             if let Some(hint) = config.and_then(|e| e.hint.as_ref()) {
                 event["hint"] = json!(hint);
             }
@@ -908,6 +918,11 @@ async fn run(cli: &Cli, output: &mut Output, cancel: watch::Receiver<Option<i32>
         }
         _ => None,
     };
+    let needed = secrets::needed(&config, &targets);
+    if !needed.is_empty() {
+        crate::reporting::protect_process();
+    }
+    let secrets = secrets::resolve(&needed, &settings.workdir, cancel.clone()).await?;
     let mut last_run = last::Recorder::new(&config_file);
     let mut identity = retention::RunIdentity::new();
     if let Some(dir) = detached_run {
@@ -938,6 +953,7 @@ async fn run(cli: &Cli, output: &mut Output, cancel: watch::Receiver<Option<i32>
         config_dir: config_file.parent().map(PathBuf::from),
         caches: Default::default(),
         cache_forwarded: None,
+        secrets: Arc::new(secrets),
     };
     execute(run, name, identity).await
 }
@@ -997,6 +1013,8 @@ pub(crate) struct Run {
     pub caches: tokio::sync::OnceCell<Arc<cache::Session>>,
     /// A remote Sprite run's minted cache key from its controller.
     pub cache_forwarded: Option<cache::Forwarded>,
+    /// The run's resolved secrets, read by every invocation.
+    pub secrets: Arc<secrets::Secrets>,
 }
 
 /// The invocation that activated a child, and the call job that did it.
@@ -1338,6 +1356,8 @@ async fn invocation(
         },
         environment: run.profile.clone(),
         settings_env: settings.env,
+        settings_secrets: settings.secrets,
+        secrets: run.secrets.clone(),
         sprite_state: run.sprite_state.clone(),
         caches: None,
         // Only cache saves still running end a call job early.
@@ -1714,6 +1734,7 @@ mod tests {
             config_dir: None,
             caches: Default::default(),
             cache_forwarded: None,
+            secrets: Default::default(),
         };
         let started = root.join("started");
         let signaller = tokio::spawn(async move {

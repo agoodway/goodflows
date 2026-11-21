@@ -139,6 +139,8 @@ fn denied_reason(name: &str, tokens: (Option<&str>, Option<&str>)) -> Option<&'s
         Some("the controller mints a cache key for each Sprite run")
     } else if name == crate::cache::SPRITE_CACHE_ENV {
         Some("the controller forwards the run's cache key itself")
+    } else if name == crate::secrets::SPRITE_SECRETS_ENV {
+        Some("the controller forwards the run's secrets itself")
     } else if RUNNER_OWNED.contains(&name) {
         Some("the remote runner sets it itself")
     } else {
@@ -1072,6 +1074,13 @@ async fn run_inner(
         .workdir
         .clone()
         .context("workflow workdir")?;
+    // Resolved on the controller, with the selection the Sprite will run,
+    // and forwarded like `pass_env` values: the Sprite never runs `op`.
+    let needed = crate::secrets::needed(&selected, &targets);
+    if !needed.is_empty() {
+        crate::reporting::protect_process();
+    }
+    let resolved = crate::secrets::resolve(&needed, &hook_workdir, cancel.clone()).await?;
     let mut secrets = controller_secrets(&document);
     let sensitive = snapshot::Sensitive {
         values: secrets
@@ -1080,12 +1089,26 @@ async fn run_inner(
             .chain(
                 forwarded
                     .values()
+                    .chain(resolved.values.values())
                     .filter(|v| v.len() >= MIN_SENTINEL_BYTES)
                     .map(|v| v.as_bytes().to_vec()),
             )
             .collect(),
     };
-    secrets.extend(forwarded.values().filter(|v| v.len() >= 4).cloned());
+    secrets.extend(
+        forwarded
+            .values()
+            .chain(resolved.values.values())
+            .filter(|v| v.len() >= crate::secrets::MIN_MASKED_BYTES)
+            .cloned(),
+    );
+    if !resolved.values.is_empty() {
+        forwarded.insert(
+            crate::secrets::SPRITE_SECRETS_ENV.into(),
+            serde_json::to_string(&resolved.values)?,
+        );
+    }
+    drop(resolved);
     let snap = tokio::task::block_in_place(|| {
         snapshot::take(
             &root,

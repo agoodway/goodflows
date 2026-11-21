@@ -1,0 +1,25 @@
+#!/bin/sh
+# Fake 1Password CLI for tests: `op read --no-newline REFERENCE`.
+# Appends each call to $FAKE_OP_LOG and prints the value that the line
+# `REFERENCE=VALUE` in $FAKE_OP_VALUES gives (printf %b escapes, so a test can
+# write bytes that are not UTF-8). An unknown reference fails like `op` does.
+# The reference in $FAKE_OP_SLOW sleeps instead of answering.
+printf '%s\n' "$*" >> "${FAKE_OP_LOG:?}"
+if [ "$1" != read ] || [ "$2" != --no-newline ] || [ $# -ne 3 ]; then
+  echo "[ERROR] unexpected arguments: $*" >&2
+  exit 2
+fi
+reference=$3
+if [ "$reference" = "${FAKE_OP_SLOW:-}" ]; then
+  exec sleep 60
+fi
+while IFS= read -r line; do
+  case $line in
+    "$reference="*)
+      printf '%b' "${line#"$reference="}"
+      exit 0
+      ;;
+  esac
+done < "${FAKE_OP_VALUES:?}"
+printf '[ERROR] 2026/11/20 10:00:00 "%s" isn'"'"'t an item in the vault\nsecond line\n' "$reference" >&2
+exit 1

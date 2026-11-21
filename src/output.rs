@@ -514,6 +514,9 @@ fn render(
                     if job.get("reports").is_some() {
                         writeln!(out, "    reports: {}", names(&job["reports"]))?;
                     }
+                    if job.get("secrets").is_some() {
+                        writeln!(out, "    secrets: {}", names(&job["secrets"]))?;
+                    }
                     for cache in job["caches"].as_array().into_iter().flatten() {
                         let key = &cache["key"];
                         writeln!(

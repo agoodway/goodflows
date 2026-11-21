@@ -687,7 +687,9 @@ fn submit(root: &Root, scope: &Scope) -> Result<u8> {
     // Values stay in memory only; never written to disk or argv.
     let env: BTreeMap<String, String> =
         serde_json::from_slice(&read_frame(&mut stdin, 64 * 1024 * 1024)?).context("env")?;
-    if env.contains_key(crate::cache::SPRITE_CACHE_ENV) {
+    if env.contains_key(crate::cache::SPRITE_CACHE_ENV)
+        || env.contains_key(crate::secrets::SPRITE_SECRETS_ENV)
+    {
         // Same-user jobs must not read the minted cache key from this
         // process's memory.
         crate::reporting::protect_process();
@@ -1145,7 +1147,11 @@ fn serve_one(root: &Root, info: &SupervisorInfo, stream: UnixStream) -> Result<(
     let mut line = String::new();
     reader.read_line(&mut line)?;
     let request: Value = serde_json::from_str(&line)?;
-    if request["env"].get(crate::cache::SPRITE_CACHE_ENV).is_some() {
+    if request["env"].get(crate::cache::SPRITE_CACHE_ENV).is_some()
+        || request["env"]
+            .get(crate::secrets::SPRITE_SECRETS_ENV)
+            .is_some()
+    {
         // The supervisor now holds a minted cache key.
         crate::reporting::protect_process();
     }
@@ -1572,11 +1578,13 @@ struct Worker<'a> {
 
 impl Worker<'_> {
     /// The forwarded values hooks and the workflow process get: everything
-    /// but the minted cache key, which only the runner's cache client reads.
+    /// but the minted cache key, which only the runner's cache client reads,
+    /// and the resolved secrets, which only the runner reads.
     fn user_env(&self) -> impl Iterator<Item = (&String, &String)> {
-        self.env
-            .iter()
-            .filter(|(name, _)| name.as_str() != crate::cache::SPRITE_CACHE_ENV)
+        self.env.iter().filter(|(name, _)| {
+            name.as_str() != crate::cache::SPRITE_CACHE_ENV
+                && name.as_str() != crate::secrets::SPRITE_SECRETS_ENV
+        })
     }
 
     fn cancel_requested(&self) -> bool {
@@ -1718,7 +1726,9 @@ fn worker(root: &Root, run_id: &str, generation: &str, lock_fd: &str) -> Result<
     std::io::stdin().read_line(&mut line)?;
     let env: BTreeMap<String, String> = serde_json::from_str(&line).context("env payload")?;
     line.clear();
-    if env.contains_key(crate::cache::SPRITE_CACHE_ENV) {
+    if env.contains_key(crate::cache::SPRITE_CACHE_ENV)
+        || env.contains_key(crate::secrets::SPRITE_SECRETS_ENV)
+    {
         // The worker outlives every job of the run; keep the key from them.
         crate::reporting::protect_process();
     }
@@ -2074,14 +2084,20 @@ fn execute(worker: &mut Worker, header: &Header) -> Result<(Phase, Terminal)> {
         }
     };
     if let Some(mut stdin) = child.stdin.take() {
-        let cache = worker
-            .env
-            .get(crate::cache::SPRITE_CACHE_ENV)
-            .cloned()
-            .unwrap_or_default();
-        // Small enough for the pipe buffer; a runner that died early just
-        // gets a broken pipe.
-        let _ = stdin.write_all(cache.as_bytes());
+        let field = |name: &str| {
+            worker
+                .env
+                .get(name)
+                .and_then(|value| serde_json::from_str::<Value>(value).ok())
+                .unwrap_or(Value::Null)
+        };
+        let payload = json!({
+            "cache": field(crate::cache::SPRITE_CACHE_ENV),
+            "secrets": field(crate::secrets::SPRITE_SECRETS_ENV),
+        });
+        // The runner reads stdin to its end before anything else; a runner
+        // that died early just gets a broken pipe.
+        let _ = stdin.write_all(payload.to_string().as_bytes());
     }
     super::testhook::pause("spawned-workflow");
     worker.register_child("workflow", child.id())?;
@@ -2222,16 +2238,25 @@ async fn exec_workflow(args: &[String]) -> Result<u8> {
     // Never derived from this process's env, which includes forwarded values.
     let run = PathBuf::from(args.get(2).context("run directory")?);
     let header: Header = read_json(&run.join("header.json"))?;
-    // The worker writes the minted cache key (or nothing) and closes stdin.
-    let mut cache = String::new();
+    // The worker writes `{"cache", "secrets"}` and closes stdin.
+    #[derive(serde::Deserialize, Default)]
+    struct Private {
+        cache: Option<crate::cache::Forwarded>,
+        secrets: Option<BTreeMap<String, String>>,
+    }
+    let mut private = String::new();
     std::io::stdin()
         .lock()
-        .take(64 * 1024)
-        .read_to_string(&mut cache)
-        .context("read the cache key")?;
-    let cache_forwarded: Option<crate::cache::Forwarded> = serde_json::from_str(&cache).ok();
-    drop(cache);
-    if cache_forwarded.is_some() {
+        .take(64 * 1024 * 1024)
+        .read_to_string(&mut private)
+        .context("read the cache key and secrets")?;
+    let Private {
+        cache: cache_forwarded,
+        secrets: forwarded_secrets,
+    } = serde_json::from_str(&private).unwrap_or_default();
+    drop(private);
+    let forwarded_secrets = forwarded_secrets.unwrap_or_default();
+    if cache_forwarded.is_some() || !forwarded_secrets.is_empty() {
         crate::reporting::protect_process();
     }
     let (_signals, cancel) = crate::cancellation()?;
@@ -2247,6 +2272,11 @@ async fn exec_workflow(args: &[String]) -> Result<u8> {
         config.select(&request.jobs)?;
         // Called workflows run their complete graphs, exactly as locally.
         let targets = document.called_workflows(&config.jobs, profile)?;
+        // The controller resolved them; a Sprite never runs `op`.
+        let secrets = crate::secrets::Secrets::forwarded(
+            &crate::secrets::needed(&config, &targets),
+            forwarded_secrets,
+        )?;
         let history = crate::config::HistoryOverrides {
             history: request.history,
             history_dir: Some(results.join("history")),
@@ -2278,6 +2308,7 @@ async fn exec_workflow(args: &[String]) -> Result<u8> {
             config_dir: None,
             caches: Default::default(),
             cache_forwarded,
+            secrets: std::sync::Arc::new(secrets),
         };
         crate::execute(
             run,

@@ -178,6 +178,7 @@ With `--json`, a run or other command that cannot do what it was asked ends with
 | `no_failed_jobs` | 2 | `run --failed` found nothing to rerun: the last run had no failed or timed-out job |
 | `unknown_run` | 2 | [`status`, `wait`, or `cancel`](#detached-runs) found no detached run with that id for the config |
 | `config_exists` | 2 | `init` would overwrite an existing config; pass `--force` |
+| `secret_unavailable` | 1 | A [secret](#secrets) could not be read before any job started; `secret` names the variable |
 | `runtime` | 1 | Anything else that stopped goodflows, including `history` and `reports upload` request errors and the `--sprite` and `sprite` command checks |
 
 `message` is the same text that text mode prints after `Error:`. An unknown workflow, job, or environment message lists the names that exist. An optional `hint` suggests a fix, such as `did you mean 'test'?` for a close match. Text mode prints it on a `Hint:` line.
@@ -256,7 +257,7 @@ goodflows run release --jobs publish
 
 That command runs `prepare`, `checks`, and `publish`. The `checks` call runs every job in `ci`. `--jobs` filters only the workflow you named.
 
-A call job accepts `name`, `depends_on`, and `condition`. It rejects `timeout_secs`, `partitions`, `env`, `outputs`, `reports`, and `shell = false`. It publishes no outputs, so goodflows rejects `needs.checks.outputs...`. A job has one of `command`, nonempty `steps`, or `workflow`.
+A call job accepts `name`, `depends_on`, and `condition`. It rejects `timeout_secs`, `partitions`, `env`, `secrets`, `outputs`, `reports`, and `shell = false`. It publishes no outputs, so goodflows rejects `needs.checks.outputs...`. A job has one of `command`, nonempty `steps`, or `workflow`.
 
 `depends_on` is the only ordering. A job with no dependency path to a call can run while that call runs. The call waits until the called workflow finishes, including that workflow's reporting. The call passes when the called workflow passes. Jobs skipped inside it by a condition or a dependency do not fail the call. The call fails when a job inside it fails or times out. A false condition skips the call and does not start the workflow. A failed or skipped call skips its own dependents.
 
@@ -294,7 +295,7 @@ A job has a `command` or a nonempty `steps` list, not both. Steps run in order i
 
 A command publishes outputs by writing one JSON object to the path in `GOODFLOWS_OUTPUT`. The file must be at most 64 KiB. Each value must be a boolean, a number, or a string. An empty file publishes nothing. A command job must not set `outputs`. The JSON object's keys are that job's outputs.
 
-A step job publishes only the keys in its `outputs` map. The map's values are expressions, usually `steps.ID.outputs.KEY`. Step outputs stay inside the job until that map promotes them. Partitioned jobs cannot publish job outputs. Output values are not redacted.
+A step job publishes only the keys in its `outputs` map. The map's values are expressions, usually `steps.ID.outputs.KEY`. Step outputs stay inside the job until that map promotes them. Partitioned jobs cannot publish job outputs. Resolved secret values in output keys, strings and numbers are replaced with `[redacted]` (see Secrets); nothing else is redacted.
 
 ```toml
 [[jobs]]
@@ -373,6 +374,37 @@ Those three commands match the file above, which has a default workflow and no w
 `test = 6` replaces the declared count of every partitioned job named `test`. A reachable workflow that has an unpartitioned job named `test` makes that `--env` fail before any job starts, including a call hidden by a false condition. A name the workflow does not use is ignored.
 
 Settings precedence is CLI flags, then the profile, then the workflow, then `[settings]`, then the built-in defaults. The same order merges `env` by key. CLI flags do not include an env map. A profile's `settings` take the same fields as a workflow's. `env` values are literal strings with no interpolation, and an empty string sets the variable to empty.
+
+### Secrets
+
+A job can get a credential from 1Password instead of the caller's environment. Settings map an environment variable name to a secret reference, and each job lists the names it needs:
+
+```toml
+[settings.secrets]
+DATABASE_URL = "op://dev/postgres/url"
+
+[environments.ci.settings.secrets]
+DATABASE_URL = "op://ci/postgres/url"
+
+[[jobs]]
+name = "integration"
+command = "cargo test --test db"
+secrets = ["DATABASE_URL"]
+```
+
+A reference is a URI, and its scheme picks the provider. Only `op://` is supported: `op://vault/item/field` or `op://vault/item/section/field`, optionally followed by a query such as `?attribute=otp`, at most 1,024 bytes, with no whitespace. Any other value, such as `0p://...` or a pasted password, fails `validate` with `config_invalid`.
+
+`secrets` merges by key like `env`: `[settings]`, then the workflow's `settings.secrets`, then the selected profile's. A profile can only point an existing name at another reference; it cannot add a name. A name follows the `env` rules and cannot be a goodflows variable, the reporting `url_env` or `token_env`, or the `[cache] token_env`. One settings table cannot set a name in both `env` and `secrets`, and a job's or step's `env` cannot set a name the job lists. A job that lists a name no settings define fails validation. Call jobs reject `secrets`.
+
+Only the jobs that list a secret receive it, in their command and every step. It replaces a caller or `env` variable of the same name. Conditions, expressions, cache keys and other jobs never see the value; `env.DATABASE_URL` in an expression reads the caller's environment as before.
+
+Secrets are opt-in and lazy. Before the first job starts, goodflows reads each distinct reference that a selected job, or a job of a workflow it calls, lists, once per run, with `op read --no-newline`. The first read runs alone (up to 120 seconds, so the 1Password app can ask for approval once), the rest at most 8 at a time (30 seconds each). A job that a condition later skips still counts. A run whose selection lists no secret, such as `goodflows --jobs fmt`, never looks for `op`. `validate` and `list` check references but never read them; `list` shows each job's secret names.
+
+You need the [1Password CLI](https://developer.1password.com/docs/cli/get-started/) on `PATH`, signed in through the desktop app integration or, in CI and detached runs, a service account (`OP_SERVICE_ACCOUNT_TOKEN`). `op` runs with the caller's environment, so `OP_ACCOUNT` and `OP_CONNECT_*` work too. A missing `op`, a failed read, a timeout, or a value that is not valid UTF-8 or contains NUL stops the run before any job starts with `secret_unavailable` (exit 1). The message names the variable, the reference and the first line of `op`'s error, never a value.
+
+goodflows replaces every resolved value with `[redacted]` in every job's stdout and stderr before it reaches the terminal, `job_output` events, log files, failure output in the summary, `last`, MCP results and report uploads, and in published job outputs and their errors (keys, strings, and numbers whose written text or parsed form contains a value, which become the string `[redacted]`; two keys that mask to the same text fail the job). A value split across reads or lines is still masked. Only the exact value is masked: base64, URL-encoded or partial forms, and files a job writes (report files, cache archives, build artifacts) are not. A value shorter than 4 bytes is delivered unmasked, with one warning that names the secret.
+
+[Sprite runs](#sprites) read secrets on the controller and send the values privately; the Sprite never runs `op`.
 
 ### Caches
 
@@ -523,7 +555,7 @@ goodflows validate --json
 goodflows list --json
 ```
 
-`--log-dir .goodflows-logs` stores raw stdout and stderr for each run in a new directory under that path. `log_runs` (default 10) is how many of those directories to keep per workflow. The files are not redacted. Add the directory to `.gitignore`.
+`--log-dir .goodflows-logs` stores raw stdout and stderr for each run in a new directory under that path. `log_runs` (default 10) is how many of those directories to keep per workflow. Output is stored raw, except that resolved [secrets](#secrets) are replaced with `[redacted]`. Add the directory to `.gitignore`.
 
 ```bash
 goodflows --log-dir .goodflows-logs --log-runs 5
@@ -705,7 +737,7 @@ command = "cargo test --locked"
 
 `sprite_prefix` is 1 to 20 characters: lowercase ASCII letters, digits, or hyphens, starting with a letter or digit. Set it only in the top-level `[settings]`. `[sprite]` is top-level only. `setup` and `resume` are required for a remote run. They are nonempty shell commands. `true` is a deliberate no-op. goodflows does not look for `.agents/setup` and does not install toolchains for you. `pass_env` lists caller variables to forward. A name that is unset fails before anything remote runs. An empty value counts as set. The default is to forward nothing.
 
-`SPRITE_TOKEN`, `SPRITES_TOKEN`, and the reporting API key stay on the controller. `pass_env` cannot name them. Declared [caches](#caches) live in the Sprite's state directory between runs. With a remote cache store, the controller mints a short-lived `ck_` key for each run, so `pass_env` cannot name `[cache] token_env` either.
+`SPRITE_TOKEN`, `SPRITES_TOKEN`, and the reporting API key stay on the controller. `pass_env` cannot name them. Declared [caches](#caches) live in the Sprite's state directory between runs. With a remote cache store, the controller mints a short-lived `ck_` key for each run, so `pass_env` cannot name `[cache] token_env` either. [Secrets](#secrets) are read on the controller and forwarded privately; setup and resume hooks never see them, and `pass_env` cannot name `GOODFLOWS_SPRITE_SECRETS`.
 
 ```bash
 goodflows run --sprite "$THREAD_ID"

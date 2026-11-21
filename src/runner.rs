@@ -258,6 +258,10 @@ pub struct Options {
     /// Resolved settings env defaults, layered over the caller's environment
     /// and under job and step env.
     pub settings_env: BTreeMap<String, String>,
+    /// This invocation's merged secret references by name.
+    pub settings_secrets: BTreeMap<String, String>,
+    /// The run's resolved secrets; their masker covers every job's output.
+    pub secrets: Arc<crate::secrets::Secrets>,
     /// `GOODFLOWS_SPRITE_STATE_DIR` for a remote Sprite run. `None` for local
     /// runs, which never inherit an ambient value.
     pub sprite_state: Option<String>,
@@ -540,6 +544,8 @@ struct Shared {
     reporting: Arc<ReportingEnv>,
     environment: Option<String>,
     settings_env: BTreeMap<String, String>,
+    settings_secrets: BTreeMap<String, String>,
+    secrets: Arc<crate::secrets::Secrets>,
     sprite_state: Option<String>,
     rss: Arc<RssMonitor>,
     caches: Option<Arc<cache::Invocation>>,
@@ -665,6 +671,8 @@ pub async fn execute(
         reporting: options.reporting.clone(),
         environment: options.environment.clone(),
         settings_env: options.settings_env.clone(),
+        settings_secrets: options.settings_secrets.clone(),
+        secrets: options.secrets.clone(),
         sprite_state: options.sprite_state.clone(),
         // One sampler serves the whole run tree.
         rss: scope.tree.rss.clone(),
@@ -1104,6 +1112,8 @@ async fn run_call(
             deadline: None,
             rss: shared.rss.clone(),
             caches: HashMap::new(),
+            secrets: Vec::new(),
+            masker: shared.secrets.masker.clone(),
         };
         execution
             .condition(job.condition.as_ref(), &env, &[], None)
@@ -1168,6 +1178,20 @@ async fn run_job(
     let commands = Mutex::new(Vec::new());
     let execution: Result<()> = async {
         let logs = open_logs(log_dir, index, job, partition).await?;
+        // The values this job's commands receive. Resolution read every
+        // reference a selected job lists, so a missing one is a bug.
+        let secrets = job
+            .secrets
+            .iter()
+            .map(|name| {
+                let value = shared
+                    .settings_secrets
+                    .get(name)
+                    .and_then(|reference| shared.secrets.values.get(reference))
+                    .with_context(|| format!("secret {name} was not resolved"))?;
+                Ok((name.clone(), value.clone()))
+            })
+            .collect::<Result<Vec<_>>>()?;
         let mut execution = JobExecution {
             job,
             workdir,
@@ -1186,6 +1210,8 @@ async fn run_job(
             }),
             rss: shared.rss.clone(),
             caches: HashMap::new(),
+            secrets,
+            masker: shared.secrets.masker.clone(),
         };
         output
             .emit(Partition::tag(
@@ -1380,6 +1406,10 @@ struct JobExecution<'a> {
     rss: Arc<RssMonitor>,
     /// `caches.NAME.hit` for each of the job's caches, once restored.
     caches: HashMap<String, bool>,
+    /// The secrets the job lists, by name, for its command and steps only.
+    secrets: Vec<(String, String)>,
+    /// Masks every resolved value of the run in output.
+    masker: crate::secrets::Masker,
 }
 
 impl JobExecution<'_> {
@@ -1590,6 +1620,11 @@ impl JobExecution<'_> {
             for (key, value) in self.reporting.reserved(&job.name, self.partition) {
                 command.env(key, value);
             }
+            // Never in `env`, which conditions and expressions read; a listed
+            // secret replaces a caller or env value of the same name.
+            for (name, value) in &self.secrets {
+                command.env(name, value);
+            }
         }
         // After the reporting removals, so partition identity always wins.
         let [index_key, count_key] = config::PARTITION_ENV;
@@ -1659,6 +1694,7 @@ impl JobExecution<'_> {
             output.clone(),
             tails.clone(),
             self.rss.clone(),
+            self.masker.stream(),
         ));
         let pipe = receiver(child.stderr.take().context("missing stderr pipe")?.into())?;
         readers.spawn(drain(
@@ -1672,6 +1708,7 @@ impl JobExecution<'_> {
             output.clone(),
             tails.clone(),
             self.rss.clone(),
+            self.masker.stream(),
         ));
         let mut reaped: Option<Rusage> = None;
 
@@ -1747,11 +1784,14 @@ impl JobExecution<'_> {
         }
         if result.status == Status::Passed {
             if let Some(file) = &output_file {
-                match read_outputs(file.path()).await {
+                match read_outputs(file.path(), &self.masker).await {
                     Ok(outputs) => result.outputs = outputs,
                     Err(error) => {
                         result.status = Status::Failed;
-                        result.error = Some(format!("invalid job outputs: {error:#}"));
+                        result.error = Some(
+                            self.masker
+                                .mask_str(&format!("invalid job outputs: {error:#}")),
+                        );
                     }
                 }
             }
@@ -2019,7 +2059,7 @@ fn group_rss(_wanted: &[i32]) -> HashMap<i32, u64> {
     HashMap::new()
 }
 
-async fn read_outputs(path: &Path) -> Result<Map<String, Value>> {
+async fn read_outputs(path: &Path, masker: &crate::secrets::Masker) -> Result<Map<String, Value>> {
     const LIMIT: u64 = 65_536;
     let file = tokio::fs::OpenOptions::new()
         .read(true)
@@ -2037,17 +2077,42 @@ async fn read_outputs(path: &Path) -> Result<Map<String, Value>> {
     if bytes.is_empty() {
         return Ok(Map::new());
     }
-    let outputs: Map<String, Value> =
-        serde_json::from_slice(&bytes).context("expected a JSON object")?;
-    for (key, value) in &outputs {
+    // serde's type errors quote the rejected input in its parsed form, which
+    // masking cannot match (`1234.50` becomes `1234.5`), so only the position is kept.
+    let outputs: BTreeMap<String, Box<serde_json::value::RawValue>> =
+        serde_json::from_slice(&bytes).map_err(|error| match error.classify() {
+            serde_json::error::Category::Data => anyhow::anyhow!(
+                "expected a JSON object at line {} column {}",
+                error.line(),
+                error.column()
+            ),
+            _ => anyhow::Error::new(error).context("expected a JSON object"),
+        })?;
+    let mut masked = Map::new();
+    for (key, raw) in outputs {
         if key.trim().is_empty() || key.chars().any(char::is_control) {
             bail!("output keys must be nonempty and contain no control characters");
         }
-        if !matches!(value, Value::Bool(_) | Value::Number(_) | Value::String(_)) {
-            bail!("output '{key}' must be a boolean, number, or string");
+        let key = masker.mask_str(&key);
+        let mut value: Value =
+            serde_json::from_str(raw.get()).with_context(|| format!("output '{key}'"))?;
+        match &mut value {
+            Value::String(text) => *text = masker.mask_str(text),
+            Value::Number(number) => {
+                let rendered = number.to_string();
+                if masker.mask_str(raw.get()) != raw.get() || masker.mask_str(&rendered) != rendered
+                {
+                    value = Value::String(crate::secrets::REDACTED.into());
+                }
+            }
+            Value::Bool(_) => {}
+            _ => bail!("output '{key}' must be a boolean, number, or string"),
+        }
+        if masked.insert(key.clone(), value).is_some() {
+            bail!("output '{key}' is duplicated after masking");
         }
     }
-    Ok(outputs)
+    Ok(masked)
 }
 
 /// Create a new log file, private to the invoking user, inside this run's
@@ -2071,6 +2136,7 @@ async fn open_log(dir: Option<&Path>, filename: &str) -> Result<Option<tokio::fs
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn drain<R: AsyncRead + Unpin>(
     mut reader: R,
     source: Value,
@@ -2079,6 +2145,7 @@ async fn drain<R: AsyncRead + Unpin>(
     output: Output,
     tails: SharedTails,
     rss: Arc<RssMonitor>,
+    mut mask: crate::secrets::MaskStream,
 ) -> Result<()> {
     let event = |data: &[u8]| {
         let mut event = source.clone();
@@ -2094,14 +2161,16 @@ async fn drain<R: AsyncRead + Unpin>(
             break;
         }
         rss.request();
+        // Masked before any sink sees it; a possible start of a value waits.
+        let masked = mask.feed(&chunk[..count]);
         tails
             .lock()
             .expect("tail mutex poisoned")
-            .append(stream, &chunk[..count]);
+            .append(stream, &masked);
         if let Some(file) = log.as_mut() {
-            file.write_all(&chunk[..count]).await?;
+            file.write_all(&masked).await?;
         }
-        pending.extend_from_slice(&chunk[..count]);
+        pending.extend_from_slice(&masked);
         loop {
             let length = match pending.iter().position(|&b| b == b'\n') {
                 Some(index) => index + 1,
@@ -2126,6 +2195,17 @@ async fn drain<R: AsyncRead + Unpin>(
             output.emit(event(&pending[..length])).await?;
             pending.drain(..length);
         }
+    }
+    let rest = mask.finish();
+    if !rest.is_empty() {
+        tails
+            .lock()
+            .expect("tail mutex poisoned")
+            .append(stream, &rest);
+        if let Some(file) = log.as_mut() {
+            file.write_all(&rest).await?;
+        }
+        pending.extend_from_slice(&rest);
     }
     if !pending.is_empty() {
         output.emit(event(&pending)).await?;

@@ -37,6 +37,7 @@ match for a misspelled job.
 | `unknown_run` | `2` | `status`, `wait` or `cancel` found no detached run with that id beside that config |
 | `config_exists` | `2` | `init` would overwrite an existing config; pass `--force` |
 | `ambiguous_harness` | `2` | `skills install` detected harnesses that load different directories; pass `--harness` |
+| `secret_unavailable` | `1` | A secret a selected job lists could not be read from 1Password before any job started; `secret` names the variable, and no job ran |
 | `runtime` | `1` | Anything else that stopped goodflows |
 
 `goodflows list` and `goodflows list --workflows` show the names that exist.

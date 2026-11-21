@@ -10,7 +10,7 @@ See proposal.md for why. What exists today:
 - `read_outputs` reads a command's `GOODFLOWS_OUTPUT` file into job outputs, which reach events, expressions and the last-run record.
 - `Config::workflow(name, profile)` returns a workflow's config with settings already merged. `Config::called_workflows` returns every workflow reachable through calls under the profile, which `Run.targets` holds.
 - Credential names are validated with `valid_env_name` and rejected when they collide with reserved names (`validate_env`, `RESERVED_ENV`, `PARTITION_ENV`, `ENVIRONMENT_ENV`, `OUTPUT_ENV`, `SPRITE_STATE_ENV`, the reporting `token_env`).
-- Sprite runs send forwarded `pass_env` values in a private frame after the header (`src/sprite/mod.rs`). The minted cache key travels in the same frame under `SPRITE_CACHE_ENV`. On the Sprite, `Worker::user_env` filters that key out of what hooks and the workflow process inherit, and the worker writes the key to the workflow process's stdin, which `exec_workflow` reads into `Run.cache_forwarded`. Controller credentials and forwarded values are added to `Sensitive` (the snapshot refuses source files that contain them) and to `sprite.secrets` (`transport::sanitize` replaces them in diagnostics).
+- Sprite runs send forwarded `pass_env` values in a private frame after the header (`src/sprite/mod.rs`). The minted cache key travels in the same frame under `SPRITE_CACHE_ENV`. On the Sprite, `Worker::user_env` filters that key out of what hooks and the workflow process inherit, and the worker writes the key to the workflow process's stdin, which `exec_workflow` reads into `Run.cache_forwarded`. Controller credentials and forwarded values are added to `Sensitive` (the snapshot excludes source files that contain them, and the run continues) and to `sprite.secrets` (`transport::sanitize` replaces them in diagnostics).
 - `run --detach` re-executes goodflows in a new session with stdin from `/dev/null` and inherits the caller's environment.
 - Error codes are stable. Exit 1 covers runtime errors after the command and config were accepted.
 
@@ -115,13 +115,17 @@ A value shorter than 4 bytes cannot be masked without corrupting unrelated outpu
 
 `drain` passes each chunk through `feed` before it touches `Tails`, the log file or the event line splitter, and passes `finish()` through the same three sinks before its existing flush. A value split across two `read` calls, or spanning lines, is still masked. Output waits only while its tail could be the start of a secret, so streaming output without newlines is not delayed otherwise. With no secrets, `feed` returns the chunk unchanged.
 
-`read_outputs` masks every string in the parsed outputs, so a published output cannot carry a value into events, expressions or the last-run record.
+`read_outputs` parses each value as raw JSON first. It masks every key and every string, and replaces a number with the string `[redacted]` when either the text the job wrote or serde's rendering of it contains a value: a 23-digit number parses as a float that renders differently (`1.2345678901234568e22`), and `1234.50` renders as `1234.5`. Two keys that mask to the same text fail the job instead of one silently replacing the other. When the file is not a JSON object, the error gives only the line and column: serde's type error quotes the rejected input in its parsed form (`1234.50` as `1234.5`), which masking cannot match. A value that fails to parse names its masked key. Every error a bad output file produces is also masked before it reaches `result.error`, so a published output cannot carry a value into events, expressions, the summary or the last-run record.
+
+A local run and a Sprite controller that need any secret call `reporting::protect_process()` before the first `op read`, so no other process of the same user can read the values from goodflows' memory or `/proc/<pid>/environ` while they are held.
+
+Whether the 1Password desktop app still identifies the caller while goodflows is not dumpable is unverified: it may inspect `op`'s parent through `/proc/<pid>/exe`, which a non-dumpable process refuses. Task 8.1 checks that the approval prompt names goodflows or the terminal correctly. If it fails or shows an unknown app, the fallback is to call `protect_process()` after `resolve` instead of before, which leaves the values unprotected only while the reads run.
 
 Why mask every resolved value in every job, not only the job's own: a job can receive a secret indirectly, for example from a file an earlier job wrote. Masking all values costs nothing extra.
 
 ### Sprite runs
 
-The controller resolves the run's secrets after `check_remote_env` and before the snapshot, with the same selection rules applied to the request. Their values go into `Sensitive`, so a source file that contains one stops the snapshot as forwarded values do, and into `sprite.secrets`, so `transport::sanitize` masks them in diagnostics.
+The controller resolves the run's secrets after `check_remote_env` and before the snapshot, with the same selection rules applied to the request. Their values go into `Sensitive`, so a source file that contains one is excluded from the snapshot, as forwarded values are, and into `sprite.secrets`, so `transport::sanitize` masks them in diagnostics.
 
 The values travel in the private environment frame under a new reserved key, `GOODFLOWS_SPRITE_SECRETS`, as JSON mapping references to values. `pass_env` cannot name it. On the Sprite:
 
