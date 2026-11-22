@@ -34,6 +34,7 @@ Each feature file starts with an H1 title and one paragraph describing the behav
 
 - [Change request lifecycle](./change-request-lifecycle.md) covers `cr path`, `cr open` before code and from a claims file, `cr claims`, `cr push`, `cr ready|draft|close|reopen`, `cr status` and `cr verdict`.
 - [Scenario sets](./scenario-sets.md) covers `cr scenarios upload|approve|reject|diff` for an intent set approved before code.
+- [Diff-only change requests](./diff-only.md) covers a change request with no OpenSpec change under `scenarios.diff_only = "weakening"`: the default diff set path, `cr scenarios list`, `cr scenarios diff --source diff` against the baseline, accepting a weakened diff set through `cr answer`, and a docs-only push. Drive it in its own run.
 - [Verify runs](./verify-runs.md) covers `cr runs upload` of a `.verify` run folder, with and without evidence files.
 - [Review policy](./review-policy.md) covers `policy get|set|history`, `features sync` and how a policy version changes the verdict.
 - [Review and events](./review-and-events.md) covers `cr review`, `cr answer`, `cr tasks`, `cr wait`, `events`, `cr lease` and `cr merged`.
