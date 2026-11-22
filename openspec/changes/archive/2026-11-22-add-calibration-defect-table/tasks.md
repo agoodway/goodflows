@@ -13,7 +13,7 @@
 ## 2. Docs
 
 - [x] 2.1 Describe the text output in the README's "Change requests" section
-- [ ] 2.2 Add a calibration step to `.agents/skills/verify-goodflows-cli/features/review-policy.md` once goodflows_web#31 is deployed
+- [x] 2.2 Moved to #55: add a calibration step to `.agents/skills/verify-goodflows-cli/features/review-policy.md` once goodflows_web#31 is deployed
 
 ## 3. Finish
 
