@@ -32,6 +32,7 @@ pub fn renders(kind: &str) -> bool {
             | "change_request_tasks"
             | "change_request_task"
             | "scenario_set"
+            | "scenario_sets"
             | "scenario_decision"
             | "scenario_changes"
             | "verify_run"
@@ -105,6 +106,7 @@ pub fn render(event: &Value, out: &mut impl Write) -> Result<()> {
             }
         }
         "scenario_changes" => scenario_changes(event, out)?,
+        "scenario_sets" => scenario_sets(event, out)?,
         "verify_run" => {
             let r = &event["results"];
             writeln!(
@@ -386,6 +388,16 @@ fn scenario_set_line(source: &str, set: &Value, out: &mut impl Write) -> Result<
             if approved { "approved" } else { "not approved" }
         )?;
     }
+    // A diff set is accepted through diff_set_weakened answers; weakening is
+    // measured from its baseline, the newest accepted version or v1.
+    if source == "diff" {
+        if set["accepted"] == true {
+            write!(out, "  accepted")?;
+        }
+        if set["baseline_version"].is_u64() && set["baseline_version"] != set["version"] {
+            write!(out, "  baseline v{}", set["baseline_version"])?;
+        }
+    }
     if set["graded"] == false {
         writeln!(out, "  not graded")?;
         return Ok(());
@@ -459,15 +471,67 @@ fn coverage_line(coverage: &Value, out: &mut impl Write) -> Result<()> {
     Ok(())
 }
 
+/// `cr scenarios list`: each set's versions, newest first, marking the
+/// current one, approved intent and accepted diff versions, and the diff
+/// baseline.
+fn scenario_sets(event: &Value, out: &mut impl Write) -> Result<()> {
+    for source in event["sources"].as_array().into_iter().flatten() {
+        let source = source.as_str().unwrap_or_default();
+        let set = &event["sets"][source];
+        let versions = set["versions"].as_array().cloned().unwrap_or_default();
+        if versions.is_empty() {
+            writeln!(
+                out,
+                "{source} set of change request #{}: no versions",
+                event["number"]
+            )?;
+            continue;
+        }
+        writeln!(out, "{source} set of change request #{}:", event["number"])?;
+        for version in &versions {
+            write!(
+                out,
+                "  v{}  {}  {}",
+                s(&version["version"]),
+                short(&version["digest"]),
+                s(&version["inserted_at"])
+            )?;
+            let mut marks = Vec::new();
+            if version["version"] == set["current"]["version"] {
+                marks.push("current");
+            }
+            if source == "intent" && version["approved"] == true {
+                marks.push("approved");
+            }
+            if source == "diff" && version["accepted"] == true {
+                marks.push("accepted");
+            }
+            if source == "diff" && version["version"] == set["baseline_version"] {
+                marks.push("baseline");
+            }
+            if !marks.is_empty() {
+                write!(out, "  {}", marks.join(", "))?;
+            }
+            writeln!(out)?;
+        }
+    }
+    Ok(())
+}
+
 fn scenario_changes(event: &Value, out: &mut impl Write) -> Result<()> {
     let comparison = &event["comparison"];
     writeln!(
         out,
-        "{} set of change request #{}: version {} against {}",
+        "{} set of change request #{}: version {} against {}{}",
         s(&event["source"]),
         event["number"],
         s(&comparison["to"]),
-        s(&comparison["from"])
+        s(&comparison["from"]),
+        if event["from_baseline"] == true {
+            " (the baseline)"
+        } else {
+            ""
+        }
     )?;
     let changes = comparison["changes"]
         .as_array()
@@ -768,7 +832,8 @@ mod tests {
                         {"id": "s1", "priority": "must", "result": "passed", "run_id": run},
                         {"id": "s2", "priority": "should", "result": "failed", "run_id": run},
                         {"id": "s3", "priority": "should", "result": null, "run_id": run}]},
-                "diff": {"version": 1, "digest": "e".repeat(64), "approved": false, "graded": false,
+                "diff": {"version": 4, "digest": "e".repeat(64), "approved": false, "accepted": false,
+                    "baseline_version": 2, "graded": false,
                     "scenarios": [{"id": "d1", "priority": "must", "result": null, "run_id": null}]}},
             "coverage": {"version": 5, "unmapped_areas": ["scripts/release.sh"],
                 "features": [{"id": "imports", "driven": true}, {"id": "exports", "driven": false}]},
@@ -777,7 +842,7 @@ mod tests {
             "computed_at": "2026-11-21T10:00:00Z"}}));
         assert_eq!(
             rendered,
-            "Verdict: needs_review  (head aaaaaaaaaaaa, policy v3)\n  needs_review  undriven_feature  [exports]\n      Feature exports was not driven\n  intent set v2 dddddddddddd  approved  passed 1, failed 1, not run 1  (failed: s2; not run: s3)\n  diff set v1 eeeeeeeeeeee  not graded\n  coverage: feature index v5; 1 unmapped areas (scripts/release.sh); 1 of 2 features not driven: exports\n  counted runs: 1\n  review: 1/2 items cleared\n"
+            "Verdict: needs_review  (head aaaaaaaaaaaa, policy v3)\n  needs_review  undriven_feature  [exports]\n      Feature exports was not driven\n  intent set v2 dddddddddddd  approved  passed 1, failed 1, not run 1  (failed: s2; not run: s3)\n  diff set v4 eeeeeeeeeeee  baseline v2  not graded\n  coverage: feature index v5; 1 unmapped areas (scripts/release.sh); 1 of 2 features not driven: exports\n  counted runs: 1\n  review: 1/2 items cleared\n"
         );
     }
 

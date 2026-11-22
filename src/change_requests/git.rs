@@ -283,6 +283,12 @@ impl ClaimsPath {
     pub fn absolute(&self, toplevel: &Path) -> PathBuf {
         toplevel.join(&self.relative)
     }
+
+    /// The default diff scenario set, next to the claims file:
+    /// `.goodflows/change-requests/<branch>/qa-scenarios.md`.
+    pub fn scenarios(&self) -> PathBuf {
+        self.relative.with_file_name("qa-scenarios.md")
+    }
 }
 
 /// Joins `git diff -z --name-status` and `--numstat` output, which list the

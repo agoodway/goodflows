@@ -456,6 +456,116 @@ fn scenario_sets_are_uploaded_byte_for_byte_with_section_digests() {
     assert_eq!(request.json(), json!({"digest": sha256(SET.as_bytes())}));
 }
 
+/// A change request with only a diff set: the default set file, versions
+/// with the baseline, a comparison from the baseline, and approve pointing
+/// at the review.
+#[test]
+fn a_diff_only_change_request_uses_the_default_set_and_its_baseline() {
+    let p = checkout();
+    let head = git(&p, &["rev-parse", "--short", "HEAD"]);
+    let set = format!("---\nformat: qa-scenarios/2\nsource: diff\nbranch: \"feat/login\"\nbase: \"main\"\nrevision: \"{head}\"\nreview: \"7\"\nscenarios:\n  - {{id: 1, name: Sign in, priority: must}}\nregressions: []\n---\n# QA: feat/login\n\n## Scenarios\n\n### 1. Sign in (Must)\n\n1. Click **Sign in**.\n");
+    let dir = p.dir.join(".goodflows/change-requests/feat/login");
+    let digest = sha256(set.as_bytes());
+    let version = |n: u64, accepted: bool| {
+        json!({"version": n, "digest": format!("{n}").repeat(64), "inserted_at": "2026-11-21T10:00:00Z",
+               "approved": false, "accepted": accepted})
+    };
+    // v2 is accepted and v3 current: the baseline is v2, not v1 or v3.
+    let sets = json!({"intent": {"current": null, "versions": []},
+        "diff": {"current": {"source": "diff", "version": 3}, "versions": [version(3, false), version(2, true), version(1, false)]}});
+    let mock = Mock::start(move |r, _| {
+        let path = r
+            .path
+            .strip_prefix("/api/v1/projects/goodcases/change-requests")
+            .unwrap();
+        match (r.method.as_str(), path.split('?').next().unwrap()) {
+            ("GET", "") if path.contains("state=draft") => {
+                ok(json!({"data": [cr(7, "draft", None)], "next_cursor": null}))
+            }
+            ("GET", "") => ok(json!({"data": [], "next_cursor": null})),
+            ("GET", "/7/scenario-sets") => ok(json!({"data": sets})),
+            ("GET", "/7/verdict") => ok(json!({"data": {"state": "needs_review",
+                "scenarios": {"intent": null, "diff": {"version": 3, "baseline_version": 2}}}})),
+            ("GET", "/7/scenario-sets/diff/compare") => ok(json!({"data": {"source": "diff",
+                "from": if path.contains("from=1") { 1 } else if path.contains("from=2") { 2 } else { 0 },
+                "to": 3, "changes": []}})),
+            ("POST", "/7/scenario-sets") => created(
+                json!({"data": {"version": 3, "digest": r.json()["content"].as_str().map(|c| sha256(c.as_bytes()))}}),
+            ),
+            _ => Reply::Status(404, vec![], String::new()),
+        }
+    });
+
+    let path = last_event(&p.run(&["cr", "path", "--json"]));
+    assert_eq!(
+        path["scenarios_path"],
+        ".goodflows/change-requests/feat/login/qa-scenarios.md"
+    );
+    assert_eq!(path["scenarios_exists"], false);
+    let missing = run(&p, &mock, &["cr", "scenarios", "upload"]);
+    assert!(!missing.status.success());
+    assert!(
+        stderr(&missing).contains("qa-scenarios.md"),
+        "{}",
+        stderr(&missing)
+    );
+
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("qa-scenarios.md"), &set).unwrap();
+    let output = run(&p, &mock, &["cr", "scenarios", "upload", "--json"]);
+    success(&output);
+    assert_eq!(last_event(&output)["source"], "diff");
+    assert_eq!(last_event(&output)["digest"], digest);
+    let upload = mock.requests().pop().unwrap();
+    assert_eq!(upload.json()["content"].as_str().unwrap(), set);
+
+    let listed = stdout(&run(
+        &p,
+        &mock,
+        &["cr", "scenarios", "list", "--source", "diff"],
+    ));
+    assert_eq!(
+        listed,
+        format!(
+            "diff set of change request #7:\n  v3  {}  2026-11-21T10:00:00Z  current\n  v2  {}  2026-11-21T10:00:00Z  accepted, baseline\n  v1  {}  2026-11-21T10:00:00Z\n",
+            "3".repeat(12),
+            "2".repeat(12),
+            "1".repeat(12)
+        )
+    );
+
+    let compared = run(&p, &mock, &["cr", "scenarios", "diff", "--source", "diff"]);
+    success(&compared);
+    assert!(mock
+        .requests()
+        .pop()
+        .unwrap()
+        .path
+        .ends_with("/diff/compare?from=2"));
+    assert!(stdout(&compared)
+        .starts_with("diff set of change request #7: version 3 against 2 (the baseline)\n"));
+    success(&run(
+        &p,
+        &mock,
+        &["cr", "scenarios", "diff", "--source", "diff", "--from", "1"],
+    ));
+    assert!(mock
+        .requests()
+        .pop()
+        .unwrap()
+        .path
+        .ends_with("/diff/compare?from=1"));
+
+    let approve = run(&p, &mock, &["cr", "scenarios", "approve"]);
+    assert!(!approve.status.success());
+    assert!(
+        stderr(&approve).contains("has only a diff set")
+            && stderr(&approve).contains("goodflows cr review"),
+        "{}",
+        stderr(&approve)
+    );
+}
+
 #[test]
 fn a_run_folder_uploads_as_verify_run_with_its_artifacts() {
     let p = checkout();

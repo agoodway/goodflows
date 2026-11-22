@@ -129,7 +129,7 @@ Examples:
     /// Print the default claims file path for the current branch
     #[command(after_help = "Examples:
   goodflows cr path                           # .goodflows/change-requests/<branch>/cr.md, absolute
-  goodflows cr path --json                    # with the repository-relative path and the branch
+  goodflows cr path --json                    # with the branch and the default diff set path (qa-scenarios.md)
   goodflows cr open                           # then create the change request from it")]
     Path,
     /// Show the verdict: pending, blocked, needs_review or mergeable, with one reason per rule that fired
@@ -195,9 +195,10 @@ Examples:
         #[command(flatten)]
         pick: Pick,
     },
-    /// Upload, approve, reject and compare QA scenario sets
+    /// Upload, list, approve, reject and compare QA scenario sets
     #[command(after_help = "Examples:
-  goodflows cr scenarios upload qa-scenarios.md   # upload a set exactly as written
+  goodflows cr scenarios upload               # the branch's diff set, .goodflows/change-requests/<branch>/qa-scenarios.md
+  goodflows cr scenarios list                 # every version, approved or accepted
   goodflows cr scenarios approve              # approve the current intent set
   goodflows cr scenarios diff                 # what changed since the approved version")]
     Scenarios {
@@ -341,16 +342,35 @@ approval. Each scenario's section digest covers its heading under ## Scenarios (
 #### 3. Name under a group heading) up to the next heading at its level or higher. Results never go into the set: upload them with cr runs upload.
 
 Examples:
+  goodflows cr scenarios upload               # the default diff set (goodflows cr path --json)
   goodflows cr scenarios upload openspec/changes/add-login/qa-scenarios.md   # an intent set
   goodflows cr scenarios upload qa.md -n 42   # change request 42
   goodflows cr scenarios upload qa.md --json  # print the version and digest as JSON"
     )]
     Upload {
-        file: PathBuf,
+        /// The qa-scenarios/2 file (default: .goodflows/change-requests/<branch>/qa-scenarios.md)
+        file: Option<PathBuf>,
         #[command(flatten)]
         pick: Pick,
     },
-    /// Approve the intent set (default: the current version's digest)
+    /// List the versions of the intent and diff sets, with approved and accepted
+    #[command(
+        after_help = "A diff set is accepted by approving its diff_set_weakened review items (cr review, cr answer);
+its baseline, the version weakening is measured from, is the newest accepted version, else v1.
+
+Examples:
+  goodflows cr scenarios list                 # both sets, newest version first
+  goodflows cr scenarios list --source diff   # only the diff set
+  goodflows cr scenarios list --json          # the server's lists as JSON"
+    )]
+    List {
+        #[command(flatten)]
+        pick: Pick,
+        /// Only this set
+        #[arg(long, value_enum)]
+        source: Option<SetSource>,
+    },
+    /// Approve the intent set (default: the current version's digest); diff sets are accepted through cr answer
     #[command(after_help = "Examples:
   goodflows cr scenarios approve              # the current intent version
   goodflows cr scenarios approve qa-scenarios.md   # the digest of this file
@@ -365,7 +385,7 @@ Examples:
         #[arg(long, value_name = "SHA256")]
         digest: Option<String>,
     },
-    /// Reject the intent set (default: the current version's digest)
+    /// Reject the intent set (default: the current version's digest); diff sets are answered through cr answer
     #[command(after_help = "Examples:
   goodflows cr scenarios reject --note S2-tests-the-wrong-path   # the current intent version
   goodflows cr scenarios reject qa-scenarios.md --note Missing-export   # the digest of this file
@@ -385,14 +405,14 @@ Examples:
     /// Show what changed between set versions by scenario ID, weakening changes first
     #[command(after_help = "Examples:
   goodflows cr scenarios diff                 # the current intent version against the approved one
-  goodflows cr scenarios diff --source diff   # the diff set against its previous version
+  goodflows cr scenarios diff --source diff   # the current diff version against its baseline
   goodflows cr scenarios diff --from 1 --to 3 # two given versions")]
     Diff {
         #[command(flatten)]
         pick: Pick,
         #[arg(long, value_enum, default_value_t = SetSource::Intent)]
         source: SetSource,
-        /// Compare from this version (default: the newest approved intent version, or the previous diff version)
+        /// Compare from this version (default: the newest approved intent version, or the diff baseline: the newest accepted diff version, else v1)
         #[arg(long, value_name = "VERSION")]
         from: Option<u64>,
         /// Compare to this version (default: the current one)
@@ -897,6 +917,7 @@ pub async fn cr(
         let git = Git::new(reporting.map_or("GOODFLOWS_API_KEY", |r| r.token_env.as_str()));
         let top = git.toplevel().await?;
         let path = git.claims_path().await?;
+        let scenarios = path.scenarios();
         output
             .emit(json!({
                 "type": "change_request_path",
@@ -904,6 +925,9 @@ pub async fn cr(
                 "absolute_path": path.absolute(&top).to_string_lossy(),
                 "branch": path.branch,
                 "exists": path.absolute(&top).is_file(),
+                "scenarios_path": scenarios.to_string_lossy(),
+                "scenarios_absolute_path": top.join(&scenarios).to_string_lossy(),
+                "scenarios_exists": top.join(&scenarios).is_file(),
             }))
             .await?;
         return Ok(0);
@@ -1204,6 +1228,7 @@ fn command_name(command: &CrCommand) -> &'static str {
         CrCommand::Reopen { .. } => "reopen",
         CrCommand::Scenarios { command } => match command {
             ScenariosCommand::Upload { .. } => "scenarios upload",
+            ScenariosCommand::List { .. } => "scenarios list",
             ScenariosCommand::Approve { .. } => "scenarios approve",
             ScenariosCommand::Reject { .. } => "scenarios reject",
             ScenariosCommand::Diff { .. } => "scenarios diff",
@@ -1442,9 +1467,23 @@ async fn wait(
 async fn scenarios(ctx: &Ctx<'_>, command: &ScenariosCommand) -> Result<u8> {
     match command {
         ScenariosCommand::Upload { file, pick } => {
+            let file = match file {
+                Some(file) => file.clone(),
+                None => {
+                    let top = ctx.git.toplevel().await?;
+                    let file = top.join(ctx.git.claims_path().await?.scenarios());
+                    if !file.is_file() {
+                        bail!(
+                            "there is no scenario set at {}, the branch's default diff set; write it there (gs-qa-scenarios) or pass the set file",
+                            file.display()
+                        );
+                    }
+                    file
+                }
+            };
             let shown = file.display().to_string();
             // Read as bytes and send as they are: the digest covers them.
-            let text = read_text(file)?;
+            let text = read_text(&file)?;
             let set = markdown::scenario_set(&text, &shown)?;
             if set.dirty {
                 bail!("{shown} covers uncommitted changes (revision ends +dirty); commit them and write the set again");
@@ -1482,6 +1521,30 @@ async fn scenarios(ctx: &Ctx<'_>, command: &ScenariosCommand) -> Result<u8> {
             .await?;
             Ok(0)
         }
+        ScenariosCommand::List { pick, source } => {
+            let number = ctx.number(*pick).await?;
+            let mut sets = scenario_sets(ctx, number).await?;
+            // The server's baseline rule: the newest accepted diff version, else v1.
+            if let Some(versions) = sets["diff"]["versions"]
+                .as_array()
+                .filter(|v| !v.is_empty())
+            {
+                let baseline = versions
+                    .iter()
+                    .filter(|v| v["accepted"] == true)
+                    .filter_map(|v| v["version"].as_u64())
+                    .max()
+                    .unwrap_or(1);
+                sets["diff"]["baseline_version"] = json!(baseline);
+            }
+            let sources: Vec<String> = match source {
+                Some(source) => vec![name(*source)],
+                None => vec!["intent".into(), "diff".into()],
+            };
+            ctx.emit(json!({"type": "scenario_sets", "number": number, "sources": sources, "sets": sets}))
+                .await?;
+            Ok(0)
+        }
         ScenariosCommand::Approve { pick, file, digest } => {
             decide(ctx, *pick, file.as_deref(), digest.as_deref(), None).await
         }
@@ -1498,8 +1561,21 @@ async fn scenarios(ctx: &Ctx<'_>, command: &ScenariosCommand) -> Result<u8> {
             to,
         } => {
             let number = ctx.number(*pick).await?;
+            // A diff set's weakening is measured from its baseline, so compare
+            // from it unless --from is given; the server defaults to the
+            // previous version.
+            let baseline = match (source, from) {
+                (SetSource::Diff, None) => {
+                    let diff = &ctx.verdict(number).await?["scenarios"]["diff"];
+                    diff["baseline_version"]
+                        .as_u64()
+                        .filter(|b| to.or(diff["version"].as_u64()).is_some_and(|t| *b < t))
+                }
+                _ => None,
+            };
+            let from = from.or(baseline);
             let source = name(*source);
-            let query: Vec<_> = [("from", *from), ("to", *to)]
+            let query: Vec<_> = [("from", from), ("to", *to)]
                 .into_iter()
                 .filter_map(|(k, v)| v.map(|v| (k, v.to_string())))
                 .collect();
@@ -1517,11 +1593,24 @@ async fn scenarios(ctx: &Ctx<'_>, command: &ScenariosCommand) -> Result<u8> {
                 )
                 .await?;
             let comparison = data(body, "scenarios diff")?;
-            ctx.emit(json!({"type": "scenario_changes", "number": number, "source": source, "comparison": comparison}))
+            ctx.emit(json!({"type": "scenario_changes", "number": number, "source": source, "comparison": comparison, "from_baseline": baseline.is_some()}))
                 .await?;
             Ok(0)
         }
     }
+}
+
+/// `GET …/scenario-sets`: the current version and versions, newest first,
+/// of the `intent` and `diff` sets.
+async fn scenario_sets(ctx: &Ctx<'_>, number: u64) -> Result<Value> {
+    let body = ctx
+        .api
+        .get(
+            &["change-requests", &number.to_string(), "scenario-sets"],
+            &[],
+        )
+        .await?;
+    data(body, "scenario sets")
 }
 
 /// Approve, or with a note reject, an intent set digest: the given one, a
@@ -1545,20 +1634,16 @@ async fn decide(
             &std::fs::read(file).with_context(|| format!("could not read {}", file.display()))?,
         ),
         (None, None) => {
-            let body = ctx
-                .api
-                .get(
-                    &["change-requests", &number.to_string(), "scenario-sets"],
-                    &[],
-                )
-                .await?;
-            let sets = data(body, "scenario sets")?;
-            sets["intent"]["current"]["digest"]
-                .as_str()
-                .ok_or_else(|| {
-                    anyhow!("change request #{number} has no intent scenario set; upload one first")
-                })?
-                .to_owned()
+            let sets = scenario_sets(ctx, number).await?;
+            match sets["intent"]["current"]["digest"].as_str() {
+                Some(digest) => digest.to_owned(),
+                None if sets["diff"]["current"].is_object() => bail!(
+                    "change request #{number} has only a diff set; a diff set is accepted by approving its diff_set_weakened items: goodflows cr review"
+                ),
+                None => bail!(
+                    "change request #{number} has no intent scenario set; upload one first"
+                ),
+            }
         }
     };
     let (route, body) = match note {
