@@ -217,7 +217,7 @@ pub fn claims(text: &str, file: &str) -> Result<Claims> {
     // The server refuses an id that is not a nonblank string, such as a bare 1.
     for list in ["questions", "decisions"] {
         for (index, entry) in fields[list].as_array().into_iter().flatten().enumerate() {
-            if !entry["id"].as_str().is_some_and(|id| !id.trim().is_empty()) {
+            if entry["id"].as_str().is_none_or(|id| id.trim().is_empty()) {
                 problems.push(format!(
                     "{file}: {list}[{index}].id must be a quoted string, such as id: \"1\""
                 ));
