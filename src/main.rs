@@ -858,8 +858,21 @@ async fn run(cli: &Cli, output: &mut Output, cancel: watch::Receiver<Option<i32>
         if let Some(flag) = cli.run_only_flag_besides(own) {
             return Err(usage(format!("{flag} cannot be used with {name} commands")));
         }
-        let (document, _) = Config::load(cli.config.as_deref())?;
-        let reporting = document.reporting.as_ref();
+        // Validating files needs no server, so no config either.
+        let local = matches!(
+            command,
+            Commands::Cr {
+                command: change_requests::CrCommand::Validate { .. }
+            } | Commands::Features {
+                command: change_requests::FeaturesCommand::Validate { .. }
+            }
+        );
+        let document = if local {
+            None
+        } else {
+            Some(Config::load(cli.config.as_deref())?.0)
+        };
+        let reporting = document.as_ref().and_then(|d| d.reporting.as_ref());
         return match command {
             Commands::Cr { command } => {
                 change_requests::cr(reporting, command, output, cancel).await

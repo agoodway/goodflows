@@ -7,7 +7,7 @@
 //! The set digest is always the SHA-256 of `scenarios.md`, never a digest
 //! `run.md` states.
 
-use super::markdown::{self, scenario_id};
+use super::markdown::{self, scenario_id, Invalid, Problems};
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
@@ -47,88 +47,120 @@ pub struct Run {
 
 pub fn read(folder: &Path) -> Result<Run> {
     let shown = folder.display().to_string();
-    let scenarios_file = folder.join("scenarios.md");
-    let scenarios = std::fs::read(&scenarios_file).with_context(|| {
-        format!("{shown} has no scenarios.md, the copy of the scenario set the run graded")
-    })?;
-    let digest = markdown::sha256_hex(&scenarios);
-    let scenarios =
-        String::from_utf8(scenarios).map_err(|_| anyhow!("{shown}/scenarios.md is not UTF-8"))?;
-    let set = markdown::scenario_set(&scenarios, &format!("{shown}/scenarios.md"))?;
+    let mut problems = Problems::default();
+    let set = problems.take(scenarios(folder, &shown));
 
     let notes_file = format!("{shown}/run.md");
-    let notes = std::fs::read_to_string(folder.join("run.md"))
-        .with_context(|| format!("{shown} has no run.md"))?;
-    let front = markdown::split(&notes).ok_or_else(|| {
-        anyhow!("{notes_file} must start with YAML front matter between --- lines")
-    })?;
-    let fields = markdown::parse(front.yaml, &notes_file)?;
+    let fields = problems
+        .take(
+            std::fs::read_to_string(folder.join("run.md"))
+                .with_context(|| format!("{shown} has no run.md"))
+                .and_then(|notes| {
+                    let front = markdown::split(&notes).ok_or_else(|| {
+                        anyhow!("{notes_file} must start with YAML front matter between --- lines")
+                    })?;
+                    Ok((
+                        markdown::refuse_anchors(front.yaml, &notes_file),
+                        markdown::parse(front.yaml, &notes_file),
+                    ))
+                }),
+        )
+        .and_then(|(anchors, fields)| {
+            problems.take(anchors);
+            problems.take(fields)
+        });
+    let Some(fields) = fields else {
+        return Err(Invalid(problems.0).into());
+    };
     if fields["format"] != NOTES_FORMAT {
-        bail!("{notes_file}: the front matter needs format: \"{NOTES_FORMAT}\"");
+        problems.push(format!(
+            "{notes_file}: the front matter needs format: \"{NOTES_FORMAT}\""
+        ));
     }
     // The digest is always computed from scenarios.md; a stated one must agree.
-    if let Some(stated) = fields["set"]["sha256"].as_str() {
+    if let (Some(stated), Some((_, digest))) = (fields["set"]["sha256"].as_str(), &set) {
         if stated != digest {
-            bail!("{notes_file}: set.sha256 is {stated}, but scenarios.md has SHA-256 {digest}; the run folder's copy of the set changed");
+            problems.push(format!("{notes_file}: set.sha256 is {stated}, but scenarios.md has SHA-256 {digest}; the run folder's copy of the set changed"));
         }
     }
     let field = |key: &str| &fields[key];
-    let required = |key: &str| -> Result<&Value> {
-        match field(key) {
-            Value::Null => bail!("{notes_file}: the front matter needs {key}"),
-            value => Ok(value),
-        }
-    };
 
-    let commit = required("commit")?
-        .as_str()
-        .filter(|c| {
+    let commit = required(&fields, "commit", &notes_file, &mut problems).and_then(|value| {
+        let commit = value.as_str().filter(|c| {
             matches!(c.len(), 40 | 64) && c.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
-        })
-        .ok_or_else(|| {
-            anyhow!("{notes_file}: commit must be the full commit SHA in lowercase hex")
-        })?;
+        });
+        if commit.is_none() {
+            problems.push(format!(
+                "{notes_file}: commit must be the full commit SHA in lowercase hex"
+            ));
+        }
+        commit
+    });
     let branch = text_or_null(field("branch"));
     if let Some(b) = branch.as_str() {
         if b.len() > MAX_BRANCH_BYTES || has_control(b) {
-            bail!("{notes_file}: branch must be at most {MAX_BRANCH_BYTES} bytes without control characters");
+            problems.push(format!("{notes_file}: branch must be at most {MAX_BRANCH_BYTES} bytes without control characters"));
         }
     }
-    let dirty = required("dirty")?
-        .as_bool()
-        .ok_or_else(|| anyhow!("{notes_file}: dirty must be true or false"))?;
+    let dirty = required(&fields, "dirty", &notes_file, &mut problems).and_then(|value| {
+        let dirty = value.as_bool();
+        if dirty.is_none() {
+            problems.push(format!("{notes_file}: dirty must be true or false"));
+        }
+        dirty
+    });
 
     let mut artifacts: Vec<Artifact> = Vec::new();
     let mut by_path: BTreeMap<PathBuf, String> = BTreeMap::new();
     let mut results = Vec::new();
     let mut seen = BTreeSet::new();
-    for (index, result) in required("results")?
-        .as_array()
-        .ok_or_else(|| anyhow!("{notes_file}: results must be a list"))?
-        .iter()
-        .enumerate()
-    {
-        let id = scenario_id(&result["id"])
-            .ok_or_else(|| anyhow!("{notes_file}: results[{index}] needs a scenario id"))?;
+    let listed = required(&fields, "results", &notes_file, &mut problems).and_then(|value| {
+        if value.as_array().is_none() {
+            problems.push(format!("{notes_file}: results must be a list"));
+        }
+        value.as_array()
+    });
+    for (index, result) in listed.into_iter().flatten().enumerate() {
+        let Some(id) = scenario_id(&result["id"]) else {
+            problems.push(format!(
+                "{notes_file}: results[{index}] needs a scenario id"
+            ));
+            continue;
+        };
         if !seen.insert(id.clone()) {
-            bail!("{notes_file}: scenario {id} has more than one result");
+            problems.push(format!(
+                "{notes_file}: scenario {id} has more than one result"
+            ));
+            continue;
         }
         let outcome = match result["result"].as_str() {
             Some(r @ ("passed" | "failed" | "not_run")) => r,
-            _ => bail!("{notes_file}: scenario {id}: result must be passed, failed or not_run"),
+            _ => {
+                problems.push(format!(
+                    "{notes_file}: scenario {id}: result must be passed, failed or not_run"
+                ));
+                ""
+            }
         };
         let mut evidence = Vec::new();
         for path in result["evidence"].as_array().into_iter().flatten() {
-            let path = path.as_str().ok_or_else(|| {
-                anyhow!("{notes_file}: scenario {id}: evidence must list file paths")
-            })?;
-            let relative = evidence_path(path).ok_or_else(|| {
-                anyhow!("{notes_file}: scenario {id}: evidence {path:?} must be a path inside the run folder")
-            })?;
+            let Some(path) = path.as_str() else {
+                problems.push(format!(
+                    "{notes_file}: scenario {id}: evidence must list file paths"
+                ));
+                continue;
+            };
+            let Some(relative) = evidence_path(path) else {
+                problems.push(format!("{notes_file}: scenario {id}: evidence {path:?} must be a path inside the run folder"));
+                continue;
+            };
             let artifact_id = match by_path.get(&relative) {
                 Some(artifact_id) => artifact_id.clone(),
                 None => {
-                    let artifact = artifact(folder, &relative, &artifacts)?;
+                    let Some(artifact) = problems.take(artifact(folder, &relative, &artifacts))
+                    else {
+                        continue;
+                    };
                     by_path.insert(relative, artifact.id.clone());
                     let artifact_id = artifact.id.clone();
                     artifacts.push(artifact);
@@ -144,7 +176,7 @@ pub fn read(folder: &Path) -> Result<Run> {
                 .as_str()
                 .is_some_and(|s| s.len() > MAX_RESULT_TEXT_BYTES)
             {
-                bail!("{notes_file}: scenario {id}: {key} must be at most {MAX_RESULT_TEXT_BYTES} bytes");
+                problems.push(format!("{notes_file}: scenario {id}: {key} must be at most {MAX_RESULT_TEXT_BYTES} bytes"));
             }
         }
         results.push(json!({
@@ -156,25 +188,27 @@ pub fn read(folder: &Path) -> Result<Run> {
         }));
     }
     if results.len() > MAX_RESULTS {
-        bail!(
+        problems.push(format!(
             "{notes_file}: results holds {} entries; a run may hold at most {MAX_RESULTS}",
             results.len()
-        );
+        ));
     }
-    let missing: Vec<_> = set.ids.iter().filter(|id| !seen.contains(*id)).collect();
-    let extra: Vec<_> = seen.iter().filter(|id| !set.ids.contains(id)).collect();
-    if !missing.is_empty() || !extra.is_empty() {
-        bail!(
-            "{notes_file}: results must hold exactly the scenarios of scenarios.md (missing: {}; not in the set: {})",
-            list(&missing),
-            list(&extra)
-        );
+    if let (Some((set, _)), Some(_)) = (&set, listed) {
+        let missing: Vec<_> = set.ids.iter().filter(|id| !seen.contains(*id)).collect();
+        let extra: Vec<_> = seen.iter().filter(|id| !set.ids.contains(id)).collect();
+        if !missing.is_empty() || !extra.is_empty() {
+            problems.push(format!(
+                "{notes_file}: results must hold exactly the scenarios of scenarios.md (missing: {}; not in the set: {})",
+                list(&missing),
+                list(&extra)
+            ));
+        }
     }
     if artifacts.len() > MAX_ARTIFACTS {
-        bail!(
+        problems.push(format!(
             "{notes_file}: the evidence names {} files; a run may upload at most {MAX_ARTIFACTS}",
             artifacts.len()
-        );
+        ));
     }
 
     let folder_name = folder
@@ -183,32 +217,60 @@ pub fn read(folder: &Path) -> Result<Run> {
         .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
         .unwrap_or_else(|| shown.clone());
     let run_id = match field("run_id") {
-        Value::Null => uuid::Uuid::new_v5(
-            &RUN_ID_NAMESPACE,
-            format!("{folder_name}\n{commit}").as_bytes(),
-        )
-        .to_string(),
-        value => value
-            .as_str()
-            .filter(|id| crate::fsutil::canonical_uuid(id))
-            .ok_or_else(|| anyhow!("{notes_file}: run_id must be a lowercase canonical UUID"))?
-            .to_owned(),
+        Value::Null => Some(
+            uuid::Uuid::new_v5(
+                &RUN_ID_NAMESPACE,
+                format!("{folder_name}\n{}", commit.unwrap_or_default()).as_bytes(),
+            )
+            .to_string(),
+        ),
+        value => {
+            let id = value
+                .as_str()
+                .filter(|id| crate::fsutil::canonical_uuid(id))
+                .map(str::to_owned);
+            if id.is_none() {
+                problems.push(format!(
+                    "{notes_file}: run_id must be a lowercase canonical UUID"
+                ));
+            }
+            id
+        }
+    };
+    let started_at = required(&fields, "started_at", &notes_file, &mut problems)
+        .and_then(|value| problems.take(time(value, "started_at", &notes_file)));
+    let finished_at = required(&fields, "finished_at", &notes_file, &mut problems)
+        .and_then(|value| problems.take(time(value, "finished_at", &notes_file)));
+    let changed_files = changed_files(field("changed_files"), &notes_file, &mut problems);
+    let features = features(field("features"), &notes_file, &mut problems);
+    let drift = drift(field("drift"), &notes_file, &mut problems);
+    problems.check()?;
+    let (
+        Some((set, digest)),
+        Some(commit),
+        Some(dirty),
+        Some(run_id),
+        Some(started_at),
+        Some(finished_at),
+    ) = (set, commit, dirty, run_id, started_at, finished_at)
+    else {
+        unreachable!("every missing value is a recorded problem");
     };
     let mut document = json!({
         "format": "verify-run/1",
         "run_id": run_id,
-        "started_at": time(required("started_at")?, "started_at", &notes_file)?,
-        "finished_at": time(required("finished_at")?, "finished_at", &notes_file)?,
+        "started_at": started_at,
+        "finished_at": finished_at,
         "source": {
             "commit": commit,
             "branch": branch,
             "dirty": dirty,
-            "changed_files": changed_files(field("changed_files"), &notes_file)?,
+            "changed_files": changed_files,
         },
         "scenario_set": {"digest": digest, "source": set.source},
         "results": results,
-        "features": features(field("features"), &notes_file)?,
-        "drift": drift(field("drift"), &notes_file)?,
+        "features": features,
+        "drift": drift,
         "artifacts": artifacts.iter().map(|a| json!({
             "id": a.id,
             "path": a.file.to_string_lossy(),
@@ -226,6 +288,34 @@ pub fn read(folder: &Path) -> Result<Run> {
         document,
         artifacts,
     })
+}
+
+/// The run folder's `scenarios.md` as a scenario set, with its SHA-256.
+fn scenarios(folder: &Path, shown: &str) -> Result<(markdown::ScenarioSet, String)> {
+    let bytes = std::fs::read(folder.join("scenarios.md")).with_context(|| {
+        format!("{shown} has no scenarios.md, the copy of the scenario set the run graded")
+    })?;
+    let digest = markdown::sha256_hex(&bytes);
+    let text =
+        String::from_utf8(bytes).map_err(|_| anyhow!("{shown}/scenarios.md is not UTF-8"))?;
+    let set = markdown::scenario_set(&text, &format!("{shown}/scenarios.md"))?;
+    Ok((set, digest))
+}
+
+/// The front matter's `key`, or `None` with the missing key recorded.
+fn required<'a>(
+    fields: &'a Value,
+    key: &str,
+    file: &str,
+    problems: &mut Problems,
+) -> Option<&'a Value> {
+    match &fields[key] {
+        Value::Null => {
+            problems.push(format!("{file}: the front matter needs {key}"));
+            None
+        }
+        value => Some(value),
+    }
 }
 
 fn list(items: &[&String]) -> String {
@@ -247,19 +337,28 @@ fn text_or_null(value: &Value) -> Value {
     }
 }
 
-fn list_or_empty<'a>(value: &'a Value, key: &str, file: &str, max: usize) -> Result<&'a [Value]> {
+fn list_or_empty<'a>(
+    value: &'a Value,
+    key: &str,
+    file: &str,
+    max: usize,
+    problems: &mut Problems,
+) -> &'a [Value] {
     let items = match value {
         Value::Null => &[][..],
         Value::Array(items) => items.as_slice(),
-        _ => bail!("{file}: {key} must be a list"),
+        _ => {
+            problems.push(format!("{file}: {key} must be a list"));
+            &[][..]
+        }
     };
     if items.len() > max {
-        bail!(
+        problems.push(format!(
             "{file}: {key} holds {} entries; a run may hold at most {max}",
             items.len()
-        );
+        ));
     }
-    Ok(items)
+    items
 }
 
 /// A Unicode control character, as the server's `@control` matches them.
@@ -269,57 +368,74 @@ fn has_control(s: &str) -> bool {
 }
 
 /// Each feature as exactly `{id, entry_point, result}`; other keys are dropped.
-fn features(value: &Value, file: &str) -> Result<Value> {
+fn features(value: &Value, file: &str, problems: &mut Problems) -> Value {
     let mut features = Vec::new();
-    for (index, feature) in list_or_empty(value, "features", file, MAX_FEATURES)?
+    for (index, feature) in list_or_empty(value, "features", file, MAX_FEATURES, problems)
         .iter()
         .enumerate()
     {
         if !feature.is_object() {
-            bail!("{file}: features[{index}] must be a mapping with id, entry_point and result");
+            problems.push(format!(
+                "{file}: features[{index}] must be a mapping with id, entry_point and result"
+            ));
+            continue;
         }
-        let id = feature["id"]
-            .as_str()
-            .ok_or_else(|| anyhow!("{file}: features[{index}] needs a string id"))?;
+        let Some(id) = feature["id"].as_str() else {
+            problems.push(format!("{file}: features[{index}] needs a string id"));
+            continue;
+        };
         if id.trim().is_empty() || id.len() > MAX_FEATURE_ID_BYTES || has_control(id) {
-            bail!("{file}: features[{index}]: id must be 1 to {MAX_FEATURE_ID_BYTES} bytes, not blank, without control characters");
+            problems.push(format!("{file}: features[{index}]: id must be 1 to {MAX_FEATURE_ID_BYTES} bytes, not blank, without control characters"));
         }
         let entry_point = match &feature["entry_point"] {
             Value::Null => Value::Null,
             Value::String(s) if s.len() <= MAX_TEXT_BYTES => json!(s),
-            Value::String(_) => bail!(
-                "{file}: features[{index}] ({id}): entry_point must be at most {MAX_TEXT_BYTES} bytes"
-            ),
-            _ => bail!("{file}: features[{index}] ({id}): entry_point must be a string"),
+            Value::String(_) => {
+                problems.push(format!(
+                    "{file}: features[{index}] ({id}): entry_point must be at most {MAX_TEXT_BYTES} bytes"
+                ));
+                Value::Null
+            }
+            _ => {
+                problems.push(format!(
+                    "{file}: features[{index}] ({id}): entry_point must be a string"
+                ));
+                Value::Null
+            }
         };
         let result = match feature["result"].as_str() {
             Some(r @ ("passed" | "failed" | "not_run")) => r,
             _ => {
-                bail!("{file}: features[{index}] ({id}): result must be passed, failed or not_run")
+                problems.push(format!(
+                    "{file}: features[{index}] ({id}): result must be passed, failed or not_run"
+                ));
+                ""
             }
         };
         features.push(json!({"id": id, "entry_point": entry_point, "result": result}));
     }
-    Ok(Value::Array(features))
+    Value::Array(features)
 }
 
-fn drift(value: &Value, file: &str) -> Result<Value> {
+fn drift(value: &Value, file: &str, problems: &mut Problems) -> Value {
     let mut drift = Vec::new();
-    for (index, item) in list_or_empty(value, "drift", file, MAX_DRIFT)?
+    for (index, item) in list_or_empty(value, "drift", file, MAX_DRIFT, problems)
         .iter()
         .enumerate()
     {
         match item.as_str() {
             Some(s) if s.len() <= MAX_TEXT_BYTES => drift.push(json!(s)),
-            _ => bail!("{file}: drift[{index}] must be a string of at most {MAX_TEXT_BYTES} bytes"),
+            _ => problems.push(format!(
+                "{file}: drift[{index}] must be a string of at most {MAX_TEXT_BYTES} bytes"
+            )),
         }
     }
-    Ok(Value::Array(drift))
+    Value::Array(drift)
 }
 
-fn changed_files(value: &Value, file: &str) -> Result<Value> {
+fn changed_files(value: &Value, file: &str, problems: &mut Problems) -> Value {
     let mut paths = Vec::new();
-    for (index, item) in list_or_empty(value, "changed_files", file, MAX_CHANGED_FILES)?
+    for (index, item) in list_or_empty(value, "changed_files", file, MAX_CHANGED_FILES, problems)
         .iter()
         .enumerate()
     {
@@ -331,10 +447,10 @@ fn changed_files(value: &Value, file: &str) -> Result<Value> {
             {
                 paths.push(json!(p))
             }
-            _ => bail!("{file}: changed_files[{index}] must be a relative path of 1 to {MAX_PATH_BYTES} bytes without control characters"),
+            _ => problems.push(format!("{file}: changed_files[{index}] must be a relative path of 1 to {MAX_PATH_BYTES} bytes without control characters")),
         }
     }
-    Ok(Value::Array(paths))
+    Value::Array(paths)
 }
 
 /// An RFC 3339 time as written; YAML may also hold it unquoted.
@@ -523,6 +639,17 @@ mod tests {
             .to_string();
         assert!(
             error.contains("run.md: features[0] needs a string id"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn run_notes_refuse_anchors_and_aliases() {
+        let error = read_with("drift: [&d \"R&D\", *d]\n")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("run.md: YAML anchors and aliases are not supported"),
             "{error}"
         );
     }

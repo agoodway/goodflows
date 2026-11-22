@@ -17,8 +17,10 @@ use anyhow::{anyhow, bail, Context, Result};
 use api::{data, explain_conflict, quoted, Api, Body, HttpError};
 use clap::{Args, Subcommand, ValueEnum};
 use git::Git;
+use markdown::Problems;
 use reqwest::Method;
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::sync::watch;
@@ -138,6 +140,28 @@ Examples:
   goodflows cr path --json                    # with the branch and the default diff set path (qa-scenarios.md)
   goodflows cr open                           # then create the change request from it")]
     Path,
+    /// Check claims files, scenario sets and run folders as the commands that upload them read them, and list every problem
+    #[command(
+        after_help = "Each file is checked by the format in its front matter: change-claims/2 as cr open and cr claims
+read it, qa-scenarios/2 as cr scenarios upload reads it, and a .verify/<app>/<run-id>/ folder (or
+its run.md) as cr runs upload reads it. Every problem in a file is listed; warnings name what an
+upload would trip on later, such as claims for a head other than HEAD. Exits 1 when any file has
+errors. Needs no API key or goodflows.toml. The server checks more of a claims file than its
+format, cr and head; those fields are not checked here. Feature files: goodflows features validate.
+
+Without paths it checks the branch's claims file and diff set (goodflows cr path), each
+openspec/changes/*/qa-scenarios.md and each .verify/<app>/<run-id>/ run folder.
+
+Examples:
+  goodflows cr validate                       # every change request file in the checkout
+  goodflows cr validate .goodflows/change-requests/feat/login/cr.md   # one file
+  goodflows cr validate .verify/web/20261119T143000Z-a1b2c3d   # a run folder
+  goodflows cr validate --json                # every file's errors and warnings as JSON"
+    )]
+    Validate {
+        /// Files or run folders to check (default: the change request files in the checkout)
+        paths: Vec<PathBuf>,
+    },
     /// Show the verdict: pending, blocked, needs_review or mergeable, with one reason per rule that fired
     #[command(after_help = "Examples:
   goodflows cr verdict                        # the current branch's change request
@@ -588,6 +612,23 @@ Examples:
         #[arg(long)]
         dir: Option<PathBuf>,
     },
+    /// Check the feature files as features sync reads them, without a server, and list every problem
+    #[command(
+        after_help = "Checks each feature file's front matter: valid YAML, id and title strings, and paths a list of
+globs. Also checks that no two files with paths share an id and that some file has paths. A file
+without paths is a warning, since features sync skips it. Exits 1 when anything sync would refuse
+is found. Needs no API key or goodflows.toml.
+
+Examples:
+  goodflows features validate                 # the one .agents/skills/verify-*/features directory
+  goodflows features validate --dir .claude/skills/verify-web/features   # another directory
+  goodflows features validate --json          # every file's errors and warnings as JSON"
+    )]
+    Validate {
+        /// The features directory (default: the one verify-*/features directory in a skills directory)
+        #[arg(long)]
+        dir: Option<PathBuf>,
+    },
 }
 
 #[derive(Args, Debug)]
@@ -974,10 +1015,15 @@ pub async fn cr(
     {
         return Err(crate::usage("--state cannot be used with cr tasks done"));
     }
+    if let CrCommand::Validate { paths } = command {
+        // Needs no server.
+        let git = Git::new(reporting.map_or("GOODFLOWS_API_KEY", |r| r.token_env.as_str()));
+        return validate(paths, &git, output).await;
+    }
     let label = format!("cr {}", command_name(command));
     let ctx = Ctx::new(reporting, &label, output, cancel)?;
     match command {
-        CrCommand::Path => unreachable!(),
+        CrCommand::Path | CrCommand::Validate { .. } => unreachable!(),
         CrCommand::Open {
             claims,
             openspec_change,
@@ -1255,6 +1301,189 @@ pub async fn cr(
     }
 }
 
+/// `cr validate`: each file checked as the command that uploads it reads
+/// it, with every problem that command would refuse and warnings for what
+/// it would trip on later.
+async fn validate(paths: &[PathBuf], git: &Git, output: &Output) -> Result<u8> {
+    let paths = if paths.is_empty() {
+        discover(git).await?
+    } else {
+        paths.to_vec()
+    };
+    let head = git.head().await.ok();
+    let files: Vec<Value> = paths
+        .iter()
+        .map(|path| check(path, head.as_deref()))
+        .collect();
+    let ok = files.iter().all(|file| file["ok"] == true);
+    output
+        .emit(json!({"type": "cr_validation", "ok": ok, "files": files}))
+        .await?;
+    Ok(if ok { 0 } else { 1 })
+}
+
+/// The change request files of the checkout: the branch's claims file and
+/// diff set, each OpenSpec change's `qa-scenarios.md`, and every
+/// `.verify/<app>/<run-id>/` run folder, relative to the working directory
+/// when they are under it.
+async fn discover(git: &Git) -> Result<Vec<PathBuf>> {
+    let top = git.toplevel().await?;
+    let mut found = Vec::new();
+    let path = git.claims_path().await?;
+    for file in [path.absolute(&top), top.join(path.scenarios())] {
+        if file.is_file() {
+            found.push(file);
+        }
+    }
+    let children = |dir: PathBuf| -> Vec<PathBuf> {
+        let mut paths: Vec<_> = std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.is_dir())
+            .collect();
+        paths.sort();
+        paths
+    };
+    for change in children(top.join("openspec/changes")) {
+        let set = change.join("qa-scenarios.md");
+        if change.file_name().is_some_and(|n| n != "archive") && set.is_file() {
+            found.push(set);
+        }
+    }
+    for app in children(top.join(".verify")) {
+        found.extend(
+            children(app)
+                .into_iter()
+                .filter(|run| run.join("run.md").is_file()),
+        );
+    }
+    if found.is_empty() {
+        bail!("found no change request files (the claims file at goodflows cr path, openspec/changes/*/qa-scenarios.md or .verify/<app>/<run-id>/ run folders); pass the files to check");
+    }
+    let cwd = std::env::current_dir().unwrap_or_default();
+    Ok(found
+        .into_iter()
+        .map(|path| {
+            path.strip_prefix(&cwd)
+                .map_or(path.clone(), Path::to_path_buf)
+        })
+        .collect())
+}
+
+/// One file's result: its kind, the problems that block its upload, and
+/// warnings.
+fn check(path: &Path, head: Option<&str>) -> Value {
+    let shown = path.display().to_string();
+    let mut warnings = Vec::new();
+    let (kind, result) = check_file(path, &shown, head, &mut warnings);
+    let errors = result.err().map(markdown::problems).unwrap_or_default();
+    json!({
+        "file": shown,
+        "kind": kind,
+        "ok": errors.is_empty(),
+        "errors": errors,
+        "warnings": warnings,
+    })
+}
+
+fn check_file(
+    path: &Path,
+    shown: &str,
+    head: Option<&str>,
+    warnings: &mut Vec<String>,
+) -> (&'static str, Result<()>) {
+    if path.is_dir() {
+        if !path.join("run.md").is_file() {
+            return (
+                "unknown",
+                Err(anyhow!("{shown} is a directory without run.md; pass a .verify/<app>/<run-id>/ run folder or a file")),
+            );
+        }
+        return ("verify_run", verify_run::read(path).map(drop));
+    }
+    let text = match read_text(path) {
+        Ok(text) => text,
+        Err(error) => return ("unknown", Err(error)),
+    };
+    let format = markdown::split(&text)
+        .and_then(|front| markdown::parse(front.yaml, shown).ok())
+        .and_then(|fields| fields["format"].as_str().map(str::to_owned));
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    // The format names the kind; a file whose format is missing or wrong is
+    // checked as its usual name suggests, so its problems are reported.
+    let kind = match format.as_deref() {
+        Some("change-claims/2") => "claims",
+        Some("qa-scenarios/2") => "scenario_set",
+        Some(verify_run::NOTES_FORMAT) => "verify_run",
+        _ if name == "cr.md" => "claims",
+        _ if name.ends_with("scenarios.md") => "scenario_set",
+        _ if name == "run.md" => "verify_run",
+        _ => "unknown",
+    };
+    let result = match kind {
+        "claims" => check_claims(&text, shown, head, warnings),
+        "scenario_set" => check_set(&text, shown, warnings),
+        "verify_run" => verify_run::read(path.parent().unwrap_or(Path::new("."))).map(drop),
+        _ if in_features_dir(path) => Err(anyhow!(
+            "{shown} is a feature file; check it with goodflows features validate"
+        )),
+        _ => Err(anyhow!(
+            "{shown}: the front matter's format must be change-claims/2, qa-scenarios/2 or {}",
+            verify_run::NOTES_FORMAT
+        )),
+    };
+    (kind, result)
+}
+
+fn check_claims(
+    text: &str,
+    shown: &str,
+    head: Option<&str>,
+    warnings: &mut Vec<String>,
+) -> Result<()> {
+    let claims = markdown::claims(text, shown)?;
+    if claims.cr.is_none() && markdown::set_cr(text, 1, shown).is_err() {
+        bail!("{shown}: the front matter needs a top-level cr: null line for cr open to fill in");
+    }
+    if let Some(head) = head.filter(|h| *h != claims.head) {
+        warnings.push(format!(
+            "{shown}: head is {} but HEAD is {head}; cr claims uploads claims only for HEAD",
+            crate::output::visible(&claims.head)
+        ));
+    }
+    if claims.cr.is_none() && claims.title.is_none() {
+        warnings.push(format!(
+            "{shown}: the body has no # heading, so cr open needs --title"
+        ));
+    }
+    Ok(())
+}
+
+fn check_set(text: &str, shown: &str, warnings: &mut Vec<String>) -> Result<()> {
+    let set = markdown::scenario_set(text, shown)?;
+    markdown::sections(text, &set.ids, shown)?;
+    if set.dirty {
+        warnings.push(format!("{shown}: revision ends +dirty, so cr scenarios upload refuses it until the changes are committed and the set is written again"));
+    }
+    Ok(())
+}
+
+/// A file in a verify skill's `verify-*/features` directory.
+fn in_features_dir(path: &Path) -> bool {
+    let dir = path.parent();
+    dir.and_then(Path::file_name)
+        .is_some_and(|n| n == "features")
+        && dir
+            .and_then(Path::parent)
+            .and_then(Path::file_name)
+            .is_some_and(|n| n.to_string_lossy().starts_with("verify-"))
+}
+
 fn command_name(command: &CrCommand) -> &'static str {
     match command {
         CrCommand::Open { .. } => "open",
@@ -1262,6 +1491,7 @@ fn command_name(command: &CrCommand) -> &'static str {
         CrCommand::Push { .. } => "push",
         CrCommand::Status { .. } => "status",
         CrCommand::Path => "path",
+        CrCommand::Validate { .. } => "validate",
         CrCommand::Verdict { .. } => "verdict",
         CrCommand::Wait { .. } => "wait",
         CrCommand::Ready { .. } => "ready",
@@ -2084,63 +2314,32 @@ pub async fn features(
     output: &Output,
     cancel: watch::Receiver<Option<i32>>,
 ) -> Result<u8> {
-    let FeaturesCommand::Sync { dir } = command;
-    let ctx = Ctx::new(reporting, "features sync", output, cancel)?;
-    let dir = match dir {
-        Some(dir) => dir.clone(),
-        None => features_dir(&ctx.git.toplevel().await?)?,
+    let token_env = reporting.map_or("GOODFLOWS_API_KEY", |r| r.token_env.as_str());
+    let dir = match command {
+        FeaturesCommand::Sync { dir } | FeaturesCommand::Validate { dir } => match dir {
+            Some(dir) => dir.clone(),
+            None => features_dir(&Git::new(token_env).toplevel().await?)?,
+        },
     };
-    let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
-        .with_context(|| format!("could not read {}", dir.display()))?
-        .filter_map(|entry| entry.ok().map(|e| e.path()))
-        .filter(|path| {
-            path.extension().is_some_and(|e| e == "md")
-                && !path
-                    .file_stem()
-                    .is_some_and(|s| s.eq_ignore_ascii_case("readme"))
-                && path.is_file()
-        })
-        .collect();
-    files.sort();
+    let read = read_features(&dir)?;
+    let errors = feature_dir_problems(&dir, &read);
+    if let FeaturesCommand::Validate { .. } = command {
+        return validate_features(&dir, read, errors, output).await;
+    }
+    // Needs the server, unlike validate.
+    let ctx = Ctx::new(reporting, "features sync", output, cancel)?;
+    let mut problems = Problems(errors);
     let mut features = Vec::new();
     let mut skipped = Vec::new();
-    for file in &files {
-        let shown = file.display().to_string();
-        let text = read_text(file)?;
-        let stem = file
-            .file_stem()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let (fields, body) = match markdown::split(&text) {
-            Some(front) => (markdown::parse(front.yaml, &shown)?, front.body),
-            None => (json!({}), text.as_str()),
-        };
-        let id = fields["id"].as_str().map_or(stem, str::to_owned);
-        let Some(paths) = fields["paths"].as_array().filter(|p| !p.is_empty()) else {
-            skipped.push(id);
-            continue;
-        };
-        if !paths.iter().all(Value::is_string) {
-            bail!("{shown}: paths must be a list of globs");
+    for (_, feature) in read {
+        match feature {
+            Ok(feature) if feature.paths.is_empty() => skipped.push(feature.id),
+            Ok(feature) => features
+                .push(json!({"id": feature.id, "title": feature.title, "paths": feature.paths})),
+            Err(errors) => problems.0.extend(errors),
         }
-        let title = fields["title"]
-            .as_str()
-            .map(str::to_owned)
-            .or_else(|| {
-                body.lines()
-                    .find_map(|l| l.strip_prefix("# "))
-                    .map(|t| t.trim().to_owned())
-            })
-            .filter(|t| !t.is_empty())
-            .unwrap_or_else(|| id.clone());
-        features.push(json!({"id": id, "title": title, "paths": paths}));
     }
-    if features.is_empty() {
-        bail!(
-            "no feature file in {} has paths globs in its front matter; nothing to sync",
-            dir.display()
-        );
-    }
+    problems.check()?;
     let body = ctx
         .api
         .post(
@@ -2158,6 +2357,116 @@ pub async fn features(
     }))
     .await?;
     Ok(0)
+}
+
+/// Each feature file of `dir`, every `.md` but README, with what it reads
+/// as or its problems.
+type FeatureFiles = Vec<(PathBuf, Result<markdown::Feature, Vec<String>>)>;
+
+fn read_features(dir: &Path) -> Result<FeatureFiles> {
+    let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
+        .with_context(|| format!("could not read {}", dir.display()))?
+        .filter_map(|entry| entry.ok().map(|e| e.path()))
+        .filter(|path| {
+            path.extension().is_some_and(|e| e == "md")
+                && !path
+                    .file_stem()
+                    .is_some_and(|s| s.eq_ignore_ascii_case("readme"))
+                && path.is_file()
+        })
+        .collect();
+    files.sort();
+    Ok(files
+        .into_iter()
+        .map(|file| {
+            let shown = file.display().to_string();
+            let stem = file
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let feature = read_text(&file)
+                .and_then(|text| markdown::feature(&text, &stem, &shown))
+                .map_err(markdown::problems);
+            (file, feature)
+        })
+        .collect())
+}
+
+/// Problems of the directory as a whole: an id that several files with
+/// paths share, which the index could hold only once, and no file with
+/// paths, which leaves nothing to sync.
+fn feature_dir_problems(dir: &Path, files: &FeatureFiles) -> Vec<String> {
+    let mut by_id: BTreeMap<&str, Vec<String>> = BTreeMap::new();
+    for (file, feature) in files {
+        if let Some(feature) = feature.as_ref().ok().filter(|f| !f.paths.is_empty()) {
+            by_id
+                .entry(&feature.id)
+                .or_default()
+                .push(file.display().to_string());
+        }
+    }
+    let mut problems: Vec<String> = by_id
+        .iter()
+        .filter(|(_, files)| files.len() > 1)
+        .map(|(id, files)| {
+            format!(
+                "feature id {id} is used by {}; give each file its own id",
+                files.join(" and ")
+            )
+        })
+        .collect();
+    if by_id.is_empty() {
+        problems.push(format!(
+            "no feature file in {} has paths globs in its front matter; nothing to sync",
+            dir.display()
+        ));
+    }
+    problems
+}
+
+async fn validate_features(
+    dir: &Path,
+    read: FeatureFiles,
+    errors: Vec<String>,
+    output: &Output,
+) -> Result<u8> {
+    let mut ok = errors.is_empty();
+    let mut features = Vec::new();
+    let mut skipped = Vec::new();
+    let mut files = Vec::new();
+    for (file, feature) in read {
+        let file = file.display().to_string();
+        files.push(match feature {
+            Ok(feature) => {
+                let mut warnings = Vec::new();
+                if feature.paths.is_empty() {
+                    warnings.push(format!(
+                        "{file}: no paths globs in the front matter, so features sync skips it"
+                    ));
+                    skipped.push(feature.id.clone());
+                } else {
+                    features.push(feature.id.clone());
+                }
+                json!({"file": file, "id": feature.id, "ok": true, "errors": [], "warnings": warnings})
+            }
+            Err(errors) => {
+                ok = false;
+                json!({"file": file, "id": null, "ok": false, "errors": errors, "warnings": []})
+            }
+        });
+    }
+    output
+        .emit(json!({
+            "type": "feature_validation",
+            "dir": dir.display().to_string(),
+            "ok": ok,
+            "features": features,
+            "skipped": skipped,
+            "files": files,
+            "errors": errors,
+        }))
+        .await?;
+    Ok(if ok { 0 } else { 1 })
 }
 
 /// The one `verify-*/features` directory in the checkout's skills directories.

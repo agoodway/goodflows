@@ -103,7 +103,7 @@ fn to_json(value: serde_yaml_ng::Value) -> Result<Value> {
 }
 
 /// Refuses anchors and aliases, which serde_yaml_ng expands silently.
-fn refuse_anchors(yaml: &str, file: &str) -> Result<()> {
+pub fn refuse_anchors(yaml: &str, file: &str) -> Result<()> {
     for line in yaml.lines() {
         let content = line.split(" #").next().unwrap_or_default();
         let unquoted = content.trim_start().trim_start_matches("- ");
@@ -127,6 +127,50 @@ fn refuse_anchors(yaml: &str, file: &str) -> Result<()> {
     Ok(())
 }
 
+/// Every problem found in the files a command read, each naming its file.
+#[derive(Debug)]
+pub struct Invalid(pub Vec<String>);
+
+impl std::fmt::Display for Invalid {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0.join("\n"))
+    }
+}
+
+impl std::error::Error for Invalid {}
+
+/// Collects problems so one pass reports all of them.
+#[derive(Default)]
+pub struct Problems(pub Vec<String>);
+
+impl Problems {
+    pub fn push(&mut self, problem: impl Into<String>) {
+        self.0.push(problem.into());
+    }
+
+    /// The value of `result`, or `None` with its problems recorded.
+    pub fn take<T>(&mut self, result: Result<T>) -> Option<T> {
+        result.map_err(|error| self.0.extend(problems(error))).ok()
+    }
+
+    pub fn check(self) -> Result<()> {
+        if self.0.is_empty() {
+            Ok(())
+        } else {
+            Err(Invalid(self.0).into())
+        }
+    }
+}
+
+/// The problems an error reports: each one an [`Invalid`] lists, or the
+/// error itself.
+pub fn problems(error: anyhow::Error) -> Vec<String> {
+    match error.downcast::<Invalid>() {
+        Ok(Invalid(problems)) => problems,
+        Err(error) => vec![format!("{error:#}")],
+    }
+}
+
 pub fn sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     digest.iter().map(|b| format!("{b:02x}")).collect()
@@ -144,30 +188,43 @@ pub fn claims(text: &str, file: &str) -> Result<Claims> {
     let front = split(text).ok_or_else(|| {
         anyhow!("{file}: a claims file must start with YAML front matter between --- lines")
     })?;
-    refuse_anchors(front.yaml, file)?;
-    let fields = parse(front.yaml, file)?;
+    let mut problems = Problems::default();
+    problems.take(refuse_anchors(front.yaml, file));
+    let Some(fields) = problems.take(parse(front.yaml, file)) else {
+        return Err(Invalid(problems.0).into());
+    };
     if fields["format"] != "change-claims/2" {
-        bail!("{file}: format must be change-claims/2");
+        problems.push(format!("{file}: format must be change-claims/2"));
     }
     let cr = match &fields["cr"] {
         Value::Null => None,
-        value => Some(
-            value
-                .as_u64()
-                .filter(|n| *n > 0)
-                .ok_or_else(|| anyhow!("{file}: cr must be a change request number or null"))?,
-        ),
+        value => {
+            let number = value.as_u64().filter(|n| *n > 0);
+            if number.is_none() {
+                problems.push(format!(
+                    "{file}: cr must be a change request number or null"
+                ));
+            }
+            number
+        }
     };
-    let head = fields["head"]
-        .as_str()
-        .ok_or_else(|| anyhow!("{file}: head must be the commit the claims describe"))?
-        .to_owned();
+    let head = fields["head"].as_str().map(str::to_owned);
+    if head.is_none() {
+        problems.push(format!(
+            "{file}: head must be the commit the claims describe"
+        ));
+    }
+    problems.check()?;
     let title = lines(front.body)
         .map(|(_, line)| bare(line))
         .find_map(|line| line.strip_prefix("# "))
         .map(|t| t.trim().to_owned())
         .filter(|t| !t.is_empty());
-    Ok(Claims { cr, head, title })
+    Ok(Claims {
+        cr,
+        head: head.unwrap_or_default(),
+        title,
+    })
 }
 
 /// The file with its front matter's `cr:` line set to `number`, and
@@ -208,27 +265,42 @@ pub fn scenario_set(text: &str, file: &str) -> Result<ScenarioSet> {
     let front = split(text).ok_or_else(|| {
         anyhow!("{file}: a scenario set must start with YAML front matter between --- lines")
     })?;
-    let fields = parse(front.yaml, file)?;
+    let mut problems = Problems::default();
+    problems.take(refuse_anchors(front.yaml, file));
+    let Some(fields) = problems.take(parse(front.yaml, file)) else {
+        return Err(Invalid(problems.0).into());
+    };
     if fields["format"] != "qa-scenarios/2" {
-        bail!("{file}: format must be qa-scenarios/2");
+        problems.push(format!("{file}: format must be qa-scenarios/2"));
     }
     let source = match fields["source"].as_str() {
         Some(s @ ("intent" | "diff")) => s.to_owned(),
-        _ => bail!("{file}: source must be intent or diff"),
+        _ => {
+            problems.push(format!("{file}: source must be intent or diff"));
+            String::new()
+        }
     };
     let scenarios = fields["scenarios"]
         .as_array()
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| anyhow!("{file}: scenarios must list at least one scenario"))?;
+        .map_or(&[][..], Vec::as_slice);
+    if scenarios.is_empty() {
+        problems.push(format!("{file}: scenarios must list at least one scenario"));
+    }
     let mut ids = Vec::with_capacity(scenarios.len());
-    for scenario in scenarios {
-        let id = scenario_id(&scenario["id"])
-            .ok_or_else(|| anyhow!("{file}: every scenario needs an id"))?;
+    for (index, scenario) in scenarios.iter().enumerate() {
+        let Some(id) = scenario_id(&scenario["id"]) else {
+            problems.push(format!(
+                "{file}: scenarios[{index}]: every scenario needs an id, a positive integer or a nonempty string"
+            ));
+            continue;
+        };
         if ids.contains(&id) {
-            bail!("{file}: scenario id {id} appears twice");
+            problems.push(format!("{file}: scenario id {id} appears twice"));
+            continue;
         }
         ids.push(id);
     }
+    problems.check()?;
     let dirty = fields["revision"]
         .as_str()
         .is_some_and(|r| r.ends_with("+dirty"));
@@ -279,6 +351,7 @@ pub fn sections(text: &str, ids: &[String], file: &str) -> Result<Vec<Value>> {
         .position(|(_, level, _)| *level <= 2)
         .map_or(headings.len(), |i| first + 1 + i);
     let mut found: BTreeMap<&str, Value> = BTreeMap::new();
+    let mut twice = Vec::new();
     for index in first + 1..last {
         let (start, level, title) = headings[index];
         if !(3..=4).contains(&level) {
@@ -296,19 +369,80 @@ pub fn sections(text: &str, ids: &[String], file: &str) -> Result<Vec<Value>> {
             .find(|(_, next, _)| *next <= level)
             .map_or(text.len(), |(offset, _, _)| *offset);
         let section = json!({"id": id, "sha256": sha256_hex(&text.as_bytes()[start..end])});
-        if found.insert(id, section).is_some() {
-            bail!("{file}: scenario {id} has more than one heading");
+        if found.insert(id, section).is_some() && !twice.contains(&id) {
+            twice.push(id);
         }
     }
-    ids.iter()
-        .map(|id| {
-            found.remove(id.as_str()).ok_or_else(|| {
-                anyhow!(
-                    "{file}: scenario {id} has no \"### {id}. <name>\" heading under ## Scenarios"
-                )
-            })
+    let mut problems = Problems::default();
+    for id in twice {
+        problems.push(format!("{file}: scenario {id} has more than one heading"));
+    }
+    let mut sections = Vec::with_capacity(ids.len());
+    for id in ids {
+        match found.remove(id.as_str()) {
+            Some(section) => sections.push(section),
+            None => problems.push(format!(
+                "{file}: scenario {id} has no \"### {id}. <name>\" heading under ## Scenarios"
+            )),
+        }
+    }
+    problems.check()?;
+    Ok(sections)
+}
+
+/// What `features sync` reads from a verify skill's feature file.
+pub struct Feature {
+    pub id: String,
+    pub title: String,
+    /// The `paths` globs of the code the feature covers; empty when the
+    /// file sets none, and then sync skips it.
+    pub paths: Vec<String>,
+}
+
+/// A feature file named `stem`, which need not have front matter.
+pub fn feature(text: &str, stem: &str, file: &str) -> Result<Feature> {
+    let (fields, body) = match split(text) {
+        Some(front) => (parse(front.yaml, file)?, front.body),
+        None => (json!({}), text),
+    };
+    let mut problems = Problems::default();
+    let id = match &fields["id"] {
+        Value::Null => stem.to_owned(),
+        Value::String(id) if !id.trim().is_empty() => id.clone(),
+        _ => {
+            problems.push(format!("{file}: id must be a nonempty string"));
+            stem.to_owned()
+        }
+    };
+    let title = match &fields["title"] {
+        Value::Null => None,
+        Value::String(title) => Some(title.trim().to_owned()),
+        _ => {
+            problems.push(format!("{file}: title must be a string"));
+            None
+        }
+    };
+    let paths = match &fields["paths"] {
+        Value::Null => Vec::new(),
+        Value::Array(globs) if globs.iter().all(Value::is_string) => globs
+            .iter()
+            .filter_map(|glob| glob.as_str().map(str::to_owned))
+            .collect(),
+        _ => {
+            problems.push(format!("{file}: paths must be a list of globs"));
+            Vec::new()
+        }
+    };
+    problems.check()?;
+    let title = title
+        .or_else(|| {
+            body.lines()
+                .find_map(|l| l.strip_prefix("# "))
+                .map(|t| t.trim().to_owned())
         })
-        .collect()
+        .filter(|t| !t.is_empty())
+        .unwrap_or_else(|| id.clone());
+    Ok(Feature { id, title, paths })
 }
 
 #[cfg(test)]
@@ -353,6 +487,18 @@ mod tests {
         // An ampersand inside a value is not an anchor.
         let text = "---\nformat: change-claims/2\ncr: 7\nhead: abc\nreach: \"R&D * all\"\nnote: Q&A\n---\n";
         assert_eq!(claims(text, "x.md").unwrap().cr, Some(7));
+    }
+
+    #[test]
+    fn scenario_sets_refuse_anchors_and_aliases() {
+        let set = "---\nformat: qa-scenarios/2\nsource: intent\nscenarios:\n  - &one {id: 1, name: \"Q&A\"}\n  - *one\n---\n";
+        let error = scenario_set(set, "qa.md").err().unwrap().to_string();
+        assert!(
+            error.starts_with("qa.md: YAML anchors and aliases are not supported"),
+            "{error}"
+        );
+        // The alias also repeats scenario 1, and both problems are listed.
+        assert!(error.contains("scenario id 1 appears twice"), "{error}");
     }
 
     /// A grouped diff set in the gs-qa-scenarios template, with a numbered

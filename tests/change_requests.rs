@@ -794,6 +794,135 @@ fn tasks_done_marks_a_task_of_the_given_change_request() {
 }
 
 #[test]
+fn cr_validate_lists_every_problem_in_each_file_without_config_or_server() {
+    let p = checkout();
+    std::fs::remove_file(p.dir.join("goodflows.toml")).unwrap();
+    let head = git(&p, &["rev-parse", "HEAD"]);
+    let validate = |args: &[&str]| {
+        p.command()
+            .args(["cr", "validate", "--json"])
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let dir = p.dir.join(".goodflows/change-requests/feat/login");
+    std::fs::create_dir_all(&dir).unwrap();
+    // Three problems in the claims file, and a set whose scenarios are
+    // both listed twice and missing a section.
+    std::fs::write(
+        dir.join("cr.md"),
+        "---\nformat: change-claims/1\ncr: 0\n---\n# Add login\n",
+    )
+    .unwrap();
+    let change = p.dir.join("openspec/changes/add-login");
+    std::fs::create_dir_all(&change).unwrap();
+    std::fs::write(
+        change.join("qa-scenarios.md"),
+        "---\nformat: qa-scenarios/2\nsource: intent\nscenarios:\n  - {id: 1}\n  - {id: 2}\n---\n## Scenarios\n### 1. A\n### 1. Again\n",
+    )
+    .unwrap();
+    let output = validate(&[]);
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    let event = last_event(&output);
+    assert_eq!(
+        event["files"][0]["file"],
+        ".goodflows/change-requests/feat/login/cr.md"
+    );
+    assert_eq!(event["files"][0]["kind"], "claims");
+    assert_eq!(
+        event["files"][0]["errors"],
+        json!([
+            ".goodflows/change-requests/feat/login/cr.md: format must be change-claims/2",
+            ".goodflows/change-requests/feat/login/cr.md: cr must be a change request number or null",
+            ".goodflows/change-requests/feat/login/cr.md: head must be the commit the claims describe",
+        ])
+    );
+    assert_eq!(
+        event["files"][1]["errors"],
+        json!([
+            "openspec/changes/add-login/qa-scenarios.md: scenario 1 has more than one heading",
+            "openspec/changes/add-login/qa-scenarios.md: scenario 2 has no \"### 2. <name>\" heading under ## Scenarios",
+        ])
+    );
+
+    // Valid claims for another head pass with a warning; cr open could not
+    // fill in claims without a cr: line.
+    std::fs::write(
+        dir.join("cr.md"),
+        "---\nformat: change-claims/2\ncr: 4\nhead: abc\n---\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("other.md"),
+        format!("---\nformat: change-claims/2\nhead: {head}\n---\n# T\n"),
+    )
+    .unwrap();
+    let output = validate(&[
+        ".goodflows/change-requests/feat/login/cr.md",
+        ".goodflows/change-requests/feat/login/other.md",
+    ]);
+    assert_eq!(output.status.code(), Some(1));
+    let files = last_event(&output)["files"].clone();
+    assert_eq!(files[0]["ok"], true);
+    assert_eq!(
+        files[0]["warnings"],
+        json!([format!(".goodflows/change-requests/feat/login/cr.md: head is abc but HEAD is {head}; cr claims uploads claims only for HEAD")])
+    );
+    assert_eq!(
+        files[1]["errors"],
+        json!([".goodflows/change-requests/feat/login/other.md: the front matter needs a top-level cr: null line for cr open to fill in"])
+    );
+    let output = validate(&[".goodflows/change-requests/feat/login/cr.md"]);
+    success(&output);
+}
+
+#[test]
+fn features_validate_and_sync_refuse_the_same_files() {
+    let p = checkout();
+    let dir = p.dir.join(".agents/skills/verify-web/features");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("a.md"), "---\nid: login\npaths: [lib/a]\n---\n").unwrap();
+    std::fs::write(dir.join("b.md"), "---\nid: login\npaths: [lib/b]\n---\n").unwrap();
+    std::fs::write(dir.join("c.md"), "---\nid: [x]\npaths: lib/**\n---\n").unwrap();
+    std::fs::write(dir.join("d.md"), "# No paths\n").unwrap();
+    let mock = Mock::start(|_, _| created(json!({"data": {"version": 1}})));
+    let output = run(&p, &mock, &["features", "validate", "--json"]);
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    let event = last_event(&output);
+    let c = dir.join("c.md").display().to_string();
+    assert_eq!(
+        event["files"][2]["errors"],
+        json!([
+            format!("{c}: id must be a nonempty string"),
+            format!("{c}: paths must be a list of globs")
+        ])
+    );
+    assert_eq!(event["files"][3]["ok"], true);
+    assert_eq!(event["skipped"], json!(["d"]));
+    assert_eq!(
+        event["errors"],
+        json!([format!(
+            "feature id login is used by {} and {}; give each file its own id",
+            dir.join("a.md").display(),
+            dir.join("b.md").display()
+        )])
+    );
+    let sync = run(&p, &mock, &["features", "sync"]);
+    assert_eq!(sync.status.code(), Some(1));
+    assert!(
+        stderr(&sync).contains("feature id login is used by"),
+        "{}",
+        stderr(&sync)
+    );
+    assert!(mock.requests().is_empty());
+
+    std::fs::write(dir.join("b.md"), "---\npaths: [lib/b]\n---\n").unwrap();
+    std::fs::remove_file(dir.join("c.md")).unwrap();
+    success(&run(&p, &mock, &["features", "validate"]));
+    success(&run(&p, &mock, &["features", "sync"]));
+}
+
+#[test]
 fn policy_set_sends_the_toml_file_as_json_after_the_current_version() {
     let p = checkout();
     std::fs::write(

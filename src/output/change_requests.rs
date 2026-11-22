@@ -42,6 +42,8 @@ pub fn renders(kind: &str) -> bool {
             | "review_policy_versions"
             | "calibration"
             | "feature_index"
+            | "cr_validation"
+            | "feature_validation"
             | "project_events"
             | "merge_lease"
             | "defect"
@@ -157,6 +159,12 @@ pub fn render(event: &Value, out: &mut impl Write) -> Result<()> {
                 )?;
             }
         }
+        "cr_validation" => validation(&event["files"], &[], out)?,
+        "feature_validation" => validation(
+            &event["files"],
+            event["errors"].as_array().map_or(&[][..], Vec::as_slice),
+            out,
+        )?,
         "review_policy" => policy(event, out)?,
         "review_policy_versions" => {
             for version in event["versions"].as_array().into_iter().flatten() {
@@ -214,6 +222,46 @@ pub fn render(event: &Value, out: &mut impl Write) -> Result<()> {
         }
         _ => {}
     }
+    Ok(())
+}
+
+/// One line per file, its errors and warnings under it, then problems of
+/// the files together and a count.
+fn validation(files: &Value, errors: &[Value], out: &mut impl Write) -> Result<()> {
+    let files = files.as_array().map_or(&[][..], Vec::as_slice);
+    let mut failed = 0;
+    for file in files {
+        let ok = file["ok"] == true;
+        failed += usize::from(!ok);
+        let kind = file["kind"]
+            .as_str()
+            .map_or(String::new(), |k| format!(" ({})", visible(k)));
+        writeln!(
+            out,
+            "{} {}{kind}",
+            if ok { "ok    " } else { "failed" },
+            s(&file["file"])
+        )?;
+        for (label, key) in [("error", "errors"), ("warning", "warnings")] {
+            for problem in file[key].as_array().into_iter().flatten() {
+                writeln!(out, "  {label}: {}", s(problem))?;
+            }
+        }
+    }
+    for problem in errors {
+        writeln!(out, "error: {}", s(problem))?;
+    }
+    writeln!(
+        out,
+        "{} checked: {} ok, {failed} failed{}",
+        files.len(),
+        files.len() - failed,
+        if errors.is_empty() {
+            ""
+        } else {
+            "; the files together have errors"
+        }
+    )?;
     Ok(())
 }
 
