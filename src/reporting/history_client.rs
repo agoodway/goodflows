@@ -202,7 +202,7 @@ pub async fn show(
 /// The publisher's target, resolved from the same `[reporting]` variables.
 fn target(reporting: Option<&Reporting>) -> Result<publish::Target> {
     let Some(reporting) = reporting else {
-        bail!("history commands require a top-level [reporting] block");
+        bail!("history commands require a top-level [reporting] block; add [reporting] with project = \"<slug>\" to the config");
     };
     let read = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
     let key = read(&reporting.token_env);

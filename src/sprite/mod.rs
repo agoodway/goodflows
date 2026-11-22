@@ -69,21 +69,38 @@ fn parse_run(value: &str) -> std::result::Result<String, String> {
 #[derive(clap::Subcommand)]
 pub enum Command {
     /// Show ownership, preparation and runs; records confirmed process loss
+    #[command(after_help = "Examples:
+  goodflows sprite status T-1                # ownership, preparation, active and recent runs
+  goodflows sprite status T-1 --json         # the same as JSON events
+  goodflows sprite logs T-1 --run <UUID>     # then read one listed run's events")]
     Status {
+        /// The caller identity `run --sprite` used, such as an agent thread ID
         #[arg(value_parser = naming::parse_identity)]
         identity: String,
     },
     /// Print a run's saved lifecycle and workflow events (reads only)
+    #[command(after_help = "Examples:
+  goodflows sprite logs T-1 --run <UUID>         # the run's saved events as text
+  goodflows sprite logs T-1 --run <UUID> --json  # the events as JSON
+  goodflows sprite status T-1                    # find run ids")]
     Logs {
+        /// The caller identity `run --sprite` used, such as an agent thread ID
         #[arg(value_parser = naming::parse_identity)]
         identity: String,
+        /// The run id (a lowercase canonical UUID), as sprite status lists it
         #[arg(long, value_name = "UUID", value_parser = parse_run)]
         run: String,
     },
     /// Download a run's saved results into a verified local bundle (never publishes)
+    #[command(after_help = "Examples:
+  goodflows sprite collect T-1 --run <UUID>                 # into .goodflows/sprites/<scope>/<run>
+  goodflows sprite collect T-1 --run <UUID> --output out    # under another base directory
+  goodflows sprite collect T-1 --run <UUID> --json          # print the result as JSON")]
     Collect {
+        /// The caller identity `run --sprite` used, such as an agent thread ID
         #[arg(value_parser = naming::parse_identity)]
         identity: String,
+        /// The run id (a lowercase canonical UUID), as sprite status lists it
         #[arg(long, value_name = "UUID", value_parser = parse_run)]
         run: String,
         /// Bundle base directory (default .goodflows/sprites/<scope>/<run>)
@@ -91,9 +108,15 @@ pub enum Command {
         output: Option<PathBuf>,
     },
     /// Request cancellation of exactly this run (hooks or workflow)
+    #[command(after_help = "Examples:
+  goodflows sprite cancel T-1 --run <UUID>         # cancel the run
+  goodflows sprite cancel T-1 --run <UUID> --json  # print the result as JSON
+  goodflows sprite status T-1                      # check that it stopped")]
     Cancel {
+        /// The caller identity `run --sprite` used, such as an agent thread ID
         #[arg(value_parser = naming::parse_identity)]
         identity: String,
+        /// The run id (a lowercase canonical UUID), as sprite status lists it
         #[arg(long, value_name = "UUID", value_parser = parse_run)]
         run: String,
     },
@@ -104,7 +127,12 @@ pub enum Command {
     /// uncollected results are lost permanently. Remote runs are otherwise never
     /// pruned, so retained Sprites keep using storage. A reused Sprite is one
     /// trust domain: fresh per-run source directories do not isolate hostile jobs.
+    #[command(after_help = "Examples:
+  goodflows sprite destroy T-1               # asks for confirmation on a terminal
+  goodflows sprite destroy T-1 --yes         # without prompting, as automation must
+  goodflows sprite collect T-1 --run <UUID>  # first keep a run's results")]
     Destroy {
+        /// The caller identity `run --sprite` used, such as an agent thread ID
         #[arg(value_parser = naming::parse_identity)]
         identity: String,
         /// Skip the interactive confirmation (required without a terminal)

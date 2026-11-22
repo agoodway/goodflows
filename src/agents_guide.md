@@ -8,7 +8,7 @@ it. Pass `--config PATH` to every command below when the run used it.
 | `0` | Every selected job passed or was skipped | Green |
 | `1` | A job failed or timed out, or goodflows hit a runtime error after it accepted the command and config | Read the `Failures` section; the command is right |
 | `2` | A usage or config error: bad arguments, no config, a config that does not parse or validate, an unknown workflow, job, environment or run id, or no record for `last` or `run --failed` | Fix the command or the config, then run it again |
-| `75` | Only from `wait` and `cancel`: the run is still going. Neither a pass nor a fail | Run the same command again |
+| `75` | Only from `wait` and `cancel`: the run is still going; from `cr wait`: the verdict is not there yet. Neither a pass nor a fail | Run the same command again |
 | `130`, `143` | Interrupted by SIGINT or SIGTERM; `cancel` makes a detached run exit `143` | Rerun when nothing interrupts it |
 
 `last` and `wait` exit with the exit code of the run they report, so `1`

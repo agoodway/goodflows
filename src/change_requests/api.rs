@@ -43,7 +43,7 @@ impl Api {
         cancel: watch::Receiver<Option<i32>>,
     ) -> Result<Self> {
         let Some(reporting) = reporting else {
-            bail!("{command} requires a top-level [reporting] block naming the project");
+            bail!("{command} requires a top-level [reporting] block naming the project; add [reporting] with project = \"<slug>\" to the config");
         };
         let read = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
         let key = read(&reporting.token_env);

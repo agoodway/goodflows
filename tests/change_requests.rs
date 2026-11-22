@@ -748,6 +748,52 @@ fn features_sync_uploads_feature_files_with_paths() {
 }
 
 #[test]
+fn defect_sends_its_ticket_and_severity() {
+    let p = checkout();
+    let mock = Mock::start(|_, _| created(json!({"data": {"id": "d1"}})));
+    let output = run(
+        &p,
+        &mock,
+        &[
+            "cr",
+            "defect",
+            "--commit",
+            "HEAD",
+            "--ticket",
+            "GOO-400",
+            "--severity",
+            "high",
+        ],
+    );
+    success(&output);
+    let request = mock.requests().pop().unwrap();
+    assert_eq!(request.path, "/api/v1/projects/goodcases/defects");
+    assert_eq!(
+        request.json(),
+        json!({"commit": git(&p, &["rev-parse", "HEAD"]), "ticket": "GOO-400", "severity": "high"})
+    );
+}
+
+#[test]
+fn tasks_done_marks_a_task_of_the_given_change_request() {
+    let p = checkout();
+    for args in [
+        &["cr", "tasks", "done", "5b1f", "-n", "42"][..],
+        &["cr", "tasks", "-n", "42", "done", "5b1f"],
+    ] {
+        let mock = Mock::start(|_, _| ok(json!({"data": {"id": "5b1f", "state": "done"}})));
+        success(&run(&p, &mock, args));
+        let requests = mock.requests();
+        assert_eq!(requests.len(), 1, "{args:?}: no branch lookup with -n");
+        assert_eq!(requests[0].method, "POST");
+        assert_eq!(
+            requests[0].path, "/api/v1/projects/goodcases/change-requests/42/tasks/5b1f/done",
+            "{args:?}"
+        );
+    }
+}
+
+#[test]
 fn policy_set_sends_the_toml_file_as_json_after_the_current_version() {
     let p = checkout();
     std::fs::write(

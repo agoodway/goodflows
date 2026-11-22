@@ -44,25 +44,25 @@ use tokio::sync::watch;
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
-    /// Config file (default: goodflows.toml or .goodflows.toml)
+    /// Config file (default: goodflows.toml, else .goodflows.toml, in the current directory)
     #[arg(short, long, global = true)]
     config: Option<PathBuf>,
-    /// Apply a named environment's settings and partition counts (no automatic selection)
+    /// Apply the [environments.<NAME>] profile's settings and partition counts (no profile applies without this flag)
     #[arg(long, global = true, value_name = "NAME")]
     env: Option<String>,
-    /// Maximum concurrent jobs (0 uses logical CPU count)
+    /// Maximum concurrent jobs (default: the settings' parallelism, else the logical CPU count; 0 means the CPU count)
     #[arg(short, long, global = true)]
     parallelism: Option<usize>,
-    /// Stop launching jobs after a failure; running jobs finish
+    /// Stop launching jobs after a failure; running jobs finish (the default unless settings set fail_fast = false)
     #[arg(long, global = true, conflicts_with = "no_fail_fast")]
     fail_fast: bool,
-    /// Continue unrelated jobs after failures
+    /// Keep launching jobs that do not depend on a failed one (conflicts with --fail-fast)
     #[arg(long, global = true)]
     no_fail_fast: bool,
-    /// Run selected jobs and their transitive dependencies
+    /// Run only these jobs, comma-separated or repeated, and the jobs they depend on (names from `goodflows list`)
     #[arg(long, global = true, value_delimiter = ',')]
     jobs: Vec<String>,
-    /// Emit versioned JSON Lines events to stdout; `--json=summary` prints only a run's start, errors and summary
+    /// Emit versioned JSON Lines events to stdout; `--json=summary` (with `=`) prints only a run's start, errors and summary
     #[arg(long, global = true, value_enum, value_name = "EVENTS", num_args = 0..=1, require_equals = true, default_missing_value = "all")]
     json: Option<output::Json>,
     /// Run text output [default: failures when stdout is not a terminal or a coding agent runs goodflows, else stream]
@@ -71,7 +71,7 @@ struct Cli {
     /// Save raw per-job stdout/stderr files in a new per-run directory under this directory
     #[arg(long, global = true)]
     log_dir: Option<PathBuf>,
-    /// Write a run history file for this run
+    /// Write a local run history file for this run, even when settings disable it (conflicts with --no-history)
     #[arg(long, global = true, conflicts_with = "no_history")]
     history: bool,
     /// Do not write the local run history file, even when settings enable it (does not stop [reporting] history uploads)
@@ -80,10 +80,10 @@ struct Cli {
     /// Write the run history file under this directory (enables history)
     #[arg(long, global = true, value_name = "DIR")]
     history_dir: Option<PathBuf>,
-    /// Link the run to this ticket ID in its history (repeatable, at most 32)
+    /// Link the run to this ticket ID in its history, besides the one in the branch name (repeatable, at most 32)
     #[arg(long, global = true, value_name = "ID", value_parser = links::ticket_arg)]
     ticket: Vec<String>,
-    /// Link the run to this agent thread URL in its history (repeatable, at most 32)
+    /// Link the run to this agent thread URL in its history, besides the current agent thread's (repeatable, at most 32)
     #[arg(long = "thread-url", global = true, value_name = "URL", value_parser = links::thread_url_arg)]
     thread_url: Vec<String>,
     /// Log run directories to keep per workflow (default 10)
@@ -105,7 +105,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Run checks (default)
+    /// Run a workflow's jobs; also what bare `goodflows` does
     #[command(after_help = "Examples:
   goodflows run                      # run the default workflow
   goodflows run --jobs test          # run the test job and the jobs it depends on
@@ -120,17 +120,17 @@ enum Commands {
         /// Text output [default: failures when stdout is not a terminal or a coding agent runs goodflows, else stream]
         #[arg(long, value_enum, value_name = "MODE")]
         output: Option<output::Mode>,
-        /// Rerun only the jobs the last local run's `Rerun failed:` hint names, in its workflow and environment
+        /// Rerun only the jobs the last local run's `Rerun failed:` hint names, in its workflow and environment (conflicts with --jobs and --sprite; a different WORKFLOW or --env exits 2)
         #[arg(long, conflicts_with = "sprite")]
         failed: bool,
-        /// Start the run in the background and print its run id; follow it with `status` and `wait`
+        /// Start the run in the background and print its run id; follow it with `wait`, `status` and `cancel` (conflicts with --sprite)
         #[arg(long, conflicts_with = "sprite")]
         detach: bool,
         /// Internal: run as the background process of a detached run that owns this directory
         #[arg(long, hide = true, value_name = "DIR", requires = "detach")]
         detached_run: Option<PathBuf>,
     },
-    /// Show a detached run's progress: running, passed and failed jobs
+    /// Show a detached run's progress (from `run --detach`): running, passed and failed jobs
     #[command(after_help = "Examples:
   id=$(goodflows run --detach)       # start a run in the background
   goodflows status \"$id\"             # show which jobs are running, passed and failed
@@ -154,7 +154,7 @@ enum Commands {
         #[arg(long, value_name = "SECS")]
         timeout: Option<u64>,
     },
-    /// Cancel a detached run: send it SIGTERM, then report it once it has stopped
+    /// Cancel a detached run: send it SIGTERM, then report it once it has stopped (75 when still stopping after 30 seconds)
     #[command(after_help = "Examples:
   id=$(goodflows run --detach)       # start a run in the background
   goodflows cancel \"$id\"             # stop it; its running and waiting jobs are cancelled
@@ -171,17 +171,17 @@ enum Commands {
   goodflows last --config ci.toml    # show the last run of the project configured by ci.toml
   goodflows run --failed             # then rerun only the jobs it named as failed")]
     Last,
-    /// Validate config and selections without executing commands
+    /// Check the config, and a workflow, --env and --jobs selection, without running anything (exit 2 on a problem)
     #[command(after_help = "Examples:
   goodflows validate                        # check every workflow under every environment
   goodflows validate ci                     # check only the ci workflow
   goodflows validate --env ci               # check with the ci environment applied
   goodflows validate ci --jobs test --json  # show the jobs `run ci --jobs test` would run")]
     Validate {
-        /// Workflow to check (default: every workflow)
+        /// Workflow to check (default: every workflow; --jobs needs one)
         workflow: Option<String>,
     },
-    /// List jobs and dependencies
+    /// List a workflow's jobs and their dependencies, or the workflows with --workflows
     #[command(after_help = "Examples:
   goodflows list                     # list the default workflow's jobs and dependencies
   goodflows list ci                  # list the ci workflow's jobs
@@ -191,34 +191,34 @@ enum Commands {
         /// Workflow whose jobs to list (default: the workflow named `default`, or the config's top-level jobs)
         #[arg(conflicts_with = "workflows")]
         workflow: Option<String>,
-        /// List available workflows rather than jobs
+        /// List available workflows rather than jobs (conflicts with WORKFLOW and --jobs)
         #[arg(long, conflicts_with = "jobs")]
         workflows: bool,
     },
-    /// Generate a project config
+    /// Write a starter config with jobs for the detected project type (Rust, Elixir, Node or Go)
     #[command(after_help = "Examples:
   goodflows init                         # detect the project type and write goodflows.toml
   goodflows init --template rust         # use the Rust template instead of detection
   goodflows init --workflow ci --force   # put the jobs in a ci workflow; overwrite any existing config
   goodflows init --config ci.toml        # write the config to ci.toml")]
     Init {
-        /// Override project detection
+        /// The project type (default: detected from Cargo.toml, mix.exs, package.json or go.mod; generic when none is found)
         #[arg(long, value_enum)]
         template: Option<init::Template>,
-        /// Overwrite an existing config without prompting
+        /// Overwrite an existing config without prompting (without a terminal, init otherwise exits 2 with config_exists)
         #[arg(long)]
         force: bool,
-        /// Generate jobs inside this named workflow
+        /// Generate jobs inside this named workflow (default: top-level jobs, the default workflow)
         #[arg(long)]
         workflow: Option<String>,
     },
-    /// Manage saved test timing reports
+    /// Retry uploading a run's saved test timing reports and run record to the [reporting] server
     #[command(after_help = REPORTS_EXAMPLES)]
     Reports {
         #[command(subcommand)]
         command: ReportsCommand,
     },
-    /// Read run records stored by the [reporting] server
+    /// Read run records uploaded to the [reporting] server (for this checkout's last local run, use `last`)
     #[command(after_help = "Examples:
   goodflows history list                                     # list stored runs, newest first
   goodflows history list --workflow ci --branch main         # only ci runs on main
@@ -302,10 +302,10 @@ const REPORTS_EXAMPLES: &str = "Examples:
 
 #[derive(Subcommand)]
 enum ReportsCommand {
-    /// Retry publishing a saved invocation's finalized reports without running jobs
+    /// Retry publishing a saved invocation's finalized reports and run record without running jobs; exits 1 unless the server stored them all
     #[command(after_help = REPORTS_EXAMPLES)]
     Upload {
-        /// Run directory under the reporting spool (contains manifest.json)
+        /// Run directory under the reporting spool (default spool .goodflows/reports; it contains manifest.json)
         run_directory: PathBuf,
         /// Total publishing budget in seconds (default 30), for large reports on slow links
         #[arg(long, value_name = "SECONDS", value_parser = clap::value_parser!(u64).range(1..=3600))]
@@ -411,8 +411,27 @@ impl Cli {
         // `reports upload` and `skills install` reject `--config` too.
         let configless = |command| hide(run_only(command), &["config"]);
         let unlogged = |command| hide(command, &["log_dir"]);
+        /// Shows a command's own `--ticket` and `--thread-url`, which share
+        /// their ids with the hidden run flags.
+        fn own_links(command: clap::Command) -> clap::Command {
+            command.mut_args(|arg| {
+                let own = !arg.is_global_set()
+                    && ["ticket", "thread_url"].contains(&arg.get_id().as_str());
+                if own {
+                    arg.hide(false)
+                } else {
+                    arg
+                }
+            })
+        }
         command
-            .mut_subcommand("init", single)
+            .mut_subcommand("init", |init| {
+                // `mut_arg` would rebuild the global `--config` without its value.
+                single(init).mut_args(|arg| match arg.get_id().as_str() {
+                    "config" => arg.help("Where to write the config (default: goodflows.toml)"),
+                    _ => arg,
+                })
+            })
             .mut_subcommand("validate", unlogged)
             .mut_subcommand("list", unlogged)
             .mut_subcommand("reports", |r| configless(r).mut_subcommands(configless))
@@ -423,19 +442,11 @@ impl Cli {
                 // `list` has its own `--ticket` and `--thread-url` filters.
                 run_only(history)
                     .mut_subcommands(run_only)
-                    .mut_subcommand("list", |list| {
-                        list.mut_args(|arg| {
-                            let filter = !arg.is_global_set()
-                                && ["ticket", "thread_url"].contains(&arg.get_id().as_str());
-                            if filter {
-                                arg.hide(false)
-                            } else {
-                                arg
-                            }
-                        })
-                    })
+                    .mut_subcommand("list", own_links)
             })
-            .mut_subcommand("cr", |cr| every(cr, &single))
+            .mut_subcommand("cr", |cr| {
+                every(cr, &single).mut_subcommand("defect", own_links)
+            })
             .mut_subcommand("policy", |policy| every(policy, &single))
             .mut_subcommand("features", |features| every(features, &single))
             .mut_subcommand("events", |events| {
@@ -503,8 +514,36 @@ impl Cli {
                 .count()
         };
         let (tickets_typed, thread_urls_typed) = (typed("--ticket"), typed("--thread-url"));
-        let matches = Self::parser().try_get_matches_from(args)?;
+        let matches = Self::parser().try_get_matches_from(args.iter())?;
         let cli = <Self as clap::FromArgMatches>::from_arg_matches(&matches)?;
+        // `cr tasks -n` is global so it can follow `done` too, and clap keeps
+        // only the last of a global flag given at both levels.
+        if let Some(Commands::Cr {
+            command: change_requests::CrCommand::Tasks { .. },
+        }) = &cli.command
+        {
+            let numbers = args
+                .iter()
+                .map(|arg| arg.to_string_lossy())
+                .take_while(|arg| arg != "--")
+                .filter(|arg| {
+                    (arg.starts_with("-n") && !arg.starts_with("--"))
+                        || *arg == "--number"
+                        || arg.starts_with("--number=")
+                })
+                .count();
+            if numbers > 1 {
+                let mut parser = Self::parser();
+                let tasks = parser
+                    .find_subcommand_mut("cr")
+                    .and_then(|cr| cr.find_subcommand_mut("tasks"))
+                    .expect("cr tasks exists");
+                return Err(tasks.error(
+                    clap::error::ErrorKind::ArgumentConflict,
+                    "the argument '--number <N>' cannot be used multiple times",
+                ));
+            }
+        }
         Ok(Self {
             tickets_typed,
             thread_urls_typed,
@@ -803,7 +842,20 @@ async fn run(cli: &Cli, output: &mut Output, cancel: watch::Receiver<Option<i32>
             Commands::Features { .. } => "features",
             _ => "events",
         };
-        if let Some(flag) = cli.run_only_flag() {
+        // `cr defect --ticket` shares its id with the run flag, as `history
+        // list --ticket` does: typed once, it is the defect's ticket.
+        let defect = matches!(
+            command,
+            Commands::Cr {
+                command: change_requests::CrCommand::Defect { .. }
+            }
+        );
+        let own: &[&str] = if defect && cli.tickets_typed == 1 {
+            &["--ticket"]
+        } else {
+            &[]
+        };
+        if let Some(flag) = cli.run_only_flag_besides(own) {
             return Err(usage(format!("{flag} cannot be used with {name} commands")));
         }
         let (document, _) = Config::load(cli.config.as_deref())?;
@@ -2229,6 +2281,31 @@ mod tests {
     }
 
     #[test]
+    fn cr_tasks_takes_one_number_before_or_after_done() {
+        for args in [
+            &["cr", "tasks", "-n", "42", "done", "5b1f"][..],
+            &["cr", "tasks", "done", "5b1f", "-n", "42"],
+            &["cr", "tasks", "-n", "42"],
+        ] {
+            assert!(parse(args).is_ok(), "{args:?}");
+        }
+        for args in [
+            &["cr", "tasks", "-n", "1", "done", "5b1f", "-n", "2"][..],
+            &["cr", "tasks", "-n1", "done", "5b1f", "--number=2"],
+            &[
+                "cr", "tasks", "--state", "done", "done", "5b1f", "-n", "1", "-n", "2",
+            ],
+        ] {
+            let error = parse(args).err().unwrap_or_else(|| panic!("{args:?}"));
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::ArgumentConflict,
+                "{args:?}"
+            );
+        }
+    }
+
+    #[test]
     fn workflow_arguments_are_described() {
         let parser = Cli::parser();
         for name in ["run", "validate", "list"] {
@@ -2245,11 +2322,6 @@ mod tests {
     /// The path of every visible command below `command`, which is at `path`.
     fn command_paths(command: &clap::Command, path: Vec<String>, paths: &mut Vec<Vec<String>>) {
         paths.push(path.clone());
-        // Sprite subcommands are defined with the Sprite code; `sprite --help`
-        // shows their examples.
-        if path == ["sprite"] {
-            return;
-        }
         for sub in command.get_subcommands() {
             if !sub.is_hide_set() && sub.get_name() != "help" {
                 let mut path = path.clone();

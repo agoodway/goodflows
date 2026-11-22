@@ -37,7 +37,10 @@ const COMMIT_RETRIES: u32 = 5;
 pub const CR_EXAMPLES: &str = "A change request's description is its claims file (change-claims/2, written by gs-change-request):
   CREATE with cr open --claims <file> while the file's cr is null; it writes the new number into cr.
   UPDATE with cr claims <file> once cr is set, after each new commit.
-Commands find the change request of the current branch unless given --number.
+Commands find the change request of the current branch unless given --number. They talk to the
+GoodFlows server of the config's [reporting] project, at $GOODFLOWS_URL with the key in
+$GOODFLOWS_API_KEY (the block's url_env and token_env); writes need an sk_ key. --json prints one
+JSON event. Failures exit 1 and bad arguments 2; cr wait exits 75 when its timeout passes.
 
 Examples:
   goodflows cr open                           # create from the default claims file (goodflows cr path)
@@ -53,12 +56,13 @@ pub struct Pick {
 
 #[derive(Subcommand, Debug)]
 pub enum CrCommand {
-    /// CREATE a change request from a claims (description) file whose cr is null, or before code without one
+    /// CREATE a change request from a claims (description) file whose cr is null, or with --title before the file exists
     #[command(
         after_help = "Finds the one draft or open change request whose source branch is the current branch, or
 creates a draft for it. When the claims file exists, it also reports Git facts for HEAD, writes the
-change request number into the file's cr, and uploads the claims. Without the file it prints the
-number, so an intent scenario set can be uploaded and approved before code.
+change request number into the file's cr, and uploads the claims; the file's head must be HEAD.
+Without the file it prints the number, so an intent scenario set can be uploaded and approved
+before code. Once cr is set, update the change request with cr claims instead.
 
 Examples:
   goodflows cr open                           # create from the default claims file (goodflows cr path)
@@ -66,16 +70,16 @@ Examples:
   goodflows cr open --openspec-change add-login --title Login   # before code, without claims"
     )]
     Open {
-        /// The change-claims/2 file (default: .goodflows/change-requests/<branch>/cr.md)
+        /// The change-claims/2 file, which must exist (default: the path cr path prints, used only when it exists)
         #[arg(long, value_name = "FILE")]
         claims: Option<PathBuf>,
-        /// The OpenSpec change this change request implements; set only when it is created
+        /// The OpenSpec change id this change request implements (a-z, 0-9 and -); set only when it is created, and it cannot change
         #[arg(long, value_name = "ID", value_parser = openspec_change)]
         openspec_change: Option<String>,
-        /// Title of a new change request (default: the claims file's # heading; required without one)
+        /// Title of a new change request (default: the claims file's # heading; required without a claims file)
         #[arg(long)]
         title: Option<String>,
-        /// Target branch of a new change request (default: the project's default branch)
+        /// Target branch of a new change request (default: the project's default branch on the server); to change it later, use cr retarget
         #[arg(long, value_name = "BRANCH")]
         target: Option<String>,
         /// Skip git fetch origin <target> and use the target branch as this checkout has it
@@ -84,9 +88,11 @@ Examples:
     },
     /// UPDATE a change request's description: report Git facts for HEAD, then upload the claims file
     #[command(
+        mut_arg("number", |arg| arg.help("The change request number, which must match the file's cr (default: the file's cr, else the one draft or open change request of the current branch)")),
         after_help = "The file's cr names the change request; when it is null, the change request of the current
-branch is used and its number written into cr. Claims describe one head: commit first, and upload
-new claims after each push.
+branch is used and its number written into cr. Claims describe one head: commit first, set the
+file's head to HEAD, and upload new claims after each new commit. A change request that does not
+exist yet is created with cr open.
 
 Examples:
   goodflows cr claims                         # the default claims file (goodflows cr path)
@@ -102,7 +108,7 @@ Examples:
         #[arg(long)]
         no_fetch: bool,
     },
-    /// Run git push, then report Git facts for the new head
+    /// Run git push, then report Git facts for the new head (upload its claims with cr claims)
     #[command(after_help = "Examples:
   goodflows cr push                           # git push, then report Git facts for HEAD
   goodflows cr push -- -u origin HEAD         # arguments after -- go to git push
@@ -113,7 +119,7 @@ Examples:
         /// Skip git fetch origin <target> and use the target branch as this checkout has it
         #[arg(long)]
         no_fetch: bool,
-        /// Arguments for git push
+        /// Arguments for git push, after --, such as -u origin HEAD (default: none)
         #[arg(last = true, value_name = "GIT_PUSH_ARGS")]
         git_args: Vec<String>,
     },
@@ -126,7 +132,7 @@ Examples:
         #[command(flatten)]
         pick: Pick,
     },
-    /// Print the default claims file path for the current branch
+    /// Print the default claims file path for the current branch (needs no server)
     #[command(after_help = "Examples:
   goodflows cr path                           # .goodflows/change-requests/<branch>/cr.md, absolute
   goodflows cr path --json                    # with the branch and the default diff set path (qa-scenarios.md)
@@ -149,13 +155,13 @@ Examples:
     Wait {
         #[command(flatten)]
         pick: Pick,
-        /// Verdict states to wait for
+        /// Verdict states to wait for, comma-separated or repeated; exits 0 once the verdict is one of them
         #[arg(long, value_enum, value_delimiter = ',', required = true)]
         until: Vec<VerdictState>,
-        /// Stop waiting after this many seconds (default: no limit)
+        /// Stop waiting after this many seconds and exit 75 (default: no limit)
         #[arg(long, value_name = "SECS")]
         timeout: Option<u64>,
-        /// Seconds between checks
+        /// Seconds between checks, 1-3600
         #[arg(long, value_name = "SECS", default_value_t = 10, value_parser = clap::value_parser!(u64).range(1..=3600))]
         interval: u64,
     },
@@ -187,10 +193,13 @@ Examples:
         pick: Pick,
     },
     /// Reopen a closed change request in the state it had (default: the one closed change request of the current branch)
-    #[command(after_help = "Examples:
+    #[command(
+        mut_arg("number", |arg| arg.help("The change request number (default: the one closed change request of the current branch)")),
+        after_help = "Examples:
   goodflows cr reopen -n 42                   # change request 42
   goodflows cr reopen --json                  # print the change request as JSON
-  goodflows cr close -n 42                    # close it again")]
+  goodflows cr close -n 42                    # close it again"
+    )]
     Reopen {
         #[command(flatten)]
         pick: Pick,
@@ -205,7 +214,7 @@ Examples:
         #[command(subcommand)]
         command: ScenariosCommand,
     },
-    /// Upload verify runs
+    /// Upload verify runs that graded a scenario set, with their evidence
     #[command(after_help = "Examples:
   goodflows cr runs upload .verify/web/20261119T143000Z-a1b2c3d   # upload a run folder
   goodflows cr runs upload .verify/web/20261119T143000Z-a1b2c3d --json   # print the result as JSON
@@ -223,7 +232,7 @@ Examples:
         #[command(flatten)]
         pick: Pick,
     },
-    /// Answer a review packet item at the current head
+    /// Answer a review packet item from cr review: approve, reject, request_change or choose, at the current head
     #[command(after_help = "Examples:
   goodflows cr answer one_way_door:3f2a approve                 # approve an item
   goodflows cr answer question:9c1b choose --option b           # choose an option
@@ -231,11 +240,12 @@ Examples:
     Answer {
         #[command(flatten)]
         pick: Pick,
-        /// The item id from cr review
+        /// The item id from cr review, such as question:9c1b
         item_id: String,
+        /// The answer; cr review lists the answers each item allows
         #[arg(value_enum)]
         answer: AnswerKind,
-        /// The chosen option (choose only)
+        /// The chosen option (required for choose, and only for choose)
         #[arg(long)]
         option: Option<String>,
         /// Why (required for reject and request_change)
@@ -245,9 +255,10 @@ Examples:
         #[arg(long, value_name = "SHA")]
         head: Option<String>,
     },
-    /// List the change request's tasks, or mark one done
+    /// List the change request's tasks, or mark one done with cr tasks done <TASK_ID>
     #[command(
-        args_conflicts_with_subcommands = true,
+        // Global, so `-n` goes before or after `done`.
+        mut_arg("number", |arg| arg.global(true)),
         after_help = "Examples:
   goodflows cr tasks                          # open and stale tasks
   goodflows cr tasks --state done             # finished tasks
@@ -256,13 +267,13 @@ Examples:
     Tasks {
         #[command(flatten)]
         pick: Pick,
-        /// Only tasks in this state (default: open and stale)
+        /// Only tasks in this state (default: open and stale; not with done)
         #[arg(long, value_enum)]
         state: Option<TaskState>,
         #[command(subcommand)]
         command: Option<TasksCommand>,
     },
-    /// Report that the change request was merged on the Git host
+    /// Report that the change request was merged on the Git host (goodflows never merges)
     #[command(after_help = "Examples:
   goodflows cr merged --commit HEAD           # the merge commit checked out now
   goodflows cr merged -n 42 --commit 3f2a9c1 --target main   # a merge into main
@@ -270,17 +281,17 @@ Examples:
     Merged {
         #[command(flatten)]
         pick: Pick,
-        /// The merged commit on the target branch
+        /// The merged commit on the target branch: a full SHA, or a Git revision this checkout resolves
         #[arg(long, value_name = "REV")]
         commit: String,
         /// The branch it was merged into (default: the change request's target branch)
         #[arg(long, value_name = "BRANCH")]
         target: Option<String>,
-        /// The merge lease held for the merge
+        /// The id of the merge lease held for the merge, from cr lease acquire
         #[arg(long, value_name = "LEASE_ID")]
         lease: Option<String>,
     },
-    /// Change the target branch (no Git ref changes); then report Git facts again
+    /// Change the target branch on the server (no Git ref changes); then report Git facts again with cr claims
     #[command(after_help = "Examples:
   goodflows cr retarget main                  # target main after the parent merged
   goodflows cr retarget release -n 42         # change request 42
@@ -288,6 +299,7 @@ Examples:
     Retarget {
         #[command(flatten)]
         pick: Pick,
+        /// The new target branch
         branch: String,
     },
     /// Set or clear the parent change request of a stacked change
@@ -298,10 +310,10 @@ Examples:
     Parent {
         #[command(flatten)]
         pick: Pick,
-        /// The parent's number
+        /// The parent change request's number (required unless --clear)
         #[arg(required_unless_present = "clear", value_parser = clap::value_parser!(u64).range(1..))]
         parent: Option<u64>,
-        /// Remove the parent
+        /// Remove the parent (conflicts with PARENT)
         #[arg(long, conflicts_with = "parent")]
         clear: bool,
     },
@@ -320,14 +332,16 @@ Examples:
   goodflows cr defect --number 42 --severity low   # by change request
   goodflows policy calibration                # then see defects by lane and rule")]
     Defect {
-        /// The change request that shipped the defect
+        /// The change request that shipped the defect (conflicts with --commit; one of the two is required)
         #[arg(short, long, value_name = "N", required_unless_present = "commit", conflicts_with = "commit", value_parser = clap::value_parser!(u64).range(1..))]
         number: Option<u64>,
-        /// A commit that shipped the defect
+        /// A commit that shipped the defect: a Git revision this checkout resolves (conflicts with --number)
         #[arg(long, value_name = "REV")]
         commit: Option<String>,
-        #[arg(long)]
+        /// The ticket that tracks the defect, such as GOO-400
+        #[arg(long, value_name = "ID")]
         ticket: Option<String>,
+        /// How bad the defect is (default: none recorded)
         #[arg(long, value_enum)]
         severity: Option<Severity>,
     },
@@ -335,11 +349,12 @@ Examples:
 
 #[derive(Subcommand, Debug)]
 pub enum ScenariosCommand {
-    /// Upload a qa-scenarios/2 set file exactly as written
+    /// Upload a qa-scenarios/2 set file exactly as written, as a new version of its intent or diff set
     #[command(
         after_help = "The set's digest covers its raw bytes, so the file is never reformatted; any edit needs a new
 approval. Each scenario's section digest covers its heading under ## Scenarios (### 3. Name, or
-#### 3. Name under a group heading) up to the next heading at its level or higher. Results never go into the set: upload them with cr runs upload.
+#### 3. Name under a group heading) up to the next heading at its level or higher. A diff set
+whose revision ends +dirty is refused. Results never go into the set: upload them with cr runs upload.
 
 Examples:
   goodflows cr scenarios upload               # the default diff set (goodflows cr path --json)
@@ -348,7 +363,7 @@ Examples:
   goodflows cr scenarios upload qa.md --json  # print the version and digest as JSON"
     )]
     Upload {
-        /// The qa-scenarios/2 file (default: .goodflows/change-requests/<branch>/qa-scenarios.md)
+        /// The qa-scenarios/2 file; its front matter's source (intent or diff) names the set (default: .goodflows/change-requests/<branch>/qa-scenarios.md)
         file: Option<PathBuf>,
         #[command(flatten)]
         pick: Pick,
@@ -370,7 +385,7 @@ Examples:
         #[arg(long, value_enum)]
         source: Option<SetSource>,
     },
-    /// Approve the intent set (default: the current version's digest); diff sets are accepted through cr answer
+    /// Approve the intent set: the current version, a set file's digest or a given digest; diff sets are accepted through cr answer
     #[command(after_help = "Examples:
   goodflows cr scenarios approve              # the current intent version
   goodflows cr scenarios approve qa-scenarios.md   # the digest of this file
@@ -378,14 +393,14 @@ Examples:
     Approve {
         #[command(flatten)]
         pick: Pick,
-        /// Approve this set file's digest
+        /// Approve the SHA-256 digest of this set file's bytes (default: the current intent version's digest)
         #[arg(conflicts_with = "digest")]
         file: Option<PathBuf>,
-        /// Approve this digest
+        /// Approve this digest, 64 lowercase hex characters (conflicts with FILE)
         #[arg(long, value_name = "SHA256")]
         digest: Option<String>,
     },
-    /// Reject the intent set (default: the current version's digest); diff sets are answered through cr answer
+    /// Reject the intent set with a note: the current version, a set file's digest or a given digest; diff sets are answered through cr answer
     #[command(after_help = "Examples:
   goodflows cr scenarios reject --note S2-tests-the-wrong-path   # the current intent version
   goodflows cr scenarios reject qa-scenarios.md --note Missing-export   # the digest of this file
@@ -393,12 +408,13 @@ Examples:
     Reject {
         #[command(flatten)]
         pick: Pick,
-        /// Reject this set file's digest
+        /// Reject the SHA-256 digest of this set file's bytes (default: the current intent version's digest)
         #[arg(conflicts_with = "digest")]
         file: Option<PathBuf>,
+        /// Reject this digest, 64 lowercase hex characters (conflicts with FILE)
         #[arg(long, value_name = "SHA256")]
         digest: Option<String>,
-        /// Why the set is wrong
+        /// Why the set is wrong (required)
         #[arg(long, required = true)]
         note: String,
     },
@@ -410,6 +426,7 @@ Examples:
     Diff {
         #[command(flatten)]
         pick: Pick,
+        /// Which set to compare: intent, the set approved before code, or diff, the set written from the change
         #[arg(long, value_enum, default_value_t = SetSource::Intent)]
         source: SetSource,
         /// Compare from this version (default: the newest approved intent version, or the diff baseline: the newest accepted diff version, else v1)
@@ -425,6 +442,7 @@ Examples:
 pub enum RunsCommand {
     /// Upload a .verify/<app>/<run-id>/ run folder as a verify-run/1 document with its evidence
     #[command(
+        mut_arg("number", |arg| arg.help("The change request whose verdict to show after the upload (default: the one draft or open change request of the current branch, if any)")),
         after_help = "The folder needs scenarios.md, the set the run graded, and run.md, whose YAML front matter has
 format: \"verify-run-notes/1\", commit, branch, dirty, started_at, finished_at and results (id,
 result, failed_step, reason, evidence paths), and may have set (path, sha256), changed_files,
@@ -437,6 +455,7 @@ Examples:
   goodflows cr runs upload .verify/web/20261119T143000Z-a1b2c3d --json   # print the result as JSON"
     )]
     Upload {
+        /// The run folder, such as .verify/web/20261119T143000Z-a1b2c3d
         folder: PathBuf,
         #[command(flatten)]
         pick: Pick,
@@ -448,14 +467,18 @@ pub enum TasksCommand {
     /// Mark a task done
     #[command(after_help = "Examples:
   goodflows cr tasks done 5b1f                # mark task 5b1f done
+  goodflows cr tasks done 5b1f -n 42          # mark task 5b1f of change request 42 done
   goodflows cr tasks done 5b1f --json         # print the task as JSON
   goodflows cr tasks                          # list what is left")]
-    Done { task_id: String },
+    Done {
+        /// The task id cr tasks lists
+        task_id: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
 pub enum LeaseCommand {
-    /// Take the merge slot for HEAD of an open, mergeable change request
+    /// Take the merge slot for HEAD of an open, mergeable change request and print the lease id
     #[command(after_help = "Examples:
   goodflows cr lease acquire                  # merge onto origin/<target>
   goodflows cr lease acquire --base origin/main   # merge onto this commit
@@ -470,18 +493,24 @@ pub enum LeaseCommand {
         #[arg(long, conflicts_with = "base")]
         no_fetch: bool,
     },
-    /// Extend a lease by the policy's lease TTL
+    /// Extend a lease by the policy's lease TTL; run it before the lease expires
     #[command(after_help = "Examples:
   goodflows cr lease heartbeat 7c0e           # extend lease 7c0e
   goodflows cr lease heartbeat 7c0e --json    # print the lease as JSON
   goodflows cr lease release 7c0e             # free the slot when done")]
-    Heartbeat { lease_id: String },
+    Heartbeat {
+        /// The lease id cr lease acquire printed
+        lease_id: String,
+    },
     /// Release a lease and free the slot
     #[command(after_help = "Examples:
   goodflows cr lease release 7c0e             # free the slot
   goodflows cr lease release 7c0e --json      # print the result as JSON
   goodflows cr lease acquire                  # take it again")]
-    Release { lease_id: String },
+    Release {
+        /// The lease id cr lease acquire printed
+        lease_id: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -505,10 +534,12 @@ pub enum PolicyCommand {
   goodflows policy set policy.toml --previous-version 3   # fail if another write landed after 3
   goodflows policy set policy.toml --note Require-ci   # record why")]
     Set {
+        /// The review-policy/1 TOML file (format defaults to review-policy/1); start from policy get
         file: PathBuf,
         /// The version this one replaces; a write fails when another landed first (default: the current version)
         #[arg(long, value_name = "N")]
         previous_version: Option<u64>,
+        /// Why this version was written, stored with it
         #[arg(long)]
         note: Option<String>,
     },
@@ -518,8 +549,10 @@ pub enum PolicyCommand {
   goodflows policy history --limit 5          # the newest 5
   goodflows policy history --json             # as JSON, with next_cursor")]
     History {
+        /// Versions per page, 1-200 (server default 50)
         #[arg(long, value_name = "N", value_parser = clap::value_parser!(u16).range(1..=200))]
         limit: Option<u16>,
+        /// The next page, as printed after the previous one
         #[arg(long)]
         cursor: Option<String>,
     },
@@ -551,7 +584,7 @@ Examples:
   goodflows features sync --json              # print the version and features as JSON"
     )]
     Sync {
-        /// The features directory (default: the one verify-*/features directory in a skills directory)
+        /// The features directory (default: the one verify-*/features directory in .agents/skills, .claude/skills or .cursor/skills)
         #[arg(long)]
         dir: Option<PathBuf>,
     },
@@ -559,12 +592,13 @@ Examples:
 
 #[derive(Args, Debug)]
 pub struct EventsArgs {
-    /// Return events after this cursor, an event id (default: from the oldest kept)
+    /// Return events after this cursor, an event id such as the next cursor printed (default: from the oldest kept)
     #[arg(long, value_name = "CURSOR")]
     after: Option<u64>,
-    /// Seconds to wait for an event when none is ready, 0-30
+    /// Seconds to wait for an event when none is ready, 0-30 (default: return at once; 30 with --follow)
     #[arg(long, value_name = "SECS", value_parser = clap::value_parser!(u8).range(0..=30))]
     wait: Option<u8>,
+    /// Events per page, 1-200
     #[arg(long, value_name = "N", value_parser = clap::value_parser!(u16).range(1..=200))]
     limit: Option<u16>,
     /// Keep reading with 30-second long-polls until interrupted
@@ -931,6 +965,14 @@ pub async fn cr(
             }))
             .await?;
         return Ok(0);
+    }
+    if let CrCommand::Tasks {
+        state: Some(_),
+        command: Some(_),
+        ..
+    } = command
+    {
+        return Err(crate::usage("--state cannot be used with cr tasks done"));
     }
     let label = format!("cr {}", command_name(command));
     let ctx = Ctx::new(reporting, &label, output, cancel)?;
