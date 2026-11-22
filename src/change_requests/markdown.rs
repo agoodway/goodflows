@@ -214,6 +214,16 @@ pub fn claims(text: &str, file: &str) -> Result<Claims> {
             "{file}: head must be the commit the claims describe"
         ));
     }
+    // The server refuses an id that is not a nonblank string, such as a bare 1.
+    for list in ["questions", "decisions"] {
+        for (index, entry) in fields[list].as_array().into_iter().flatten().enumerate() {
+            if entry["id"].as_str().is_none_or(|id| id.trim().is_empty()) {
+                problems.push(format!(
+                    "{file}: {list}[{index}].id must be a quoted string, such as id: \"1\""
+                ));
+            }
+        }
+    }
     problems.check()?;
     let title = lines(front.body)
         .map(|(_, line)| bare(line))
@@ -487,6 +497,17 @@ mod tests {
         // An ampersand inside a value is not an anchor.
         let text = "---\nformat: change-claims/2\ncr: 7\nhead: abc\nreach: \"R&D * all\"\nnote: Q&A\n---\n";
         assert_eq!(claims(text, "x.md").unwrap().cr, Some(7));
+        let ids = "---\nformat: change-claims/2\ncr: null\nhead: abc\nquestions:\n  - {id: \"1\", text: q}\n  - {id: 2, text: q}\ndecisions:\n  - {id: 1, path: a}\n---\n";
+        let error = claims(ids, "x.md").err().unwrap().to_string();
+        assert!(
+            error.contains("questions[1].id must be a quoted string"),
+            "{error}"
+        );
+        assert!(
+            error.contains("decisions[0].id must be a quoted string"),
+            "{error}"
+        );
+        assert!(!error.contains("questions[0]"), "{error}");
     }
 
     #[test]
