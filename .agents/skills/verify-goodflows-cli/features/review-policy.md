@@ -58,7 +58,7 @@ Preconditions: the baseline. The verdict steps build on [Change request lifecycl
 
 ## Gotchas
 
-- `policy set` sends the TOML as written; the server parses it. A TOML error is the server's `422`, quoted by the CLI.
+- `policy set` parses the TOML itself and sends the document as JSON, adding `format = "review-policy/1"` when the file has none. A TOML syntax error fails before any request with `<file> is not valid TOML: …` and exit `1`. A file that parses but has an invalid setting is the server's `422`, quoted by the CLI.
 - Only owners and admins write policy. The launch key belongs to the seeded owner, so a `403` here is a finding.
 - Limits must be positive: `max_changed_files = 0` is a `422`.
 - Set the policy back (`max_changed_lines = 1500`, a new version) before driving recipes that expect the default verdict.
