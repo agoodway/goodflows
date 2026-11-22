@@ -210,17 +210,130 @@ pub fn render(event: &Value, out: &mut impl Write) -> Result<()> {
             }
             next_cursor(event, out)?;
         }
-        "review_answer" | "change_request_task" | "merge_lease" | "defect" | "calibration" => {
+        "calibration" => calibration(&event["report"], out)?,
+        "review_answer" | "change_request_task" | "merge_lease" | "defect" => {
             let key = match event["type"].as_str() {
                 Some("review_answer") => "answer",
                 Some("change_request_task") => "task",
                 Some("merge_lease") => "lease",
-                Some("defect") => "defect",
-                _ => "report",
+                _ => "defect",
             };
             dump(&event[key], 0, out)?;
         }
         _ => {}
+    }
+    Ok(())
+}
+
+const LANES: [&str; 3] = ["auto", "reviewed", "bypass"];
+
+/// The calibration report: the counts first, then one line per defect,
+/// newest first. The defect section appears only when the server sends it.
+fn calibration(report: &Value, out: &mut impl Write) -> Result<()> {
+    writeln!(
+        out,
+        "Calibration {} to {}",
+        s(&report["from"]),
+        s(&report["to"])
+    )?;
+    for lane in LANES {
+        let stats = &report["lanes"][lane];
+        let rate = stats["defect_rate"]
+            .as_f64()
+            .map_or("-".to_owned(), |r| format!("{}%", (r * 100.0).round()));
+        writeln!(
+            out,
+            "  {lane}  {} merged  {} defective  {} defects  {rate}",
+            s(&stats["merged_count"]),
+            s(&stats["defective_count"]),
+            s(&stats["defect_count"])
+        )?;
+    }
+    writeln!(out, "Policy versions:")?;
+    for version in report["policy_versions"].as_array().into_iter().flatten() {
+        let lanes: Vec<String> = LANES
+            .iter()
+            .map(|lane| {
+                let stats = &version["lanes"][*lane];
+                format!(
+                    "{lane} {}/{}",
+                    s(&stats["merged_count"]),
+                    s(&stats["defective_count"])
+                )
+            })
+            .collect();
+        writeln!(out, "  v{}  {}", s(&version["version"]), lanes.join("  "))?;
+    }
+    writeln!(out, "Rules:")?;
+    for rule in report["rules"].as_array().into_iter().flatten() {
+        writeln!(
+            out,
+            "  {}  fired {}, with defects {}",
+            s(&rule["rule"]),
+            s(&rule["fired_count"]),
+            s(&rule["fired_with_defects_count"])
+        )?;
+    }
+    writeln!(out, "Gaps: {}", list(&report["gaps"]))?;
+    writeln!(out, "Globs:")?;
+    for glob in report["globs"].as_array().into_iter().flatten() {
+        writeln!(
+            out,
+            "  {}  {} defects",
+            s(&glob["glob"]),
+            s(&glob["defect_count"])
+        )?;
+    }
+    writeln!(
+        out,
+        "  unmatched  {} defects",
+        s(&report["unmatched_defect_count"])
+    )?;
+    if let Some(defects) = report["defects"].as_array() {
+        if defects.is_empty() {
+            writeln!(out, "Defects: none")?;
+        } else {
+            writeln!(out, "Defects:")?;
+        }
+        let joined = |value: &Value| {
+            let items: Vec<String> = value.as_array().into_iter().flatten().map(s).collect();
+            if items.is_empty() {
+                "-".to_owned()
+            } else {
+                items.join(",")
+            }
+        };
+        for defect in defects {
+            let number = match &defect["change_request"] {
+                Value::Null => "-".to_owned(),
+                n => format!("#{}", s(n)),
+            };
+            writeln!(
+                out,
+                "  {}  {number}  {}  {}  {}  v{}  {}  {}",
+                s(&defect["recorded_at"]),
+                s(&defect["severity"]),
+                s(&defect["ticket"]),
+                s(&defect["lane"]),
+                s(&defect["policy_version"]),
+                joined(&defect["rules"]),
+                joined(&defect["globs"])
+            )?;
+        }
+        if report["defects_truncated"] == true {
+            writeln!(
+                out,
+                "Showing the {} newest defects; more exist. Narrow the window with --from and --to.",
+                defects.len()
+            )?;
+        }
+    }
+    if report.get("unattributed_defect_count").is_some() {
+        writeln!(
+            out,
+            "Unattributed defects recorded in the window: {}",
+            s(&report["unattributed_defect_count"])
+        )?;
     }
     Ok(())
 }
@@ -954,5 +1067,82 @@ mod tests {
             "`goodflows cr answer -n 42 question:9c1b choose --option <option> --head {}`",
             "a".repeat(40)
         )));
+    }
+
+    fn report() -> Value {
+        let stats = |m: u64, d: u64, n: u64, rate: Value| json!({"merged_count": m, "defective_count": d, "defect_count": n, "defect_rate": rate});
+        json!({
+            "from": "2026-08-24T00:00:00Z", "to": "2026-11-22T00:00:00Z",
+            "lanes": {"auto": stats(20, 3, 5, json!(0.15)),
+                      "reviewed": stats(3, 1, 1, json!(0.3333333333333333)),
+                      "bypass": stats(0, 0, 0, Value::Null)},
+            "policy_versions": [{"version": 7, "lanes": {"auto": stats(20, 3, 5, json!(0.15)),
+                "reviewed": stats(3, 1, 1, json!(0.3)), "bypass": stats(0, 0, 0, Value::Null)}}],
+            "rules": [{"rule": "path_match", "fired_count": 2, "fired_with_defects_count": 1}],
+            "gaps": [46, 51],
+            "globs": [{"glob": "app/priv/**", "defect_count": 2}],
+            "unmatched_defect_count": 1
+        })
+    }
+
+    #[test]
+    fn calibration_prints_the_counts_then_the_defects() {
+        let mut report = report();
+        report["defects"] = json!([
+            {"recorded_at": "2026-11-03T09:00:00Z", "change_request": 43, "severity": "high",
+             "ticket": "GOO-512", "lane": "reviewed", "policy_version": 7,
+             "rules": ["max_changed_lines", "path_match"], "globs": ["app/priv/repo/migrations/**"]},
+            {"recorded_at": "2026-11-02T09:00:00Z", "change_request": 46, "severity": null,
+             "ticket": null, "lane": "auto", "policy_version": 7, "rules": [], "globs": []}
+        ]);
+        report["defects_truncated"] = json!(true);
+        report["unattributed_defect_count"] = json!(2);
+        let rendered = text(json!({"type": "calibration", "report": report}));
+        assert_eq!(
+            rendered,
+            "Calibration 2026-08-24T00:00:00Z to 2026-11-22T00:00:00Z
+  auto  20 merged  3 defective  5 defects  15%
+  reviewed  3 merged  1 defective  1 defects  33%
+  bypass  0 merged  0 defective  0 defects  -
+Policy versions:
+  v7  auto 20/3  reviewed 3/1  bypass 0/0
+Rules:
+  path_match  fired 2, with defects 1
+Gaps: 46, 51
+Globs:
+  app/priv/**  2 defects
+  unmatched  1 defects
+Defects:
+  2026-11-03T09:00:00Z  #43  high  GOO-512  reviewed  v7  max_changed_lines,path_match  app/priv/repo/migrations/**
+  2026-11-02T09:00:00Z  #46  -  -  auto  v7  -  -
+Showing the 2 newest defects; more exist. Narrow the window with --from and --to.
+Unattributed defects recorded in the window: 2
+"
+        );
+    }
+
+    #[test]
+    fn calibration_without_the_defect_list_prints_only_the_counts() {
+        let rendered = text(json!({"type": "calibration", "report": report()}));
+        assert!(rendered.contains("  auto  20 merged"), "{rendered}");
+        assert!(rendered.ends_with("  unmatched  1 defects\n"), "{rendered}");
+        assert!(!rendered.contains("Defects") && !rendered.contains("Unattributed"));
+
+        let mut empty = report();
+        empty["defects"] = json!([]);
+        empty["defects_truncated"] = json!(false);
+        let rendered = text(json!({"type": "calibration", "report": empty}));
+        assert!(rendered.ends_with("Defects: none\n"), "{rendered}");
+    }
+
+    #[test]
+    fn calibration_escapes_server_text() {
+        let mut report = report();
+        report["defects"] = json!([{"recorded_at": "t", "change_request": 1, "severity": "low",
+            "ticket": "GOO-1\u{1b}[2J", "lane": "auto", "policy_version": 1,
+            "rules": ["r\u{1b}"], "globs": []}]);
+        let rendered = text(json!({"type": "calibration", "report": report}));
+        assert!(!rendered.contains('\u{1b}'), "{rendered:?}");
+        assert!(rendered.contains("GOO-1"), "{rendered}");
     }
 }
