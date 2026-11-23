@@ -120,6 +120,7 @@ pub fn read(folder: &Path) -> Result<Run> {
         }
         value.as_array()
     });
+    let names = folder_names(folder);
     for (index, result) in listed.into_iter().flatten().enumerate() {
         let Some(id) = scenario_id(&result["id"]) else {
             problems.push(format!(
@@ -150,7 +151,7 @@ pub fn read(folder: &Path) -> Result<Run> {
                 ));
                 continue;
             };
-            let Some(relative) = evidence_path(path) else {
+            let Some(relative) = evidence_path(path, names.as_ref()) else {
                 problems.push(format!("{notes_file}: scenario {id}: evidence {path:?} must be a path inside the run folder"));
                 continue;
             };
@@ -499,14 +500,30 @@ fn rfc3339(t: &str) -> bool {
             && digits(&rest[4..6]))
 }
 
+/// The run folder's last two names, `<app>` and `<run-id>`, which a
+/// `.verify/<app>/<run-id>/` evidence prefix must match.
+fn folder_names(folder: &Path) -> Option<[std::ffi::OsString; 2]> {
+    let folder = folder.canonicalize().ok()?;
+    let run = folder.file_name()?.to_owned();
+    let app = folder.parent()?.file_name()?.to_owned();
+    Some([app, run])
+}
+
 /// A relative path inside the run folder. Evidence may name the file as
-/// `.verify/<app>/<run-id>/<file>` or relative to the folder; only the
-/// part after the run folder counts.
-fn evidence_path(path: &str) -> Option<PathBuf> {
+/// `.verify/<app>/<run-id>/<file>` when `<app>/<run-id>` is this folder
+/// (`names`), or relative to the folder; only the part after the run
+/// folder counts.
+fn evidence_path(path: &str, names: Option<&[std::ffi::OsString; 2]>) -> Option<PathBuf> {
     let path = Path::new(path);
     let components: Vec<_> = path.components().collect();
-    let relative: PathBuf = match components.first() {
-        Some(Component::Normal(first)) if *first == ".verify" && components.len() > 3 => {
+    let relative: PathBuf = match components.as_slice() {
+        [Component::Normal(first), Component::Normal(app), Component::Normal(run), _, ..]
+            if *first == ".verify" =>
+        {
+            let [ours_app, ours_run] = names?;
+            if app != ours_app || run != ours_run {
+                return None;
+            }
             components[3..].iter().collect()
         }
         _ => path.to_path_buf(),
@@ -686,13 +703,30 @@ mod tests {
 
     #[test]
     fn evidence_paths_stay_inside_the_run_folder() {
-        assert_eq!(evidence_path("01.png"), Some(PathBuf::from("01.png")));
+        let names = [
+            std::ffi::OsString::from("web"),
+            std::ffi::OsString::from("20261119T143000Z-a1b2c3d"),
+        ];
         assert_eq!(
-            evidence_path(".verify/web/20261119T143000Z-a1b2c3d/shots/01.png"),
+            evidence_path("01.png", Some(&names)),
+            Some(PathBuf::from("01.png"))
+        );
+        assert_eq!(
+            evidence_path(
+                ".verify/web/20261119T143000Z-a1b2c3d/shots/01.png",
+                Some(&names)
+            ),
             Some(PathBuf::from("shots/01.png"))
         );
         for bad in ["../secret", "/etc/passwd", "a/../../b", "", "."] {
-            assert_eq!(evidence_path(bad), None, "{bad}");
+            assert_eq!(evidence_path(bad, Some(&names)), None, "{bad}");
+        }
+        // A prefix naming another app or run points outside this folder.
+        for other in [
+            ".verify/web/run-9/shots/01.png",
+            ".verify/api/20261119T143000Z-a1b2c3d/shots/01.png",
+        ] {
+            assert_eq!(evidence_path(other, Some(&names)), None, "{other}");
         }
     }
 }
