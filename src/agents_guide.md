@@ -42,6 +42,46 @@ match for a misspelled job.
 
 `goodflows list` and `goodflows list --workflows` show the names that exist.
 
+## Errors from `cr`, `features`, `policy` and `events`
+
+These commands have no codes of their own. Their `error` event has one of
+these codes:
+
+| `code` | Exit | Meaning |
+|---|---|---|
+| `usage` | `2` | The arguments did not parse or do not go together, such as `--env cannot be used with cr commands`, `--state cannot be used with cr tasks done`, `--base` with `--no-fetch`, or a `cr answer` value other than `approve`, `reject`, `request_change` or `choose` |
+| `missing_config`, `config_parse`, `config_invalid` | `2` | The config, as for a run. `cr validate` and `features validate` read no config |
+| `runtime` | `1` | Everything else: no `[reporting]` block, `GOODFLOWS_URL` or `GOODFLOWS_API_KEY` unset, a file that fails its checks, a git failure, or an error from the server |
+
+`cr wait` exits `75` when `--timeout` passes before the verdict reaches a
+wanted state, and a signal makes any of them exit `128` plus its number,
+such as `130`.
+
+A server error reads `<command> failed: <reason> (HTTP <status>): <body>`,
+such as `cr ready failed: forbidden (HTTP 403)` for a key without write
+access. Nothing is retried, except the commit of `cr runs upload`, which
+retries a `503` five times. The CLI rewrites the server's conflicts below
+into a message that says what to do. Each one still has `code` `runtime`
+and exits `1`, so match the conflict in `message`, not `code`. Any other
+`409` keeps the generic message.
+
+| Server conflict | Command | Next step |
+|---|---|---|
+| `slot_taken` | `cr lease acquire` | Another change request holds the target branch's merge slot until the time the message names; wait for it to merge or expire, then acquire again |
+| `not_mergeable` | `cr lease acquire` | The verdict is not `mergeable`; read `goodflows cr verdict` |
+| `stale_head` | `cr lease acquire` | HEAD is not the change request's reported head; run `goodflows cr push` or `goodflows cr claims`, or check out the head the message names |
+| `not_open` | `cr lease acquire` | The change request is not open; run `goodflows cr ready` first |
+| `lease_not_active` | `cr lease heartbeat`, `cr lease release` | The lease is unknown, released or expired; acquire a new one with `goodflows cr lease acquire` |
+| Different Git facts for the head | `cr open`, `cr claims`, `cr push` | That HEAD was reported against the target with another merge base; make a new commit, or retarget, and report again |
+| Different claims for the head | `cr open`, `cr claims` | Claims are fixed per head; commit the change, set the file's `head` to the new HEAD, and upload again |
+| The change request moved to another head | `cr answer` | Read `goodflows cr review` again and answer at the new head |
+| `previous_version` is not current | `policy set` | Another write landed first; read `goodflows policy get`, make the change again, and set it |
+
+`events` without `--follow` fails the same way when the server deleted the
+events after `--after` (`410` with `latest_cursor`): resync from the
+current state, then read with `--after` set to the `latest_cursor` the
+message names. With `--follow` it prints a note and goes on from there.
+
 ## Read a failure
 
 A failed job is not a skipped one. A job is skipped when a dependency did not
