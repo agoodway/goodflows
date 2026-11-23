@@ -186,6 +186,14 @@ The CLI SHALL read a claims file as YAML front matter between a first line `---`
 - **WHEN** `cr.md` has front matter `format: change-claims/1` and `cr: 0` and no `head`
 - **THEN** the problems are `<file>: format must be change-claims/2`, `<file>: cr must be a change request number or null` and `<file>: head must be the commit the claims describe`
 
+#### Scenario: Ampersand in plain text
+- **WHEN** `cr.md` has `reach: Login & signup` and `door_reason: |` followed by the line `  *Not* reversible`
+- **THEN** no anchor or alias problem is reported, because `&` and `*` count as an anchor or alias only where a node starts and a name follows
+
+#### Scenario: Alias
+- **WHEN** `cr.md` has `reach: *r`
+- **THEN** the problems include `<file>: YAML anchors and aliases are not supported`
+
 ### Requirement: The claims title is the first level-1 heading
 A new change request's title SHALL come from the claims body's first line starting `# `, trimmed, and an empty heading SHALL count as none. Lines starting `## ` SHALL NOT count.
 
