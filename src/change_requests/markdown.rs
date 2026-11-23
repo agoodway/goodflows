@@ -110,8 +110,10 @@ fn to_json(value: serde_yaml_ng::Value) -> Result<Value> {
 /// Elsewhere, as in `reach: Login & signup`, inside quotes, after `#`, or
 /// in the lines of a `|` or `>` block scalar, it is text.
 pub fn refuse_anchors(yaml: &str, file: &str) -> Result<()> {
-    // The indentation of the line that opened a block scalar.
+    // The indentation of the node that owns an open block scalar.
     let mut block: Option<usize> = None;
+    // Open `[` and `{`, which a flow collection may close on a later line.
+    let mut flow = 0usize;
     for line in yaml.lines() {
         let indent = line.len() - line.trim_start_matches(' ').len();
         if let Some(parent) = block {
@@ -124,7 +126,11 @@ pub fn refuse_anchors(yaml: &str, file: &str) -> Result<()> {
         let blank = |i: usize| chars.get(i).is_none_or(|c| c.is_whitespace());
         let mut in_quote: Option<char> = None;
         let mut node_start = true;
-        let mut flow = 0usize;
+        // The column of the line's innermost block node: a `-` or `?`
+        // indicator, or the first key after them. A block scalar's lines
+        // are indented deeper than it.
+        let mut owner = indent;
+        let mut keyed = false;
         for (i, &c) in chars.iter().enumerate() {
             if let Some(q) = in_quote {
                 if c == q {
@@ -140,7 +146,12 @@ pub fn refuse_anchors(yaml: &str, file: &str) -> Result<()> {
             }
             if node_start {
                 match c {
-                    '-' | '?' if blank(i + 1) => continue,
+                    '-' | '?' if blank(i + 1) => {
+                        if !keyed {
+                            owner = indent + i;
+                        }
+                        continue;
+                    }
                     '&' | '*' if !blank(i + 1) && !",[]{}".contains(chars[i + 1]) => {
                         bail!("{file}: YAML anchors and aliases are not supported")
                     }
@@ -149,11 +160,15 @@ pub fn refuse_anchors(yaml: &str, file: &str) -> Result<()> {
                         continue;
                     }
                     '|' | '>' if flow == 0 => {
-                        block = Some(indent);
+                        block = Some(owner);
                         break;
                     }
                     '"' | '\'' => in_quote = Some(c),
                     _ => {}
+                }
+                if flow == 0 && !keyed {
+                    owner = indent + i;
+                    keyed = true;
                 }
                 node_start = false;
             }
@@ -514,6 +529,8 @@ mod tests {
             "left_open:\n  - {risk: \"R&D\", note: a & b}\n",
             "reach: x # see &a and *b\n",
             "door_reason: |\n  *Not* reversible\n  &c\nreach: page\n",
+            "items:\n  - note: |\n      &a text\n    name: a & b\n",
+            "items: [\n  first, a & b,\n  c * d\n]\n",
         ] {
             assert!(text(plain).is_ok(), "{plain:?}");
             // serde_yaml_ng reads these as text too.
@@ -526,6 +543,9 @@ mod tests {
             "map: {k: *x}\n",
             "? *k\n",
             "door_reason: |\n  text\nreach: *r\n",
+            "items:\n  - note: |\n      text\n    name: &n hello\n",
+            "items: [\n  first, &n hello\n]\n",
+            "items: [\n  first,\n  *n\n]\n",
         ] {
             let error = text(anchored).unwrap_err().to_string();
             assert!(
