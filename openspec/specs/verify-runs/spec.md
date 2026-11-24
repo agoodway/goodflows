@@ -76,7 +76,7 @@ Each result's `result` MUST be `passed`, `failed` or `not_run`. `failed_step` an
 - **THEN** the command exits 1 with `scenario <id>: result must be passed, failed or not_run`
 
 ### Requirement: Evidence paths stay inside the run folder
-Each `evidence` entry MUST be a string path. A path starting `.verify/<app>/<run-id>/` SHALL be read relative to the run folder after those three parts; any other path is already relative to it. The relative path MUST be nonempty with only normal parts, else `evidence <path> must be a path inside the run folder`.
+Each `evidence` entry MUST be a string path. A path starting `.verify/<app>/<run-id>/`, where `<app>` and `<run-id>` are the run folder's parent and own names, SHALL be read relative to the run folder after those three parts; one naming another app or run MUST be refused. Any other path is already relative to the run folder. The relative path MUST be nonempty with only normal parts, else `evidence <path> must be a path inside the run folder`.
 
 #### Scenario: Prefixed path
 - **WHEN** evidence is `.verify/web/20261119T143000Z-a1b2c3d/shots/01.png`
@@ -85,6 +85,10 @@ Each `evidence` entry MUST be a string path. A path starting `.verify/<app>/<run
 #### Scenario: Escaping paths
 - **WHEN** evidence is `../secret`, `/etc/passwd`, `a/../../b`, `""` or `.`
 - **THEN** each is refused as not inside the run folder
+
+#### Scenario: Another run's prefix
+- **WHEN** the run folder is `.verify/web/run-1` and evidence is `.verify/web/run-9/shots/01.png`
+- **THEN** it is refused with `evidence ".verify/web/run-9/shots/01.png" must be a path inside the run folder`, even when `.verify/web/run-1/shots/01.png` exists
 
 ### Requirement: Evidence files are regular files of 1 byte to 50 MiB
 Each evidence file MUST exist (`evidence file <file> does not exist`), be a regular file and not a symbolic link (`evidence <file> is not a regular file`), hold 1 byte to 50 MiB (`evidence file <file> must hold 1 byte to 50 MiB`), and have a relative path of at most 1024 bytes without control characters. A run MUST name at most 200 distinct files.
