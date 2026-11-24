@@ -103,25 +103,83 @@ fn to_json(value: serde_yaml_ng::Value) -> Result<Value> {
 }
 
 /// Refuses anchors and aliases, which serde_yaml_ng expands silently.
+///
+/// An `&` or `*` is an anchor or alias only where a node starts: at the
+/// start of a line's content, after `- `, `? ` or `: `, after `[` or `{`,
+/// or after `,` inside a flow collection, and only when a name follows it.
+/// Elsewhere, as in `reach: Login & signup`, inside quotes, after `#`, or
+/// in the lines of a `|` or `>` block scalar, it is text.
 pub fn refuse_anchors(yaml: &str, file: &str) -> Result<()> {
+    // The indentation of the node that owns an open block scalar.
+    let mut block: Option<usize> = None;
+    // Open `[` and `{`, which a flow collection may close on a later line.
+    let mut flow = 0usize;
     for line in yaml.lines() {
-        let content = line.split(" #").next().unwrap_or_default();
-        let unquoted = content.trim_start().trim_start_matches("- ");
-        let mut in_quote: Option<char> = None;
-        let mut previous = ' ';
-        for c in unquoted.chars() {
-            match in_quote {
-                Some(q) if c == q => in_quote = None,
-                Some(_) => {}
-                None if c == '"' || c == '\'' => in_quote = Some(c),
-                None if (c == '&' || c == '*')
-                    && matches!(previous, ' ' | ':' | '-' | '[' | ',') =>
-                {
-                    bail!("{file}: YAML anchors and aliases are not supported")
-                }
-                None => {}
+        let indent = line.len() - line.trim_start_matches(' ').len();
+        if let Some(parent) = block {
+            if line.trim().is_empty() || indent > parent {
+                continue;
             }
-            previous = c;
+            block = None;
+        }
+        let chars: Vec<char> = line[indent..].chars().collect();
+        let blank = |i: usize| chars.get(i).is_none_or(|c| c.is_whitespace());
+        let mut in_quote: Option<char> = None;
+        let mut node_start = true;
+        // The column of the line's innermost block node: a `-` or `?`
+        // indicator, or the first key after them. A block scalar's lines
+        // are indented deeper than it.
+        let mut owner = indent;
+        let mut keyed = false;
+        for (i, &c) in chars.iter().enumerate() {
+            if let Some(q) = in_quote {
+                if c == q {
+                    in_quote = None;
+                }
+                continue;
+            }
+            if c.is_whitespace() {
+                continue;
+            }
+            if c == '#' && (i == 0 || chars[i - 1].is_whitespace()) {
+                break;
+            }
+            if node_start {
+                match c {
+                    '-' | '?' if blank(i + 1) => {
+                        if !keyed {
+                            owner = indent + i;
+                        }
+                        continue;
+                    }
+                    '&' | '*' if !blank(i + 1) && !",[]{}".contains(chars[i + 1]) => {
+                        bail!("{file}: YAML anchors and aliases are not supported")
+                    }
+                    '[' | '{' => {
+                        flow += 1;
+                        continue;
+                    }
+                    '|' | '>' if flow == 0 => {
+                        block = Some(owner);
+                        break;
+                    }
+                    '"' | '\'' => in_quote = Some(c),
+                    _ => {}
+                }
+                if flow == 0 && !keyed {
+                    owner = indent + i;
+                    keyed = true;
+                }
+                node_start = false;
+            }
+            match c {
+                ':' if blank(i + 1) || (flow > 0 && ",]}".contains(chars[i + 1])) => {
+                    node_start = true
+                }
+                ',' if flow > 0 => node_start = true,
+                ']' | '}' if flow > 0 => flow -= 1,
+                _ => {}
+            }
         }
     }
     Ok(())
@@ -460,6 +518,42 @@ mod tests {
     use super::*;
 
     const CLAIMS: &str = "---\r\nformat: change-claims/2\r\ncr: null\r\nhead: abc\r\ndoor: two_way\r\n---\r\n\r\n# Add login\r\n\r\ncr: in the body\r\n";
+
+    #[test]
+    fn anchors_are_refused_only_where_a_node_starts() {
+        let text = |yaml: &str| refuse_anchors(yaml, "cr.md").map(|()| yaml.to_owned());
+        for plain in [
+            "reach: Login & signup\n",
+            "fact: 2 * 3 is 6\n",
+            "reach: \"Login & signup\"\n",
+            "left_open:\n  - {risk: \"R&D\", note: a & b}\n",
+            "reach: x # see &a and *b\n",
+            "door_reason: |\n  *Not* reversible\n  &c\nreach: page\n",
+            "items:\n  - note: |\n      &a text\n    name: a & b\n",
+            "items: [\n  first, a & b,\n  c * d\n]\n",
+        ] {
+            assert!(text(plain).is_ok(), "{plain:?}");
+            // serde_yaml_ng reads these as text too.
+            assert!(parse(plain, "cr.md").is_ok(), "{plain:?}");
+        }
+        for anchored in [
+            "base: &b {x: 1}\nother: *b\n",
+            "- &one {id: 1}\n",
+            "list: [a, *x]\n",
+            "map: {k: *x}\n",
+            "? *k\n",
+            "door_reason: |\n  text\nreach: *r\n",
+            "items:\n  - note: |\n      text\n    name: &n hello\n",
+            "items: [\n  first, &n hello\n]\n",
+            "items: [\n  first,\n  *n\n]\n",
+        ] {
+            let error = text(anchored).unwrap_err().to_string();
+            assert!(
+                error.contains("anchors and aliases"),
+                "{anchored:?}: {error}"
+            );
+        }
+    }
 
     #[test]
     fn claims_are_read_and_only_the_cr_line_changes() {
