@@ -134,13 +134,16 @@ server keeps the change request `pending` (`dependency_not_merged`) until a
 change request linking each dependency merges. Nothing is sent when no
 change is linked or `change.md` is not in the commit.
 
-While a change is built, its deltas follow the code. The builder may edit
-lines that come from `by: agent` decisions or `left_to_builder`, and add
-behavior the spec does not cover without changing a goal or anti-goal; it
-records each edit as a `by: agent` decision whose `why` starts with "Found
-while building:" and keeps `status: approved`. An edit to a `by: user`
-decision, a goal or anti-goal, or a `one_way` door goes back to the user,
-and the change is `proposed` until they approve it again.
+While a change is built, its deltas follow the code. The builder may change
+the text of requirements already in the delta where that text comes from
+`by: agent` decisions or `left_to_builder`, or says nothing about a
+behavior the code needs, without changing a goal or anti-goal; it records
+each edit as a `by: agent` decision whose `why` starts with "Found while
+building:" and keeps `status: approved`. Adding, removing or renaming a
+requirement, editing `qa-scenarios.md` (every added or modified
+requirement needs a Must scenario there), or changing what a `by: user`
+decision, a goal or an anti-goal says goes back to the user, and the
+change is `proposed` until they approve it again.
 
 `goodflows change verified <id> [--base <rev>]` runs once the code has been
 verified against the change. It writes

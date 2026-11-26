@@ -205,11 +205,11 @@ No `TBD` or `TODO` anywhere. Every `Refs:` id and `covers` target exists. A smal
 5. **One round for the user.** Ask the theirs pile, with the review findings kept for the user, in one message, most important first, in the grill format. When the pile is empty, say so. This is the only round of questions the checks produce for this version of the change; do not run them again. Apply the answers and validate again.
 6. **Hand over.** Lead with the three to five calls where a wrong guess would cost the most, such as `by: agent` decisions about a wire contract, stored data, security or a quality target, each with what you chose and the main alternative. List the remaining `by: agent` decisions and `left_to_builder` entries after them, and ask the user to approve the change. Apply what they answer. When they approve, set `status: approved`.
 
-A later edit to an approved change goes back through steps 1 to 6 and back to `status: proposed` until approved again.
+A later edit to an approved change goes back through steps 1 to 6 and back to `status: proposed` until approved again, except during a build: `gf-change-build` may change the text of requirements already in the delta where it comes from `by: agent` decisions or `left_to_builder`, or is silent about a behavior the code needs, recording each edit as a `by: agent` decision whose `why` starts with "Found while building:", and the change stays `approved`. Adding, removing or renaming a requirement, `qa-scenarios.md`, and what a `by: user` decision, a goal or an anti-goal says stay the user's.
 
 ## 5. Next steps
 
-Name these and stop. Implementing starts in a new session, from the files:
+Name these and stop. Implementing starts in a new session, from the files, with the `gf-change-build` skill, which runs the first two commands itself when the change request does not exist yet; approving the intent set stays with the user:
 
 ```bash
 goodflows cr open --change <id> --title "<title>"

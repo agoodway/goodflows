@@ -911,7 +911,13 @@ npx skills add agoodway/goodflows --skill maintain-ci-skill
 npx skills add agoodway/goodflows --skill gf-change-explore
 ```
 
-`goodflows skills install` writes `create-ci-skill`, `maintain-ci-skill` and `gf-change-explore` into the directory the current coding agent loads project skills from, one directory per skill, such as `.claude/skills/create-ci-skill/SKILL.md`. The skills are built into the binary, so they match the goodflows you run. Rerunning replaces the installed copies with the built-in ones.
+[`gf-change-build`](skills/gf-change-build/SKILL.md) builds an approved change and takes its change request to a verdict, unattended. A main agent orchestrates fresh subagents: one builds the change with a failing test first for each Must scenario, four verify it at once (spec to code, code to spec, the decisions and bars, and the QA scenarios through the repo's verify skill), and one fixes what they find. The spec deltas follow the code as it is built: the implementer may change the text of requirements already in the change where it came from the agent's own decisions or says nothing, records each edit as a "Found while building:" decision, and leaves new requirements, your decisions, the goals and the intent set to you. It then records the verification with `goodflows change verified`, archives the change in the branch, commits, pushes, uploads runs and claims, and fixes what the verdict asks of an agent until the change request is mergeable or needs your review. Questions for you come in one report at the end; it never approves, answers a review item, lowers the policy, or merges.
+
+```bash
+npx skills add agoodway/goodflows --skill gf-change-build
+```
+
+`goodflows skills install` writes `create-ci-skill`, `maintain-ci-skill`, `gf-change-explore` and `gf-change-build` into the directory the current coding agent loads project skills from, one directory per skill, such as `.claude/skills/create-ci-skill/SKILL.md`. The skills are built into the binary, so they match the goodflows you run. Rerunning replaces the installed copies with the built-in ones.
 
 ```bash
 goodflows skills install

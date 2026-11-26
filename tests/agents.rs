@@ -25,6 +25,13 @@ fn skills_install_in_a_claude_code_session_writes_every_skill_under_claude() {
     for file in [
         "create-ci-skill/SKILL.md",
         "maintain-ci-skill/SKILL.md",
+        "gf-change-build/SKILL.md",
+        "gf-change-build/build-prompt.md",
+        "gf-change-build/close-prompt.md",
+        "gf-change-build/fix-prompt.md",
+        "gf-change-build/preflight-prompt.md",
+        "gf-change-build/ship-prompt.md",
+        "gf-change-build/verify-prompt.md",
         "gf-change-explore/SKILL.md",
         "gf-change-explore/builder-check-prompt.md",
         "gf-change-explore/over-spec-check-prompt.md",

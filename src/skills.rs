@@ -11,13 +11,46 @@ use std::path::Path;
 
 /// The skills this binary installs, embedded as they are in `skills/`: each
 /// skill's name and its files, `SKILL.md` first.
-const SKILLS: [(&str, &[(&str, &str)]); 3] = [
+const SKILLS: [(&str, &[(&str, &str)]); 4] = [
     (
         "create-ci-skill",
         &[(
             "SKILL.md",
             include_str!("../skills/create-ci-skill/SKILL.md"),
         )],
+    ),
+    (
+        "gf-change-build",
+        &[
+            (
+                "SKILL.md",
+                include_str!("../skills/gf-change-build/SKILL.md"),
+            ),
+            (
+                "build-prompt.md",
+                include_str!("../skills/gf-change-build/build-prompt.md"),
+            ),
+            (
+                "close-prompt.md",
+                include_str!("../skills/gf-change-build/close-prompt.md"),
+            ),
+            (
+                "fix-prompt.md",
+                include_str!("../skills/gf-change-build/fix-prompt.md"),
+            ),
+            (
+                "preflight-prompt.md",
+                include_str!("../skills/gf-change-build/preflight-prompt.md"),
+            ),
+            (
+                "ship-prompt.md",
+                include_str!("../skills/gf-change-build/ship-prompt.md"),
+            ),
+            (
+                "verify-prompt.md",
+                include_str!("../skills/gf-change-build/verify-prompt.md"),
+            ),
+        ],
     ),
     (
         "gf-change-explore",
@@ -331,6 +364,13 @@ mod tests {
                 files,
                 [
                     ".claude/skills/create-ci-skill/SKILL.md",
+                    ".claude/skills/gf-change-build/SKILL.md",
+                    ".claude/skills/gf-change-build/build-prompt.md",
+                    ".claude/skills/gf-change-build/close-prompt.md",
+                    ".claude/skills/gf-change-build/fix-prompt.md",
+                    ".claude/skills/gf-change-build/preflight-prompt.md",
+                    ".claude/skills/gf-change-build/ship-prompt.md",
+                    ".claude/skills/gf-change-build/verify-prompt.md",
                     ".claude/skills/gf-change-explore/SKILL.md",
                     ".claude/skills/gf-change-explore/builder-check-prompt.md",
                     ".claude/skills/gf-change-explore/over-spec-check-prompt.md",
