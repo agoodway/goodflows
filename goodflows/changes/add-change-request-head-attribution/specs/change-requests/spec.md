@@ -1,7 +1,8 @@
 ## MODIFIED Requirements
 
 ### Requirement: Git facts describe HEAD against the target
-The CLI SHALL report a `git-facts/1` document to `POST .../change-requests/<N>/git-facts` with `head`, `target` (`branch`, `merge_base`), `commits` from the merge base to HEAD oldest first (`sha`, `parents`, `changed_files` against the first parent) and `diff.files` from the merge base to HEAD. The target commit SHALL be `origin/<target>`, else the local `<target>`.
+Refs: G1, D5, D6
+The CLI SHALL report a `git-facts/1` document to `POST .../change-requests/<N>/git-facts` with `head`, `target` (`branch`, `merge_base`), `commits` from the merge base to HEAD oldest first (`sha`, `parents`, `changed_files` against the first parent) and `diff.files` from the merge base to HEAD. The target commit SHALL be `origin/<target>`, else the local `<target>`. The posted body SHALL be the document's keys plus `links` and `agent` when collected; the `git_facts` summary and all command output SHALL come from the document alone. A `422` answer SHALL NOT be retried without `links` and `agent`.
 
 #### Scenario: Two commits with a rename
 - **WHEN** `feat/login` adds `lib/login.ex` (2 lines) in one commit and renames `old.txt` to `docs/new.txt` in the next
@@ -12,7 +13,8 @@ The CLI SHALL report a `git-facts/1` document to `POST .../change-requests/<N>/g
 - **THEN** the posted body has the document's keys plus `links` and `agent`, and the event's `git_facts` summary is the same as without attribution
 
 ### Requirement: cr open creates or reuses the branch's change request
-`cr open` SHALL need a checked-out branch (`HEAD is detached; cr open needs the change request's branch checked out`) of 1-256 bytes without control characters. It SHALL reuse the branch's one draft or open change request, or create a draft with `POST .../change-requests` and body `title`, `source_branch`, and `openspec_change`, `target_branch` and `links` when given or collected.
+Refs: G1, D4
+`cr open` SHALL need a checked-out branch (`HEAD is detached; cr open needs the change request's branch checked out`) of 1-256 bytes without control characters. It SHALL reuse the branch's one draft or open change request without updating it, or create a draft with `POST .../change-requests` and body `title`, `source_branch`, and `openspec_change`, `target_branch` and `links` when given or collected.
 
 #### Scenario: Create from a claims file
 - **WHEN** branch `feat/login` has no change request, the default claims file has `# Add login`, and no link source supplies a link
@@ -29,7 +31,8 @@ The CLI SHALL report a `git-facts/1` document to `POST .../change-requests/<N>/g
 ## ADDED Requirements
 
 ### Requirement: Git facts reports carry the head's links
-A Git facts report SHALL carry `links` collected as run records collect them: `GOODFLOWS_TICKETS` and `GOODFLOWS_THREAD_URLS`, the agent session, then `Amp-Thread-ID` trailers and ticket prefixes from git, with the same validation and caps. `links` and each empty list SHALL be omitted.
+Refs: G1, G2, D1, D2
+A Git facts report (`cr open` with a claims file, `cr claims`, `cr push`) SHALL carry `links` collected as run records collect them, with the same validation and caps: `GOODFLOWS_TICKETS` and `GOODFLOWS_THREAD_URLS`, then the agent session, then `Amp-Thread-ID` trailers and tickets matching the root `[settings] ticket_prefixes` from git. `cr` commands SHALL keep rejecting `--ticket` and `--thread-url`. `links` and each empty list SHALL be omitted.
 
 #### Scenario: Session and trailer
 - **WHEN** `cr push` runs with `AMP_CURRENT_THREAD_ID=T-<a>` and a branch commit has the trailer `Amp-Thread-ID: T-<b>`
@@ -40,6 +43,7 @@ A Git facts report SHALL carry `links` collected as run records collect them: `G
 - **THEN** the report body has no `links` key
 
 ### Requirement: The trailer scan follows the change request's target
+Refs: D1
 For a change request command, the git scan SHALL read the messages of at most 200 commits reachable from HEAD but not from the target commit the Git facts use (`origin/<target>`, else `<target>`), newest first, and SHALL ignore `GITHUB_BASE_REF`. Run records SHALL keep their base.
 
 #### Scenario: Trailer on the target branch
@@ -47,7 +51,8 @@ For a change request command, the git scan SHALL read the messages of at most 20
 - **THEN** `links.threads` holds `T-<new>` and not `T-<old>`
 
 ### Requirement: Git facts reports name the agent
-A Git facts report SHALL carry `agent` with `name` from `GOODFLOWS_AGENT`, or `amp` when that is unset and the agent session supplies a thread, and `model` from `GOODFLOWS_MODEL` when set. Without a name it SHALL omit `agent`, even when `GOODFLOWS_MODEL` is set. Only the caller's process environment SHALL be read.
+Refs: G1, D3
+A Git facts report SHALL carry `agent` with `name` from `GOODFLOWS_AGENT`, or `amp` when that is unset or invalid and `AMP_CURRENT_THREAD_ID` or `AMP_THREAD_ID` names a valid thread, and `model` from `GOODFLOWS_MODEL` when set. Without a name it SHALL omit `agent`, even when `GOODFLOWS_MODEL` is set. Only the caller's process environment SHALL be read.
 
 #### Scenario: Harness names itself
 - **WHEN** `cr push` runs with `GOODFLOWS_AGENT=claude-code` and `GOODFLOWS_MODEL=claude-opus-5-5`
@@ -62,6 +67,7 @@ A Git facts report SHALL carry `agent` with `name` from `GOODFLOWS_AGENT`, or `a
 - **THEN** the report body has no `agent` key
 
 ### Requirement: Invalid attribution never fails a command
+Refs: G2, D3
 `GOODFLOWS_AGENT` MUST be 1 to 64 bytes matching `[a-z0-9][a-z0-9._-]*` and `GOODFLOWS_MODEL` 1 to 128 bytes of printable ASCII without spaces. An invalid value SHALL be dropped with a stderr warning naming the variable but not its value, and the command's exit code MUST NOT change.
 
 #### Scenario: Uppercase agent name
@@ -73,6 +79,7 @@ A Git facts report SHALL carry `agent` with `name` from `GOODFLOWS_AGENT`, or `a
 - **THEN** stderr warns about `GOODFLOWS_MODEL`, and the report's `agent` is `{"name": "codex"}`
 
 ### Requirement: Attribution is collected once, only when sent
+Refs: D4
 A change request command SHALL collect links and agent at most once, when it first sends a Git facts report or creates a change request, and a command that sends neither MUST NOT run git to collect them.
 
 #### Scenario: Reuse without a claims file
