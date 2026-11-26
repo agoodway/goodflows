@@ -32,6 +32,7 @@ fn skills_install_in_a_claude_code_session_writes_every_skill_under_claude() {
         "gf-change-build/preflight-prompt.md",
         "gf-change-build/ship-prompt.md",
         "gf-change-build/verify-prompt.md",
+        "gf-change-merge/SKILL.md",
         "gf-change-write/SKILL.md",
         "gf-change-write/builder-check-prompt.md",
         "gf-change-write/over-spec-check-prompt.md",

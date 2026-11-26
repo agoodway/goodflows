@@ -923,7 +923,13 @@ npx skills add agoodway/goodflows --skill gf-change-write
 npx skills add agoodway/goodflows --skill gf-change-build
 ```
 
-`goodflows skills install` writes `create-ci-skill`, `maintain-ci-skill`, `gf-change-write` and `gf-change-build` into the directory the current coding agent loads project skills from, one directory per skill, such as `.claude/skills/create-ci-skill/SKILL.md`. The skills are built into the binary, so they match the goodflows you run. Rerunning replaces the installed copies with the built-in ones.
+[`gf-change-merge`](skills/gf-change-merge/SKILL.md) merges a change's change request when you ask it to, never on its own. It checks that the verdict is mergeable and the change is archived in the branch, takes the target branch's merge lease, and fast-forwards the target to the graded head, or makes one merge commit when it cannot. When the lease's base is not the base the change request was graded on, it first drives each graded scenario set on the merge result and uploads the runs, so the server grades what will land. It keeps the lease alive with a heartbeat while it works, releases it on any stop before the push, pushes without force, and reports the merged commit with `goodflows cr merged`. It never squashes, approves, answers a review item, or lowers the policy.
+
+```bash
+npx skills add agoodway/goodflows --skill gf-change-merge
+```
+
+`goodflows skills install` writes `create-ci-skill`, `maintain-ci-skill`, `gf-change-write`, `gf-change-build` and `gf-change-merge` into the directory the current coding agent loads project skills from, one directory per skill, such as `.claude/skills/create-ci-skill/SKILL.md`. The skills are built into the binary, so they match the goodflows you run. Rerunning replaces the installed copies with the built-in ones.
 
 ```bash
 goodflows skills install

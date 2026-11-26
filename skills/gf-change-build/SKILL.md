@@ -94,4 +94,6 @@ Write it from the status blocks and `held.md`, in this order:
 3. Whether the change was archived; what `verification.md` lists under `open` if not; and, when fixes landed after archiving, that its hashes predate them.
 4. What the run fixed, the heads it pushed, and any blocker with its evidence.
 
+Merging is not part of this run. When the verdict is `mergeable`, say that the `gf-change-merge` skill merges it when the person asks.
+
 When the person answers, apply each answer as they direct and remove its `question` line from `held.md`. An answer that changes a `by: user` decision, a requirement or `qa-scenarios.md` sends the change back to `status: proposed` until the person approves it again. Then run this skill again on the same change: it resumes from `.goodflows/build/<id>/log.md`.
