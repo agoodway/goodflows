@@ -1,7 +1,7 @@
 ---
 format: goodflows-change/1
 id: add-schema-command
-status: approved
+status: archived
 size: small
 door: one_way
 capabilities: [file-schemas, change-requests]
