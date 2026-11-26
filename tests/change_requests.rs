@@ -861,7 +861,7 @@ fn cr_validate_lists_every_problem_in_each_file_without_config_or_server() {
     // fill in claims without a cr: line.
     std::fs::write(
         dir.join("cr.md"),
-        "---\nformat: change-claims/2\ncr: 4\nhead: abc\n---\n",
+        "---\nformat: change-claims/2\ncr: 4\nhead: abc\ndoor: two_way\ndoor_reason: r\nreach: r\nsafe_because:\n  - {fact: f, location: a:1, proof: stated}\nleft_open: []\nquestions: []\ndecisions: []\n---\n",
     )
     .unwrap();
     std::fs::write(

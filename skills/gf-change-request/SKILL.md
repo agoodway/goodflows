@@ -60,103 +60,19 @@ The claims are per head. When the file already exists, read its front matter fir
 
 ## The file
 
-Use this shape. Write the prose through the `gs-unslop` skill when it is installed. Without it, keep to these rules: sentence-case headings, straight quotes, no em dashes or emoji, a named actor, and no sentence that would still be true of any other change. Do not add an AI attribution footer.
+Run `goodflows schema show change-claims/2` and write the file from the template and rules it prints: the front matter's keys and values, quoting, and the body's headings. They match the goodflows that checks the file. If your goodflows has no `schema` command, tell the user it is older than this skill and needs updating, and stop.
 
-```markdown
----
-format: change-claims/2
-cr: null
-head: "[full commit SHA of HEAD]"
-door: two_way
-door_reason: "[why a revert is or is not enough]"
-reach: "[who or what is hit if this is wrong]"
-safe_because:
-  - fact: "[a fact that makes the change safe]"
-    location: "[path:line]"
-    proof: ran
-    evidence:
-      - ".verify/[app]/[run-id]/run.md#[scenario id]"
-    covers:
-      capability: "[capability]"
-      requirement: "[Requirement]"
-      scenario: "[Scenario]"
-left_open:
-  - risk: "[how it breaks]"
-    location: "[path:line]"
-    affected: "[who or what is hit]"
-questions:
-  - id: "1"
-    text: "[the question the reviewer must answer]"
-    options:
-      - "[an option]"
-      - "[another option]"
-    recommendation: "[one of the options, copied exactly]"
-decisions:
-  - id: "1"
-    path: "[path from the repository root]"
-    hunk: |-
-      @@ -10,3 +10,4 @@ [the hunk exactly as git diff prints it]
-       [context line]
-      -[removed line]
-      +[added line]
-    note: "[why this hunk changed, or what the reviewer should check]"
----
+Write the prose through the `gs-unslop` skill when it is installed. Without it, keep to these rules: sentence-case headings, straight quotes, no em dashes or emoji, a named actor, and no sentence that would still be true of any other change. Do not add an AI attribution footer.
 
-# [type: what changed]
+### What goes in the front matter
 
-## What changed
+The schema says what each key holds; these rules say how to fill it for this branch:
 
-<what a person or the system does differently>
-
-## How it works
-
-<one short paragraph>
-
-<the smallest picture that makes the change clear>
-
-## Evidence
-
-<what was run, and what it showed>
-
-## What could break
-
-Door: <one-way or two-way, and why a revert is or is not enough>
-
-Reach: <who or what is hit if this is wrong>
-
-Safe because: <each fact, file:line, and how far it was proven>
-
-Left open: <each remaining risk, or "None found.">
-
-## How to check
-
-<the smallest steps a reviewer can run>
-
-## Questions for the reviewer
-
-<each question with its options and your recommendation, or "None.">
-
-## Decisions to judge
-
-<each decision hunk as a diff block with its note, or "None.">
-```
-
-### Front matter
-
-The front matter is the contract goodflows reads. Keep it exactly as follows:
-
-- The file starts with a line that holds only `---`, and the front matter ends at the next such line. Nothing comes before it.
-- Write the keys in the order the shape shows. Quote every string value with double quotes, and escape a double quote inside one as `\"`. The one exception is `hunk`, which is a literal block scalar, `|-`, so the diff lines keep their exact text. Numbers, `null`, and the lowercase values below stay bare.
-- `format` is `change-claims/2`. A change to the fields that would break a reader gets a new number. Version 2 renamed `depends_on` to `safe_because`, so the key is not read as a dependency on other change requests, and added `evidence` and `covers` to each fact.
-- `cr` is the change request number goodflows gave, as a bare integer. Before the change request exists it is `null`. The goodflows CLI writes the number into this field when it creates the change request. Take it from the existing file or from the user. Never guess it, and never ask a host for it.
-- `head` is the full SHA that `git rev-parse HEAD` prints.
-- `door` is `one_way` or `two_way`, and `door_reason` says why.
-- `safe_because` lists each fact the change is safe because of, with at least one entry. A trivial change still names one, such as "No code reads this file" with `proof: stated`. `location` is a real `file:line`. `proof` is how far you proved the fact, on the `gs-blast-radius` scale, from weakest to strongest: `stated`, `pointed`, `walked`, or `ran`. See What could break.
-- `evidence` is optional, and lists where the proof is, as paths from the repository root. An entry is a file in a verify run, such as `.verify/web/20261121T1200Z-b6524cb/03-cancel.png`, a QA run's `run.md` with `#` and the scenario id, such as `.verify/web/20261121T1200Z-b6524cb/run.md#3`, or a test as `file:line`. A `ran` fact names at least one entry, and every entry exists on disk. Without evidence, a fact is `walked` at most. Use a verify run only when the verify-run rule in Evidence says it applies.
-- `covers` is optional, and ties the fact to a spec scenario with `capability`, `requirement`, and `scenario`, copied exactly from the goodflows change's spec delta, or from `goodflows/specs/<capability>/spec.md` once the change is archived. See Spec scenarios no one can see.
-- `left_open` lists each remaining risk, or is `[]`.
-- `questions` lists what the reviewer must decide that you could not settle from the code, the specs, or the request, or is `[]`. `id` is a quoted string that counts from `"1"`, because goodflows refuses a bare number. `options` has two or more entries. `recommendation` is one of the `options`, copied exactly.
-- `decisions` lists at most three hunks a reviewer should judge, or is `[]`. A hunk is a decision when it holds a tradeoff, a rejected alternative, a behavior that changes, or an edge case you resolved. Leave routine edits out. `id` is a quoted string that counts from `"1"`, as in `questions`. `path` is the file's path from the repository root. `hunk` starts at its `@@` line and is copied from `git diff origin/<base>...HEAD -- <path>`, cut to the lines that carry the decision, with no line edited. `note` is one sentence on why it changed or what to check.
+- `cr`: keep the value from the existing file, or take it from the user. Never guess it, and never ask a host for it. Before the change request exists it is `null`, and the goodflows CLI writes the number in when it creates the change request.
+- `head`: what `git rev-parse HEAD` prints now.
+- `safe_because`: at least one fact, even for a trivial change, such as "No code reads this file" with `proof: stated`. Give each fact the proof you reached, on the scale in What could break, not the one you meant to reach. A `ran` fact names at least one `evidence` entry, and every entry exists on disk; without evidence a fact is `walked` at most. Use a verify run only when the rule in Verify runs says it applies. Set `covers` as Spec scenarios no one can see says.
+- `questions`: what the reviewer must decide that you could not settle from the code, the specs, or the request.
+- `decisions`: at most three hunks a reviewer should judge: a tradeoff, a rejected alternative, a behavior that changes, or an edge case you resolved. Leave routine edits out. Copy each `hunk` from `git diff origin/<base>...HEAD -- <path>`, cut to the lines that carry the decision, with no line edited. Write each `note` as one sentence on why the hunk changed or what the reviewer should check.
 - The body says the same things for the reviewer. When you change one, change the other.
 
 ### Title

@@ -82,6 +82,22 @@ events after `--after` (`410` with `latest_cursor`): resync from the
 current state, then read with `--after` set to the `latest_cursor` the
 message names. With `--follow` it prints a note and goes on from there.
 
+## File formats: `goodflows schema`
+
+goodflows owns the formats of the files it reads: scenario sets
+(`qa-scenarios/2`, intent or diff), a verify run's `run.md`
+(`verify-run-notes/1`), a change request's claims file (`change-claims/2`)
+and a verify skill's feature files (`feature-file/1`).
+`goodflows schema list` names them, with the file each applies to and its
+validator. Before writing one, run `goodflows schema show <format>`
+(`--source intent` or `--source diff` for a scenario set) and follow it
+over any skill's default format; it prints a template, the field, body and
+handling rules, and the validator to run after writing. `--json` prints
+the same as one `schema` event with `template`, `fields`, `body`,
+`handling` and `validate`. It needs no API key or `goodflows.toml`.
+`goodflows skills install` writes a block pointing at it into the
+project's `AGENTS.md`, and into `CLAUDE.md` for Claude Code.
+
 ## Goodflows changes: `goodflows-change/1`
 
 A change is planned before code in `goodflows/changes/<id>/` (`<id>` is

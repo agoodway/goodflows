@@ -251,10 +251,122 @@ fn write(root: &Path, dir: &str) -> Result<Vec<String>> {
     Ok(written)
 }
 
+/// The lines that open and close goodflows's block in a project's AGENTS.md.
+const FORMATS_START: &str = "<!-- goodflows:formats -->";
+const FORMATS_END: &str = "<!-- /goodflows:formats -->";
+
+/// The block that points agents at `goodflows schema`.
+fn formats_block() -> String {
+    use crate::change_requests::{markdown, verify_run};
+    format!(
+        "{FORMATS_START}
+## File formats
+
+This project lands work through goodflows. Before writing a scenario set, a verify run's run.md, a change
+request's claims file, or a feature file, run `goodflows schema show <format>` and follow it instead of a
+skill's default format:
+
+- Scenario sets: `{set}` (`--source intent` or `--source diff`)
+- Verify run notes: `{notes}`
+- Change request claims: `{claims}`
+- Feature files: `{feature}`
+
+After writing, run the validator the schema names and fix every error it lists.
+{FORMATS_END}
+",
+        set = markdown::SET_FORMAT,
+        notes = verify_run::NOTES_FORMAT,
+        claims = markdown::CLAIMS_FORMAT,
+        feature = crate::schema::FEATURE_FORMAT,
+    )
+}
+
+/// `text` with goodflows's formats block replaced in place, or appended
+/// when it has none. The block is a line equal to [`FORMATS_START`] up to
+/// the next line equal to [`FORMATS_END`], with no other start line
+/// between; a marker anywhere else is the project's text. Every byte
+/// outside the block is kept.
+fn with_formats_block(text: &str) -> String {
+    let block = formats_block();
+    let mut start = None;
+    let mut offset = 0;
+    let mut found = None;
+    for line in text.split_inclusive('\n') {
+        let bare = line.trim_end_matches(['\n', '\r']);
+        if bare == FORMATS_START {
+            start = Some(offset);
+        } else if let (FORMATS_END, Some(start)) = (bare, start) {
+            found = Some((start, offset + line.len()));
+            break;
+        }
+        offset += line.len();
+    }
+    match found {
+        Some((start, end)) => format!("{}{block}{}", &text[..start], &text[end..]),
+        None if text.is_empty() => block,
+        None if text.ends_with('\n') => format!("{text}\n{block}"),
+        None => format!("{text}\n\n{block}"),
+    }
+}
+
+/// Writes the formats block into `path`, creating the file when missing,
+/// and returns whether the file changed.
+fn write_formats_block(path: &Path) -> Result<bool> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "could not read {} as UTF-8 text; fix or move it, then run goodflows skills install again",
+                    path.display()
+                )
+            })
+        }
+    };
+    let updated = with_formats_block(&text);
+    if updated == text {
+        return Ok(false);
+    }
+    std::fs::write(path, updated).with_context(|| {
+        format!(
+            "could not write {}; make it writable, then run goodflows skills install again",
+            path.display()
+        )
+    })?;
+    Ok(true)
+}
+
+/// Whether CLAUDE.md already loads AGENTS.md with an `@AGENTS.md` import line.
+fn imports_agents_md(root: &Path) -> bool {
+    std::fs::read_to_string(root.join("CLAUDE.md"))
+        .is_ok_and(|text| text.lines().any(|line| line.trim() == "@AGENTS.md"))
+}
+
+/// Writes the formats block where the harnesses read project guidance:
+/// AGENTS.md always, and CLAUDE.md for Claude Code, which does not read
+/// AGENTS.md, unless CLAUDE.md already imports it. Returns the files that
+/// changed.
+fn write_guidance(root: &Path, harnesses: &[Harness]) -> Result<Vec<String>> {
+    let mut files = vec!["AGENTS.md"];
+    if harnesses.contains(&Harness::Claude) && !imports_agents_md(root) {
+        files.push("CLAUDE.md");
+    }
+    let mut written = Vec::new();
+    for file in files {
+        if write_formats_block(&root.join(file))? {
+            written.push(file.to_owned());
+        }
+    }
+    Ok(written)
+}
+
 /// `goodflows skills install`, in the current directory.
 pub async fn install(harness: Option<Harness>, output: &Output) -> Result<u8> {
     let target = target(harness, std::env::vars_os())?;
-    let files = write(&std::env::current_dir()?, target.dir)?;
+    let root = std::env::current_dir()?;
+    let mut files = write(&root, target.dir)?;
+    files.extend(write_guidance(&root, &target.harnesses)?);
     let harnesses: Vec<_> = target.harnesses.iter().map(|h| h.name()).collect();
     output
         .emit(json!({"type":"skills_installed", "directory":target.dir, "harnesses":harnesses, "source":target.source, "files":files}))
@@ -362,6 +474,32 @@ mod tests {
                 (target.dir, target.harnesses, target.source),
                 (dir, vec![harness], "flag")
             );
+        }
+    }
+
+    #[test]
+    fn the_formats_block_is_replaced_in_place_and_other_text_kept() {
+        let block = formats_block();
+        assert_eq!(with_formats_block(""), block);
+        assert_eq!(
+            with_formats_block("# Rules\r\nNo tabs."),
+            format!("# Rules\r\nNo tabs.\n\n{block}")
+        );
+        let old = "<!-- goodflows:formats -->\nold text\n<!-- /goodflows:formats -->\r\n";
+        let file = format!("# Rules\n\n{old}After.\n");
+        let updated = with_formats_block(&file);
+        assert_eq!(updated, format!("# Rules\n\n{block}After.\n"));
+        assert_eq!(with_formats_block(&updated), updated);
+        assert!(block.contains("goodflows schema show <format>"));
+        // A marker inside a line, or a start line with no end line, is the
+        // project's text: the block is appended, and a rerun replaces only it.
+        for project in [
+            "Mention <!-- goodflows:formats --> inline.\nKeep this line.\n",
+            "<!-- goodflows:formats -->\nKeep this line.\n",
+        ] {
+            let once = with_formats_block(project);
+            assert_eq!(once, format!("{project}\n{block}"));
+            assert_eq!(with_formats_block(&once), once);
         }
     }
 

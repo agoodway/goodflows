@@ -147,39 +147,14 @@ Refs: D1, G1
 
 ### qa-scenarios.md
 
-The acceptance scenarios, as a `qa-scenarios/2` intent set. It uploads to the change request unchanged, and the server refuses any key it does not know, so write exactly these keys:
+The acceptance scenarios, as a `qa-scenarios/2` intent set. It uploads to the change request unchanged, and the server refuses any key it does not know. Run `goodflows schema show qa-scenarios/2 --source intent` and write the file from the template and rules it prints; they match the goodflows that will check the file. If your goodflows has no `schema` command, tell the user it is older than this skill and needs updating.
 
-```markdown
----
-format: qa-scenarios/2
-source: intent
-change: add-review-answer-reapply
-specs: uncommitted
-scenarios:
-  - id: 1
-    name: Untouched items are re-applied, touched ones skipped
-    priority: must
-    covers:
-      - capability: change-request-review
-        requirement: --untouched picks only items whose paths did not change
-        implied: true
----
+What to put in it:
 
-# QA: add-review-answer-reapply
-
-## Scenarios
-
-### 1. Untouched items are re-applied, touched ones skipped (Must)
-
-Answer two items, push a commit that touches one item's paths, then re-apply the untouched ones.
-
-- Expect: the untouched item's answer is recorded at the new head; the touched one is listed as skipped with its reason.
-```
-
-- `change` is the change id. `specs` is `uncommitted` until the change is committed; then it may be the commit's hex SHA.
+- `change` is the change id, and `specs` stays `uncommitted` until the change is committed.
 - Each `covers` entry names a capability and a requirement exactly as written in the delta, plus either `scenario: <spec scenario name>` or `implied: true`. Since spec scenarios are rare, `implied: true` is the usual case.
 - Every requirement is covered by at least one `must` scenario. Use `should` and `could` for the rest. At most 3 scenarios cover one requirement.
-- Under `## Scenarios`, each scenario has a `### <id>. <name> (<Priority>)` heading. Its steps say what a person does and what they should see in terms of behavior, not exact output text.
+- Each scenario's steps say what a person does and what they should see in terms of behavior, not exact output text.
 - Every Must scenario ends in at least one expected result that a wrong build would fail and someone can check: an exit code, a stored state, a field's value, what is or is not sent. "It works" or "it behaves correctly" is not an expected result.
 - Do not write `coverage` rows; `covers` does that job.
 

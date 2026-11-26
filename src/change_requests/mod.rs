@@ -9,8 +9,8 @@
 mod api;
 mod changes;
 mod git;
-mod markdown;
-mod verify_run;
+pub(crate) mod markdown;
+pub(crate) mod verify_run;
 
 use crate::config::Reporting;
 use crate::output::Output;
@@ -150,7 +150,9 @@ read it, qa-scenarios/2 as cr scenarios upload reads it, and a .verify/<app>/<ru
 its run.md) as cr runs upload reads it. Every problem in a file is listed; warnings name what an
 upload would trip on later, such as claims for a head other than HEAD. Exits 1 when any file has
 errors. Needs no API key or goodflows.toml. The server checks more of a claims file than its
-format, cr and head; those fields are not checked here. Feature files: goodflows features validate.
+format, cr and head; of the rest, missing and unknown keys, door, proof, ran facts without evidence and
+recommendations outside their options are warnings. Feature files: goodflows features validate.
+How to write each format: goodflows schema show <format>.
 
 Without paths it checks the branch's claims file and diff set (goodflows cr path), each
 goodflows/changes/*/qa-scenarios.md and each .verify/<app>/<run-id>/ run folder.
@@ -1476,8 +1478,8 @@ fn check_file(
     // The format names the kind; a file whose format is missing or wrong is
     // checked as its usual name suggests, so its problems are reported.
     let kind = match format.as_deref() {
-        Some("change-claims/2") => "claims",
-        Some("qa-scenarios/2") => "scenario_set",
+        Some(markdown::CLAIMS_FORMAT) => "claims",
+        Some(markdown::SET_FORMAT) => "scenario_set",
         Some(verify_run::NOTES_FORMAT) => "verify_run",
         _ if name == "cr.md" => "claims",
         _ if name.ends_with("scenarios.md") => "scenario_set",
@@ -1492,7 +1494,9 @@ fn check_file(
             "{shown} is a feature file; check it with goodflows features validate"
         )),
         _ => Err(anyhow!(
-            "{shown}: the front matter's format must be change-claims/2, qa-scenarios/2 or {}",
+            "{shown}: the front matter's format must be {}, {} or {}",
+            markdown::CLAIMS_FORMAT,
+            markdown::SET_FORMAT,
             verify_run::NOTES_FORMAT
         )),
     };
@@ -1515,6 +1519,7 @@ fn check_claims(
             crate::output::visible(&claims.head)
         ));
     }
+    warnings.extend(markdown::claims_server_warnings(text, shown));
     if claims.cr.is_none() && claims.title.is_none() {
         warnings.push(format!(
             "{shown}: the body has no # heading, so cr open needs --title"

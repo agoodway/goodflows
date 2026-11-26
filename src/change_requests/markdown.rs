@@ -11,6 +11,31 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::ops::Range;
 
+/// The `format` of a change request's claims file.
+pub const CLAIMS_FORMAT: &str = "change-claims/2";
+/// Every key of a claims file's front matter; the server refuses a missing
+/// or unknown one.
+pub const CLAIMS_KEYS: [&str; 10] = [
+    "format",
+    "cr",
+    "head",
+    "door",
+    "door_reason",
+    "reach",
+    "safe_because",
+    "left_open",
+    "questions",
+    "decisions",
+];
+/// A claims file's `door` values.
+pub const DOORS: [&str; 2] = ["one_way", "two_way"];
+/// A fact's `proof` levels, from weakest to strongest.
+pub const PROOF_LEVELS: [&str; 4] = ["stated", "pointed", "walked", "ran"];
+/// The `format` of a QA scenario set.
+pub const SET_FORMAT: &str = "qa-scenarios/2";
+/// The `source` values of a scenario set.
+pub const SET_SOURCES: [&str; 2] = ["intent", "diff"];
+
 /// A file split at its front matter: the YAML between a first line `---`
 /// and the next line `---`, and the body after it.
 pub struct FrontMatter<'a> {
@@ -251,8 +276,8 @@ pub fn claims(text: &str, file: &str) -> Result<Claims> {
     let Some(fields) = problems.take(parse(front.yaml, file)) else {
         return Err(Invalid(problems.0).into());
     };
-    if fields["format"] != "change-claims/2" {
-        problems.push(format!("{file}: format must be change-claims/2"));
+    if fields["format"] != CLAIMS_FORMAT {
+        problems.push(format!("{file}: format must be {CLAIMS_FORMAT}"));
     }
     let cr = match &fields["cr"] {
         Value::Null => None,
@@ -293,6 +318,66 @@ pub fn claims(text: &str, file: &str) -> Result<Claims> {
         head: head.unwrap_or_default(),
         title,
     })
+}
+
+/// What the server would refuse in a claims file that [`claims`] accepts:
+/// a missing or unknown key, a `door` or `proof` outside its values, a
+/// `ran` fact without evidence, and a recommendation that is not one of
+/// its question's options. The server checks more than this.
+pub fn claims_server_warnings(text: &str, file: &str) -> Vec<String> {
+    let Some(fields) = split(text).and_then(|front| parse(front.yaml, file).ok()) else {
+        return Vec::new();
+    };
+    let Some(object) = fields.as_object() else {
+        return Vec::new();
+    };
+    let mut warnings = Vec::new();
+    let upload = "so the server refuses the upload";
+    for key in CLAIMS_KEYS.iter().filter(|k| !object.contains_key(**k)) {
+        warnings.push(format!("{file}: the front matter has no {key}, {upload}"));
+    }
+    for key in object.keys().filter(|k| !CLAIMS_KEYS.contains(&k.as_str())) {
+        warnings.push(format!("{file}: {key} is not a claims key, {upload}"));
+    }
+    if object.contains_key("door") && !fields["door"].as_str().is_some_and(|d| DOORS.contains(&d)) {
+        warnings.push(format!(
+            "{file}: door must be {}, {upload}",
+            DOORS.join(" or ")
+        ));
+    }
+    for (index, fact) in fields["safe_because"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .enumerate()
+    {
+        let proof = fact["proof"].as_str();
+        if !proof.is_some_and(|p| PROOF_LEVELS.contains(&p)) {
+            warnings.push(format!(
+                "{file}: safe_because[{index}].proof must be {}, {upload}",
+                PROOF_LEVELS.join(", ")
+            ));
+        }
+        if proof == Some("ran") && fact["evidence"].as_array().is_none_or(Vec::is_empty) {
+            warnings.push(format!(
+                "{file}: safe_because[{index}] has proof: ran and no evidence, {upload}"
+            ));
+        }
+    }
+    for (index, question) in fields["questions"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .enumerate()
+    {
+        let options = question["options"].as_array();
+        if !options.is_some_and(|o| o.contains(&question["recommendation"])) {
+            warnings.push(format!(
+                "{file}: questions[{index}].recommendation must be one of its options, {upload}"
+            ));
+        }
+    }
+    warnings
 }
 
 /// The file with its front matter's `cr:` line set to `number`, and
@@ -345,13 +430,16 @@ pub fn scenario_set(text: &str, file: &str) -> Result<ScenarioSet> {
     let Some(fields) = problems.take(parse(front.yaml, file)) else {
         return Err(Invalid(problems.0).into());
     };
-    if fields["format"] != "qa-scenarios/2" {
-        problems.push(format!("{file}: format must be qa-scenarios/2"));
+    if fields["format"] != SET_FORMAT {
+        problems.push(format!("{file}: format must be {SET_FORMAT}"));
     }
     let source = match fields["source"].as_str() {
-        Some(s @ ("intent" | "diff")) => s.to_owned(),
+        Some(s) if SET_SOURCES.contains(&s) => s.to_owned(),
         _ => {
-            problems.push(format!("{file}: source must be intent or diff"));
+            problems.push(format!(
+                "{file}: source must be {}",
+                SET_SOURCES.join(" or ")
+            ));
             String::new()
         }
     };
@@ -574,6 +662,22 @@ mod tests {
         assert_eq!(
             set_cr(&updated, 43, "cr.md").unwrap(),
             CLAIMS.replacen("cr: null", "cr: 43", 1)
+        );
+    }
+
+    #[test]
+    fn claims_server_warnings_name_what_the_server_refuses() {
+        let text = "---\nformat: change-claims/2\ncr: null\nhead: abc\ndoor: maybe\nreach: x\nextra: 1\nsafe_because:\n  - {fact: f, location: a:1, proof: ran}\n  - {fact: f, location: a:1, proof: sure, evidence: [e]}\nleft_open: []\nquestions:\n  - {id: \"1\", text: q, options: [a, b], recommendation: c}\ndecisions: []\n---\n";
+        assert_eq!(
+            claims_server_warnings(text, "cr.md"),
+            [
+                "cr.md: the front matter has no door_reason, so the server refuses the upload",
+                "cr.md: extra is not a claims key, so the server refuses the upload",
+                "cr.md: door must be one_way or two_way, so the server refuses the upload",
+                "cr.md: safe_because[0] has proof: ran and no evidence, so the server refuses the upload",
+                "cr.md: safe_because[1].proof must be stated, pointed, walked, ran, so the server refuses the upload",
+                "cr.md: questions[0].recommendation must be one of its options, so the server refuses the upload",
+            ]
         );
     }
 

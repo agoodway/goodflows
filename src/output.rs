@@ -557,6 +557,53 @@ fn render(
                 text(&event, "template")
             )?,
             "init_cancelled" => writeln!(out, "Kept existing {}", text(&event, "path"))?,
+            "schema_list" => {
+                for format in event["formats"].as_array().into_iter().flatten() {
+                    let sources = names(&format["sources"]);
+                    if sources.is_empty() {
+                        writeln!(out, "{}", text(format, "format"))?;
+                    } else {
+                        writeln!(
+                            out,
+                            "{}  (--source {})",
+                            text(format, "format"),
+                            sources.replace(", ", "|")
+                        )?;
+                    }
+                    writeln!(
+                        out,
+                        "  file: {}\n  accepts: {}\n  validate: {}",
+                        text(format, "file"),
+                        names(&format["accepted"]),
+                        text(format, "validate")
+                    )?;
+                }
+                writeln!(out, "\nPrint one with goodflows schema show <format>.")?;
+            }
+            "schema" => {
+                let variant = event["source"]
+                    .as_str()
+                    .map(|s| format!(" ({s} set)"))
+                    .unwrap_or_default();
+                writeln!(
+                    out,
+                    "{}{variant}, goodflows {}\n\nTemplate:\n\n```markdown\n{}```",
+                    text(&event, "format"),
+                    text(&event, "goodflows_version"),
+                    text(&event, "template")
+                )?;
+                for (key, title) in [
+                    ("fields", "Fields"),
+                    ("body", "Body"),
+                    ("handling", "Handling"),
+                ] {
+                    writeln!(out, "\n{title}:")?;
+                    for rule in event[key].as_array().into_iter().flatten() {
+                        writeln!(out, "- {}", rule.as_str().unwrap_or_default())?;
+                    }
+                }
+                writeln!(out, "\nValidate: {}", text(&event, "validate"))?;
+            }
             "skills_installed" => {
                 let harnesses = names(&event["harnesses"]);
                 if harnesses.is_empty() {

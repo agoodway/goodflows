@@ -16,18 +16,24 @@ use std::path::{Component, Path, PathBuf};
 /// The `format` of `run.md`'s front matter.
 pub const NOTES_FORMAT: &str = "verify-run-notes/1";
 
+/// A scenario's or feature's `result` in `run.md`.
+pub const RESULTS: [&str; 3] = ["passed", "failed", "not_run"];
+
+/// The lengths of a full commit SHA: SHA-1 and SHA-256 object names.
+pub const COMMIT_LENGTHS: [usize; 2] = [40, 64];
+
 pub const MAX_ARTIFACT_BYTES: u64 = 50 * 1024 * 1024;
 pub const MAX_ARTIFACTS: usize = 200;
 // The server's `verify-run/1` limits (goodflows_web `VerifyRuns.Document`).
-const MAX_RESULTS: usize = 200;
-const MAX_FEATURES: usize = 500;
-const MAX_DRIFT: usize = 100;
-const MAX_CHANGED_FILES: usize = 10_000;
-const MAX_FEATURE_ID_BYTES: usize = 64;
-const MAX_TEXT_BYTES: usize = 1_024;
-const MAX_RESULT_TEXT_BYTES: usize = 4_096;
-const MAX_PATH_BYTES: usize = 4_096;
-const MAX_BRANCH_BYTES: usize = 256;
+pub const MAX_RESULTS: usize = 200;
+pub const MAX_FEATURES: usize = 500;
+pub const MAX_DRIFT: usize = 100;
+pub const MAX_CHANGED_FILES: usize = 10_000;
+pub const MAX_FEATURE_ID_BYTES: usize = 64;
+pub const MAX_TEXT_BYTES: usize = 1_024;
+pub const MAX_RESULT_TEXT_BYTES: usize = 4_096;
+pub const MAX_PATH_BYTES: usize = 4_096;
+pub const MAX_BRANCH_BYTES: usize = 256;
 
 /// Namespace for run IDs derived from a run folder that names none.
 const RUN_ID_NAMESPACE: uuid::Uuid = uuid::uuid!("0b6f1c2e-6a8d-5c3e-9f41-7d2a4e8b9c10");
@@ -87,7 +93,8 @@ pub fn read(folder: &Path) -> Result<Run> {
 
     let commit = required(&fields, "commit", &notes_file, &mut problems).and_then(|value| {
         let commit = value.as_str().filter(|c| {
-            matches!(c.len(), 40 | 64) && c.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+            COMMIT_LENGTHS.contains(&c.len())
+                && c.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
         });
         if commit.is_none() {
             problems.push(format!(
@@ -135,7 +142,7 @@ pub fn read(folder: &Path) -> Result<Run> {
             continue;
         }
         let outcome = match result["result"].as_str() {
-            Some(r @ ("passed" | "failed" | "not_run")) => r,
+            Some(r) if RESULTS.contains(&r) => r,
             _ => {
                 problems.push(format!(
                     "{notes_file}: scenario {id}: result must be passed, failed or not_run"
@@ -405,7 +412,7 @@ fn features(value: &Value, file: &str, problems: &mut Problems) -> Value {
             }
         };
         let result = match feature["result"].as_str() {
-            Some(r @ ("passed" | "failed" | "not_run")) => r,
+            Some(r) if RESULTS.contains(&r) => r,
             _ => {
                 problems.push(format!(
                     "{file}: features[{index}] ({id}): result must be passed, failed or not_run"

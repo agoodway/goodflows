@@ -13,6 +13,7 @@ mod output;
 mod reporting;
 mod retention;
 mod runner;
+mod schema;
 mod secrets;
 mod skills;
 mod sprite;
@@ -253,6 +254,15 @@ enum Commands {
         #[command(subcommand)]
         command: change_requests::FeaturesCommand,
     },
+    /// Print the formats of the files goodflows reads: scenario sets, run notes, claims files and feature files (needs no server)
+    #[command(after_help = "Examples:
+  goodflows schema list                               # every format, its file and its validator
+  goodflows schema show qa-scenarios/2 --source diff  # how to write a diff scenario set
+  goodflows schema show verify-run-notes/1 --json     # the run notes format as one JSON event")]
+    Schema {
+        #[command(subcommand)]
+        command: schema::Command,
+    },
     /// Check goodflows changes (goodflows/changes/<id>/), record them as verified, and archive them into goodflows/specs/
     #[command(after_help = "Examples:
   goodflows change validate                  # every change under goodflows/changes/
@@ -330,7 +340,7 @@ const SKILLS_EXAMPLES: &str = "Examples:
 
 #[derive(Subcommand)]
 enum SkillsCommand {
-    /// Write create-ci-skill, maintain-ci-skill, gf-change-write, gf-change-build, gf-change-merge and gf-change-request into the harness's skills directory, replacing earlier copies
+    /// Write create-ci-skill, maintain-ci-skill, gf-change-write, gf-change-build, gf-change-merge and gf-change-request into the harness's skills directory, replacing earlier copies, and point AGENTS.md (and CLAUDE.md for Claude Code) at goodflows schema
     #[command(after_help = SKILLS_EXAMPLES)]
     Install {
         /// The harness to install for (default: detected from its environment variables; .agents/skills when none is)
@@ -624,6 +634,7 @@ impl Cli {
                 | Commands::Cr { .. }
                 | Commands::Policy { .. }
                 | Commands::Features { .. }
+                | Commands::Schema { .. }
                 | Commands::Events(_)
                 | Commands::Last
                 | Commands::Status { .. }
@@ -899,6 +910,13 @@ async fn run(cli: &Cli, output: &mut Output, cancel: watch::Receiver<Option<i32>
             }
             _ => unreachable!(),
         };
+    }
+    if let Some(Commands::Schema { command }) = &cli.command {
+        let config = cli.config.is_some().then_some("--config");
+        if let Some(flag) = config.or_else(|| cli.run_only_flag()) {
+            return Err(usage(format!("{flag} cannot be used with schema")));
+        }
+        return schema::command(command, output).await;
     }
     if let Some(Commands::Sprite { command }) = &cli.command {
         return sprite::command(cli, command, output, cancel).await;
