@@ -266,13 +266,13 @@ command = "true"
 reports = ["test-timings"]
 
 [[jobs]]
-name = "{long}"
+name = "{unreported}"
 command = "true"
 env = {{ GOODFLOWS_API_KEY = "not the token here" }}
 "#,
         ascii = "j".repeat(64),
         multibyte = "é".repeat(32),
-        long = "n".repeat(100),
+        unreported = "n".repeat(64),
     ));
     let output = p.run(&["validate", "--json"]);
     success(&output);
@@ -2093,11 +2093,11 @@ fn replay_refuses_tampered_manifests_without_contacting_the_server() {
         ),
         (
             Box::new(|m| m["jobs"][0]["name"] = json!("j".repeat(65))),
-            "job names",
+            "job name must be nonempty, at most 64 UTF-8 bytes, and contain no control characters",
         ),
         (
             Box::new(|m| m["jobs"][0]["name"] = json!("a\u{7}b")),
-            "job names",
+            "job 'a\\u{7}b': job name must be nonempty, at most 64 UTF-8 bytes, and contain no control characters",
         ),
         (
             Box::new(|m| {
@@ -2106,7 +2106,26 @@ fn replay_refuses_tampered_manifests_without_contacting_the_server() {
             }),
             "duplicate job name",
         ),
-        (Box::new(|m| m["workflow"] = json!("")), "workflow name"),
+        (
+            Box::new(|m| m["workflow"] = json!("")),
+            "workflow '': workflow name must be nonempty, at most 64 UTF-8 bytes, and contain no control characters",
+        ),
+        (
+            Box::new(|m| m["jobs"][0]["name"] = json!("   ")),
+            "job '   ': job name must be nonempty, at most 64 UTF-8 bytes, and contain no control characters",
+        ),
+        (
+            Box::new(|m| m["workflow"] = json!("   ")),
+            "workflow '   ': workflow name must be nonempty, at most 64 UTF-8 bytes, and contain no control characters",
+        ),
+        (
+            Box::new(|m| m["environment"] = json!(" ")),
+            "environment ' ': environment name must be nonempty, at most 64 UTF-8 bytes, and contain no control characters",
+        ),
+        (
+            Box::new(|m| m["environment"] = json!("e".repeat(65))),
+            "environment name must be nonempty, at most 64 UTF-8 bytes, and contain no control characters",
+        ),
     ];
     let mock = Mock::store();
     for (edit, message) in cases {
@@ -2182,6 +2201,36 @@ fn replay_revalidates_snapshots_before_sending() {
     );
     assert_eq!(mock.requests().len(), 1);
     assert_eq!(mock.requests()[0].json()["report"]["report_id"], "r2");
+}
+
+#[test]
+fn replay_does_not_send_snapshots_with_invalid_names() {
+    for (field, value) in [
+        ("environment", json!("e".repeat(65))),
+        ("environment", json!("   ")),
+        ("job", json!("   ")),
+        ("workflow", json!("\t")),
+    ] {
+        let mock = Mock::store();
+        let (p, dir) = saved_run(None);
+        let path = dir.join("test/pending/000.json");
+        let mut snapshot: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        snapshot[field] = value.clone();
+        std::fs::write(&path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+        let output = replay(&p.dir, &dir, Some(&mock.url), &["--json"]);
+        assert_eq!(output.status.code(), Some(1), "{field} {value}");
+        let events = events(&output);
+        let pending = by_type(&events, "report_upload_pending");
+        assert_eq!(pending.len(), 1, "{field} {value}");
+        assert_eq!(pending[0]["reason"], "invalid_snapshot");
+        let summary = events.last().unwrap();
+        assert_eq!(
+            (summary["acknowledged"].clone(), summary["invalid"].clone()),
+            (json!(1), json!(1))
+        );
+        assert_eq!(mock.requests().len(), 1);
+        assert_eq!(mock.requests()[0].json()["report"]["report_id"], "r2");
+    }
 }
 
 #[test]
@@ -3683,13 +3732,19 @@ fn run_record_directory_exists_before_jobs_run_without_report_jobs() {
 
 #[test]
 fn invalid_records_are_skipped_without_freezing() {
-    // Until validate-job-names lands, only reporting job names are capped at 64 bytes.
-    let long = "j".repeat(65);
+    // Config cannot produce an invalid name, but it can give a job more
+    // steps than the record's graph may list.
+    let skipped_steps = "[[jobs.steps]]\nid = \"s{}\"\ncommand = \"true\"\ncondition = { expression = \"false\" }\n";
+    let skipped_steps: String = (0..1024)
+        .map(|i| skipped_steps.replace("{}", &i.to_string()))
+        .collect();
     let mock = Mock::store();
     for (command, code) in [("true", 0), ("exit 3", 1)] {
         let p = project_with(
             HISTORY,
-            &format!("[[jobs]]\nname = \"{long}\"\ncommand = '{command}'\n"),
+            &format!(
+                "[[jobs]]\nname = \"j\"\n[[jobs.steps]]\nid = \"first\"\ncommand = '{command}'\n{skipped_steps}"
+            ),
         );
         let output = run_history(&p, &["--json", "--history"], Some(&mock.url));
         assert_eq!(output.status.code(), Some(code));
@@ -3697,8 +3752,7 @@ fn invalid_records_are_skipped_without_freezing() {
         let skipped = by_type(&events, "run_upload_skipped");
         assert_eq!(skipped.len(), 1);
         assert_eq!(skipped[0]["reason"], "invalid_record");
-        assert_eq!(skipped[0]["path"], "results[0].name");
-        assert!(!skipped[0].to_string().contains(&long));
+        assert_eq!(skipped[0]["path"], "graph.jobs[0].steps");
         // Nothing is kept for replay and the manifest is as finalized.
         let dir = &run_dirs(&p)[0];
         assert!(!dir.join("run-record.json").exists());

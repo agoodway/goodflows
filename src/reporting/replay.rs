@@ -80,15 +80,23 @@ fn validate(manifest: &Manifest) -> Result<()> {
     // The env names choose which of this process's variables become the
     // endpoint and the Bearer key, so they follow the config rules exactly.
     config::validate_credential_env_names(&manifest.url_env, &manifest.token_env)?;
-    if !config::valid_report_name(&manifest.workflow) {
-        bail!("workflow name is invalid");
+    if !run_contract::valid_name(&manifest.workflow) {
+        bail!(
+            "workflow '{}': workflow name {}",
+            manifest.workflow.escape_debug(),
+            config::NAME_RULE
+        );
     }
-    if manifest
+    if let Some(environment) = manifest
         .environment
         .as_deref()
-        .is_some_and(|e| !config::valid_report_name(e))
+        .filter(|e| !run_contract::valid_name(e))
     {
-        bail!("environment name is invalid");
+        bail!(
+            "environment '{}': environment name {}",
+            environment.escape_debug(),
+            config::NAME_RULE
+        );
     }
     // A run record is listed exactly when the manifest is version 3, and
     // otherwise partition entries exist exactly when it is version 2, so an
@@ -115,8 +123,12 @@ fn validate(manifest: &Manifest) -> Result<()> {
     // and the indexes seen so far.
     let mut names: HashMap<&str, Option<(u32, HashSet<u32>)>> = HashMap::new();
     for job in &manifest.jobs {
-        if !config::valid_report_name(&job.name) {
-            bail!("job names must be 1-64 UTF-8 bytes without control characters");
+        if !run_contract::valid_name(&job.name) {
+            bail!(
+                "job '{}': job name {}",
+                job.name.escape_debug(),
+                config::NAME_RULE
+            );
         }
         match (names.get_mut(job.name.as_str()), job.partition) {
             (None, None) => {

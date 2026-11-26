@@ -47,8 +47,8 @@ Every key in the JSON object a command writes to `$GOODFLOWS_OUTPUT` MUST follow
 - **THEN** the output is accepted and the dependent receives its value
 
 ### Requirement: Saved report names follow the name rule
-Refs: G1, G2, NG3, D7
-Replay and upload of saved reports MUST apply the name rule to the workflow, environment and job names in a run manifest and in every request snapshot. A manifest with a name that breaks the rule MUST be refused before any request is built. A snapshot with such a name MUST NOT be sent and SHALL be counted as `invalid_envelope`.
+Refs: G1, G2, NG3, D7, D8, D9
+Replay and upload of saved reports MUST apply the name rule to the workflow, environment and job names in a run manifest and in every request snapshot. A manifest with a name that breaks the rule MUST be refused before any request is built. A snapshot with such a name MUST NOT be sent and SHALL be counted as `invalid_envelope`: its envelope check fails with that code, upload reports it as `report_upload_pending` with reason `invalid_snapshot` and counts it in the summary's `invalid` total, and the run's other valid snapshots are still sent.
 
 #### Scenario: Whitespace-only name in a manifest
 - **WHEN** a hand-edited run manifest names a job `"   "`

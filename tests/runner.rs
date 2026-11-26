@@ -34,7 +34,7 @@ fn validation_rejects_invalid_configs_before_commands_execute() {
     let cases = [
         ("", "no jobs"),
         ("[[jobs]]\nname='a'\ncommand='touch ran'\n[[jobs]]\nname='a'\ncommand='true'", "duplicate job"),
-        ("[[jobs]]\nname=' '\ncommand='touch ran'", "empty job name"),
+        ("[[jobs]]\nname=' '\ncommand='touch ran'", "job name must be nonempty"),
         ("[[jobs]]\nname='a'\ncommand=' '", "empty command"),
         ("[[jobs]]\nname='a'\ncommand='touch ran'\ncondition=' '", "condition must be nonempty"),
         ("[[jobs]]\nname='a'\ncommand='touch ran'\ncondition=\"true\\u0000\"", "condition must be nonempty"),
@@ -1066,4 +1066,232 @@ fn plain_text_labels_instances_with_the_profile_count() {
         assert!(out.contains(&format!("test ({index}/6) PASSED")), "{out}");
     }
     assert!(!out.contains("/3)"), "{out}");
+}
+
+/// A config with one workflow, environment profile, job, step id and output
+/// key, each named by `name(kind)`, plus jobs whose names are valid only
+/// because spaces, punctuation and non-ASCII text are allowed.
+fn names_config(name: impl Fn(&str) -> String) -> String {
+    format!(
+        r#"
+[[jobs]]
+name = "{job}"
+outputs = {{ "{output}" = "steps.{step}.outputs.value" }}
+[[jobs.steps]]
+id = "{step}"
+command = "true"
+[[jobs]]
+name = "{wide}"
+command = "true"
+[[jobs]]
+name = "a b,c"
+command = "true"
+[[jobs]]
+name = "-x"
+command = "true"
+[[jobs]]
+name = "it's"
+command = "true"
+[[workflows."{workflow}".jobs]]
+name = "w"
+command = "true"
+[environments."{environment}".settings]
+parallelism = 1
+"#,
+        job = name("job"),
+        output = name("output"),
+        step = name("step"),
+        workflow = name("workflow"),
+        environment = name("environment"),
+        wide = "é".repeat(32),
+    )
+}
+
+#[test]
+fn every_kind_of_name_follows_one_64_byte_rule() {
+    let p = Project::new(&names_config(|kind| kind[..1].repeat(64)));
+    success(&p.run(&["validate"]));
+    for long in ["workflow", "environment", "job", "step", "output"] {
+        let p = Project::new(&names_config(|kind| {
+            kind[..1].repeat(if kind == long { 65 } else { 64 })
+        }));
+        let output = p.run(&["validate"]);
+        assert_eq!(output.status.code(), Some(2), "{long}");
+        let error = stderr(&output);
+        assert!(
+            error.contains(&format!(
+                "{long} name must be nonempty, at most 64 UTF-8 bytes, and contain no control characters"
+            )),
+            "{long}: {error}"
+        );
+    }
+}
+
+#[test]
+fn long_job_names_are_refused_in_every_workflow_before_anything_runs() {
+    let long = "j".repeat(65);
+    let job = format!("name = \"{long}\"\ncommand = \"touch ran\"\n");
+    let root = format!("[[jobs]]\n{job}");
+    let other = format!(
+        "[[jobs]]\nname = \"ok\"\ncommand = \"touch ran\"\n[[workflows.other.jobs]]\n{job}"
+    );
+    for config in [root, other] {
+        let p = Project::new(&config);
+        for args in [&["validate"][..], &["list"], &["run"], &[]] {
+            let output = p.run(args);
+            assert_eq!(output.status.code(), Some(2), "{config} {args:?}");
+            let error = stderr(&output);
+            assert!(
+                error.contains(&format!(
+                    "job '{long}': job name must be nonempty, at most 64 UTF-8 bytes"
+                )),
+                "{args:?}: {error}"
+            );
+            assert!(!p.dir.join("ran").exists());
+        }
+    }
+    let p = Project::new(
+        "[[jobs]]\nname = \"a\"\ncommand = \"touch ran\"\n[[jobs]]\nname = \"a\"\ncommand = \"true\"\n",
+    );
+    let output = p.run(&["validate"]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(stderr(&output).contains("duplicate job name 'a'"));
+}
+
+#[test]
+fn blank_and_control_character_job_names_are_refused_escaped() {
+    let cases = [
+        ("   ", "   "),
+        ("", ""),
+        ("a\\u001b[2Jb", "a\\u{1b}[2Jb"),
+        ("a\\tb", "a\\tb"),
+        ("a\\nb", "a\\nb"),
+        ("a\\rb", "a\\rb"),
+        ("a\\u0000b", "a\\0b"),
+        ("a\\u009bb", "a\\u{9b}b"),
+    ];
+    for (name, escaped) in cases {
+        let p = Project::new(&format!(
+            "[[jobs]]\nname = \"{name}\"\ncommand = \"touch ran\"\n"
+        ));
+        for args in [&["validate"][..], &["run"]] {
+            let output = p.run(args);
+            assert_eq!(output.status.code(), Some(2), "{name:?}");
+            let error = stderr(&output);
+            assert!(
+                error.contains(&format!(
+                    "job '{escaped}': job name must be nonempty, at most 64 UTF-8 bytes, and contain no control characters"
+                )),
+                "{name:?}: {error}"
+            );
+            assert!(
+                !output
+                    .stderr
+                    .iter()
+                    .chain(&output.stdout)
+                    .any(|&b| b != b'\n' && b.is_ascii_control()),
+                "{name:?}: {error:?}"
+            );
+            assert!(!error.contains('\u{9b}'), "{error:?}");
+            assert!(!p.dir.join("ran").exists());
+        }
+    }
+    // The name is reported before the job's other problems.
+    let p =
+        Project::new("[[jobs]]\nname = \"a\\u001bb\"\ncommand = \"touch ran\"\ntimeout_secs = 0\n");
+    let output = p.run(&["validate"]);
+    assert_eq!(output.status.code(), Some(2));
+    let error = stderr(&output);
+    let name = error.find("job name must be").expect(&error);
+    let timeout = error.find("timeout_secs").expect(&error);
+    assert!(name < timeout, "{error}");
+    assert!(!error.contains('\u{1b}'), "{error:?}");
+}
+
+#[test]
+fn workflow_and_environment_names_are_escaped_in_every_error() {
+    let rule = "must be nonempty, at most 64 UTF-8 bytes, and contain no control characters";
+    let p = Project::new(
+        r#"[[workflows."w\u001b[2Jx".jobs]]
+name = "j"
+command = "touch ran"
+timeout_secs = 0
+
+[environments."e\u001b[2Jx".partitions]
+nope = 2
+
+[environments."e\u001b[2Jx".settings.env]
+GOODFLOWS_OUTPUT = "x"
+"#,
+    );
+    for args in [&["validate"][..], &["list"], &["run"]] {
+        let output = p.run(args);
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        let error = stderr(&output);
+        for expected in [
+            format!("workflow 'w\\u{{1b}}[2Jx': workflow name {rule}"),
+            "workflow 'w\\u{1b}[2Jx': job 'j' timeout_secs must be greater than zero".to_owned(),
+            format!("environment 'e\\u{{1b}}[2Jx': environment name {rule}"),
+            "environment 'e\\u{1b}[2Jx': unknown job 'nope'".to_owned(),
+            "environment 'e\\u{1b}[2Jx' settings env".to_owned(),
+        ] {
+            assert!(error.contains(&expected), "{args:?} {expected}: {error}");
+        }
+        assert!(
+            !output
+                .stderr
+                .iter()
+                .chain(&output.stdout)
+                .any(|&b| b != b'\n' && b.is_ascii_control()),
+            "{args:?}: {error:?}"
+        );
+        assert!(!p.dir.join("ran").exists());
+    }
+}
+
+#[test]
+fn step_ids_and_output_keys_are_escaped_in_every_error() {
+    let p = Project::new(
+        r#"[settings.secrets]
+TOKEN = "op://dev/item/token"
+
+[[jobs]]
+name = "j"
+secrets = ["TOKEN"]
+outputs = { "k\u001b[2Jx" = "@", "r\u001b[2Jx" = "steps['n\\u001b[2Jx'].outputs.v" }
+
+[[jobs.steps]]
+id = "s\u001b[2Jx"
+command = "touch ran"
+env = { TOKEN = "x" }
+
+[[jobs.steps]]
+id = "s\u001b[2Jx"
+command = "touch ran"
+"#,
+    );
+    for args in [&["validate"][..], &["list"], &["run"]] {
+        let output = p.run(args);
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        let error = stderr(&output);
+        for expected in [
+            "step 's\\u{1b}[2Jx': step name must be",
+            "step 's\\u{1b}[2Jx': env must not set TOKEN: the job lists it in secrets",
+            "step 's\\u{1b}[2Jx': duplicate step id 's\\u{1b}[2Jx'",
+            "output 'k\\u{1b}[2Jx': output name must be",
+            "output 'k\\u{1b}[2Jx': expected scalar literal",
+            "output 'r\\u{1b}[2Jx': output reference requires an earlier step 'n\\u{1b}[2Jx'",
+        ] {
+            assert!(error.contains(expected), "{args:?} {expected}: {error}");
+        }
+        assert!(
+            !output
+                .stderr
+                .iter()
+                .chain(&output.stdout)
+                .any(|&b| b != b'\n' && b.is_ascii_control()),
+            "{args:?}: {error:?}"
+        );
+        assert!(!p.dir.join("ran").exists());
+    }
 }

@@ -1,7 +1,7 @@
 ---
 format: goodflows-change/1
 id: validate-job-names
-status: proposed
+status: approved
 size: small
 door: two_way
 capabilities: [name-rule, run-report]
@@ -63,6 +63,16 @@ decisions:
     answer: They call the shared predicate for workflow, environment and job names in manifests and snapshots, so a whitespace-only name, which only hand-editing a spool file can produce, is now refused. Replay's existing error messages stay as they are.
     by: agent
     why: The old report check did not trim, so whitespace-only names reached the server, which refuses them.
+  - id: D8
+    question: How does an upload show a snapshot refused for a name?
+    answer: Its envelope check fails with invalid_envelope, and upload handles it like any other snapshot that fails revalidation, a report_upload_pending event with reason invalid_snapshot and one more in the summary's invalid count, while the run's other valid snapshots are still sent.
+    by: agent
+    why: "Found while building: upload maps every envelope check failure to the existing invalid_snapshot reason and invalid count, so invalid_envelope is never printed; the requirement now says what a user sees."
+  - id: D9
+    question: What does replay say when a manifest name breaks the rule?
+    answer: "Replay's manifest errors state the rule from the shared rule message and name the name, escaped, as workflow '<name>': workflow name must be ..., environment '<name>': environment name must be ... and job '<name>': job name must be .... This replaces D7's choice to keep replay's existing messages."
+    by: agent
+    why: "Found while building: the old job message said 1-64 UTF-8 bytes without control characters, which a whitespace-only name satisfies, and did not say which job, and the workflow and environment messages did not state the rule."
 left_to_builder:
   - Config name errors keep the existing wording "<kind> name must be nonempty, at most 64 UTF-8 bytes, and contain no control characters"; a job error is prefixed with job '<name escaped with escape_debug>', and inside a named workflow with that workflow's prefix as today.
   - The runtime output key error is wrapped by the existing "invalid job outputs" message and states the same rule.

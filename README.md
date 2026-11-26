@@ -141,6 +141,12 @@ Jobs run with `sh -c` unless the job sets `shell = false`. With `shell = false`,
 
 goodflows rejects unknown keys. It checks the whole file before any command runs. `goodflows validate` reports every problem it finds in one pass. A file that is not valid TOML, or that has an unknown key, reports only that first error, because parsing stops there.
 
+Every name goodflows accepts follows one rule, the same rule the run history and test timing endpoints apply:
+
+- <a id="name-rule"></a>**Names** of workflows, environment profiles, jobs, caches, step ids, `outputs` keys, and the keys a command writes to `GOODFLOWS_OUTPUT` must be nonempty after trimming whitespace, at most 64 UTF-8 bytes, and contain no control characters. Spaces, punctuation and non-ASCII text are allowed. goodflows checks every workflow and profile in the file, selected or not, before anything runs, and a bad name is a config error (exit 2) that names the kind of name and, for a job, step or output key, which one. A key written to `GOODFLOWS_OUTPUT` is checked when the command finishes: a bad key fails that command or step with `invalid job outputs`, the job publishes no outputs, and its dependents are skipped.
+
+Upgrading from 0.9 or earlier: job names over 64 bytes were accepted unless the job declared `reports`, and keys written to `GOODFLOWS_OUTPUT` had no length limit. Rename a long job name along with its `depends_on`, `--jobs` and profile `partitions` references, and shorten a long output key along with the expressions that use it. Scripts that matched the messages `empty job name`, `job '<name>' contains invalid control characters`, `reporting job name must be ...` or `output keys must be nonempty and contain no control characters` should match `job name must be nonempty, at most 64 UTF-8 bytes, and contain no control characters` or `output name must be ...` instead.
+
 Environment values are literal strings. Layers merge by key, and a later layer replaces the same key: the calling process, `[settings.env]`, the workflow's `settings.env`, the selected profile's `settings.env`, the job's `env`, then the step's `env`.
 
 goodflows sets `GOODFLOWS_RUN_ID` itself. A command that may publish outputs also receives `GOODFLOWS_OUTPUT`. A selected profile sets `GOODFLOWS_ENVIRONMENT` to the profile name. Partitioned jobs receive `GOODFLOWS_PARTITION` (1-based) and `GOODFLOWS_PARTITION_COUNT`. Reporting jobs receive `GOODFLOWS_REPORT_DIR`. Config must not set those names.
@@ -293,7 +299,7 @@ Expressions can read `env.NAME`, `needs.JOB.outputs.KEY` for a job listed in `de
 
 A job has a `command` or a nonempty `steps` list, not both. Steps run in order in one parallelism slot, under the job's `timeout_secs`.
 
-A command publishes outputs by writing one JSON object to the path in `GOODFLOWS_OUTPUT`. The file must be at most 64 KiB. Each value must be a boolean, a number, or a string. An empty file publishes nothing. A command job must not set `outputs`. The JSON object's keys are that job's outputs.
+A command publishes outputs by writing one JSON object to the path in `GOODFLOWS_OUTPUT`. The file must be at most 64 KiB. Each key must follow the [name rule](#name-rule), so at most 64 UTF-8 bytes. Each value must be a boolean, a number, or a string. An empty file publishes nothing. A command job must not set `outputs`. The JSON object's keys are that job's outputs.
 
 A step job publishes only the keys in its `outputs` map. The map's values are expressions, usually `steps.ID.outputs.KEY`. Step outputs stay inside the job until that map promotes them. Partitioned jobs cannot publish job outputs. Resolved secret values in output keys, strings and numbers are replaced with `[redacted]` (see Secrets); nothing else is redacted.
 
@@ -664,7 +670,7 @@ The record holds the same fields the history file would hold: outcome, timings, 
 - `ci`, when the caller's environment has `GITHUB_ACTIONS=true`. It is built from `GITHUB_EVENT_NAME`, `GITHUB_RUN_ID`, `GITHUB_RUN_ATTEMPT`, `GITHUB_REF`, `RUNNER_NAME`, `GITHUB_SERVER_URL`, and `GITHUB_REPOSITORY`. A value that fails its rule is left out. Settings and job `env` never supply these values.
 - `graph`, the job graph that `graph_sha256` hashes. It lists every selected job with its command, step commands, and condition text, each cut to 1,024 bytes. That includes jobs that were skipped or never started, so the server receives command text for jobs that did not run. A workflow-call job names its target and the target's hash. The target's jobs are in the called workflow's own record.
 
-The key and URL variables must be set when the run starts. When either is unset, the run prints `run history for <workflow> upload skipped: credentials unavailable`, keeps nothing, and sends nothing. Leave the key unset on machines that should not upload, such as laptops. A URL that is not a valid endpoint gives `invalid url` instead. goodflows does not send a record that breaks the server's rules, such as a job name longer than 64 bytes. The line then ends `upload skipped: invalid record at <path>`, where `<path>` is a field path such as `results[3].name`.
+The key and URL variables must be set when the run starts. When either is unset, the run prints `run history for <workflow> upload skipped: credentials unavailable`, keeps nothing, and sends nothing. Leave the key unset on machines that should not upload, such as laptops. A URL that is not a valid endpoint gives `invalid url` instead. goodflows does not send a record that breaks the server's rules, such as a job with more than 1024 steps; names cannot break them, because config follows the same [name rule](#name-rule). The line then ends `upload skipped: invalid record at <path>`, where `<path>` is a field path such as `results[3].name`.
 
 The upload runs after the test reports, before the final report, and uses what is left of the same 30-second budget. It never changes the exit code. A record that was not stored stays in the spool, and [`reports upload`](#test-timing-reports) sends it again. That includes a record refused with HTTP 422 by a server that does not accept it yet.
 

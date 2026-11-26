@@ -452,3 +452,58 @@ command = "echo \"$MODE\" > mode"
         [("ci", "scan"), ("suite", "first"), ("suite", "second")]
     );
 }
+
+#[test]
+fn runtime_output_keys_follow_the_name_rule() {
+    // A step and a command that write a 65-byte key fail with the rule.
+    let long = "k".repeat(65);
+    let write = format!(r#"printf '%s' '{{"{long}":"x"}}' > "$GOODFLOWS_OUTPUT""#);
+    for producer in [
+        format!("outputs = {{ v = 'steps.s.outputs.v' }}\n[[jobs.steps]]\nid = 's'\ncommand = '''{write}'''"),
+        format!("command = '''{write}'''"),
+    ] {
+        let p = Project::new(&format!(
+            "[[jobs]]\nname = 'produce'\n{producer}\n[[jobs]]\nname = 'consume'\ncommand = 'touch ran'\ndepends_on = ['produce']\n"
+        ));
+        let output = p.run(&["run", "--json"]);
+        assert_eq!(output.status.code(), Some(1), "{producer}");
+        let events = events(&output);
+        let results = &events.last().unwrap()["results"];
+        assert_eq!(results[0]["status"], "failed", "{producer}");
+        let error = results[0]["error"].as_str().unwrap();
+        assert!(
+            error.contains(
+                "invalid job outputs: output name must be nonempty, at most 64 UTF-8 bytes, and contain no control characters"
+            ),
+            "{error}"
+        );
+        assert_eq!(results[0]["outputs"], json!({}));
+        assert_eq!(results[1]["status"], "skipped");
+        assert!(!p.dir.join("ran").exists());
+    }
+
+    // A 64-byte key is published and a dependent reads it.
+    let key = "k".repeat(64);
+    let p = Project::new(&format!(
+        r#"
+[[jobs]]
+name = "produce"
+outputs = {{ "{key}" = "steps.s.outputs['{key}']" }}
+[[jobs.steps]]
+id = "s"
+command = '''printf '%s' '{{"{key}":"x"}}' > "$GOODFLOWS_OUTPUT"'''
+[[jobs]]
+name = "consume"
+depends_on = ["produce"]
+condition = {{ expression = "needs.produce.outputs['{key}'] == \"x\"" }}
+command = "touch ran"
+"#
+    ));
+    let output = p.run(&["run", "--json"]);
+    assert_eq!(output.status.code(), Some(0), "{}", stdout(&output));
+    let events = events(&output);
+    let results = &events.last().unwrap()["results"];
+    assert_eq!(results[0]["outputs"], json!({ key.as_str(): "x" }));
+    assert_eq!(results[1]["status"], "passed");
+    assert!(p.dir.join("ran").exists());
+}

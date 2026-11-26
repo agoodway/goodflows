@@ -12,7 +12,7 @@
 //! reported on its enclosing object, so no submitted key or value ever
 //! reaches the error.
 
-use super::contract::MAX_SAFE_INTEGER;
+use super::contract::{MAX_NAME_BYTES, MAX_SAFE_INTEGER};
 use reqwest::Url;
 use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet};
@@ -25,7 +25,6 @@ pub const MAX_DEPTH: usize = 8;
 const MAX_ENTRIES: usize = 1024;
 /// `command`, `error`, and graph command and condition text.
 const MAX_TEXT_BYTES: usize = 1024;
-const MAX_NAME_BYTES: usize = 64;
 const MAX_BRANCH_BYTES: usize = 256;
 pub const MAX_CI_RUN_ID_BYTES: usize = 256;
 pub const MAX_URL_BYTES: usize = 2048;
@@ -128,8 +127,9 @@ pub fn validate(record: &Value, encoded_len: usize) -> Result<(), Violation> {
     Ok(())
 }
 
-/// The server's name rule: 1-64 UTF-8 bytes, no control characters, and not
-/// only whitespace.
+/// The goodflows name rule, which is also the server's: 1 to
+/// [`MAX_NAME_BYTES`] UTF-8 bytes, no control characters, and not only
+/// whitespace. Every name check calls this.
 pub fn valid_name(name: &str) -> bool {
     valid_label(name, MAX_NAME_BYTES) && !name.trim().is_empty()
 }

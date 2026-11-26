@@ -2090,9 +2090,7 @@ async fn read_outputs(path: &Path, masker: &crate::secrets::Masker) -> Result<Ma
         })?;
     let mut masked = Map::new();
     for (key, raw) in outputs {
-        if key.trim().is_empty() || key.chars().any(char::is_control) {
-            bail!("output keys must be nonempty and contain no control characters");
-        }
+        crate::config::validate_name(&key, "output")?;
         let key = masker.mask_str(&key);
         let mut value: Value =
             serde_json::from_str(raw.get()).with_context(|| format!("output '{key}'"))?;

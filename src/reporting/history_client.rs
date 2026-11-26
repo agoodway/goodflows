@@ -100,11 +100,7 @@ fn lowercase_hex(value: &str, lengths: &[usize]) -> bool {
 
 /// The server's name rule, for `--workflow`, `--environment` and `--event`.
 pub fn name(value: &str) -> Result<String, String> {
-    checked(
-        value,
-        valid_name(value),
-        "must be 1-64 bytes, contain no control characters and not be only whitespace",
-    )
+    checked(value, valid_name(value), crate::config::NAME_RULE)
 }
 
 pub fn commit(value: &str) -> Result<String, String> {
@@ -355,7 +351,11 @@ mod tests {
     fn filter_rules_match_the_server() {
         assert!(name("ci").is_ok());
         for bad in ["", " ", "a\u{1b}b", &"n".repeat(65)] {
-            assert!(name(bad).is_err(), "{bad:?}");
+            assert_eq!(
+                name(bad),
+                Err(crate::config::NAME_RULE.to_owned()),
+                "{bad:?}"
+            );
         }
         assert!(name(&"é".repeat(32)).is_ok());
         assert!(commit(&"a".repeat(40)).is_ok());

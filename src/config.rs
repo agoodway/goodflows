@@ -96,7 +96,7 @@ fn did_you_mean<'a>(name: &str, candidates: impl IntoIterator<Item = &'a str>) -
     let names: Vec<_> = close
         .iter()
         .take(3)
-        .map(|(_, name)| format!("'{name}'"))
+        .map(|(_, name)| format!("'{}'", name.escape_debug()))
         .collect();
     Some(format!("did you mean {}?", names.join(" or ")))
 }
@@ -447,13 +447,6 @@ fn validate_credential_env_name(block: &str, field: &str, name: &str) -> Result<
         bail!("{block} {field} must not name a reserved goodflows variable");
     }
     Ok(())
-}
-
-/// The server's workflow/job/environment name rule: 1-64 UTF-8 bytes, no control characters.
-pub fn valid_report_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() <= crate::reporting::contract::MAX_NAME_BYTES
-        && !name.chars().any(char::is_control)
 }
 
 pub fn valid_project_slug(slug: &str) -> bool {
@@ -1152,9 +1145,16 @@ pub fn validate_workflow_name(name: &str) -> Result<()> {
     validate_name(name, "workflow")
 }
 
-fn validate_name(name: &str, kind: &str) -> Result<()> {
-    if name.trim().is_empty() || name.len() > 64 || name.chars().any(char::is_control) {
-        bail!("{kind} name must be nonempty, at most 64 UTF-8 bytes, and contain no control characters");
+/// What [`crate::reporting::run_contract::valid_name`] requires, after
+/// "<kind> name". The 64 is `MAX_NAME_BYTES`; a test keeps them equal.
+pub(crate) const NAME_RULE: &str =
+    "must be nonempty, at most 64 UTF-8 bytes, and contain no control characters";
+
+/// Workflow, environment, job, step, cache and output names, including keys
+/// a command writes to `GOODFLOWS_OUTPUT`.
+pub(crate) fn validate_name(name: &str, kind: &str) -> Result<()> {
+    if !crate::reporting::run_contract::valid_name(name) {
+        bail!("{kind} name {NAME_RULE}");
     }
     Ok(())
 }
@@ -1242,6 +1242,7 @@ impl Config {
             );
         }
         for (name, workflow) in &mut config.workflows {
+            let label = name.escape_debug();
             workflow.settings.workdir = note(
                 &mut problems,
                 resolve_workdir(
@@ -1252,15 +1253,16 @@ impl Config {
                         .as_deref()
                         .or(shared_workdir.as_deref()),
                 )
-                .with_context(|| format!("workflow '{name}'")),
+                .with_context(|| format!("workflow '{label}'")),
             );
         }
         for (name, environment) in &mut config.environments {
+            let label = name.escape_debug();
             if let Some(workdir) = &environment.settings.workdir {
                 environment.settings.workdir = note(
                     &mut problems,
                     resolve_workdir(base, Some(workdir))
-                        .with_context(|| format!("environment '{name}'")),
+                        .with_context(|| format!("environment '{label}'")),
                 );
             }
         }
@@ -1278,18 +1280,21 @@ impl Config {
             .context("settings"),
         );
         for (name, workflow) in &mut config.workflows {
+            let label = name.escape_debug();
             if let Some(dir) = &workflow.settings.history_dir {
                 workflow.settings.history_dir = note(
                     &mut problems,
-                    resolve_history_dir(base, dir).with_context(|| format!("workflow '{name}'")),
+                    resolve_history_dir(base, dir).with_context(|| format!("workflow '{label}'")),
                 );
             }
         }
         for (name, environment) in &mut config.environments {
+            let label = name.escape_debug();
             if let Some(dir) = &environment.settings.history_dir {
                 environment.settings.history_dir = note(
                     &mut problems,
-                    resolve_history_dir(base, dir).with_context(|| format!("environment '{name}'")),
+                    resolve_history_dir(base, dir)
+                        .with_context(|| format!("environment '{label}'")),
                 );
             }
         }
@@ -1352,21 +1357,23 @@ impl Config {
             );
         }
         for (name, workflow) in &self.workflows {
+            let label = name.escape_debug();
             note(
                 &mut problems,
                 workflow
                     .cache
                     .validate()
-                    .with_context(|| format!("workflow '{name}' cache")),
+                    .with_context(|| format!("workflow '{label}' cache")),
             );
         }
         for (name, environment) in &self.environments {
+            let label = name.escape_debug();
             note(
                 &mut problems,
                 environment
                     .cache
                     .validate()
-                    .with_context(|| format!("environment '{name}' cache")),
+                    .with_context(|| format!("environment '{label}' cache")),
             );
         }
         let reporting = self.reporting.as_ref();
@@ -1392,10 +1399,11 @@ impl Config {
             self.settings.validate_history().context("settings"),
         );
         for (name, workflow) in &self.workflows {
+            let label = name.escape_debug();
             note(
                 &mut problems,
                 validate_settings_env(&workflow.settings.env, reporting)
-                    .with_context(|| format!("workflow '{name}' settings env")),
+                    .with_context(|| format!("workflow '{label}' settings env")),
             );
             problems.extend(
                 validate_settings_secrets(
@@ -1405,21 +1413,22 @@ impl Config {
                     cache_token_env,
                 )
                 .into_iter()
-                .map(|problem| problem.context(format!("workflow '{name}' settings secrets"))),
+                .map(|problem| problem.context(format!("workflow '{label}' settings secrets"))),
             );
             note(
                 &mut problems,
                 workflow
                     .settings
                     .validate_history()
-                    .with_context(|| format!("workflow '{name}' settings")),
+                    .with_context(|| format!("workflow '{label}' settings")),
             );
         }
         for (name, environment) in &self.environments {
+            let label = name.escape_debug();
             note(
                 &mut problems,
                 validate_settings_env(&environment.settings.env, reporting)
-                    .with_context(|| format!("environment '{name}' settings env")),
+                    .with_context(|| format!("environment '{label}' settings env")),
             );
             problems.extend(
                 validate_settings_secrets(
@@ -1429,7 +1438,7 @@ impl Config {
                     cache_token_env,
                 )
                 .into_iter()
-                .map(|problem| problem.context(format!("environment '{name}' settings secrets"))),
+                .map(|problem| problem.context(format!("environment '{label}' settings secrets"))),
             );
             // A profile points names that exist at other references; it never
             // adds one, so `validate` can check every job's names without a profile.
@@ -1441,7 +1450,7 @@ impl Config {
                         .any(|workflow| workflow.settings.secrets.contains_key(secret));
                 if !defined {
                     problems.push(anyhow!(
-                        "environment '{name}' settings secrets: {secret} is not defined in [settings.secrets] or a workflow's settings.secrets; a profile can only change the reference of an existing name"
+                        "environment '{label}' settings secrets: {secret} is not defined in [settings.secrets] or a workflow's settings.secrets; a profile can only change the reference of an existing name"
                     ));
                 }
             }
@@ -1450,7 +1459,7 @@ impl Config {
                 environment
                     .settings
                     .validate_history()
-                    .with_context(|| format!("environment '{name}' settings")),
+                    .with_context(|| format!("environment '{label}' settings")),
             );
         }
         if !self.jobs.is_empty() {
@@ -1464,7 +1473,11 @@ impl Config {
             store_partitions(&mut self.jobs, partitions);
         }
         for (name, workflow) in &mut self.workflows {
-            note(&mut problems, validate_workflow_name(name));
+            let label = name.escape_debug();
+            note(
+                &mut problems,
+                validate_workflow_name(name).with_context(|| format!("workflow '{label}'")),
+            );
             let secrets: BTreeSet<&str> = self
                 .settings
                 .secrets
@@ -1476,13 +1489,17 @@ impl Config {
             problems.extend(
                 job_problems
                     .into_iter()
-                    .map(|problem| problem.context(format!("workflow '{name}'"))),
+                    .map(|problem| problem.context(format!("workflow '{label}'"))),
             );
             store_partitions(&mut workflow.jobs, partitions);
         }
         problems.extend(self.validate_calls());
         for name in self.environments.keys() {
-            note(&mut problems, validate_name(name, "environment"));
+            note(
+                &mut problems,
+                validate_name(name, "environment")
+                    .with_context(|| format!("environment '{}'", name.escape_debug())),
+            );
         }
         // Profile partition entries are checked for every profile, selected or
         // not, against jobs that declare `partitions` in any workflow.
@@ -1497,24 +1514,30 @@ impl Config {
             .map(|job| job.name.as_str())
             .collect();
         for (profile, environment) in &self.environments {
+            let label = profile.escape_debug();
             for (job, &count) in &environment.partitions {
+                let job_label = job.escape_debug();
                 note(
                     &mut problems,
                     partition_count(count)
-                        .with_context(|| format!("environment '{profile}': job '{job}'")),
+                        .with_context(|| format!("environment '{label}': job '{job_label}'")),
                 );
                 if !defined.contains(job.as_str()) {
                     let available = if partitioned.is_empty() {
                         "none".to_owned()
                     } else {
-                        partitioned.iter().copied().collect::<Vec<_>>().join(", ")
+                        partitioned
+                            .iter()
+                            .map(|name| name.escape_debug().to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
                     };
                     problems.push(anyhow!(
-                        "environment '{profile}': unknown job '{job}' (partitioned jobs: {available})"
+                        "environment '{label}': unknown job '{job_label}' (partitioned jobs: {available})"
                     ));
                 } else if !partitioned.contains(job.as_str()) {
                     problems.push(anyhow!(
-                        "environment '{profile}': job '{job}' is not partitioned"
+                        "environment '{label}': job '{job_label}' is not partitioned"
                     ));
                 }
             }
@@ -1554,10 +1577,14 @@ impl Config {
                 let Some(&to) = index.get(target) else {
                     let mut problem = format!(
                         "workflow '{}': job '{}': unknown workflow '{}' (available: {})",
-                        names[from],
-                        job.name,
+                        names[from].escape_debug(),
+                        job.name.escape_debug(),
                         target.escape_debug(),
-                        self.workflow_names().join(", ")
+                        self.workflow_names()
+                            .iter()
+                            .map(|name| name.escape_debug().to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
                     );
                     if let Some(hint) = did_you_mean(target, names.iter().copied()) {
                         problem = format!("{problem}; {hint}");
@@ -1594,12 +1621,12 @@ impl Config {
                         .map(|&(index, next)| {
                             format!(
                                 "workflow '{}' job '{}'",
-                                names[index],
-                                edges[index][next - 1].1
+                                names[index].escape_debug(),
+                                edges[index][next - 1].1.escape_debug()
                             )
                         })
                         .collect();
-                    path.push(format!("workflow '{}'", names[to]));
+                    path.push(format!("workflow '{}'", names[to].escape_debug()));
                     problems.push(anyhow!(
                         "workflow call cycle detected: {}",
                         path.join(" -> ")
@@ -1849,11 +1876,14 @@ fn validate_jobs(
     // A duplicate name or a bad dependency leaves no graph to check for cycles.
     let mut graph = true;
     for (index, job) in jobs.iter().enumerate() {
-        if job.name.trim().is_empty() {
-            problems.push(anyhow!("empty job name"));
+        // A job name breaking the rule may hold control characters, so every
+        // message here names the job escaped.
+        let label = job.name.escape_debug();
+        if let Err(problem) = validate_name(&job.name, "job") {
+            problems.push(problem.context(format!("job '{label}'")));
         }
         if names.insert(job.name.as_str(), index).is_some() {
-            problems.push(anyhow!("duplicate job name '{}'", job.name));
+            problems.push(anyhow!("duplicate job name '{label}'"));
             graph = false;
         }
         let (job_partitions, job_problems) = validate_job(job, reporting, secrets, &no_outputs);
@@ -1861,20 +1891,11 @@ fn validate_jobs(
         problems.extend(
             job_problems
                 .into_iter()
-                .map(|problem| problem.context(format!("job '{}'", job.name))),
+                .map(|problem| problem.context(format!("job '{label}'"))),
         );
         if job.timeout_secs == Some(0) {
             problems.push(anyhow!(
-                "job '{}' timeout_secs must be greater than zero",
-                job.name
-            ));
-        }
-        // Names appear in text output and rerun hints, so no control characters
-        // (including escape sequences). Other name rules are unchanged.
-        if job.name.chars().any(char::is_control) {
-            problems.push(anyhow!(
-                "job '{}' contains invalid control characters",
-                job.name.escape_debug()
+                "job '{label}' timeout_secs must be greater than zero"
             ));
         }
     }
@@ -1882,22 +1903,25 @@ fn validate_jobs(
     let mut dependents = vec![Vec::new(); jobs.len()];
     for (index, job) in jobs.iter().enumerate() {
         let mut seen = HashSet::new();
+        let label = job.name.escape_debug();
         for dep in &job.depends_on {
             if dep == &job.name {
-                problems.push(anyhow!("job '{}' depends on itself", job.name));
+                problems.push(anyhow!("job '{label}' depends on itself"));
                 graph = false;
                 continue;
             }
             if !seen.insert(dep) {
                 problems.push(anyhow!(
-                    "job '{}' has duplicate dependency '{}'",
-                    job.name,
-                    dep
+                    "job '{label}' has duplicate dependency '{}'",
+                    dep.escape_debug()
                 ));
                 continue;
             }
             let Some(&dep_index) = names.get(dep.as_str()) else {
-                let mut problem = format!("job '{}' depends on unknown job '{}'", job.name, dep);
+                let mut problem = format!(
+                    "job '{label}' depends on unknown job '{}'",
+                    dep.escape_debug()
+                );
                 if let Some(hint) = did_you_mean(dep, names.keys().copied()) {
                     problem = format!("{problem}; {hint}");
                 }
@@ -2066,7 +2090,7 @@ fn validate_job_secrets(job: &Job, defined: &BTreeSet<&str>) -> Vec<anyhow::Erro
             if step.env.contains_key(name) {
                 problems.push(anyhow!(
                     "step '{}': env must not set {name}: the job lists it in secrets",
-                    step.id
+                    step.id.escape_debug()
                 ));
             }
         }
@@ -2100,16 +2124,23 @@ fn validate_expression(
                 Some(_) => {}
             },
             Reference::Needs { job, .. } if !needs.contains(job) => {
-                bail!("output reference requires declared dependency '{job}'");
+                bail!(
+                    "output reference requires declared dependency '{}'",
+                    job.escape_debug()
+                );
             }
             Reference::Needs { job, .. } if no_outputs.contains_key(job.as_str()) => {
                 bail!(
-                    "{} job '{job}' publishes no outputs",
-                    no_outputs[job.as_str()]
+                    "{} job '{}' publishes no outputs",
+                    no_outputs[job.as_str()],
+                    job.escape_debug()
                 );
             }
             Reference::Step { step, .. } if !steps.contains(step) => {
-                bail!("output reference requires an earlier step '{step}'");
+                bail!(
+                    "output reference requires an earlier step '{}'",
+                    step.escape_debug()
+                );
             }
             _ => {}
         }
@@ -2157,11 +2188,6 @@ fn validate_reports(job: &Job, reporting: bool) -> Result<()> {
         if !seen.insert(format) {
             bail!("reports: duplicate format '{format}'");
         }
-    }
-    if !valid_report_name(&job.name) {
-        bail!(
-            "reporting job name must be at most 64 UTF-8 bytes and contain no control characters"
-        );
     }
     Ok(())
 }
@@ -2238,7 +2264,7 @@ fn validate_job(
     let mut steps = Vec::new();
     for step in &job.steps {
         let duplicate = if steps.contains(&step.id) {
-            Err(anyhow!("duplicate step id '{}'", step.id))
+            Err(anyhow!("duplicate step id '{}'", step.id.escape_debug()))
         } else {
             Ok(())
         };
@@ -2257,13 +2283,17 @@ fn validate_job(
         ] {
             note(
                 &mut problems,
-                check.with_context(|| format!("step '{}'", step.id)),
+                check.with_context(|| format!("step '{}'", step.id.escape_debug())),
             );
         }
         steps.push(step.id.clone());
     }
     for (key, source) in &job.outputs {
-        note(&mut problems, validate_name(key, "output"));
+        note(
+            &mut problems,
+            validate_name(key, "output")
+                .with_context(|| format!("output '{}'", key.escape_debug())),
+        );
         note(
             &mut problems,
             validate_expression(
@@ -2273,7 +2303,7 @@ fn validate_job(
                 no_outputs,
                 Some(&cache_names),
             )
-            .with_context(|| format!("output '{key}'")),
+            .with_context(|| format!("output '{}'", key.escape_debug())),
         );
     }
     (partitions, problems)
@@ -2550,17 +2580,38 @@ mod tests {
                 "[[jobs]]\nname = \"a{escape}b\"\ncommand = 'true'\n"
             ))
             .unwrap_err();
-            assert!(
-                error.contains("contains invalid control characters"),
-                "{error}"
-            );
+            assert!(error.contains(&format!("job name {NAME_RULE}")), "{error}");
         }
-        // Spaces, commas and long names stay valid.
-        let long = "x".repeat(100);
+        // Spaces, commas and names of exactly 64 bytes stay valid.
+        let long = "x".repeat(64);
         validate(&format!(
             "[[jobs]]\nname = 'a b,c'\ncommand = 'true'\n[[jobs]]\nname = '{long}'\ncommand = 'true'\n"
         ))
         .unwrap();
+        let error =
+            validate(&format!("[[jobs]]\nname = '{long}x'\ncommand = 'true'\n")).unwrap_err();
+        assert!(error.contains(&format!("job name {NAME_RULE}")), "{error}");
+    }
+
+    #[test]
+    fn name_rule_message_states_the_contract_limit() {
+        use crate::reporting::contract::MAX_NAME_BYTES;
+        assert!(
+            NAME_RULE.contains(&format!(" at most {MAX_NAME_BYTES} UTF-8 bytes,")),
+            "{NAME_RULE}"
+        );
+        let at_limit = "x".repeat(MAX_NAME_BYTES);
+        assert!(validate_name(&at_limit, "job").is_ok());
+        assert!(validate_name(&format!("{at_limit}x"), "job").is_err());
+        assert!(validate_name(&"é".repeat(MAX_NAME_BYTES / 2), "job").is_ok());
+        for bad in [
+            "", "   ", "a\tb", "a\nb", "a\rb", "a\0b", "a\u{1b}b", "a\u{9b}b",
+        ] {
+            assert!(validate_name(bad, "job").is_err(), "{bad:?}");
+        }
+        for good in ["a b,c", "-x", "it's"] {
+            assert!(validate_name(good, "job").is_ok(), "{good:?}");
+        }
     }
 
     fn resolved_env(

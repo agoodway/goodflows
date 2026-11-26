@@ -1253,9 +1253,15 @@ fn run_upload_events_have_one_text_line_each() {
             "upload skipped: spool unavailable".into(),
         ),
         (
-            format!("{HISTORY}[[jobs]]\nname = '{}'\ncommand = 'true'\n", "j".repeat(65)),
+            // More steps than the record's graph may list.
+            format!(
+                "{HISTORY}[[jobs]]\nname = 'a'\n{}",
+                (0..1025)
+                    .map(|i| format!("[[jobs.steps]]\nid = 's{i}'\ncommand = 'true'\ncondition = {{ expression = 'false' }}\n"))
+                    .collect::<String>()
+            ),
             Some(stored.url.clone()),
-            "upload skipped: invalid record at results[0].name".into(),
+            "upload skipped: invalid record at graph.jobs[0].steps".into(),
         ),
     ];
     let mocks: Vec<_> = [
@@ -1677,4 +1683,36 @@ fn history_json_emits_exactly_one_event() {
         show[0],
         serde_json::json!({"type": "history_run", "schema_version": 1, "run": body["data"]})
     );
+}
+
+#[test]
+fn failure_report_shows_escape_sequences_from_jobs_as_text() {
+    let p = Project::new(
+        "[[jobs]]\nname = 'paint'\ncommand = \"printf 'x\\u001b[2J\\r' >&2; true '\\u001b[2J'; exit 1\"\n",
+    );
+    for args in [&["--output=failures"][..], &["--output=stream"]] {
+        let output = p.run(args);
+        assert_eq!(output.status.code(), Some(1));
+        let text = stdout(&output);
+        assert!(
+            text.contains("  command: printf 'x\\u{1b}[2J\\r' >&2; true '\\u{1b}[2J'; exit 1\n"),
+            "{text}"
+        );
+        assert!(text.contains("    x\\u{1b}[2J\\r\n"), "{text}");
+        // Stream mode passes the job's own output through live; the report
+        // after it and everything in failures mode is escaped.
+        let report = &output.stdout[text.find("\ndefault  FAILED").expect(&text)..];
+        let written = if args == ["--output=failures"] {
+            &output.stdout[..]
+        } else {
+            report
+        };
+        assert!(
+            !written
+                .iter()
+                .chain(&output.stderr)
+                .any(|&b| b.is_ascii_control() && b != b'\n' && b != b'\t'),
+            "{text:?}"
+        );
+    }
 }

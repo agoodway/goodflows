@@ -626,7 +626,7 @@ pub fn validate_envelope(bytes: &[u8]) -> Result<Head, &'static str> {
     let string = |value: &Value| value.as_str().map(str::to_owned).ok_or(invalid);
     let name = |value: &Value| {
         string(value).and_then(|s| {
-            crate::config::valid_report_name(&s)
+            super::run_contract::valid_name(&s)
                 .then_some(s)
                 .ok_or(invalid)
         })
@@ -1940,6 +1940,19 @@ pub(super) mod tests {
             ),
             (
                 &|v: &mut Value| v["environment"] = json!(""),
+                "invalid_envelope",
+            ),
+            (
+                &|v: &mut Value| v["environment"] = json!("   "),
+                "invalid_envelope",
+            ),
+            (
+                &|v: &mut Value| v["environment"] = json!("e".repeat(65)),
+                "invalid_envelope",
+            ),
+            (&|v: &mut Value| v["job"] = json!(" "), "invalid_envelope"),
+            (
+                &|v: &mut Value| v["workflow"] = json!("  "),
                 "invalid_envelope",
             ),
             (
