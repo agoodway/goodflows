@@ -82,8 +82,8 @@ Why: Keys are only known at runtime and must still follow the rule the server ap
 
 1. Configure job `produce` with a step that writes `{"<65 x k>": "x"}` to `$GOODFLOWS_OUTPUT`, and job `consume` that depends on it. Run `goodflows run --json`.
    - Expect: `produce` fails with an invalid job outputs error that states the rule, it publishes no outputs, `consume` is skipped, and the run exits `1`.
-2. Change the key to exactly 64 bytes and have `consume` echo `${{ needs.produce.outputs['<64-byte key>'] }}`. Run again.
-   - Expect: both jobs pass, the run exits `0`, and `consume` prints `x`.
+2. Change the key to exactly 64 bytes and give `consume` the condition `needs.produce.outputs['<64-byte key>'] == "x"`. Run again.
+   - Expect: both jobs pass, `consume` runs rather than being skipped, and the run exits `0`.
 
 ### 5. Saved reports with invalid names are not sent (Must)
 
@@ -98,5 +98,5 @@ Why: Hand-edited spool files must not reach the server with names it refuses.
 
 Why: Job output must not clear or restyle the user's terminal.
 
-1. Configure a job whose command is `printf 'x\033[2J'; exit 1` with an error containing a bare carriage return, and run `goodflows run --output=failures > out.txt`.
+1. Configure a job whose command is `printf 'x\033[2J\ry'; exit 1`, so both its command and its output hold an escape sequence and a bare carriage return, and run `goodflows run --output=failures > out.txt`.
    - Expect: the report shows `\u{1b}[2J` and `\r` as visible text, and `out.txt` contains no raw control bytes other than newlines (tab allowed).

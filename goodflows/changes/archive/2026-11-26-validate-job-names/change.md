@@ -1,7 +1,7 @@
 ---
 format: goodflows-change/1
 id: validate-job-names
-status: approved
+status: archived
 size: small
 door: two_way
 capabilities: [name-rule, run-report]

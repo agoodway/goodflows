@@ -17,23 +17,22 @@ files:
   "tests/reporting.rs": 513cc402a4b3b7c5e627c4fd159999001c8702a3fdb4b1135bb27415790637bb
   "tests/runner.rs": 8b2292f4cbfee009390e76571d6d97517ce8a11cf615a488639b7832b38bb4ff
   "tests/steps.rs": ddfff909ead69f6c61c3d8f57d130f2022bbc5e92d346128b470f7bf3813f3b4
-open:
-  - "Runtime output keys follow the name rule | question | .goodflows/build/validate-job-names/build-1.md | QA scenario 4 step 2: goodflows has no ${{ }} interpolation in commands, so consume cannot echo the output; may the step read the key in consume's condition instead? | Recommend: amend step 4.2 so consume runs only when needs.produce.outputs['<64-byte key>'] == \"x\""
-  - "Job-provided text cannot rewrite the terminal | question | .goodflows/build/validate-job-names/build-1.md | QA scenario 6: a run cannot produce a job error with a bare carriage return, because goodflows writes error text itself; may the scenario put the CR in the command or the job's output? | Recommend: amend scenario 6 to put the CR in the command or the job's output; a unit test already covers a CR in an error"
-  - "Release notes for the name rule | question | .goodflows/build/validate-job-names/verify-bars-1.md | D6: the next release notes must repeat the README \"Upgrading from 0.9 or earlier\" note and list the removed messages; release notes are generated at release time and the repo has no changelog, so the branch cannot carry them. Will the person cutting the release add them? | Recommend: yes, copy the README paragraph into the release notes"
+open: []
 ---
 
 # Verification
 
 Each check ran three times: on the build, after fix-1 (bars-1 to bars-4 from verify-bars-1), and after fix-2 (step ids and output keys printed raw). The last round of every verifier reported no rows.
 
+The three open questions from the build (QA scenario 4.2, QA scenario 6, and the D6 release notes) were settled as recommended in the review of change request #1. Scenarios 4.2 and 6 were amended accordingly and re-driven, and nothing is open.
+
 - **bars:** checked decisions D1 to D9, the goals, non-goals and anti-goals, the left_to_builder entries, and that every Must scenario has a test that fails on a wrong implementation. It probed the built binary with control characters in workflow, environment, job and step names and in output keys, and in round 3 it confirmed with a mutation that the new escaping test fails when `escape_debug` is removed. Rounds 1 and 2 found the escaping and message gaps that fix-1 and fix-2 repaired.
 - **drift:** traced every behavior in the diff back to a requirement or decision, and checked that the builder's delta edits (D8, D9) are `by: agent`, start with "Found while building:", and are cited on the `Refs:` line. It found no behavior that the spec does not state.
-- **qa:** ran every Must scenario in `qa-scenarios.md` through the verify-goodflows-cli skill against a local goodflows_web server (run folders `.verify/goodflows-cli/20261126T094137Z-fa3eb28/`, `20261126T095613Z-fa3eb28/`, `20261126T101218Z-fa3eb28/`). Scenarios 1, 2, 3, 4.1, 5 and 6 pass. Scenario 4.2 as written and the CR-in-error part of scenario 6 are open questions listed above.
+- **qa:** ran every Must scenario in `qa-scenarios.md` through the verify-goodflows-cli skill against a local goodflows_web server (run folders `.verify/goodflows-cli/20261126T094137Z-fa3eb28/`, `20261126T095613Z-fa3eb28/`, `20261126T101218Z-fa3eb28/`). Scenarios 1, 2, 3, 4.1, 5 and 6 pass. After the review of change request #1, scenarios 4.2 and 6 were amended and re-driven (verify-qa-4, run folder `.verify/goodflows-cli/20261126T110916Z-1dbcafd/`): 4.2 now reads the 64-byte output key in `consume`'s condition, with a control that compares against a different value and skips; 6 now puts the escape sequence and carriage return in the command and its output, and the report shows them as escaped text with no raw control bytes. Both pass.
 - **spec:** checked each requirement of `name-rule` and `run-report` against the code and tests: one predicate `run_contract::valid_name` for every kind of name, load-time refusal with escaped names, runtime output keys, replay and envelope revalidation, and terminal escaping.
 
-Full check gate: `./target/release/goodflows` (fmt, clippy, test, doc) passed on the final tree.
+Full check gate: `./target/release/goodflows` (fmt, clippy, test, doc) passed on the final tree (detached run `fffa62f3-c2ce-48a0-9229-871cc09e75f4`).
 
 Not verified:
 
-- Release notes for D6 (verify-bars-1, bars-5): the next release notes must repeat the README "Upgrading from 0.9 or earlier" note and list the removed messages. The notes are generated at release time and the repository has no changelog, so the branch cannot show them. This is now a held question, listed above.
+- Release notes for D6 (verify-bars-1, bars-5): the next release notes must repeat the README "Upgrading from 0.9 or earlier" note and list the removed messages. The notes are generated at release time and the repository has no changelog, so the branch cannot show them. The review of change request #1 settled that the person cutting the release copies the README paragraph into the release notes.
