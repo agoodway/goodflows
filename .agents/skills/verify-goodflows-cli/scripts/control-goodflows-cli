@@ -245,6 +245,10 @@ cmd_record() {
   [[ $# -ge 3 ]] || die "usage: record <feature-id> <entry-point> <pass|fail> <artifact>..."
   local feature=$1 entry=$2 result=$3
   shift 3
+  local artifact
+  for artifact in "$@"; do
+    [[ -s "$run_dir/$artifact" ]] || die "artifact $artifact is missing or empty in $run_dir; an empty capture is not evidence, so record a file that shows the result"
+  done
   echo "| \`$feature\` | $entry | $result | $(printf '`%s` ' "$@")|" >>"$run_dir/run.md"
 }
 

@@ -76,6 +76,8 @@ $C record cr-create "cr open --claims (cr: null)" pass cli/open.stdout api/cr-1.
 $C finish pass "one-line summary"      # or fail / partial
 ```
 
+`record` refuses an artifact that is missing or empty. List only non-empty files as evidence in a scenario run's `run.md` too: `goodflows cr validate` refuses an empty evidence file, so `cr runs upload` would be refused as well.
+
 Proof standards:
 
 - Drive the CLI the way the `gs-change-request` and `gs-qa-scenarios` skills do: real commands in a git checkout, never hand-built requests to the routes the CLI is supposed to call. `api` is only for reading back what was stored.
