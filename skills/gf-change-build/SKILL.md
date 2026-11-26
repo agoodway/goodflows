@@ -1,6 +1,6 @@
 ---
 name: gf-change-build
-description: "Build an approved goodflows change (goodflows/changes/<id>/) and take its change request to a verdict, unattended: implement it, verify the code against the change in both directions, fix what verification finds, keep the spec deltas true to the code, archive the change, then push and drive the change request until it is mergeable or needs a person's review. Use for /gf-change-build, \"build this change\", \"implement <id>\", or after gf-change-explore approves a change. Not for planning a change (gf-change-explore), and not for merging."
+description: "Build an approved goodflows change (goodflows/changes/<id>/) and take its change request to a verdict, unattended: implement it, verify the code against the change in both directions, fix what verification finds, keep the spec deltas true to the code, archive the change, then push and drive the change request until it is mergeable or needs a person's review. Use for /gf-change-build, \"build this change\", \"implement <id>\", or after gf-change-write approves a change. Not for planning a change (gf-change-write), and not for merging."
 ---
 
 # Build a goodflows change and ship it to a verdict

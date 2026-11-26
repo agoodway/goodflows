@@ -32,10 +32,10 @@ fn skills_install_in_a_claude_code_session_writes_every_skill_under_claude() {
         "gf-change-build/preflight-prompt.md",
         "gf-change-build/ship-prompt.md",
         "gf-change-build/verify-prompt.md",
-        "gf-change-explore/SKILL.md",
-        "gf-change-explore/builder-check-prompt.md",
-        "gf-change-explore/over-spec-check-prompt.md",
-        "gf-change-explore/review-check-prompt.md",
+        "gf-change-write/SKILL.md",
+        "gf-change-write/builder-check-prompt.md",
+        "gf-change-write/over-spec-check-prompt.md",
+        "gf-change-write/review-check-prompt.md",
     ] {
         let installed = p.read(&format!(".claude/skills/{file}"));
         let repo = std::fs::read_to_string(format!("skills/{file}")).unwrap();

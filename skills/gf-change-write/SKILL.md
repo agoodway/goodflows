@@ -1,6 +1,6 @@
 ---
-name: gf-change-explore
-description: "Think a change through with the user, then write it as a small goodflows change in goodflows/changes/<id>/ (change.md, spec deltas, qa-scenarios.md). Use for /gf-change-explore, \"let's spec this\", \"plan a change\", \"explore this idea\", or before building a feature whose behavior is not settled yet. Not for implementing a change, and not for a change request's claims file."
+name: gf-change-write
+description: "Think a change through with the user, then write it as a small goodflows change in goodflows/changes/<id>/ (change.md, spec deltas, qa-scenarios.md). Use for /gf-change-write, \"let's spec this\", \"plan a change\", \"explore this idea\", or before building a feature whose behavior is not settled yet. Not for implementing a change, and not for a change request's claims file."
 ---
 
 # Explore and write a goodflows change

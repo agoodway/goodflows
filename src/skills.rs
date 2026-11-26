@@ -53,23 +53,23 @@ const SKILLS: [(&str, &[(&str, &str)]); 4] = [
         ],
     ),
     (
-        "gf-change-explore",
+        "gf-change-write",
         &[
             (
                 "SKILL.md",
-                include_str!("../skills/gf-change-explore/SKILL.md"),
+                include_str!("../skills/gf-change-write/SKILL.md"),
             ),
             (
                 "builder-check-prompt.md",
-                include_str!("../skills/gf-change-explore/builder-check-prompt.md"),
+                include_str!("../skills/gf-change-write/builder-check-prompt.md"),
             ),
             (
                 "over-spec-check-prompt.md",
-                include_str!("../skills/gf-change-explore/over-spec-check-prompt.md"),
+                include_str!("../skills/gf-change-write/over-spec-check-prompt.md"),
             ),
             (
                 "review-check-prompt.md",
-                include_str!("../skills/gf-change-explore/review-check-prompt.md"),
+                include_str!("../skills/gf-change-write/review-check-prompt.md"),
             ),
         ],
     ),
@@ -371,10 +371,10 @@ mod tests {
                     ".claude/skills/gf-change-build/preflight-prompt.md",
                     ".claude/skills/gf-change-build/ship-prompt.md",
                     ".claude/skills/gf-change-build/verify-prompt.md",
-                    ".claude/skills/gf-change-explore/SKILL.md",
-                    ".claude/skills/gf-change-explore/builder-check-prompt.md",
-                    ".claude/skills/gf-change-explore/over-spec-check-prompt.md",
-                    ".claude/skills/gf-change-explore/review-check-prompt.md",
+                    ".claude/skills/gf-change-write/SKILL.md",
+                    ".claude/skills/gf-change-write/builder-check-prompt.md",
+                    ".claude/skills/gf-change-write/over-spec-check-prompt.md",
+                    ".claude/skills/gf-change-write/review-check-prompt.md",
                     ".claude/skills/maintain-ci-skill/SKILL.md"
                 ]
             );
