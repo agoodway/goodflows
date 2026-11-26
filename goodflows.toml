@@ -1,6 +1,10 @@
 # goodflows.toml — example for a Rust project
 # Adjust parallelism to match your Amp orb size
 
+[reporting]
+project = "goodflows"
+history = true
+
 [settings]
 parallelism = 4
 fail_fast = true
