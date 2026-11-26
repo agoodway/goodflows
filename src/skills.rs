@@ -9,15 +9,43 @@ use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::Path;
 
-/// The skills this binary installs, embedded as they are in `skills/`.
-const SKILLS: [(&str, &str); 2] = [
+/// The skills this binary installs, embedded as they are in `skills/`: each
+/// skill's name and its files, `SKILL.md` first.
+const SKILLS: [(&str, &[(&str, &str)]); 3] = [
     (
         "create-ci-skill",
-        include_str!("../skills/create-ci-skill/SKILL.md"),
+        &[(
+            "SKILL.md",
+            include_str!("../skills/create-ci-skill/SKILL.md"),
+        )],
+    ),
+    (
+        "gf-change-explore",
+        &[
+            (
+                "SKILL.md",
+                include_str!("../skills/gf-change-explore/SKILL.md"),
+            ),
+            (
+                "builder-check-prompt.md",
+                include_str!("../skills/gf-change-explore/builder-check-prompt.md"),
+            ),
+            (
+                "over-spec-check-prompt.md",
+                include_str!("../skills/gf-change-explore/over-spec-check-prompt.md"),
+            ),
+            (
+                "review-check-prompt.md",
+                include_str!("../skills/gf-change-explore/review-check-prompt.md"),
+            ),
+        ],
     ),
     (
         "maintain-ci-skill",
-        include_str!("../skills/maintain-ci-skill/SKILL.md"),
+        &[(
+            "SKILL.md",
+            include_str!("../skills/maintain-ci-skill/SKILL.md"),
+        )],
     ),
 ];
 
@@ -164,13 +192,14 @@ fn target(
 /// return the files written, relative to `root`.
 fn write(root: &Path, dir: &str) -> Result<Vec<String>> {
     let mut written = Vec::new();
-    for (name, content) in SKILLS {
-        let relative = format!("{dir}/{name}/SKILL.md");
-        let path = root.join(&relative);
-        let parent = path.parent().expect("a skill file has a directory");
-        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
-        std::fs::write(&path, content).with_context(|| format!("write {}", path.display()))?;
-        written.push(relative);
+    for (name, files) in SKILLS {
+        let skill = root.join(dir).join(name);
+        std::fs::create_dir_all(&skill).with_context(|| format!("create {}", skill.display()))?;
+        for (file, content) in files {
+            let path = skill.join(file);
+            std::fs::write(&path, content).with_context(|| format!("write {}", path.display()))?;
+            written.push(format!("{dir}/{name}/{file}"));
+        }
     }
     Ok(written)
 }
@@ -302,20 +331,42 @@ mod tests {
                 files,
                 [
                     ".claude/skills/create-ci-skill/SKILL.md",
+                    ".claude/skills/gf-change-explore/SKILL.md",
+                    ".claude/skills/gf-change-explore/builder-check-prompt.md",
+                    ".claude/skills/gf-change-explore/over-spec-check-prompt.md",
+                    ".claude/skills/gf-change-explore/review-check-prompt.md",
                     ".claude/skills/maintain-ci-skill/SKILL.md"
                 ]
             );
         }
-        let read = |name: &str| {
-            std::fs::read_to_string(root.path().join(format!(".claude/skills/{name}/SKILL.md")))
-                .unwrap()
-        };
-        // The embedded copies are the repository's skill files, byte for byte.
+        // The embedded copies are the repository's skill files, byte for byte,
+        // and every file in a skill's directory is embedded.
         let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("skills");
-        for name in ["create-ci-skill", "maintain-ci-skill"] {
-            let expected = std::fs::read_to_string(repo.join(name).join("SKILL.md")).unwrap();
-            assert_eq!(read(name), expected, "{name}");
-            assert!(expected.starts_with(&format!("---\nname: {name}\n")));
+        let mut names: Vec<_> = std::fs::read_dir(&repo)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        assert_eq!(names, SKILLS.map(|(name, _)| name));
+        for (name, files) in SKILLS {
+            let mut on_disk: Vec<_> = std::fs::read_dir(repo.join(name))
+                .unwrap()
+                .map(|e| e.unwrap().file_name().into_string().unwrap())
+                .collect();
+            on_disk.sort();
+            let mut embedded: Vec<_> = files.iter().map(|(file, _)| *file).collect();
+            embedded.sort();
+            assert_eq!(on_disk, embedded, "{name}");
+            for (file, _) in files {
+                let installed = std::fs::read_to_string(
+                    root.path().join(format!(".claude/skills/{name}/{file}")),
+                )
+                .unwrap();
+                let expected = std::fs::read_to_string(repo.join(name).join(file)).unwrap();
+                assert_eq!(installed, expected, "{name}/{file}");
+            }
+            let skill = std::fs::read_to_string(repo.join(name).join("SKILL.md")).unwrap();
+            assert!(skill.starts_with(&format!("---\nname: {name}\n")));
         }
         assert!(!root.path().join(".agents").exists());
     }

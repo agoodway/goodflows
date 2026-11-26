@@ -18,14 +18,21 @@ fn install(p: &Project, vars: &[(&str, &str)], args: &[&str]) -> std::process::O
 }
 
 #[test]
-fn skills_install_in_a_claude_code_session_writes_both_skills_under_claude() {
+fn skills_install_in_a_claude_code_session_writes_every_skill_under_claude() {
     let p = Project::new("");
     let output = install(&p, &[("CLAUDECODE", "1")], &[]);
     success(&output);
-    for name in ["create-ci-skill", "maintain-ci-skill"] {
-        let installed = p.read(&format!(".claude/skills/{name}/SKILL.md"));
-        let repo = std::fs::read_to_string(format!("skills/{name}/SKILL.md")).unwrap();
-        assert_eq!(installed, repo, "{name}");
+    for file in [
+        "create-ci-skill/SKILL.md",
+        "maintain-ci-skill/SKILL.md",
+        "gf-change-explore/SKILL.md",
+        "gf-change-explore/builder-check-prompt.md",
+        "gf-change-explore/over-spec-check-prompt.md",
+        "gf-change-explore/review-check-prompt.md",
+    ] {
+        let installed = p.read(&format!(".claude/skills/{file}"));
+        let repo = std::fs::read_to_string(format!("skills/{file}")).unwrap();
+        assert_eq!(installed, repo, "{file}");
     }
     assert!(!p.dir.join(".agents").exists());
     let text = stdout(&output);
