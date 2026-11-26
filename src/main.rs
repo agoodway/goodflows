@@ -253,11 +253,12 @@ enum Commands {
         #[command(subcommand)]
         command: change_requests::FeaturesCommand,
     },
-    /// Check goodflows changes (goodflows/changes/<id>/) and archive them into goodflows/specs/
+    /// Check goodflows changes (goodflows/changes/<id>/), record them as verified, and archive them into goodflows/specs/
     #[command(after_help = "Examples:
   goodflows change validate                  # every change under goodflows/changes/
   goodflows change validate add-login --json # one change's errors and warnings as JSON
-  goodflows change archive add-login         # merge an approved change's deltas and archive it")]
+  goodflows change verified add-login        # record what the verified build looks like
+  goodflows change archive add-login         # merge an approved, verified change's deltas and archive it")]
     Change {
         #[command(subcommand)]
         command: change_requests::ChangeCommand,

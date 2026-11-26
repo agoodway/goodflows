@@ -1436,3 +1436,91 @@ fn push_sends_dependencies_only_when_they_changed() {
     );
     assert_eq!(last_event(&output)["verdict"]["state"], "pending");
 }
+
+#[test]
+fn stamp_records_what_the_branch_changed_and_archive_checks_it() {
+    let p = checkout();
+    let dir = p.dir.join("goodflows/changes/add-login");
+    std::fs::create_dir_all(dir.join("specs/auth")).unwrap();
+    std::fs::write(
+        dir.join("change.md"),
+        "---\nformat: goodflows-change/1\nid: add-login\nstatus: approved\nsize: small\ndoor: two_way\ncapabilities: [auth]\ndepends_on: []\ngoals: [{id: G1, text: Sign in}]\nnon_goals: []\nanti_goals: []\ndecisions: []\nleft_to_builder: [The form]\n---\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("specs/auth/spec.md"),
+        "## ADDED Requirements\n\n### Requirement: Sign in\nRefs: G1\nPeople SHALL sign in.\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("qa-scenarios.md"),
+        "---\nformat: qa-scenarios/2\nsource: intent\nchange: add-login\nspecs: uncommitted\nscenarios:\n  - id: 1\n    name: Sign in\n    priority: must\n    covers:\n      - {capability: auth, requirement: Sign in, implied: true}\n---\n\n# QA\n\n## Scenarios\n\n### 1. Sign in (Must)\n\nSign in.\n\n- Expect: signed in.\n",
+    )
+    .unwrap();
+    // Uncommitted, untracked and ignored files, on top of the branch's
+    // commits that add lib/login.ex and move old.txt to docs/new.txt.
+    std::fs::write(p.dir.join("lib/login.ex"), "a\nb\nc\n").unwrap();
+    std::fs::write(p.dir.join("lib/new.ex"), "new\n").unwrap();
+    std::fs::create_dir_all(p.dir.join(".verify")).unwrap();
+    std::fs::write(p.dir.join(".verify/run.md"), "x\n").unwrap();
+    let main = git(&p, &["rev-parse", "main"]);
+
+    let stamp = p
+        .command()
+        .current_dir(p.dir.join("lib"))
+        .args([
+            "change",
+            "verified",
+            "add-login",
+            "--base",
+            "main",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    success(&stamp);
+    let event = last_event(&stamp);
+    let sha = |text: &str| format!("{:x}", Sha256::digest(text.as_bytes()));
+    assert_eq!(event["base"], main);
+    assert_eq!(
+        event["files"],
+        json!({
+            "docs/new.txt": sha("one\ntwo\nthree\nfour\n"),
+            "lib/login.ex": sha("a\nb\nc\n"),
+            "lib/new.ex": sha("new\n"),
+            "old.txt": null,
+        })
+    );
+    assert_eq!(
+        event["deltas"]["auth"],
+        sha("## ADDED Requirements\n\n### Requirement: Sign in\nRefs: G1\nPeople SHALL sign in.\n")
+    );
+
+    // A file added after the stamp makes it stale.
+    std::fs::write(p.dir.join("lib/late.ex"), "late\n").unwrap();
+    let archive = p
+        .command()
+        .args(["change", "archive", "add-login"])
+        .output()
+        .unwrap();
+    assert!(!archive.status.success());
+    assert!(
+        stderr(&archive).contains("lib/late.ex changed after it was verified"),
+        "{}",
+        stderr(&archive)
+    );
+    assert!(dir.join("change.md").is_file());
+
+    std::fs::remove_file(p.dir.join("lib/late.ex")).unwrap();
+    git(&p, &["add", "."]);
+    git(&p, &["commit", "-q", "-m", "build add-login"]);
+    // Committing what was verified keeps the stamp true.
+    success(
+        &p.command()
+            .args(["change", "archive", "add-login"])
+            .output()
+            .unwrap(),
+    );
+    assert!(p.dir.join("goodflows/specs/auth/spec.md").is_file());
+    assert!(!dir.exists());
+}

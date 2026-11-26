@@ -4,13 +4,16 @@
 //! whose `goodflows-change/1` front matter has the goals, the decisions and
 //! what is left to the builder; requirement deltas in
 //! `specs/<capability>/spec.md`; and `qa-scenarios.md`, the intent scenario
-//! set. Archiving merges the deltas into `goodflows/specs/` and moves the
-//! change to `goodflows/changes/archive/YYYY-MM-DD-<id>/`.
+//! set. `change verified` records in `verification.md` which delta and file
+//! contents the built change was verified against. Archiving refuses unless
+//! that record still matches the checkout, then merges the deltas into
+//! `goodflows/specs/` and moves the change to
+//! `goodflows/changes/archive/YYYY-MM-DD-<id>/`.
 
 use super::git::Git;
 use super::markdown::{self, Invalid};
 use crate::output::Output;
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use clap::Subcommand;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
@@ -54,16 +57,41 @@ Examples:
         #[arg(value_name = "ID", value_parser = super::change_id)]
         ids: Vec<String>,
     },
-    /// Merge an approved change's spec deltas into goodflows/specs/ and move it to goodflows/changes/archive/
+    /// Record the delta and file contents a built change was verified against, in its verification.md
     #[command(
-        after_help = "Refuses, changing nothing, unless the change validates and its status is approved. Applies
+        after_help = "Run it after verifying the code against the change, once nothing is left to fix. Writes
+goodflows/changes/<id>/verification.md (goodflows-verification/1): the merge base with --base, the
+SHA-256 of each spec delta, and the SHA-256 of each file the branch changed since that merge base,
+committed or not, outside goodflows/changes/ (null for a deleted file). An existing file keeps its
+open list and its body; a new one starts with open: []. List findings left unresolved under open;
+change archive refuses until open is empty and the hashes still match the checkout.
+
+Examples:
+  goodflows change verified add-login               # against origin/HEAD
+  goodflows change verified add-login --base main   # against the local main branch
+  goodflows change verified add-login --json        # print the recorded hashes as JSON"
+    )]
+    Verified {
+        /// The change id under goodflows/changes/
+        #[arg(value_name = "ID", value_parser = super::change_id)]
+        id: String,
+        /// The branch this one merges into; verification.md records its merge base with HEAD
+        #[arg(long, value_name = "REV", default_value = "origin/HEAD")]
+        base: String,
+    },
+    /// Merge an approved, verified change's spec deltas into goodflows/specs/ and move it to goodflows/changes/archive/
+    #[command(
+        after_help = "Refuses, changing nothing, unless the change validates, its status is approved, and its
+verification.md (written by change verified) lists nothing open and still matches the checkout: the
+same delta contents, and the same changed files with the same contents since its merge base. Applies
 RENAMED, REMOVED, MODIFIED and then ADDED requirements to goodflows/specs/<capability>/spec.md,
 creating a capability spec that does not exist, and drops the Refs: lines, whose ids mean
 something only inside the change. Then sets status: archived and moves the change to
-goodflows/changes/archive/<UTC date>-<id>/.
+goodflows/changes/archive/<UTC date>-<id>/. Archive in the change's branch, before it merges.
 
 Examples:
   goodflows change validate add-login         # check it first; archive refuses on errors
+  goodflows change verified add-login         # after verifying the build
   goodflows change archive add-login          # merge and move add-login
   goodflows change archive add-login --json   # print the merged specs as JSON"
     )]
@@ -75,7 +103,8 @@ Examples:
 }
 
 pub async fn change(command: &ChangeCommand, output: &Output) -> Result<u8> {
-    let top = Git::new("GOODFLOWS_API_KEY").toplevel().await?;
+    let git = Git::new("GOODFLOWS_API_KEY");
+    let top = git.toplevel().await?;
     match command {
         ChangeCommand::Validate { ids } => {
             let ids = if ids.is_empty() {
@@ -107,11 +136,66 @@ pub async fn change(command: &ChangeCommand, output: &Output) -> Result<u8> {
                 .duration_since(std::time::UNIX_EPOCH)?
                 .as_secs();
             let (year, month, day) = crate::retention::civil_from_days((secs / 86_400) as i64);
-            let event = archive(&top, id, &format!("{year:04}-{month:02}-{day:02}"))?;
+            let dir = top.join(CHANGES).join(id);
+            let changed = match read_stamp(&dir, &format!("{CHANGES}/{id}")) {
+                Ok(Some(stamp)) => changed_files(&git, &stamp.base).await?,
+                _ => Vec::new(),
+            };
+            let event = archive(
+                &top,
+                id,
+                &format!("{year:04}-{month:02}-{day:02}"),
+                &changed,
+            )?;
             output.emit(event).await?;
             Ok(0)
         }
+        ChangeCommand::Verified { id, base } => {
+            let target = git
+                .resolve(base)
+                .await
+                .context("pass --base with the branch this one merges into")?;
+            let base = git.output(&["merge-base", "HEAD", &target]).await?;
+            let base = base.trim();
+            let changed = changed_files(&git, base).await?;
+            output.emit(stamp(&top, id, base, &changed)?).await?;
+            Ok(0)
+        }
     }
+}
+
+/// The files that differ between `base` and the working tree, committed or
+/// not, plus untracked files git does not ignore, outside `goodflows/changes/`.
+async fn changed_files(git: &Git, base: &str) -> Result<Vec<String>> {
+    let tracked = git
+        .output(&[
+            "diff",
+            "--name-only",
+            "--no-renames",
+            "--no-relative",
+            "-z",
+            base,
+            "--",
+        ])
+        .await?;
+    let untracked = git
+        .output(&[
+            "ls-files",
+            "--others",
+            "--exclude-standard",
+            "--full-name",
+            "-z",
+            "--",
+            ":/",
+        ])
+        .await?;
+    let paths: BTreeSet<String> = tracked
+        .split('\0')
+        .chain(untracked.split('\0'))
+        .filter(|path| !path.is_empty() && !path.starts_with(&format!("{CHANGES}/")))
+        .map(str::to_owned)
+        .collect();
+    Ok(paths.into_iter().collect())
 }
 
 /// Every change directory except `archive/`, sorted.
@@ -499,6 +583,9 @@ fn check(top: &Path, id: &str) -> (Report, Option<Checked>) {
         &mut report.errors,
     );
     leftovers(&dir, &base, &mut report.errors);
+    if let Err(problems) = read_stamp(&dir, &base) {
+        report.errors.extend(problems);
+    }
 
     let checked = (report.errors.is_empty()).then(|| Checked {
         status: meta.map(|m| m.status).unwrap_or_default(),
@@ -1245,8 +1332,268 @@ fn leftovers(dir: &Path, base: &str, errors: &mut Vec<String>) {
     }
 }
 
+const VERIFICATION: &str = "goodflows-verification/1";
+const STAMP_KEYS: [&str; 6] = ["format", "change", "base", "deltas", "files", "open"];
+
+/// A change's `verification.md`: what the built change was verified against.
+struct Stamp {
+    /// The merge base the changed files were found against.
+    base: String,
+    /// SHA-256 of each spec delta, by capability.
+    deltas: BTreeMap<String, String>,
+    /// SHA-256 of each changed file, `None` for a deleted one.
+    files: BTreeMap<String, Option<String>>,
+    /// Findings left unresolved; archive refuses until there are none.
+    open: Vec<String>,
+    body: String,
+}
+
+fn sha256(text: &str, len: usize) -> bool {
+    text.len() == len
+        && text
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// The change's `verification.md`, or `None` when it has none.
+fn read_stamp(dir: &Path, base: &str) -> Result<Option<Stamp>, Vec<String>> {
+    let file = format!("{base}/verification.md");
+    let path = dir.join("verification.md");
+    if !path.exists() {
+        return Ok(None);
+    }
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Err(vec![format!("{file}: not UTF-8")]);
+    };
+    let mut errors = Vec::new();
+    let Some(fields) = front_matter(&text, &file, &mut errors) else {
+        if errors.is_empty() {
+            errors.push(format!(
+                "{file}: is empty; write it with goodflows change verified"
+            ));
+        }
+        return Err(errors);
+    };
+    for key in fields.as_object().into_iter().flat_map(|o| o.keys()) {
+        if !STAMP_KEYS.contains(&key.as_str()) {
+            errors.push(format!("{file}: unknown field {key}"));
+        }
+    }
+    for key in STAMP_KEYS {
+        if fields.get(key).is_none() {
+            errors.push(format!("{file}: {key} is required"));
+        }
+    }
+    if fields["format"] != VERIFICATION {
+        errors.push(format!("{file}: format must be {VERIFICATION}"));
+    }
+    let id = base.rsplit('/').next().unwrap_or_default();
+    if fields.get("change").is_some() && fields["change"] != id {
+        errors.push(format!(
+            "{file}: change must be {id}, the change's directory name"
+        ));
+    }
+    let stamp_base = fields["base"].as_str().unwrap_or_default();
+    if fields.get("base").is_some() && !sha256(stamp_base, 40) && !sha256(stamp_base, 64) {
+        errors.push(format!("{file}: base must be a full lowercase commit SHA"));
+    }
+    let mut deltas = BTreeMap::new();
+    let mut files = BTreeMap::new();
+    for key in ["deltas", "files"] {
+        let Some(map) = fields[key].as_object() else {
+            if fields.get(key).is_some() {
+                errors.push(format!("{file}: {key} must be a mapping"));
+            }
+            continue;
+        };
+        for (name, hash) in map {
+            match (key, hash.as_str()) {
+                (_, Some(hash)) if sha256(hash, 64) => {
+                    if key == "deltas" {
+                        deltas.insert(name.clone(), hash.to_owned());
+                    } else {
+                        files.insert(name.clone(), Some(hash.to_owned()));
+                    }
+                }
+                ("files", None) if hash.is_null() => {
+                    files.insert(name.clone(), None);
+                }
+                _ => errors.push(format!(
+                    "{file}: {key}[{name}] must be a lowercase SHA-256{}",
+                    if key == "files" {
+                        ", or null for a deleted file"
+                    } else {
+                        ""
+                    }
+                )),
+            }
+        }
+    }
+    let open: Vec<String> = list(&fields, "open", &file, &mut errors)
+        .iter()
+        .filter_map(|item| {
+            let text = item.as_str().filter(|s| !s.trim().is_empty());
+            if text.is_none() {
+                errors.push(format!("{file}: open must list nonempty strings"));
+            }
+            text.map(str::to_owned)
+        })
+        .collect();
+    if !errors.is_empty() {
+        return Err(errors);
+    }
+    Ok(Some(Stamp {
+        base: stamp_base.to_owned(),
+        deltas,
+        files,
+        open,
+        body: markdown::split(&text).map_or("", |f| f.body).to_owned(),
+    }))
+}
+
+/// SHA-256 of each `specs/<capability>/spec.md` delta in the change.
+fn delta_hashes(dir: &Path) -> BTreeMap<String, String> {
+    let specs = dir.join("specs");
+    files(&specs)
+        .into_iter()
+        .filter_map(|path| {
+            let relative = path
+                .strip_prefix(&specs)
+                .ok()?
+                .to_string_lossy()
+                .replace('\\', "/");
+            let capability = relative.strip_suffix("/spec.md")?.to_owned();
+            Some((
+                capability,
+                markdown::sha256_hex(&std::fs::read(&path).ok()?),
+            ))
+        })
+        .collect()
+}
+
+/// SHA-256 of each changed file, `None` for one that no longer exists.
+fn file_hashes(top: &Path, changed: &[String]) -> BTreeMap<String, Option<String>> {
+    changed
+        .iter()
+        .map(|path| {
+            let hash = std::fs::read(top.join(path)).ok();
+            (path.clone(), hash.map(|bytes| markdown::sha256_hex(&bytes)))
+        })
+        .collect()
+}
+
+/// Writes the change's `verification.md` for `base` and the `changed`
+/// files, keeping an existing file's open list and body.
+fn stamp(top: &Path, id: &str, base: &str, changed: &[String]) -> Result<Value> {
+    let shown = format!("{CHANGES}/{id}");
+    let dir = top.join(CHANGES).join(id);
+    if !dir.join("change.md").is_file() {
+        bail!("{shown}/change.md does not exist; stamp a change after it is built");
+    }
+    let old = read_stamp(&dir, &shown).map_err(|mut problems| {
+        problems.insert(
+            0,
+            format!("{shown}/verification.md is invalid; fix it or delete it, then stamp again"),
+        );
+        Invalid(problems)
+    })?;
+    let (open, body) = old.map_or((Vec::new(), String::new()), |s| (s.open, s.body));
+    let stamp = Stamp {
+        base: base.to_owned(),
+        deltas: delta_hashes(&dir),
+        files: file_hashes(top, changed),
+        open,
+        body,
+    };
+    // JSON strings are valid YAML double-quoted scalars, so any path or
+    // finding round-trips.
+    let quote = |text: &str| Value::from(text).to_string();
+    let mut text = format!("---\nformat: {VERIFICATION}\nchange: {id}\nbase: {base}\n");
+    text.push_str(if stamp.deltas.is_empty() {
+        "deltas: {}\n"
+    } else {
+        "deltas:\n"
+    });
+    for (capability, hash) in &stamp.deltas {
+        text.push_str(&format!("  {}: {hash}\n", quote(capability)));
+    }
+    text.push_str(if stamp.files.is_empty() {
+        "files: {}\n"
+    } else {
+        "files:\n"
+    });
+    for (path, hash) in &stamp.files {
+        text.push_str(&format!(
+            "  {}: {}\n",
+            quote(path),
+            hash.as_deref().unwrap_or("null")
+        ));
+    }
+    text.push_str(if stamp.open.is_empty() {
+        "open: []\n"
+    } else {
+        "open:\n"
+    });
+    for finding in &stamp.open {
+        text.push_str(&format!("  - {}\n", quote(finding)));
+    }
+    text.push_str("---\n");
+    text.push_str(&stamp.body);
+    let path = format!("{shown}/verification.md");
+    std::fs::write(dir.join("verification.md"), text)?;
+    Ok(json!({
+        "type": "change_verified",
+        "id": id,
+        "path": path,
+        "base": base,
+        "deltas": stamp.deltas,
+        "files": stamp.files,
+        "open": stamp.open,
+    }))
+}
+
+/// Why the stamp no longer describes the checkout, given the files changed
+/// since its base; empty when it still does.
+fn stale(top: &Path, dir: &Path, stamp: &Stamp, changed: &[String]) -> Vec<String> {
+    let mut problems: Vec<String> = stamp
+        .open
+        .iter()
+        .map(|finding| format!("open: {finding}"))
+        .collect();
+    let deltas = delta_hashes(dir);
+    for capability in deltas
+        .keys()
+        .chain(stamp.deltas.keys())
+        .collect::<BTreeSet<_>>()
+    {
+        if deltas.get(capability) != stamp.deltas.get(capability) {
+            problems.push(format!(
+                "the {capability} delta changed after it was verified"
+            ));
+        }
+    }
+    let files = file_hashes(top, changed);
+    for path in files
+        .keys()
+        .chain(stamp.files.keys())
+        .collect::<BTreeSet<_>>()
+    {
+        match (stamp.files.get(path), files.get(path)) {
+            (Some(_), None) => problems.push(format!(
+                "{path} was verified as changed, but it now matches the base"
+            )),
+            (verified, now) if verified != now => {
+                problems.push(format!("{path} changed after it was verified"))
+            }
+            _ => {}
+        }
+    }
+    problems
+}
+
 /// Merges the change into `goodflows/specs/` and moves it to the archive.
-fn archive(top: &Path, id: &str, date: &str) -> Result<Value> {
+/// `changed` lists the files the branch changed since the stamp's base.
+fn archive(top: &Path, id: &str, date: &str, changed: &[String]) -> Result<Value> {
     let (report, checked) = check(top, id);
     let Some(checked) = checked else {
         let mut problems = vec![format!(
@@ -1274,6 +1621,20 @@ fn archive(top: &Path, id: &str, date: &str) -> Result<Value> {
             active.join(", ")
         );
     }
+    let dir = top.join(CHANGES).join(id);
+    let Ok(Some(stamp)) = read_stamp(&dir, &format!("{CHANGES}/{id}")) else {
+        bail!(
+            "change {id} has no verification.md; verify the code against the change, then run goodflows change verified {id}"
+        );
+    };
+    let problems = stale(top, &dir, &stamp, changed);
+    if !problems.is_empty() {
+        let mut all = vec![format!(
+            "change {id}'s verification.md does not match the checkout; nothing was archived. Resolve what is open, verify the change again, then run goodflows change verified {id}"
+        )];
+        all.extend(problems);
+        return Err(Invalid(all).into());
+    }
     let destination = format!("{CHANGES}/archive/{date}-{id}");
     if top.join(&destination).exists() {
         bail!("{destination} already exists");
@@ -1299,7 +1660,6 @@ fn archive(top: &Path, id: &str, date: &str) -> Result<Value> {
             "renamed": renamed,
         }));
     }
-    let dir = top.join(CHANGES).join(id);
     std::fs::write(dir.join("change.md"), text)?;
     std::fs::create_dir_all(top.join(CHANGES).join("archive"))?;
     std::fs::rename(&dir, top.join(&destination))?;
@@ -1593,7 +1953,8 @@ steps
         let files: Vec<(&str, String)> = valid();
         let files: Vec<(&str, &str)> = files.iter().map(|(p, t)| (*p, t.as_str())).collect();
         let top = project(&files);
-        let event = archive(top.path(), "add-login", "2026-11-25").unwrap();
+        stamp(top.path(), "add-login", BASE, &[]).unwrap();
+        let event = archive(top.path(), "add-login", "2026-11-25", &[]).unwrap();
         assert_eq!(
             event["archived_to"],
             "goodflows/changes/archive/2026-11-25-add-login"
@@ -1623,7 +1984,7 @@ steps
         let files = with("change.md", "status: approved", "status: proposed");
         let files: Vec<(&str, &str)> = files.iter().map(|(p, t)| (*p, t.as_str())).collect();
         let top = project(&files);
-        let error = archive(top.path(), "add-login", "2026-11-25").unwrap_err();
+        let error = archive(top.path(), "add-login", "2026-11-25", &[]).unwrap_err();
         assert!(error.to_string().contains("is proposed"), "{error}");
         let files = with(
             "goodflows/specs/auth/spec.md",
@@ -1632,7 +1993,7 @@ steps
         );
         let files: Vec<(&str, &str)> = files.iter().map(|(p, t)| (*p, t.as_str())).collect();
         let top = project(&files);
-        let error = archive(top.path(), "add-login", "2026-11-25").unwrap_err();
+        let error = archive(top.path(), "add-login", "2026-11-25", &[]).unwrap_err();
         assert!(
             error
                 .to_string()
@@ -1657,11 +2018,133 @@ steps
         let files = files.into_iter().map(|(p, t)| (p, t.replace("      - {capability: auth, requirement: Sign out, implied: true}", "      - {capability: auth, requirement: Sessions last 30 days, implied: true}"))).collect::<Vec<_>>();
         let files: Vec<(&str, &str)> = files.iter().map(|(p, t)| (*p, t.as_str())).collect();
         let top = project(&files);
-        let event = archive(top.path(), "add-login", "2026-11-25").unwrap();
+        stamp(top.path(), "add-login", BASE, &[]).unwrap();
+        let event = archive(top.path(), "add-login", "2026-11-25", &[]).unwrap();
         assert_eq!(event["specs"][0]["created"], true);
         let spec =
             std::fs::read_to_string(top.path().join("goodflows/specs/auth/spec.md")).unwrap();
         assert!(spec.starts_with("# auth Specification\n\n## Requirements\n\n### Requirement: Sessions last 30 days\nA session SHALL"), "{spec}");
+    }
+
+    const BASE: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    fn archived(top: &Path) -> bool {
+        top.join("goodflows/changes/archive/2026-11-25-add-login")
+            .exists()
+    }
+
+    #[test]
+    fn archive_refuses_a_missing_or_stale_verification() {
+        let files: Vec<(&str, String)> = valid();
+        let files: Vec<(&str, &str)> = files.iter().map(|(p, t)| (*p, t.as_str())).collect();
+        let top = project(&files);
+        let top = top.path();
+        let error = archive(top, "add-login", "2026-11-25", &[]).unwrap_err();
+        assert!(
+            error.to_string().contains("has no verification.md"),
+            "{error}"
+        );
+
+        let changed = ["src/login.rs".to_owned(), "src/old.rs".to_owned()];
+        std::fs::create_dir_all(top.join("src")).unwrap();
+        std::fs::write(top.join("src/login.rs"), "fn login() {}\n").unwrap();
+        // src/old.rs is deleted on the branch: it is stamped as null.
+        let event = stamp(top, "add-login", BASE, &changed).unwrap();
+        assert_eq!(event["files"]["src/old.rs"], Value::Null);
+        assert_eq!(
+            event["files"]["src/login.rs"],
+            markdown::sha256_hex(b"fn login() {}\n")
+        );
+
+        let refused = |changed: &[String], text: &str| {
+            let error = archive(top, "add-login", "2026-11-25", changed).unwrap_err();
+            assert!(error.to_string().contains(text), "{text}: {error}");
+            assert!(!archived(top));
+        };
+        // Code edited after the stamp.
+        std::fs::write(top.join("src/login.rs"), "fn login() { todo() }\n").unwrap();
+        refused(&changed, "src/login.rs changed after it was verified");
+        std::fs::write(top.join("src/login.rs"), "fn login() {}\n").unwrap();
+        // A file the branch changes that was not verified.
+        let mut more = changed.to_vec();
+        more.push("src/extra.rs".to_owned());
+        refused(&more, "src/extra.rs changed after it was verified");
+        // A stamped file the branch no longer changes.
+        refused(
+            &changed[..1],
+            "src/old.rs was verified as changed, but it now matches the base",
+        );
+        // The spec delta edited after the stamp.
+        let delta = top.join("goodflows/changes/add-login/specs/auth/spec.md");
+        let text = std::fs::read_to_string(&delta).unwrap();
+        std::fs::write(&delta, text.replace("30 days after", "31 days after")).unwrap();
+        refused(&changed, "the auth delta changed after it was verified");
+        std::fs::write(&delta, text).unwrap();
+
+        archive(top, "add-login", "2026-11-25", &changed).unwrap();
+        assert!(archived(top));
+        assert!(top
+            .join("goodflows/changes/archive/2026-11-25-add-login/verification.md")
+            .is_file());
+    }
+
+    #[test]
+    fn stamp_keeps_open_findings_and_the_body_and_archive_refuses_them() {
+        let files: Vec<(&str, String)> = valid();
+        let files: Vec<(&str, &str)> = files.iter().map(|(p, t)| (*p, t.as_str())).collect();
+        let top = project(&files);
+        let top = top.path();
+        // Paths and findings that need YAML quoting round-trip.
+        let changed = ["src/a: \"b\" #c.rs".to_owned(), "docs/ünï.md".to_owned()];
+        stamp(top, "add-login", BASE, &changed).unwrap();
+        let file = top.join("goodflows/changes/add-login/verification.md");
+        let text = std::fs::read_to_string(&file).unwrap();
+        let finding = "D3: [code] says \"null\" on 404: fix #2";
+        std::fs::write(
+            &file,
+            text.replace("open: []", &format!("open:\n  - {}", Value::from(finding)))
+                + "\nAll four verifiers ran.\n",
+        )
+        .unwrap();
+
+        stamp(top, "add-login", BASE, &changed).unwrap();
+        let dir = top.join("goodflows/changes/add-login");
+        let stamped = read_stamp(&dir, "goodflows/changes/add-login")
+            .unwrap()
+            .unwrap();
+        assert_eq!(stamped.open, vec![finding]);
+        assert_eq!(stamped.body, "\nAll four verifiers ran.\n");
+        assert_eq!(
+            stamped.files.keys().collect::<Vec<_>>(),
+            vec!["docs/ünï.md", "src/a: \"b\" #c.rs"]
+        );
+        assert_eq!(check(top, "add-login").0.errors, Vec::<String>::new());
+
+        let error = archive(top, "add-login", "2026-11-25", &changed).unwrap_err();
+        assert!(
+            error.to_string().contains(&format!("open: {finding}")),
+            "{error}"
+        );
+        assert!(!archived(top));
+    }
+
+    #[test]
+    fn validate_checks_the_verification_format() {
+        let mut files = valid();
+        files.push((
+            "goodflows/changes/add-login/verification.md",
+            format!("---\nformat: goodflows-verification/1\nchange: add-logout\nbase: {BASE}\ndeltas: {{auth: abc}}\nfiles: {{a.rs: null}}\nopen: [\"\"]\nby: me\n---\n"),
+        ));
+        let r = report(files);
+        for problem in [
+            "verification.md: unknown field by",
+            "verification.md: change must be add-login",
+            "verification.md: deltas[auth] must be a lowercase SHA-256",
+            "verification.md: open must list nonempty strings",
+        ] {
+            assert!(has(&r.errors, problem), "{problem}: {:?}", r.errors);
+        }
+        assert!(!has(&r.errors, "files[a.rs]"), "{:?}", r.errors);
     }
 
     const PASSKEYS: &str = "---
@@ -1768,7 +2251,7 @@ left_to_builder: [x]
         let files = with_passkeys("depends_on: [add-passkeys]");
         let files: Vec<(&str, &str)> = files.iter().map(|(p, t)| (*p, t.as_str())).collect();
         let top = project(&files);
-        let error = archive(top.path(), "add-login", "2026-11-25").unwrap_err();
+        let error = archive(top.path(), "add-login", "2026-11-25", &[]).unwrap_err();
         assert!(
             error
                 .to_string()

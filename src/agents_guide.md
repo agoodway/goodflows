@@ -134,12 +134,37 @@ server keeps the change request `pending` (`dependency_not_merged`) until a
 change request linking each dependency merges. Nothing is sent when no
 change is linked or `change.md` is not in the commit.
 
+While a change is built, its deltas follow the code. The builder may edit
+lines that come from `by: agent` decisions or `left_to_builder`, and add
+behavior the spec does not cover without changing a goal or anti-goal; it
+records each edit as a `by: agent` decision whose `why` starts with "Found
+while building:" and keeps `status: approved`. An edit to a `by: user`
+decision, a goal or anti-goal, or a `one_way` door goes back to the user,
+and the change is `proposed` until they approve it again.
+
+`goodflows change verified <id> [--base <rev>]` runs once the code has been
+verified against the change. It writes
+`goodflows/changes/<id>/verification.md`, a `goodflows-verification/1`
+file whose front matter has exactly `format`, `change` (the id), `base`
+(the merge base of HEAD and `--base`, default `origin/HEAD`), `deltas`
+(capability to the SHA-256 of its delta), `files` (each file that differs
+from `base` in the working tree, committed or not, plus untracked files
+git does not ignore, outside `goodflows/changes/`, to its SHA-256, or
+`null` when deleted), and `open` (findings left unresolved, as strings).
+An existing file keeps its `open` list and its body, the verification
+summary; a new one starts with `open: []`. `change validate` checks the
+file's format when it exists.
+
 `goodflows change archive <id>` archives an `approved` change that
-validates and has no active dependency: it applies RENAMED, REMOVED, MODIFIED and then ADDED
+validates, has no active dependency, and has a `verification.md` with
+nothing `open` whose delta hashes and changed files still match the
+checkout; otherwise it lists each mismatch. Archive in the change's
+branch, before it merges, so the merged code and `goodflows/specs/` agree.
+It applies RENAMED, REMOVED, MODIFIED and then ADDED
 requirements to `goodflows/specs/`, drops the `Refs:` lines, sets
 `status: archived` and moves the change to
 `goodflows/changes/archive/<UTC date>-<id>/`. On any problem it changes
-nothing. Neither command needs an API key or `goodflows.toml`.
+nothing. No `change` command needs an API key or `goodflows.toml`.
 
 ## Read a failure
 
