@@ -808,7 +808,7 @@ Other runners can write `test-timings/1` themselves. The suite id for the ExUnit
 
 A GoodFlows server can hold change requests in place of pull requests. The server stores the facts and claims a client reports for each head, the QA scenario sets and verify runs that grade it, and the project's review policy, and computes a verdict: `pending`, `blocked`, `needs_review`, or `mergeable`, with one reason per rule that fired. It never talks to the Git host. These commands report facts from the local checkout and read results back with the same `[reporting]` project, URL, and key as `history`. Writes need an `sk_` key.
 
-A change request's description is its claims file, a `change-claims/2` Markdown file that the goodstack `gs-change-request` skill writes to `goodflows cr path` (`.goodflows/change-requests/<branch>/cr.md`, or `.goodflows/change-requests/.detached/<short SHA>/cr.md` on a detached HEAD):
+A change request's description is its claims file, a `change-claims/2` Markdown file that the `gf-change-request` skill writes to `goodflows cr path` (`.goodflows/change-requests/<branch>/cr.md`, or `.goodflows/change-requests/.detached/<short SHA>/cr.md` on a detached HEAD):
 
 - `goodflows cr open [--claims <file>]` **creates** one while the file's `cr` is null. It reuses the one draft or open change request whose source branch is the current branch, or opens a draft. When the claims file exists, it reports `git-facts/1` for HEAD, writes the number into the file's `cr`, and uploads the claims. Without the file it needs `--title`, and `--change <id>` links the goodflows change in `goodflows/changes/<id>/`, so its intent scenario set can be approved before code.
 - `goodflows cr claims [<file>]` **updates** it once `cr` is set: it reports Git facts for HEAD, then uploads the claims. Claims describe one head, so the file's `head` must be HEAD.
@@ -821,7 +821,7 @@ goodflows cr scenarios upload goodflows/changes/add-login/qa-scenarios.md
 goodflows cr scenarios approve
 goodflows cr push -- -u origin HEAD        # git push, then report Git facts for the new head
 goodflows cr runs upload .verify/web/<run-id>
-goodflows cr open                          # gs-change-request wrote the claims file
+goodflows cr open                          # gf-change-request wrote the claims file
 goodflows cr ready
 goodflows cr wait --until mergeable,needs_review
 goodflows cr review                        # what the policy flagged, as Markdown
@@ -929,7 +929,13 @@ npx skills add agoodway/goodflows --skill gf-change-build
 npx skills add agoodway/goodflows --skill gf-change-merge
 ```
 
-`goodflows skills install` writes `create-ci-skill`, `maintain-ci-skill`, `gf-change-write`, `gf-change-build` and `gf-change-merge` into the directory the current coding agent loads project skills from, one directory per skill, such as `.claude/skills/create-ci-skill/SKILL.md`. The skills are built into the binary, so they match the goodflows you run. Rerunning replaces the installed copies with the built-in ones.
+[`gf-change-request`](skills/gf-change-request/SKILL.md) writes a change request's claims file, the `change-claims/2` description at `goodflows cr path`, for the current commit: the door, the reach, the facts the change is safe because of and how far each was proven, the open risks, the questions for the reviewer, and the hunks to judge, with a body a reviewer can follow without reading the diff. It keeps the file out of the commits it describes, and after a clean rebase rewrites only `head`. With `--approved` it also creates or updates the change request through `goodflows cr open` or `goodflows cr claims`; with `--commit` it commits first. It never pushes or calls a Git host.
+
+```bash
+npx skills add agoodway/goodflows --skill gf-change-request
+```
+
+`goodflows skills install` writes `create-ci-skill`, `maintain-ci-skill`, `gf-change-write`, `gf-change-build`, `gf-change-merge` and `gf-change-request` into the directory the current coding agent loads project skills from, one directory per skill, such as `.claude/skills/create-ci-skill/SKILL.md`. The skills are built into the binary, so they match the goodflows you run. Rerunning replaces the installed copies with the built-in ones.
 
 ```bash
 goodflows skills install

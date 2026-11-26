@@ -80,7 +80,7 @@ $C finish pass "one-line summary"      # or fail / partial
 
 Proof standards:
 
-- Drive the CLI the way the `gs-change-request` and `gs-qa-scenarios` skills do: real commands in a git checkout, never hand-built requests to the routes the CLI is supposed to call. `api` is only for reading back what was stored.
+- Drive the CLI the way the `gf-change-request` and `gs-qa-scenarios` skills do: real commands in a git checkout, never hand-built requests to the routes the CLI is supposed to call. `api` is only for reading back what was stored.
 - Capture the command and the resulting state: the CLI's output and exit code, and a server read of the stored record (the change request's `head`, the claims document byte for byte, the scenario set's `digest`, the verify run's `status`).
 - Check side effects outside the server too: `cr open` writes the number into the claims file's `cr`, `cr push` pushes to the bare origin (`$C git ls-remote origin`), `--json` stdout stays one JSON event per line.
 - A server `4xx` is a finding, not noise. Quote the CLI's error and the server log line in the feature's result.

@@ -270,7 +270,7 @@ Without a claims file, `cr open` SHALL create the change request from `--title` 
 - **THEN** it exits 2 with `must be 1-64 characters of a-z, 0-9 and -, starting with a letter or digit`
 
 ### Requirement: cr claims updates a change request for HEAD
-`cr claims [<file>]` SHALL read the file (default: the branch's claims file), which MUST exist (`the claims file <f> does not exist; write it first (gs-change-request)`), check its head, then read the change request, report Git facts against its target branch and upload the claims. The number SHALL be the file's `cr`, else `--number`, else the branch's change request.
+`cr claims [<file>]` SHALL read the file (default: the branch's claims file), which MUST exist (`the claims file <f> does not exist; write it first (gf-change-request)`), check its head, then read the change request, report Git facts against its target branch and upload the claims. The number SHALL be the file's `cr`, else `--number`, else the branch's change request.
 
 #### Scenario: Number conflict
 - **WHEN** the file has `cr: 7` and `cr claims -n 8` runs

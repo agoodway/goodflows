@@ -330,7 +330,7 @@ const SKILLS_EXAMPLES: &str = "Examples:
 
 #[derive(Subcommand)]
 enum SkillsCommand {
-    /// Write create-ci-skill, maintain-ci-skill, gf-change-write, gf-change-build and gf-change-merge into the harness's skills directory, replacing earlier copies
+    /// Write create-ci-skill, maintain-ci-skill, gf-change-write, gf-change-build, gf-change-merge and gf-change-request into the harness's skills directory, replacing earlier copies
     #[command(after_help = SKILLS_EXAMPLES)]
     Install {
         /// The harness to install for (default: detected from its environment variables; .agents/skills when none is)

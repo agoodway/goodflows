@@ -6,7 +6,7 @@ An agent opens a change request for its branch, before code or from a `change-cl
 
 - `cr-path` prints the default claims file for the branch.
 - `cr-open-before-code` creates a draft linked to a goodflows change without a claims file.
-- `cr-open-claims` reuses the branch's draft, reports Git facts, writes the number into `cr` and uploads the claims (the `gs-change-request --approved` create path).
+- `cr-open-claims` reuses the branch's draft, reports Git facts, writes the number into `cr` and uploads the claims (the `gf-change-request --approved` create path).
 - `cr-claims` reports facts and uploads claims for a new commit (the update path).
 - `cr-push` runs `git push` and reports facts for the pushed head.
 - `cr-states` moves the change request through ready, draft, close and reopen.

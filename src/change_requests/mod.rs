@@ -39,7 +39,7 @@ const CLAIMS_CONFLICT: &str = "Different claims are stored for this head";
 /// Retries of `POST verify-runs/:run_id/commit` answered `503`.
 const COMMIT_RETRIES: u32 = 5;
 
-pub const CR_EXAMPLES: &str = "A change request's description is its claims file (change-claims/2, written by gs-change-request):
+pub const CR_EXAMPLES: &str = "A change request's description is its claims file (change-claims/2, written by gf-change-request):
   CREATE with cr open --claims <file> while the file's cr is null; it writes the new number into cr.
   UPDATE with cr claims <file> once cr is set, after each new commit.
 Commands find the change request of the current branch unless given --number. They talk to the
@@ -1718,7 +1718,7 @@ async fn update_claims(
     };
     if !file.is_file() {
         bail!(
-            "the claims file {} does not exist; write it first (gs-change-request)",
+            "the claims file {} does not exist; write it first (gf-change-request)",
             file.display()
         );
     }
