@@ -60,9 +60,9 @@ fn created(body: Value) -> Reply {
     Reply::Status(201, vec![], body.to_string())
 }
 
-fn cr(number: u64, state: &str, openspec: Option<&str>) -> Value {
+fn cr(number: u64, state: &str, change: Option<&str>) -> Value {
     json!({"number": number, "title": "Add login", "state": state, "source_branch": "feat/login",
-           "target_branch": "main", "openspec_change": openspec, "head": null, "merge": null})
+           "target_branch": "main", "change_id": change, "head": null, "merge": null})
 }
 
 /// A change request as POST create, git-facts and claims return it: with
@@ -105,7 +105,19 @@ fn server(existing: Vec<Value>) -> Mock {
             ),
             ("POST", p) if p.ends_with("/git-facts") => {
                 let head = r.json()["head"].clone();
-                created(json!({"data": full(cr(7, "draft", None), head)}))
+                let stored = existing
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| cr(7, "draft", None));
+                created(json!({"data": full(stored, head)}))
+            }
+            ("PUT", p) if p.ends_with("/dependencies") => {
+                let mut stored = existing
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| cr(7, "draft", Some("add-login")));
+                stored["dependencies"] = r.json()["change_ids"].clone();
+                ok(json!({"data": full(stored, Value::Null)}))
             }
             ("POST", p) if p.ends_with("/claims") => {
                 let head = git_head(&r.body);
@@ -268,7 +280,7 @@ fn open_without_claims_creates_a_linked_draft_before_code() {
         &[
             "cr",
             "open",
-            "--openspec-change",
+            "--change",
             "add-login",
             "--title",
             "Add login",
@@ -284,7 +296,7 @@ fn open_without_claims_creates_a_linked_draft_before_code() {
     );
     assert_eq!(
         requests[2].json(),
-        json!({"title": "Add login", "source_branch": "feat/login", "openspec_change": "add-login"})
+        json!({"title": "Add login", "source_branch": "feat/login", "change_id": "add-login"})
     );
     let event = last_event(&output);
     assert_eq!(event["change_request"]["number"], 7);
@@ -307,7 +319,7 @@ fn open_reuses_the_branch_change_request_and_refuses_ambiguity() {
     let output = run(
         &p,
         &reuse,
-        &["cr", "open", "--openspec-change", "add-login", "--json"],
+        &["cr", "open", "--change", "add-login", "--json"],
     );
     success(&output);
     assert!(
@@ -320,11 +332,11 @@ fn open_reuses_the_branch_change_request_and_refuses_ambiguity() {
     let other = run(
         &p,
         &server(vec![cr(3, "draft", Some("add-login"))]),
-        &["cr", "open", "--openspec-change", "add-export"],
+        &["cr", "open", "--change", "add-export"],
     );
     assert_eq!(other.status.code(), Some(1));
     assert!(
-        stderr(&other).contains("links OpenSpec change add-login, not add-export"),
+        stderr(&other).contains("links change add-login, not add-export"),
         "{}",
         stderr(&other)
     );
@@ -814,7 +826,7 @@ fn cr_validate_lists_every_problem_in_each_file_without_config_or_server() {
         "---\nformat: change-claims/1\ncr: 0\n---\n# Add login\n",
     )
     .unwrap();
-    let change = p.dir.join("openspec/changes/add-login");
+    let change = p.dir.join("goodflows/changes/add-login");
     std::fs::create_dir_all(&change).unwrap();
     std::fs::write(
         change.join("qa-scenarios.md"),
@@ -840,8 +852,8 @@ fn cr_validate_lists_every_problem_in_each_file_without_config_or_server() {
     assert_eq!(
         event["files"][1]["errors"],
         json!([
-            "openspec/changes/add-login/qa-scenarios.md: scenario 1 has more than one heading",
-            "openspec/changes/add-login/qa-scenarios.md: scenario 2 has no \"### 2. <name>\" heading under ## Scenarios",
+            "goodflows/changes/add-login/qa-scenarios.md: scenario 1 has more than one heading",
+            "goodflows/changes/add-login/qa-scenarios.md: scenario 2 has no \"### 2. <name>\" heading under ## Scenarios",
         ])
     );
 
@@ -1306,4 +1318,121 @@ fn claims_fetch_the_target_first_and_explain_a_moved_merge_base() {
         "{}",
         stderr(&output)
     );
+}
+
+/// Commits `goodflows/changes/add-login/change.md` with `depends_on`.
+fn commit_change(p: &Project, depends_on: &str) {
+    let dir = p.dir.join("goodflows/changes/add-login");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("change.md"),
+        format!("---\nformat: goodflows-change/1\nid: add-login\ndepends_on: {depends_on}\n---\n"),
+    )
+    .unwrap();
+    git(p, &["add", "."]);
+    git(p, &["commit", "-q", "-m", "change"]);
+}
+
+fn dependency_puts(mock: &Mock) -> Vec<Value> {
+    mock.requests()
+        .iter()
+        .filter(|r| r.method == "PUT" && r.path.ends_with("/change-requests/7/dependencies"))
+        .map(|r| r.json())
+        .collect()
+}
+
+#[test]
+fn open_sets_dependencies_from_the_committed_change_without_archived_ones() {
+    let p = checkout();
+    let archived = p.dir.join("goodflows/changes/archive/2026-11-01-add-roles");
+    std::fs::create_dir_all(&archived).unwrap();
+    std::fs::write(archived.join("change.md"), "x\n").unwrap();
+    commit_change(&p, "[add-users, add-roles, add-users]");
+    // Only the committed change.md counts, not an edit in the working tree.
+    std::fs::write(
+        p.dir.join("goodflows/changes/add-login/change.md"),
+        "---\nformat: goodflows-change/1\nid: add-login\ndepends_on: [other]\n---\n",
+    )
+    .unwrap();
+    let mock = server(vec![]);
+    let output = run(
+        &p,
+        &mock,
+        &[
+            "cr",
+            "open",
+            "--change",
+            "add-login",
+            "--title",
+            "Add login",
+            "--json",
+        ],
+    );
+    success(&output);
+    assert_eq!(
+        dependency_puts(&mock),
+        vec![json!({"change_ids": ["add-users"]})]
+    );
+    let event = last_event(&output);
+    assert_eq!(event["dependencies"]["status"], "updated");
+    assert_eq!(
+        event["change_request"]["dependencies"],
+        json!(["add-users"])
+    );
+
+    // A change request linking no change sends nothing.
+    let unlinked = server(vec![]);
+    success(&run(
+        &p,
+        &unlinked,
+        &["cr", "open", "--title", "Add login", "--json"],
+    ));
+    assert!(dependency_puts(&unlinked).is_empty());
+}
+
+#[test]
+fn push_sends_dependencies_only_when_they_changed() {
+    let p = checkout();
+    let remote = tempfile::tempdir().unwrap();
+    git(
+        &p,
+        &["init", "-q", "--bare", remote.path().to_str().unwrap()],
+    );
+    git(
+        &p,
+        &["remote", "add", "origin", remote.path().to_str().unwrap()],
+    );
+    let mut stored = cr(7, "draft", Some("add-login"));
+    stored["dependencies"] = json!(["add-users", "add-roles"]);
+    let push = [
+        "cr",
+        "push",
+        "-n",
+        "7",
+        "--no-fetch",
+        "--json",
+        "--",
+        "-q",
+        "origin",
+        "HEAD",
+    ];
+
+    // Same ids in another order: nothing is sent.
+    commit_change(&p, "[add-roles, add-users]");
+    let mock = server(vec![stored.clone()]);
+    let output = run(&p, &mock, &push);
+    success(&output);
+    assert!(dependency_puts(&mock).is_empty());
+    assert_eq!(last_event(&output)["dependencies"]["status"], "unchanged");
+
+    // A dependency removed at the new head is sent.
+    commit_change(&p, "[add-users]");
+    let mock = server(vec![stored]);
+    let output = run(&p, &mock, &push);
+    success(&output);
+    assert_eq!(
+        dependency_puts(&mock),
+        vec![json!({"change_ids": ["add-users"]})]
+    );
+    assert_eq!(last_event(&output)["verdict"]["state"], "pending");
 }

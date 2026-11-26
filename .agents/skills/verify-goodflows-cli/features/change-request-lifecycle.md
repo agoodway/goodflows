@@ -5,7 +5,7 @@ An agent opens a change request for its branch, before code or from a `change-cl
 ## Sub-features
 
 - `cr-path` prints the default claims file for the branch.
-- `cr-open-before-code` creates a draft linked to an OpenSpec change without a claims file.
+- `cr-open-before-code` creates a draft linked to a goodflows change without a claims file.
 - `cr-open-claims` reuses the branch's draft, reports Git facts, writes the number into `cr` and uploads the claims (the `gs-change-request --approved` create path).
 - `cr-claims` reports facts and uploads claims for a new commit (the update path).
 - `cr-push` runs `git push` and reports facts for the pushed head.
@@ -14,14 +14,14 @@ An agent opens a change request for its branch, before code or from a `change-cl
 
 ## How to get to it (user POV)
 
-- `goodflows cr path`, `goodflows cr open [--claims <file>] [--openspec-change <id>] [--title <t>]`, `goodflows cr claims [<file>]`, `goodflows cr push [-- <git push args>]`, `goodflows cr ready|draft|close|reopen`, `goodflows cr status`, `goodflows cr verdict`, each with `--json`, from inside the branch's checkout.
+- `goodflows cr path`, `goodflows cr open [--claims <file>] [--change <id>] [--title <t>]`, `goodflows cr claims [<file>]`, `goodflows cr push [-- <git push args>]`, `goodflows cr ready|draft|close|reopen`, `goodflows cr status`, `goodflows cr verdict`, each with `--json`, from inside the branch's checkout.
 
 ## Driving it with control-goodflows-cli
 
 Preconditions: the baseline.
 
 - **Path.** Run `$C cli path cr path --json`. Exit `0`; `.path` is `.goodflows/change-requests/feat/verify/cr.md` and `.exists` is false.
-- **Open before code.** Run `$C cli open-before-code cr open --openspec-change add-login --title "Add login" --json`. Exit `0`; `.created` is true, `.change_request.number` is `1`, `.state` `draft`, `.openspec_change` `add-login`, and `.claims.status` `missing`. Second view: `$C api cr-1 GET /api/v1/projects/{project}/change-requests/1` returns `head` null and verdict `pending` with a `git_facts_missing` reason.
+- **Open before code.** Run `$C cli open-before-code cr open --change add-login --title "Add login" --json`. Exit `0`; `.created` is true, `.change_request.number` is `1`, `.state` `draft`, `.change_id` `add-login`, and `.claims.status` `missing`. Second view: `$C api cr-1 GET /api/v1/projects/{project}/change-requests/1` returns `head` null and verdict `pending` with a `git_facts_missing` reason.
 - **Write claims.** Write `$GF_CHECKOUT/.goodflows/change-requests/feat/verify/cr.md`:
 
   ```markdown
@@ -58,4 +58,4 @@ Preconditions: the baseline.
 - Claims describe one head: `cr claims` refuses a file whose `head` is not HEAD before sending anything. Update `head:` after every commit.
 - The server stores one set of claims per head. A second, different claims file for the same head is a `409`; commit first.
 - `cr open` fetches `origin <target>` before computing facts. In the scratch checkout `origin` is the bare repo, so this works offline; pass `--no-fetch` only when a recipe says so.
-- `cr open` with `--openspec-change add-export` on this branch fails, because the draft links `add-login` and no route changes the link. That is expected, not a failure of this feature.
+- `cr open` with `--change add-export` on this branch fails, because the draft links `add-login` and no route changes the link. That is expected, not a failure of this feature.

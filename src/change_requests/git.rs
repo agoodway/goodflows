@@ -55,7 +55,7 @@ impl Git {
     }
 
     /// The stdout of a git command, or `None` when it fails.
-    async fn try_output(&self, args: &[&str]) -> Option<String> {
+    pub async fn try_output(&self, args: &[&str]) -> Option<String> {
         let output = self
             .command(args)
             .stderr(Stdio::null())

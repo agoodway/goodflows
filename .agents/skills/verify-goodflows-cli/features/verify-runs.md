@@ -17,7 +17,7 @@ After a verify skill drives a scenario set, its run folder `.verify/<app>/<run-i
 
 Preconditions: builds on [Scenario sets](./scenario-sets.md) through **Reject** (intent version 2 approved) and on [Change request lifecycle](./change-request-lifecycle.md) through **Push**, so change request 1 has Git facts for HEAD.
 
-- **Write the run folder.** Let `R=$GF_CHECKOUT/.verify/web/run-1`. Copy the intent set: `cp $GF_CHECKOUT/openspec/changes/add-login/qa-scenarios.md $R/scenarios.md`. Write `$R/evidence/login.txt` containing `dashboard shown` and `$R/run.md`, substituting `$HEAD` and `$SHA` (`sha256sum $R/scenarios.md | cut -c1-64`):
+- **Write the run folder.** Let `R=$GF_CHECKOUT/.verify/web/run-1`. Copy the intent set: `cp $GF_CHECKOUT/goodflows/changes/add-login/qa-scenarios.md $R/scenarios.md`. Write `$R/evidence/login.txt` containing `dashboard shown` and `$R/run.md`, substituting `$HEAD` and `$SHA` (`sha256sum $R/scenarios.md | cut -c1-64`):
 
   ```markdown
   ---
@@ -27,7 +27,7 @@ Preconditions: builds on [Scenario sets](./scenario-sets.md) through **Reject** 
   dirty: false
   started_at: "2026-11-21T10:00:00Z"
   finished_at: "2026-11-21T10:05:00Z"
-  set: {path: "openspec/changes/add-login/qa-scenarios.md", sha256: "$SHA"}
+  set: {path: "goodflows/changes/add-login/qa-scenarios.md", sha256: "$SHA"}
   results:
     - {id: 1, result: passed, failed_step: null, reason: null, evidence: ["evidence/login.txt"]}
     - {id: 2, result: failed, failed_step: "1", reason: "No error shown", evidence: []}

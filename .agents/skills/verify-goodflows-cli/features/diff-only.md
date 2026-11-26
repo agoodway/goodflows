@@ -1,11 +1,11 @@
 # Diff-only change requests
 
-A project that does not use OpenSpec grades each change request on its diff scenario set alone. The agent opens a change request with no linked change, writes the diff set to the branch's default path next to the claims file, uploads it and its verify runs, and pushes. With the policy's `scenarios.diff_only` set to `weakening`, a person is asked only when a diff version removes or demotes a Must of its baseline: the newest accepted diff version, or v1. Approving every `diff_set_weakened` item accepts that version, which becomes the new baseline.
+A project that links no goodflows change grades each change request on its diff scenario set alone. The agent opens a change request with no linked change, writes the diff set to the branch's default path next to the claims file, uploads it and its verify runs, and pushes. With the policy's `scenarios.diff_only` set to `weakening`, a person is asked only when a diff version removes or demotes a Must of its baseline: the newest accepted diff version, or v1. Approving every `diff_set_weakened` item accepts that version, which becomes the new baseline.
 
 ## Sub-features
 
 - `diff-policy` writes a policy with `require_approved_intent = true` and `diff_only = "weakening"`.
-- `diff-open` opens a change request with no linked OpenSpec change from a claims file.
+- `diff-open` opens a change request with no linked change from a claims file.
 - `diff-path` prints the default diff set path, and `scenarios upload` with no file uploads it or names it when missing.
 - `diff-mergeable` grades a diff-only change request `mergeable` with no review item once a counted run passes every Must.
 - `diff-weakened` flags a demoted Must as a `diff_set_weakened` item, measured from the baseline, not the previous version.
@@ -20,12 +20,12 @@ A project that does not use OpenSpec grades each change request on its diff scen
 
 ## Driving it with control-goodflows-cli
 
-Preconditions: the baseline. Do not drive another recipe first in the same run: this one needs change request 1 to link no OpenSpec change.
+Preconditions: the baseline. Do not drive another recipe first in the same run: this one needs change request 1 to link no change.
 
 Let `D=$GF_CHECKOUT/.goodflows/change-requests/feat/verify` and `HEAD` be `$C git rev-parse HEAD`.
 
 - **Policy.** `$C cli policy-get policy get > /dev/null`, then `cp $GF_RUN_DIR/cli/policy-get.stdout $GF_CHECKOUT/policy.toml` and edit it: under `[scenarios]` set `require_approved_intent = true` and add `diff_only = "weakening"`; under `[claims]` set `min_proof_level = "stated"` so the claims add no review item. Keep the default `[evidence] ignore_paths`, which holds `docs/**`. Run `$C cli diff-policy policy set policy.toml --note Diff-only --json`. Exit `0`; `.policy.version` `1`, `.policy.policy.scenarios.diff_only` `weakening`, and `.policy.active_settings` contains `scenarios.diff_only`.
-- **Open.** Write `$D/cr.md` as in [Change request lifecycle](./change-request-lifecycle.md) **Write claims** (substitute `$HEAD`) and run `$C cli diff-open cr open --json`. Exit `0`; `.created` true, `.change_request.number` `1`, `.change_request.openspec_change` null, `.claims.wrote_cr` true, and the verdict is `pending` with only `scenario_set_missing`. Push it: `$C cli diff-push cr push --json -- -u origin HEAD`.
+- **Open.** Write `$D/cr.md` as in [Change request lifecycle](./change-request-lifecycle.md) **Write claims** (substitute `$HEAD`) and run `$C cli diff-open cr open --json`. Exit `0`; `.created` true, `.change_request.number` `1`, `.change_request.change_id` null, `.claims.wrote_cr` true, and the verdict is `pending` with only `scenario_set_missing`. Push it: `$C cli diff-push cr push --json -- -u origin HEAD`.
 - **Default path.** `$C cli diff-path cr path --json`: `.scenarios_path` is `.goodflows/change-requests/feat/verify/qa-scenarios.md` and `.scenarios_exists` false. `$C cli diff-up-missing cr scenarios upload` exits `1` naming that path.
 - **Diff set v1.** Write `$D/qa-scenarios.md`, with `$SHORT` the first 7 characters of `$HEAD`:
 
@@ -76,7 +76,7 @@ Let `D=$GF_CHECKOUT/.goodflows/change-requests/feat/verify` and `HEAD` be `$C gi
 
 - `scenarios.diff_only` applies only while `require_approved_intent` is true. With it false no set is required and nothing in this recipe asks for a person.
 - Under the default `diff_only = "needs_review"` every head gets a `diff_only_set` item instead; that is the server's default, not a CLI failure.
-- A change request linked to an OpenSpec change never gets `diff_set_weakened`: it waits on its intent set. Open this recipe's change request without `--openspec-change`.
+- A change request linked to a goodflows change never gets `diff_set_weakened`: it waits on its intent set. Open this recipe's change request without `--change`.
 - The diff set's `revision` is in its bytes, so every rewrite is a new version and a new digest. A run counts only for the digest in its `scenarios.md`: upload a run folder for each version.
 - A `diff_set_weakened` answer is tied to the diff digest that was current when it was given. Uploading another version supersedes it, even at the same head.
 - `cr answer` sends only the head, so an answer given after another diff version was uploaded at the same head applies to that version. Read `cr review` again after any upload before answering.

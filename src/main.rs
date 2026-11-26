@@ -253,6 +253,15 @@ enum Commands {
         #[command(subcommand)]
         command: change_requests::FeaturesCommand,
     },
+    /// Check goodflows changes (goodflows/changes/<id>/) and archive them into goodflows/specs/
+    #[command(after_help = "Examples:
+  goodflows change validate                  # every change under goodflows/changes/
+  goodflows change validate add-login --json # one change's errors and warnings as JSON
+  goodflows change archive add-login         # merge an approved change's deltas and archive it")]
+    Change {
+        #[command(subcommand)]
+        command: change_requests::ChangeCommand,
+    },
     /// Read the project's event feed: change request states, verdicts, scenario sets, answers and tasks
     #[command(after_help = "Examples:
   goodflows events                           # the oldest kept events
@@ -320,7 +329,7 @@ const SKILLS_EXAMPLES: &str = "Examples:
 
 #[derive(Subcommand)]
 enum SkillsCommand {
-    /// Write create-ci-skill and maintain-ci-skill into the harness's skills directory, replacing earlier copies
+    /// Write create-ci-skill, maintain-ci-skill and gf-change-explore into the harness's skills directory, replacing earlier copies
     #[command(after_help = SKILLS_EXAMPLES)]
     Install {
         /// The harness to install for (default: detected from its environment variables; .agents/skills when none is)
@@ -621,6 +630,7 @@ impl Cli {
                 | Commands::Cancel { .. }
                 | Commands::Sprite { .. }
                 | Commands::Skills { .. }
+                | Commands::Change { .. }
                 | Commands::Agents
                 | Commands::Mcp
                 | Commands::SpriteAgent { .. },
@@ -891,6 +901,13 @@ async fn run(cli: &Cli, output: &mut Output, cancel: watch::Receiver<Option<i32>
     }
     if let Some(Commands::Sprite { command }) = &cli.command {
         return sprite::command(cli, command, output, cancel).await;
+    }
+    if let Some(Commands::Change { command }) = &cli.command {
+        let config = cli.config.is_some().then_some("--config");
+        if let Some(flag) = config.or_else(|| cli.run_only_flag()) {
+            return Err(usage(format!("{flag} cannot be used with change commands")));
+        }
+        return change_requests::change(command, output).await;
     }
     if let Some(Commands::Skills {
         command: SkillsCommand::Install { harness },

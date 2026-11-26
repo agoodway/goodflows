@@ -44,6 +44,8 @@ pub fn renders(kind: &str) -> bool {
             | "feature_index"
             | "cr_validation"
             | "feature_validation"
+            | "change_validation"
+            | "change_archive"
             | "project_events"
             | "merge_lease"
             | "defect"
@@ -159,7 +161,31 @@ pub fn render(event: &Value, out: &mut impl Write) -> Result<()> {
                 )?;
             }
         }
-        "cr_validation" => validation(&event["files"], &[], out)?,
+        "cr_validation" | "change_validation" => validation(&event["files"], &[], out)?,
+        "change_archive" => {
+            writeln!(
+                out,
+                "Archived change {} to {}",
+                s(&event["id"]),
+                s(&event["archived_to"])
+            )?;
+            for spec in event["specs"].as_array().into_iter().flatten() {
+                writeln!(
+                    out,
+                    "  {}{}: {} added, {} modified, {} removed, {} renamed",
+                    s(&spec["path"]),
+                    if spec["created"] == true {
+                        " (new)"
+                    } else {
+                        ""
+                    },
+                    spec["added"],
+                    spec["modified"],
+                    spec["removed"],
+                    spec["renamed"]
+                )?;
+            }
+        }
         "feature_validation" => validation(
             &event["files"],
             event["errors"].as_array().map_or(&[][..], Vec::as_slice),
@@ -415,8 +441,8 @@ fn change_request(event: &Value, out: &mut impl Write) -> Result<()> {
         s(&cr["title"])
     )?;
     let mut details = vec![format!("head {}", short(&cr["head"]))];
-    if let Some(change) = cr["openspec_change"].as_str() {
-        details.push(format!("OpenSpec {}", visible(change)));
+    if let Some(change) = cr["change_id"].as_str() {
+        details.push(format!("change {}", visible(change)));
     }
     if let Some(parent) = cr["parent"].as_u64() {
         details.push(format!("parent #{parent}"));
@@ -447,6 +473,16 @@ fn change_request(event: &Value, out: &mut impl Write) -> Result<()> {
             facts["commits"],
             facts["files"],
             s(&facts["target"]["branch"])
+        )?;
+    }
+    let dependencies = &event["dependencies"];
+    if dependencies.is_object() {
+        writeln!(
+            out,
+            "Dependencies: {} from {}: {}",
+            s(&dependencies["status"]),
+            s(&dependencies["file"]),
+            list(&dependencies["change_ids"])
         )?;
     }
     let claims = &event["claims"];
@@ -1011,7 +1047,7 @@ mod tests {
     fn status_prints_history_states_and_public_coverage() {
         let rendered = text(json!({"type": "change_request", "action": "status",
             "change_request": {"number": 7, "state": "merged", "source_branch": "feat", "target_branch": "main",
-                "title": "Exports", "head": "c".repeat(40), "openspec_change": null, "parent": null, "merge": null,
+                "title": "Exports", "head": "c".repeat(40), "change_id": null, "parent": null, "merge": null,
                 "verdict": {"state": "pending", "head": null, "policy_version": 1, "reasons": [],
                     "scenarios": {"intent": null, "diff": null},
                     "coverage": {"version": 4, "unmapped_areas": null,

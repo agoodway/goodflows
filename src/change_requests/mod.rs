@@ -7,6 +7,7 @@
 //! `[reporting]` project, URL and key, like `history`.
 
 mod api;
+mod changes;
 mod git;
 mod markdown;
 mod verify_run;
@@ -15,6 +16,8 @@ use crate::config::Reporting;
 use crate::output::Output;
 use anyhow::{anyhow, bail, Context, Result};
 use api::{data, explain_conflict, quoted, Api, Body, HttpError};
+use changes::dependencies_at;
+pub use changes::{change, ChangeCommand};
 use clap::{Args, Subcommand, ValueEnum};
 use git::Git;
 use markdown::Problems;
@@ -69,15 +72,15 @@ before code. Once cr is set, update the change request with cr claims instead.
 Examples:
   goodflows cr open                           # create from the default claims file (goodflows cr path)
   goodflows cr open --claims cr.md --json     # a claims file elsewhere; print the result as JSON
-  goodflows cr open --openspec-change add-login --title Login   # before code, without claims"
+  goodflows cr open --change add-login --title Login   # before code, without claims"
     )]
     Open {
         /// The change-claims/2 file, which must exist (default: the path cr path prints, used only when it exists)
         #[arg(long, value_name = "FILE")]
         claims: Option<PathBuf>,
-        /// The OpenSpec change id this change request implements (a-z, 0-9 and -); set only when it is created, and it cannot change
-        #[arg(long, value_name = "ID", value_parser = openspec_change)]
-        openspec_change: Option<String>,
+        /// The id of the goodflows change (goodflows/changes/<id>/) this change request implements (a-z, 0-9 and -); set only when it is created, and it cannot change
+        #[arg(long = "change", value_name = "ID", value_parser = change_id)]
+        change_id: Option<String>,
         /// Title of a new change request (default: the claims file's # heading; required without a claims file)
         #[arg(long)]
         title: Option<String>,
@@ -150,7 +153,7 @@ errors. Needs no API key or goodflows.toml. The server checks more of a claims f
 format, cr and head; those fields are not checked here. Feature files: goodflows features validate.
 
 Without paths it checks the branch's claims file and diff set (goodflows cr path), each
-openspec/changes/*/qa-scenarios.md and each .verify/<app>/<run-id>/ run folder.
+goodflows/changes/*/qa-scenarios.md and each .verify/<app>/<run-id>/ run folder.
 
 Examples:
   goodflows cr validate                       # every change request file in the checkout
@@ -382,7 +385,7 @@ whose revision ends +dirty is refused. Results never go into the set: upload the
 
 Examples:
   goodflows cr scenarios upload               # the default diff set (goodflows cr path --json)
-  goodflows cr scenarios upload openspec/changes/add-login/qa-scenarios.md   # an intent set
+  goodflows cr scenarios upload goodflows/changes/add-login/qa-scenarios.md   # an intent set
   goodflows cr scenarios upload qa.md -n 42   # change request 42
   goodflows cr scenarios upload qa.md --json  # print the version and digest as JSON"
     )]
@@ -694,8 +697,8 @@ fn name<T: ValueEnum>(value: T) -> String {
         .to_owned()
 }
 
-/// The server's OpenSpec change id rule.
-fn openspec_change(value: &str) -> Result<String, String> {
+/// The server's change id rule.
+fn change_id(value: &str) -> Result<String, String> {
     let ok = (1..=64).contains(&value.len())
         && value.starts_with(|c: char| c.is_ascii_lowercase() || c.is_ascii_digit())
         && value
@@ -894,6 +897,62 @@ impl<'a> Ctx<'a> {
         Ok((summary, updated))
     }
 
+    /// Sets the change request's dependencies to the `depends_on` of its
+    /// linked change's `change.md` at `head`, leaving out changes archived
+    /// at `head`, when that differs from the stored list. Sends nothing when
+    /// no change is linked or `change.md` is not in `head`. Returns what was
+    /// read, with `updated` or `unchanged`, and the change request after.
+    async fn sync_dependencies(&self, cr: Value, head: &str) -> Result<(Value, Value)> {
+        let Some(change) = cr["change_id"].as_str() else {
+            return Ok((Value::Null, cr));
+        };
+        let file = format!("goodflows/changes/{change}/change.md");
+        let Some(text) = self
+            .git
+            .try_output(&["show", &format!("{head}:{file}")])
+            .await
+        else {
+            return Ok((Value::Null, cr));
+        };
+        let archive: Vec<String> = self
+            .git
+            .try_output(&[
+                "ls-tree",
+                "--name-only",
+                &format!("{head}:goodflows/changes/archive"),
+            ])
+            .await
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        let ids = dependencies_at(&text, &archive)
+            .ok_or_else(|| anyhow!("{file} at {head} has no readable front matter; check it with goodflows change validate {change}"))?;
+        let stored: Vec<&str> = cr["dependencies"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect();
+        let same = stored.len() == ids.len() && ids.iter().all(|id| stored.contains(&id.as_str()));
+        let summary = |status: &str| json!({"file": file, "change_ids": ids, "status": status});
+        if same {
+            return Ok((summary("unchanged"), cr));
+        }
+        let number = number_of(&cr)?.to_string();
+        let (_, response) = self
+            .api
+            .send(
+                Method::PUT,
+                &["change-requests", number.as_str(), "dependencies"],
+                &[],
+                Body::Json(json!({"change_ids": ids})),
+            )
+            .await?;
+        let updated = data(response, self.api.command())?;
+        Ok((summary("updated"), updated))
+    }
+
     /// Fails unless the claims describe HEAD, which the server requires.
     async fn claims_for_head(&self, claims: &markdown::Claims, file: &Path) -> Result<String> {
         let head = self.git.head().await?;
@@ -1026,7 +1085,7 @@ pub async fn cr(
         CrCommand::Path | CrCommand::Validate { .. } => unreachable!(),
         CrCommand::Open {
             claims,
-            openspec_change,
+            change_id,
             title,
             target,
             no_fetch,
@@ -1034,7 +1093,7 @@ pub async fn cr(
             open(
                 &ctx,
                 claims.as_deref(),
-                openspec_change.as_deref(),
+                change_id.as_deref(),
                 title.as_deref(),
                 target.as_deref(),
                 *no_fetch,
@@ -1323,7 +1382,7 @@ async fn validate(paths: &[PathBuf], git: &Git, output: &Output) -> Result<u8> {
 }
 
 /// The change request files of the checkout: the branch's claims file and
-/// diff set, each OpenSpec change's `qa-scenarios.md`, and every
+/// diff set, each goodflows change's `qa-scenarios.md`, and every
 /// `.verify/<app>/<run-id>/` run folder, relative to the working directory
 /// when they are under it.
 async fn discover(git: &Git) -> Result<Vec<PathBuf>> {
@@ -1346,7 +1405,7 @@ async fn discover(git: &Git) -> Result<Vec<PathBuf>> {
         paths.sort();
         paths
     };
-    for change in children(top.join("openspec/changes")) {
+    for change in children(top.join("goodflows/changes")) {
         let set = change.join("qa-scenarios.md");
         if change.file_name().is_some_and(|n| n != "archive") && set.is_file() {
             found.push(set);
@@ -1360,7 +1419,7 @@ async fn discover(git: &Git) -> Result<Vec<PathBuf>> {
         );
     }
     if found.is_empty() {
-        bail!("found no change request files (the claims file at goodflows cr path, openspec/changes/*/qa-scenarios.md or .verify/<app>/<run-id>/ run folders); pass the files to check");
+        bail!("found no change request files (the claims file at goodflows cr path, goodflows/changes/*/qa-scenarios.md or .verify/<app>/<run-id>/ run folders); pass the files to check");
     }
     let cwd = std::env::current_dir().unwrap_or_default();
     Ok(found
@@ -1524,7 +1583,7 @@ fn command_name(command: &CrCommand) -> &'static str {
 async fn open(
     ctx: &Ctx<'_>,
     claims_file: Option<&Path>,
-    openspec_change: Option<&str>,
+    change_id: Option<&str>,
     title: Option<&str>,
     target: Option<&str>,
     no_fetch: bool,
@@ -1562,11 +1621,11 @@ async fn open(
     }
     let (cr, created) = match found.pop() {
         Some(cr) => {
-            if let Some(wanted) = openspec_change {
-                let linked = cr["openspec_change"].as_str();
+            if let Some(wanted) = change_id {
+                let linked = cr["change_id"].as_str();
                 if linked != Some(wanted) {
                     bail!(
-                        "change request #{} of this branch links OpenSpec change {}, not {wanted}; the link cannot be changed",
+                        "change request #{} of this branch links change {}, not {wanted}; the link cannot be changed",
                         cr["number"],
                         linked.map_or("none".to_owned(), |l| crate::output::visible(l).into_owned())
                     );
@@ -1597,8 +1656,8 @@ async fn open(
                 bail!("the title must be 1-256 bytes without control characters");
             }
             let mut body = json!({"title": title, "source_branch": branch});
-            if let Some(change) = openspec_change {
-                body["openspec_change"] = json!(change);
+            if let Some(change) = change_id {
+                body["change_id"] = json!(change);
             }
             if let Some(target) = target {
                 body["target_branch"] = json!(target);
@@ -1623,16 +1682,26 @@ async fn open(
         "created": created,
         "change_request": cr,
     });
-    if let Some(text) = text {
+    let head = if let Some(text) = text {
         let (facts, _) = ctx.report_facts(&cr, no_fetch).await?;
         let (uploaded, latest) = ctx.upload_claims(number, &file, &text).await?;
+        let head = facts["head"].as_str().unwrap_or_default().to_owned();
         event["git_facts"] = facts;
         event["claims"] = uploaded;
-        event["verdict"] = latest["verdict"].clone();
         event["change_request"] = latest;
+        head
     } else {
         event["claims"] = json!({"file": file.display().to_string(), "status": "missing"});
+        ctx.git.head().await?
+    };
+    let (dependencies, latest) = ctx
+        .sync_dependencies(event["change_request"].take(), &head)
+        .await?;
+    if event["git_facts"].is_object() {
+        event["verdict"] = latest["verdict"].clone();
     }
+    event["dependencies"] = dependencies;
+    event["change_request"] = latest;
     ctx.emit(event).await?;
     Ok(0)
 }
@@ -1686,10 +1755,13 @@ async fn push(ctx: &Ctx<'_>, pick: Pick, git_args: &[String], no_fetch: bool) ->
     ctx.git.passthrough(&args).await?;
     let cr = ctx.show(number).await?;
     let (facts, cr) = ctx.report_facts(&cr, no_fetch).await?;
+    let head = facts["head"].as_str().unwrap_or_default().to_owned();
+    let (dependencies, cr) = ctx.sync_dependencies(cr, &head).await?;
     ctx.emit(json!({
         "type": "change_request",
         "action": "push",
         "git_facts": facts,
+        "dependencies": dependencies,
         "verdict": cr["verdict"],
         "change_request": cr,
     }))
@@ -2569,11 +2641,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn openspec_change_ids_follow_the_server_rule() {
-        assert!(openspec_change("add-login").is_ok());
-        assert!(openspec_change("2fa").is_ok());
+    fn change_ids_follow_the_server_rule() {
+        assert!(change_id("add-login").is_ok());
+        assert!(change_id("2fa").is_ok());
         for bad in ["", "-x", "Add", "a_b", &"a".repeat(65)] {
-            assert!(openspec_change(bad).is_err(), "{bad}");
+            assert!(change_id(bad).is_err(), "{bad}");
         }
     }
 }

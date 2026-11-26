@@ -298,15 +298,22 @@ pub fn claims(text: &str, file: &str) -> Result<Claims> {
 /// The file with its front matter's `cr:` line set to `number`, and
 /// nothing else changed.
 pub fn set_cr(text: &str, number: u64, file: &str) -> Result<String> {
+    set_line(text, "cr", &number.to_string(), file)
+}
+
+/// The file with its top-level front matter line `<key>: ...` replaced by
+/// `<key>: <value>`, and every other byte kept.
+pub fn set_line(text: &str, key: &str, value: &str, file: &str) -> Result<String> {
     let front = split(text).ok_or_else(|| anyhow!("{file}: no front matter"))?;
+    let prefix = format!("{key}:");
     let (offset, line) = lines(front.yaml)
-        .find(|(_, line)| line.starts_with("cr:"))
-        .ok_or_else(|| anyhow!("{file}: the front matter has no top-level cr: line"))?;
+        .find(|(_, line)| line.starts_with(&prefix))
+        .ok_or_else(|| anyhow!("{file}: the front matter has no top-level {prefix} line"))?;
     let ending = &line[bare(line).len()..];
     let start = front.range.start + offset;
     let mut updated = String::with_capacity(text.len() + 8);
     updated.push_str(&text[..start]);
-    updated.push_str(&format!("cr: {number}{ending}"));
+    updated.push_str(&format!("{key}: {value}{ending}"));
     updated.push_str(&text[start + line.len()..]);
     Ok(updated)
 }

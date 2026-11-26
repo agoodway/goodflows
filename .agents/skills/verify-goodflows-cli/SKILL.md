@@ -54,7 +54,7 @@ It is read-only. It runs goodflows_web's doctor (server pid, port ownership, `/u
 ## Drive
 
 ```bash
-$C cli open-before-code cr open --openspec-change add-login --title "Add login" --json
+$C cli open-before-code cr open --change add-login --title "Add login" --json
 $C git log --oneline -1                  # git in the scratch checkout
 $C api cr-1 GET /api/v1/projects/{project}/change-requests/1
 ```

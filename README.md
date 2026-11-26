@@ -60,7 +60,7 @@ goodflows keeps local state, such as the last run record and detached runs, in a
 - When a run or another command cannot do what it was asked, goodflows prints one `error` event. Its `code`, such as `config_invalid` or `unknown_job`, does not change between releases. Branch on `code`, not on `message`.
 - `goodflows last` shows the last run's failures again and exits with that run's exit code. After a fix, run `goodflows run --failed` to rerun only the failed jobs and the jobs they depend on.
 - If your shell stops commands after a few minutes, start the run with `goodflows run --detach`. Then call `goodflows wait <id> --timeout 90` until the exit code is not 75. `goodflows cancel <id>` stops it.
-- `goodflows skills install` adds skills that teach the next agent to run this repository's checks. `goodflows mcp` offers `run` (with `detach`), `wait`, `status`, `cancel`, `last`, `validate`, and `list` as MCP tools.
+- `goodflows skills install` adds skills that teach the next agent to run this repository's checks and to plan a change before building it. `goodflows mcp` offers `run` (with `detach`), `wait`, `status`, `cancel`, `last`, `validate`, and `list` as MCP tools.
 
 ## Install
 
@@ -804,14 +804,14 @@ A GoodFlows server can hold change requests in place of pull requests. The serve
 
 A change request's description is its claims file, a `change-claims/2` Markdown file that the goodstack `gs-change-request` skill writes to `goodflows cr path` (`.goodflows/change-requests/<branch>/cr.md`, or `.goodflows/change-requests/.detached/<short SHA>/cr.md` on a detached HEAD):
 
-- `goodflows cr open [--claims <file>]` **creates** one while the file's `cr` is null. It reuses the one draft or open change request whose source branch is the current branch, or opens a draft. When the claims file exists, it reports `git-facts/1` for HEAD, writes the number into the file's `cr`, and uploads the claims. Without the file it needs `--title`, and `--openspec-change <id>` links the OpenSpec change, so its intent scenario set can be approved before code.
+- `goodflows cr open [--claims <file>]` **creates** one while the file's `cr` is null. It reuses the one draft or open change request whose source branch is the current branch, or opens a draft. When the claims file exists, it reports `git-facts/1` for HEAD, writes the number into the file's `cr`, and uploads the claims. Without the file it needs `--title`, and `--change <id>` links the goodflows change in `goodflows/changes/<id>/`, so its intent scenario set can be approved before code.
 - `goodflows cr claims [<file>]` **updates** it once `cr` is set: it reports Git facts for HEAD, then uploads the claims. Claims describe one head, so the file's `head` must be HEAD.
 
 Before computing Git facts, `cr open`, `cr claims`, `cr push`, and `cr lease acquire` without `--base` run `git fetch --quiet origin <target>` when the checkout has an `origin` remote, so the merge base is the one the target branch has now; `--no-fetch` skips it. The server keeps one report per head and target branch: facts for the same head with a different merge base are refused, so make a new commit (or retarget) and report again. Claims are fixed per head in the same way.
 
 ```bash
-goodflows cr open --openspec-change add-login --title "Add login"
-goodflows cr scenarios upload openspec/changes/add-login/qa-scenarios.md
+goodflows cr open --change add-login --title "Add login"
+goodflows cr scenarios upload goodflows/changes/add-login/qa-scenarios.md
 goodflows cr scenarios approve
 goodflows cr push -- -u origin HEAD        # git push, then report Git facts for the new head
 goodflows cr runs upload .verify/web/<run-id>
@@ -821,10 +821,10 @@ goodflows cr wait --until mergeable,needs_review
 goodflows cr review                        # what the policy flagged, as Markdown
 ```
 
-Without OpenSpec, a change request links no change and is graded on its diff set alone. The diff set's default file is `qa-scenarios.md` next to the claims file (`goodflows cr path --json` prints it as `scenarios_path`). Its `revision` names the commit it covers, so write and upload it again after each code push. With the policy's `scenarios.diff_only` set to `weakening`, a person is asked only when a version removes or demotes a Must of its baseline: the newest accepted diff version, or v1. The person accepts the version by answering `approve` on each `diff_set_weakened` item:
+A change request with no linked change is graded on its diff set alone. The diff set's default file is `qa-scenarios.md` next to the claims file (`goodflows cr path --json` prints it as `scenarios_path`). Its `revision` names the commit it covers, so write and upload it again after each code push. With the policy's `scenarios.diff_only` set to `weakening`, a person is asked only when a version removes or demotes a Must of its baseline: the newest accepted diff version, or v1. The person accepts the version by answering `approve` on each `diff_set_weakened` item:
 
 ```bash
-goodflows cr open                          # no --openspec-change
+goodflows cr open                          # no --change
 goodflows cr scenarios upload              # .goodflows/change-requests/<branch>/qa-scenarios.md
 goodflows cr runs upload .verify/web/<run-id>
 goodflows cr scenarios diff --source diff  # the current diff version against its baseline
@@ -836,7 +836,9 @@ Commands find the change request of the current branch unless given `--number`. 
 
 `cr scenarios upload` sends the set file byte for byte, because the approved digest covers its raw bytes, with a digest per scenario section: under `## Scenarios`, from a scenario's `### <id>. ` heading (`#### <id>. ` under a group heading) to the next heading at that level or higher. It refuses a diff set whose `revision` ends `+dirty`. `cr runs upload` reads a run folder's `scenarios.md`, whose SHA-256 is the graded set's digest, and the `verify-run-notes/1` YAML front matter of its `run.md`: `format`, `commit`, `branch`, `dirty`, `started_at`, `finished_at`, and `results` (`id`, `result`, `failed_step`, `reason`, and `evidence` paths in the folder), and optionally `set` (`path`, `sha256`, which must match `scenarios.md`), `changed_files`, `features`, `drift`, `run_id`, `merge_result`, `links`, and `workflow_run_id`. It uploads each evidence file to the URL the server returns, then commits the run, retrying up to 5 times while the server answers `503` (waiting its `retry-after`, at most 10 seconds). `policy set` without `--previous-version` writes nothing when the current version already has the same document and note.
 
-`cr validate [<path>...]` checks claims files, scenario sets and run folders the way `cr open`, `cr claims`, `cr scenarios upload` and `cr runs upload` read them, and lists every problem in each file, so an agent can fix them all at once. Without paths it checks the branch's claims file and diff set, each `openspec/changes/*/qa-scenarios.md`, and each `.verify/<app>/<run-id>/` run folder. Warnings name what an upload would refuse later, such as claims for a head other than HEAD or a `+dirty` diff set. `features validate [--dir <dir>]` checks feature files the way `features sync` reads them; `features sync` now also refuses two files with `paths` that share an `id`. Both validate commands need no API key or `goodflows.toml`, and exit 1 when a file has errors. The server checks more of a claims file than its `format`, `cr` and `head`, so a claims file that validates can still be refused on upload.
+`cr validate [<path>...]` checks claims files, scenario sets and run folders the way `cr open`, `cr claims`, `cr scenarios upload` and `cr runs upload` read them, and lists every problem in each file, so an agent can fix them all at once. Without paths it checks the branch's claims file and diff set, each `goodflows/changes/*/qa-scenarios.md`, and each `.verify/<app>/<run-id>/` run folder. Warnings name what an upload would refuse later, such as claims for a head other than HEAD or a `+dirty` diff set. `features validate [--dir <dir>]` checks feature files the way `features sync` reads them; `features sync` now also refuses two files with `paths` that share an `id`. Both validate commands need no API key or `goodflows.toml`, and exit 1 when a file has errors. The server checks more of a claims file than its `format`, `cr` and `head`, so a claims file that validates can still be refused on upload.
+
+`goodflows change validate [<id>...]` and `goodflows change archive <id>` work on goodflows changes: plans written before code in `goodflows/changes/<id>/` (`change.md`, spec deltas under `specs/`, and the `qa-scenarios.md` intent set), as the `gf-change-explore` skill writes them. Validate checks that every requirement cites the goals or decisions it comes from, that every decision the user made is cited, and that a Must scenario covers every added or modified requirement, and warns about likely over-specification. Archive merges an approved change's deltas into `goodflows/specs/` and moves it to `goodflows/changes/archive/<date>-<id>/`. `goodflows agents` describes the format. Neither command needs an API key or `goodflows.toml`. A change's `depends_on` also reaches its change request: `cr open --change <id>` and every `cr push` send the list from `change.md` in the commit they report, without changes archived there, whenever it differs from the stored one, and the server keeps the change request pending until each dependency's change request merges.
 
 ### Sprites
 
@@ -903,7 +905,13 @@ npx skills add agoodway/goodflows --skill create-ci-skill
 npx skills add agoodway/goodflows --skill maintain-ci-skill
 ```
 
-`goodflows skills install` writes `create-ci-skill` and `maintain-ci-skill` into the directory the current coding agent loads project skills from, one directory per skill, such as `.claude/skills/create-ci-skill/SKILL.md`. The skills are built into the binary, so they match the goodflows you run. Rerunning replaces the installed copies with the built-in ones.
+[`gf-change-explore`](skills/gf-change-explore/SKILL.md) is a thinking partner for planning a change before code is written. It explores the code and specs with you, asks you the open decisions in rounds, each with a recommendation, and then writes a small change in `goodflows/changes/<id>/`: `change.md` with the goals, the decisions (each marked as yours or the agent's) and what is left to the implementer, one spec delta per capability with a `Refs:` line on each requirement, and a `qa-scenarios.md` intent set whose scenarios name the requirements they cover. Two fresh subagents then check it from both sides: one lists where an implementer would still have to guess, the other lists lines that pin something the implementer could decide. After your answers, a third reviews its structure and its claims about the code; the skill patches what has one right answer, applies the reviewer's recommendation as its own recorded call where a decision is needed, and brings you the rest. It never implements; it ends by naming `goodflows cr open --change <id>`.
+
+```bash
+npx skills add agoodway/goodflows --skill gf-change-explore
+```
+
+`goodflows skills install` writes `create-ci-skill`, `maintain-ci-skill` and `gf-change-explore` into the directory the current coding agent loads project skills from, one directory per skill, such as `.claude/skills/create-ci-skill/SKILL.md`. The skills are built into the binary, so they match the goodflows you run. Rerunning replaces the installed copies with the built-in ones.
 
 ```bash
 goodflows skills install

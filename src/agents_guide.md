@@ -82,6 +82,65 @@ events after `--after` (`410` with `latest_cursor`): resync from the
 current state, then read with `--after` set to the `latest_cursor` the
 message names. With `--follow` it prints a note and goes on from there.
 
+## Goodflows changes: `goodflows-change/1`
+
+A change is planned before code in `goodflows/changes/<id>/` (`<id>` is
+1-64 characters of a-z, 0-9 and -) and linked with `cr open --change <id>`.
+It holds every decision the builder cannot make alone, and nothing else:
+
+- `change.md`: YAML front matter with exactly these keys, then prose (why,
+  context, the approaches considered). `format: goodflows-change/1`; `id`
+  (the directory name); `status` (`proposed`, `approved` or `archived`);
+  `size` (`small` or `project`); `door` (`one_way` or `two_way`);
+  `capabilities` (the capability names it has deltas for); `depends_on`
+  (change ids: this change is written against the specs as they leave
+  them, and lands after them); `goals`, `non_goals` and `anti_goals` (lists of
+  `{id, text}`); `decisions` (lists of `{id, question, answer, by, why}`
+  plus optional `rejected`, a list of strings; `by` is `user` or `agent`);
+  `left_to_builder` (strings). Goal and decision ids share one namespace.
+- `specs/<capability>/spec.md`: a delta with `## ADDED Requirements`,
+  `## MODIFIED Requirements`, `## REMOVED Requirements` (each holding
+  `### Requirement: <name>` blocks) and `## RENAMED Requirements` (pairs of
+  ``- FROM: `### Requirement: <old>` `` and ``- TO: `### Requirement: <new>` ``
+  lines). The first line after each requirement heading is
+  `Refs: <id>, <id>` naming the goals and decisions it comes from.
+  `#### Scenario:` blocks are optional; keep them to boundaries.
+- `qa-scenarios.md`: a `qa-scenarios/2` intent set with `change: <id>`.
+  Each scenario's `covers` lists `{capability, requirement}` plus either
+  `scenario: <spec scenario name>` or `implied: true`.
+
+`goodflows change validate [<id>...]` exits `1` when a change has an error:
+a wrong or unknown front matter field, an `id` that is not the directory
+name, a duplicate id, a requirement without `Refs:` or citing an unknown
+id, a `by: user` decision no `Refs:` line cites, an added or modified
+requirement no Must scenario covers, a `covers` target that does not
+exist, a listed capability without a delta or a delta not listed, a
+MODIFIED, REMOVED or RENAMED target missing from
+`goodflows/specs/<capability>/spec.md`, an ADDED requirement it already
+has, a `depends_on` id that is neither an active change nor archived, a
+`depends_on` cycle among active changes (named as a path, `a → b → a`),
+or `TBD` or `TODO` anywhere. Targets are resolved with the deltas of the
+change's active dependencies applied first; a missing target that another
+active change adds names that change to add to `depends_on`. Warnings, which exit `0`, flag likely
+over-specification: more than 8 requirements in a `small` change or 20 in
+a `project`, more than 3 scenarios on one requirement, a `by: agent`
+decision or a goal no requirement cites, and an empty `left_to_builder`.
+
+`cr open --change <id>` and every `cr push` read `depends_on` from the
+linked change's `change.md` in the commit they report, leave out changes
+archived in that commit, and set the change request's dependencies with
+`PUT .../dependencies` when the list differs from the stored one. The
+server keeps the change request `pending` (`dependency_not_merged`) until a
+change request linking each dependency merges. Nothing is sent when no
+change is linked or `change.md` is not in the commit.
+
+`goodflows change archive <id>` archives an `approved` change that
+validates and has no active dependency: it applies RENAMED, REMOVED, MODIFIED and then ADDED
+requirements to `goodflows/specs/`, drops the `Refs:` lines, sets
+`status: archived` and moves the change to
+`goodflows/changes/archive/<UTC date>-<id>/`. On any problem it changes
+nothing. Neither command needs an API key or `goodflows.toml`.
+
 ## Read a failure
 
 A failed job is not a skipped one. A job is skipped when a dependency did not
