@@ -1,6 +1,6 @@
 # Review check prompt
 
-Give this prompt to a fresh subagent after the user's round of questions has been applied and the change validates again. Replace `<CHANGE_DIR>` with the change's directory, such as `goodflows/changes/add-review-answer-reapply`. Send nothing else from the conversation.
+Give this prompt to a fresh subagent once the change is written and validated, before the builder and over-spec checks. Replace `<CHANGE_DIR>` with the change's directory, such as `goodflows/changes/add-review-answer-reapply`. Send nothing else from the conversation.
 
 ```text
 You review a change to this repository for mistakes before anyone implements it. The change holds every decision the implementer cannot make alone, and nothing else: it names no functions, files or tasks, and pins exact output text only when a program parses it.

@@ -1,6 +1,6 @@
 # Over-spec check prompt
 
-Give this prompt to a fresh subagent once the change is written and validated, at the same time as the builder check. Replace `<CHANGE_DIR>` with the change's directory, such as `goodflows/changes/add-review-answer-reapply`. Send nothing else from the conversation.
+Give this prompt to a fresh subagent after the review check's fixes are applied and the change validates again, at the same time as the builder check. Replace `<CHANGE_DIR>` with the change's directory, such as `goodflows/changes/add-review-answer-reapply`. Send nothing else from the conversation.
 
 ```text
 You review a change to this repository before anyone implements it. The change should hold every decision the implementer cannot make alone, and nothing else. Your job is the "nothing else": find the lines that do not earn their place.

@@ -190,21 +190,20 @@ No `TBD` or `TODO` anywhere. Every `Refs:` id and `covers` target exists. A smal
 ## 4. Check and hand over
 
 1. **Validate.** Run `goodflows change validate <id>` when `goodflows change --help` lists it, and fix every error. Otherwise check the rules in section 3 yourself and tell the user the validator is not in their goodflows yet. Either way, run `goodflows cr validate goodflows/changes/<id>/qa-scenarios.md`.
-2. **Run both checks at once**, each in a fresh subagent: the builder check from `builder-check-prompt.md` and the over-spec check from `over-spec-check-prompt.md`, both in this skill's directory. Fill in their placeholders. Each subagent sees only its prompt, never this conversation. Without a subagent tool, do each check yourself, one after the other, reading only the files.
-3. **Sort the findings.**
+2. **Review and patch.** Run the review check from `review-check-prompt.md` in a fresh subagent first, so the other two checks read a change without mistakes; it reports mistakes in structure, consistency and claims about the code, one row per finding. Re-read a file before you edit it.
+   - `has_question: false`: apply the fix. Before fixing a claim about the code, search the code yourself to confirm it. Skip a fix whose text no longer matches, and say so.
+   - `has_question: true`: apply the `recommended` option and record it as a `by: agent` decision whose `why` says why it beat the alternatives. When the answer depends on what the user wants and nothing they said points one way, apply nothing and keep the finding for the user's round in step 5.
+   - Drop a fix that would add a task, a file list, a function name, or exact wording of output that only people read.
+   - Validate again.
+3. **Run the builder and over-spec checks at once**, each in a fresh subagent: the builder check from `builder-check-prompt.md` and the over-spec check from `over-spec-check-prompt.md`, both in this skill's directory. Fill in their placeholders. Each subagent sees only its prompt, never this conversation. Without a subagent tool, do each check yourself, one after the other, reading only the files. The builder check reads the review's decisions like any other line.
+4. **Sort the findings.**
    - Builder questions the conversation or the code already answers: write the answer into the change.
    - Minor builder questions, which a sensible builder could settle without changing what the user gets: settle them yourself, as a `by: agent` decision or a `left_to_builder` entry.
    - Over-spec lines: move each to `left_to_builder` with any constraint that matters, or delete it. Keep a line the user asked for in so many words, and say so.
-   - When the two checks pull against each other, such as the builder check asking about something an over-spec finding would cut, the builder check wins: keep or add the line, and tell the user. A wrong guess on behavior costs more than an extra line.
+   - When the two checks pull against each other, such as the builder check asking about something an over-spec finding would cut, or the over-spec check cutting a line the review added, the builder check wins: keep or add the line, and tell the user. A wrong guess on behavior costs more than an extra line.
    - Theirs: only the user can answer, and the answer changes what gets built.
-4. **One round for the user.** Ask the theirs pile in one message, most important first, in the grill format. When the pile is empty, say so. This is the only round of questions the builder and over-spec checks produce for this version of the change; do not run them again in full.
-5. **Review and patch.** Apply the answers and validate again. Then run the review check from `review-check-prompt.md` in a fresh subagent; it reports mistakes in structure, consistency and claims about the code, one row per finding. Re-read a file before you edit it.
-   - `has_question: false`: apply the fix. Before fixing a claim about the code, search the code yourself to confirm it. Skip a fix whose text no longer matches, and say so.
-   - `has_question: true`: apply the `recommended` option and record it as a `by: agent` decision whose `why` says why it beat the alternatives. When the answer depends on what the user wants and nothing they said points one way, apply nothing and put the finding at the top of the handover.
-   - Drop a fix that would add a task, a file list, a function name, or exact wording of output that only people read.
-   - Validate again.
-   - When the review changed anything beyond names and ids, run the builder check once more in a fresh subagent, adding to its prompt: "Report only on these lines, which changed since the last check:" followed by the changed lines with their files. Settle minor findings yourself and put the rest at the top of the handover.
-6. **Hand over.** Give the user the findings the review left for them. Then lead with the three to five calls where a wrong guess would cost the most, such as `by: agent` decisions about a wire contract, stored data, security or a quality target, each with what you chose and the main alternative. List the remaining `by: agent` decisions and `left_to_builder` entries after them, and ask the user to approve the change. Apply what they answer. When they approve, set `status: approved`.
+5. **One round for the user.** Ask the theirs pile, with the review findings kept for the user, in one message, most important first, in the grill format. When the pile is empty, say so. This is the only round of questions the checks produce for this version of the change; do not run them again. Apply the answers and validate again.
+6. **Hand over.** Lead with the three to five calls where a wrong guess would cost the most, such as `by: agent` decisions about a wire contract, stored data, security or a quality target, each with what you chose and the main alternative. List the remaining `by: agent` decisions and `left_to_builder` entries after them, and ask the user to approve the change. Apply what they answer. When they approve, set `status: approved`.
 
 A later edit to an approved change goes back through steps 1 to 6 and back to `status: proposed` until approved again.
 

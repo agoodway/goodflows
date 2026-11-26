@@ -1,6 +1,6 @@
 # Builder check prompt
 
-Give this prompt to a fresh subagent once the change is written and validated. Replace `<CHANGE_DIR>` with the change's directory, such as `goodflows/changes/add-review-answer-reapply`, and `<CODE_PATHS>` with the files and directories the change touches, as you found them while exploring. Send nothing else from the conversation: the check works only if the subagent knows what the implementer will know.
+Give this prompt to a fresh subagent after the review check's fixes are applied and the change validates again, at the same time as the over-spec check. Replace `<CHANGE_DIR>` with the change's directory, such as `goodflows/changes/add-review-answer-reapply`, and `<CODE_PATHS>` with the files and directories the change touches, as you found them while exploring. Send nothing else from the conversation: the check works only if the subagent knows what the implementer will know.
 
 ```text
 You are the engineer who will implement a change to this repository. You have its change files and the code, and you cannot talk to the people who wrote the change.
