@@ -1633,10 +1633,11 @@ condition = { expression = "false" }
 
 #[test]
 fn a_root_failure_during_a_call_condition_activates_no_child() {
-    // The call's shell condition passes only once `boom-done` exists. The
-    // test creates it when it reads `boom`'s `job_finished` event, which the
-    // scheduler emits only after recording the failure, so the root is
-    // stopped by the time the condition passes.
+    // The call's shell condition waits, with no time limit, until `boom-done`
+    // exists. The test creates it when it reads `boom`'s `job_finished`
+    // event, which the scheduler emits only after recording the failure, so
+    // the root is stopped by the time the condition passes, however slowly
+    // `boom` runs.
     let p = Project::new(
         r#"
 [workflows.ci.settings]
@@ -1648,7 +1649,7 @@ command = "exit 1"
 [[workflows.ci.jobs]]
 name = "integration"
 workflow = "suite"
-condition = "i=0; while [ $i -lt 500 ] && ! test -f boom-done; do sleep 0.01; i=$((i+1)); done; test -f boom-done"
+condition = "until test -f boom-done; do sleep 0.01; done"
 [[workflows.suite.jobs]]
 name = "test"
 command = "touch ran"
@@ -1660,6 +1661,17 @@ command = "touch ran"
         .stdout(std::process::Stdio::piped())
         .spawn()
         .unwrap();
+    // Should `boom`'s event never arrive, the condition would wait forever:
+    // release it after a minute, and fail below, instead of hanging.
+    let boom_done = p.dir.join("boom-done");
+    std::thread::spawn({
+        let boom_done = boom_done.clone();
+        move || {
+            std::thread::sleep(std::time::Duration::from_secs(60));
+            let _ = std::fs::write(boom_done, "");
+        }
+    });
+    let mut released = false;
     let mut events = Vec::new();
     for line in std::io::BufRead::lines(std::io::BufReader::new(child.stdout.take().unwrap())) {
         let parsed = line
@@ -1674,10 +1686,12 @@ command = "touch ran"
             }
         };
         if event["type"] == "job_finished" && event["result"]["name"] == "boom" {
-            std::fs::write(p.dir.join("boom-done"), "").unwrap();
+            std::fs::write(&boom_done, "").unwrap();
+            released = true;
         }
         events.push(event);
     }
+    assert!(released, "no job_finished event for boom: {events:?}");
     assert_eq!(child.wait().unwrap().code(), Some(1));
     // No child run started: no child events, summary, or job.
     assert!(events.iter().all(|e| e["workflow"] == "ci"), "{events:?}");
