@@ -335,6 +335,9 @@ pub struct Activation {
     pub caller_job: String,
     /// The caller's scope, under which the child's scope nests.
     pub scope: Arc<Scope>,
+    /// Counts the call as executing until the child's first launch pass;
+    /// hand it to the child's scope with [`Scope::hold`].
+    pub starting: Starting,
 }
 
 /// How a child invocation ended, for its call job's result.
@@ -360,6 +363,9 @@ pub struct Tree {
     released: watch::Sender<u64>,
     /// Units that have entered execution anywhere in the tree, for saves.
     entered: std::sync::atomic::AtomicU64,
+    /// Calls launched whose child invocation has not made its first launch
+    /// pass yet. Saves count them as executing; `max_in_flight` does not.
+    starting: AtomicUsize,
     rss: Arc<RssMonitor>,
     _rss_task: RssTask,
 }
@@ -381,6 +387,20 @@ pub struct Scope {
     max: AtomicUsize,
     /// A unit in this subtree failed or timed out.
     failed: AtomicBool,
+    /// The calling job's [`Starting`], dropped after this invocation's
+    /// first launch pass.
+    held: Mutex<Option<Starting>>,
+}
+
+/// A launched call that has no executing unit yet. Saves treat it as
+/// executing until it drops, so they never archive between a call's launch
+/// and its child's first jobs.
+pub struct Starting(Arc<Tree>);
+
+impl Drop for Starting {
+    fn drop(&mut self) {
+        self.0.starting.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl Scope {
@@ -391,6 +411,7 @@ impl Scope {
             lock: Mutex::new(()),
             released: watch::channel(0).0,
             entered: std::sync::atomic::AtomicU64::new(0),
+            starting: AtomicUsize::new(0),
             rss,
             _rss_task: rss_task,
         });
@@ -417,7 +438,22 @@ impl Scope {
             inside: AtomicUsize::new(0),
             max: AtomicUsize::new(0),
             failed: AtomicBool::new(false),
+            held: Mutex::new(None),
         }
+    }
+
+    /// Count a launched call as executing for saves until the guard drops.
+    fn starting(&self) -> Starting {
+        self.tree.starting.fetch_add(1, Ordering::SeqCst);
+        // After the count, as in `enter`.
+        self.tree.entered.fetch_add(1, Ordering::SeqCst);
+        Starting(self.tree.clone())
+    }
+
+    /// Keep the calling job's [`Starting`] until this invocation's first
+    /// launch pass.
+    pub fn hold(&self, starting: Starting) {
+        *self.held.lock().unwrap_or_else(|e| e.into_inner()) = Some(starting);
     }
 
     /// This scope and every containing scope up to the root.
@@ -483,7 +519,7 @@ impl cache::Activity for Arc<Scope> {
 
     fn executing(&self) -> usize {
         let root = self.chain().last().expect("a scope chain is never empty");
-        root.inside.load(Ordering::SeqCst)
+        root.inside.load(Ordering::SeqCst) + self.tree.starting.load(Ordering::SeqCst)
     }
 
     /// A slot of this invocation, waiting for one to free like the scheduler.
@@ -853,15 +889,19 @@ pub async fn execute(
                 .collect();
             // Counted before the task first runs, so a save spawned after
             // this pass sees the unit executing.
+            // A call counts until its child's first launch pass instead.
             let inside = job.workflow.is_none().then(|| scope.enter());
+            let starting = job.workflow.is_some().then(|| scope.starting());
             let scope = scope.clone();
             let calls = options.calls.clone();
             running.spawn(async move {
                 // The slot returns with the result, so it frees only after
                 // the scheduler records the result and any failure.
                 let (result, slot, pending) = if job.workflow.is_some() {
-                    let (result, slot) =
-                        run_call(unit.job, &job, &shared, cancel, needs, slot, calls, &scope).await;
+                    let (result, slot) = run_call(
+                        unit.job, &job, &shared, cancel, needs, slot, calls, &scope, starting,
+                    )
+                    .await;
                     (result, slot, None)
                 } else {
                     let (result, pending) =
@@ -875,6 +915,8 @@ pub async fn execute(
         for save in held.drain(..) {
             spawn_save(&mut saves, save, scope);
         }
+        // The units this pass launched now count for saves in the caller's place.
+        drop(scope.held.lock().unwrap_or_else(|e| e.into_inner()).take());
         if results.iter().all(Option::is_some) {
             if saves.is_empty() {
                 break;
@@ -1095,6 +1137,7 @@ async fn run_call(
     mut slot: Option<Slot>,
     calls: Option<Activate>,
     scope: &Arc<Scope>,
+    starting: Option<Starting>,
 ) -> (JobResult, Option<Slot>) {
     let start = Instant::now();
     let target = job.workflow.clone().expect("a call job names a workflow");
@@ -1165,6 +1208,7 @@ async fn run_call(
                 target,
                 caller_job: job.name.clone(),
                 scope: scope.clone(),
+                starting: starting.expect("the scheduler counts every call it launches"),
             })
             .await;
             result.child_run_id = end.run_id;

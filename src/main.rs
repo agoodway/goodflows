@@ -1322,6 +1322,8 @@ struct Parent {
     run_id: String,
     caller_job: String,
     scope: Arc<runner::Scope>,
+    /// The call's [`runner::Starting`], for the child's scope to hold.
+    starting: Option<runner::Starting>,
     /// Ends the call job early, once the child's results are final.
     early: tokio::sync::oneshot::Sender<runner::ChildEnd>,
     /// Set when `early` fired.
@@ -1433,6 +1435,7 @@ fn activator(run: Arc<Run>, run_id: String, children: Children, late: Late) -> r
             run_id: run_id.clone(),
             caller_job: activation.caller_job,
             scope: activation.scope,
+            starting: Some(activation.starting),
             early,
             fired: Default::default(),
             late: late.clone(),
@@ -1562,8 +1565,14 @@ async fn invocation(
     let profile = run.profile.as_deref();
     let parallelism = settings.parallelism;
     let fail_fast = settings.fail_fast;
-    let scope = match &parent {
-        Some(parent) => runner::Scope::child(&parent.scope, parallelism, fail_fast),
+    let scope = match &mut parent {
+        Some(parent) => {
+            let scope = runner::Scope::child(&parent.scope, parallelism, fail_fast);
+            if let Some(starting) = parent.starting.take() {
+                scope.hold(starting);
+            }
+            scope
+        }
         None => runner::Scope::root(parallelism, fail_fast),
     };
     // The host is sampled at run start too.
