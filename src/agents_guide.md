@@ -87,7 +87,8 @@ message names. With `--follow` it prints a note and goes on from there.
 goodflows owns the formats of the files it reads: scenario sets
 (`qa-scenarios/2`, intent or diff), a verify run's `run.md`
 (`verify-run-notes/1`), a change request's claims file (`change-claims/2`)
-and a verify skill's feature files (`feature-file/1`).
+a verify skill's feature files (`feature-file/1`), and a project's review
+policy (`review-policy/1`, TOML, checked by the server on `policy set`).
 `goodflows schema list` names them, with the file each applies to and its
 validator. Before writing one, run `goodflows schema show <format>`
 (`--source intent` or `--source diff` for a scenario set) and follow it

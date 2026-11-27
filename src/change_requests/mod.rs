@@ -34,6 +34,8 @@ const TIMED_OUT: u8 = 75;
 /// The server's `409` details for a different report at the same head.
 const GIT_FACTS_CONFLICT: &str = "Different Git facts are stored for this head and target";
 const POLICY_CONFLICT: &str = "previous_version is not the current policy version";
+/// The `format` of a review policy document; `policy set` fills it in.
+pub(crate) const POLICY_FORMAT: &str = "review-policy/1";
 const CLAIMS_CONFLICT: &str = "Different claims are stored for this head";
 
 /// Retries of `POST verify-runs/:run_id/commit` answered `503`.
@@ -2315,7 +2317,7 @@ pub async fn policy(
                 .map_err(|e| anyhow!("{} is not valid TOML: {e}", file.display()))?;
             let mut document = serde_json::to_value(document)?;
             if document.get("format").is_none() {
-                document["format"] = json!("review-policy/1");
+                document["format"] = json!(POLICY_FORMAT);
             }
             let previous = match previous_version {
                 Some(previous) => *previous,

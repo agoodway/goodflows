@@ -263,13 +263,14 @@ fn formats_block() -> String {
 ## File formats
 
 This project lands work through goodflows. Before writing a scenario set, a verify run's run.md, a change
-request's claims file, or a feature file, run `goodflows schema show <format>` and follow it instead of a
+request's claims file, a feature file, or a review policy, run `goodflows schema show <format>` and follow it instead of a
 skill's default format:
 
 - Scenario sets: `{set}` (`--source intent` or `--source diff`)
 - Verify run notes: `{notes}`
 - Change request claims: `{claims}`
 - Feature files: `{feature}`
+- Review policy (TOML): `{policy}`
 
 After writing, run the validator the schema names and fix every error it lists.
 {FORMATS_END}
@@ -278,6 +279,7 @@ After writing, run the validator the schema names and fix every error it lists.
         notes = verify_run::NOTES_FORMAT,
         claims = markdown::CLAIMS_FORMAT,
         feature = crate::schema::FEATURE_FORMAT,
+        policy = crate::change_requests::POLICY_FORMAT,
     )
 }
 

@@ -587,9 +587,10 @@ fn render(
                     .unwrap_or_default();
                 writeln!(
                     out,
-                    "{}{variant}, goodflows {}\n\nTemplate:\n\n```markdown\n{}```",
+                    "{}{variant}, goodflows {}\n\nTemplate:\n\n```{}\n{}```",
                     text(&event, "format"),
                     text(&event, "goodflows_version"),
+                    text(&event, "syntax"),
                     text(&event, "template")
                 )?;
                 for (key, title) in [

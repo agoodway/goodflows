@@ -157,6 +157,10 @@ fn list_and_show_need_no_config_and_check_names() {
             ("verify-run-notes/1", "goodflows cr validate <run folder>"),
             ("change-claims/2", "goodflows cr validate <file>"),
             ("feature-file/1", "goodflows features validate"),
+            (
+                "review-policy/1",
+                "goodflows policy set <file> (the server checks it and stores a version only when it passes)"
+            ),
         ]
     );
 
@@ -180,6 +184,7 @@ fn list_and_show_need_no_config_and_check_names() {
         (&["verify-run-notes/1"], "run.md"),
         (&["change-claims/2"], "cr.md"),
         (&["feature-file/1"], "features/<feature>.md"),
+        (&["review-policy/1"], "goodflows/review-policy.toml"),
     ] {
         assert!(
             text.contains(&format!("{}\n", args[0])) || text.contains(&format!("{}  (", args[0])),
@@ -217,7 +222,11 @@ fn list_and_show_need_no_config_and_check_names() {
             );
         }
         assert!(
-            shown.contains(&format!("```markdown\n{}```\n", template(&event))),
+            shown.contains(&format!(
+                "```{}\n{}```\n",
+                event["syntax"].as_str().unwrap(),
+                template(&event)
+            )),
             "{shown}"
         );
         assert!(shown.ends_with(&format!(
@@ -244,6 +253,64 @@ fn list_and_show_need_no_config_and_check_names() {
             stderr(&output)
         );
     }
+}
+
+#[test]
+fn the_policy_template_is_version_0_with_every_key_the_server_accepts() {
+    // Version 0 and the allowed keys as goodflows_web's review-policy spec
+    // states them; the server, not this CLI, refuses any other key.
+    let version_0: toml::Value = toml::from_str(
+        r#"
+format = "review-policy/1"
+[scenarios]
+require_approved_intent = false
+should_failures = "needs_review"
+spec_gaps = "ignore"
+approver = "any"
+diff_only = "needs_review"
+[evidence]
+required_workflows = []
+ignore_paths = ["docs/**", "**/*.md"]
+[claims]
+one_way_door = "needs_review"
+min_proof_level = "ran"
+open_items = "needs_review"
+[size]
+max_changed_files = 40
+max_changed_lines = 1500
+[coverage]
+unmapped_areas = "ignore"
+undriven_features = "ignore"
+[merge]
+lease_ttl = "10m"
+regrade_merge_result = true
+"#,
+    )
+    .unwrap();
+    let p = Project::new("");
+    let event = show(&p, &["review-policy"]);
+    assert_eq!(
+        (&event["format"], &event["syntax"]),
+        (&"review-policy/1".into(), &"toml".into())
+    );
+    let printed: toml::Value = toml::from_str(template(&event)).unwrap();
+    assert_eq!(printed, version_0);
+    // Every key, and paths, which version 0 leaves empty, has a field rule.
+    let fields = event["fields"].as_array().unwrap();
+    let rules = fields
+        .iter()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>()
+        .join("\n");
+    for (section, keys) in version_0.as_table().unwrap() {
+        for key in keys.as_table().into_iter().flat_map(|t| t.keys()) {
+            assert!(
+                rules.contains(&format!("{section}.{key}")),
+                "{section}.{key}"
+            );
+        }
+    }
+    assert!(rules.contains("[[paths]] entries of only glob and outcome"));
 }
 
 /// `skills install --json` in `p` with only `vars` in the environment.

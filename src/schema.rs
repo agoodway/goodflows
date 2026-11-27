@@ -4,7 +4,7 @@
 //! comes from the constants its parsers use; rules only the server checks
 //! are stated as prose.
 
-use crate::change_requests::{markdown, verify_run};
+use crate::change_requests::{markdown, verify_run, POLICY_FORMAT};
 use crate::output::Output;
 use anyhow::Result;
 use serde_json::json;
@@ -17,7 +17,7 @@ const EXAMPLES: &str = "Examples:
   goodflows schema list                                  # every format, its file and its validator
   goodflows schema show qa-scenarios/2 --source diff     # how to write a diff scenario set
   goodflows schema show verify-run-notes/1               # how to write a run folder's run.md
-  goodflows schema show change-claims --json             # the newest claims format as one JSON event";
+  goodflows schema show review-policy --json             # the review policy format as one JSON event";
 
 #[derive(clap::Subcommand, Debug)]
 pub enum Command {
@@ -55,32 +55,45 @@ struct Format {
     file: &'static str,
     validate: &'static str,
     sources: &'static [&'static str],
+    /// The template's language, as a code fence names it.
+    syntax: &'static str,
 }
 
-const FORMATS: [Format; 4] = [
+const FORMATS: [Format; 5] = [
     Format {
         format: markdown::SET_FORMAT,
         file: "a QA scenario set: goodflows/changes/<id>/qa-scenarios.md (intent) or .goodflows/change-requests/<branch>/qa-scenarios.md (diff)",
         validate: "goodflows cr validate <file>",
         sources: &markdown::SET_SOURCES,
+        syntax: "markdown",
     },
     Format {
         format: verify_run::NOTES_FORMAT,
         file: "run.md in a .verify/<app>/<run-id>/ run folder",
         validate: "goodflows cr validate <run folder>",
         sources: &[],
+        syntax: "markdown",
     },
     Format {
         format: markdown::CLAIMS_FORMAT,
         file: "a change request's claims file, .goodflows/change-requests/<branch>/cr.md",
         validate: "goodflows cr validate <file>",
         sources: &[],
+        syntax: "markdown",
     },
     Format {
         format: FEATURE_FORMAT,
         file: "a verify skill's feature file, <skills>/verify-<app>/features/<feature>.md (no format key)",
         validate: "goodflows features validate",
         sources: &[],
+        syntax: "markdown",
+    },
+    Format {
+        format: POLICY_FORMAT,
+        file: "a project's review policy, kept at goodflows/review-policy.toml",
+        validate: "goodflows policy set <file> (the server checks it and stores a version only when it passes)",
+        sources: &[],
+        syntax: "toml",
     },
 ];
 
@@ -99,6 +112,7 @@ pub async fn command(command: &Command, output: &Output) -> Result<u8> {
                         "file": f.file,
                         "validate": f.validate,
                         "sources": f.sources,
+                        "syntax": f.syntax,
                     })
                 })
                 .collect();
@@ -119,6 +133,7 @@ pub async fn command(command: &Command, output: &Output) -> Result<u8> {
                     "goodflows_version": env!("CARGO_PKG_VERSION"),
                     "format": format.format,
                     "source": source.map(Source::name),
+                    "syntax": format.syntax,
                     "template": schema.template,
                     "fields": schema.fields,
                     "body": schema.body,
@@ -185,6 +200,7 @@ fn schema(format: &str, source: Option<Source>) -> Schema {
         (markdown::SET_FORMAT, Some(source)) => scenario_set(source),
         (verify_run::NOTES_FORMAT, _) => run_notes(),
         (markdown::CLAIMS_FORMAT, _) => claims(),
+        (POLICY_FORMAT, _) => review_policy(),
         _ => feature_file(),
     }
 }
@@ -627,6 +643,77 @@ Preconditions:
         "goodflows features sync uploads the files with paths as the project's feature index, which maps changed files to features; at least one file needs paths.",
         "With several verify-*/features directories, pass --dir to goodflows features validate and sync.",
         "When a journey cannot pass because the seed data lacks a precondition, record the reason under Gotchas; never weaken the journey.",
+    ]);
+    Schema {
+        template,
+        fields,
+        body,
+        handling,
+    }
+}
+
+fn review_policy() -> Schema {
+    // Version 0, the default a project without a policy gets, written out
+    // so every key is shown; it is valid TOML as printed.
+    let template = format!(
+        r#"format = "{POLICY_FORMAT}"
+
+[scenarios]
+require_approved_intent = false
+should_failures = "needs_review"
+spec_gaps = "ignore"
+approver = "any"
+diff_only = "needs_review"
+
+[evidence]
+required_workflows = []
+ignore_paths = ["docs/**", "**/*.md"]
+
+[claims]
+one_way_door = "needs_review"
+min_proof_level = "ran"
+open_items = "needs_review"
+
+[size]
+max_changed_files = 40
+max_changed_lines = 1500
+
+[coverage]
+unmapped_areas = "ignore"
+undriven_features = "ignore"
+
+[merge]
+lease_ttl = "10m"
+regrade_merge_result = true
+
+# One entry per sensitive path; version 0 has none.
+# [[paths]]
+# glob = "migrations/**"
+# outcome = "needs_review"
+"#
+    );
+    let fields = lines(&[
+        "The document is TOML with format and only the sections scenarios, evidence, claims, paths, size, coverage and merge, each holding only the keys below. Any other section or key is refused. Every section and key other than format may be left out and then takes the value in the template, which is version 0, the policy of a project that never wrote one. policy set fills in format when it is missing.",
+        "scenarios.require_approved_intent: true or false. True holds a change request pending until it has an approved intent scenario set (which needs a linked goodflows change) or a diff scenario set.",
+        "scenarios.should_failures: needs_review or ignore, for a failed Should scenario in any uploaded set. scenarios.spec_gaps: needs_review or ignore, for spec scenarios the intent set does not cover.",
+        "scenarios.approver: any, other_member or admin, who may approve an intent set. scenarios.diff_only: needs_review, weakening or ignore, for a change request graded only by a diff set; it applies only under require_approved_intent.",
+        "evidence.required_workflows: up to 32 distinct workflow names; for each, the newest clean run on the head must have passed. A missing or cancelled run keeps the change request pending, and a failed one blocks it. Name only workflows whose runs are uploaded for every head.",
+        "evidence.ignore_paths: up to 100 globs of files that can change without changing what a verify run tested. A run on an earlier commit still counts when every later commit changes only these files, and these files are left out of the feature mapping. They still count toward size and still match paths. Never list a file the build embeds, ships or tests.",
+        "claims.one_way_door and claims.open_items: needs_review, blocked or ignore. claims.min_proof_level: stated, pointed, walked or ran, the weakest proof a claim's fact may have.",
+        "paths: up to 100 [[paths]] entries of only glob and outcome (needs_review, blocked or ignore), with distinct globs. A changed file matching a glob adds that outcome.",
+        "size.max_changed_files and size.max_changed_lines: positive integers; a head over either needs review. Lines are additions plus deletions.",
+        "coverage.unmapped_areas and coverage.undriven_features: needs_review, blocked or ignore. Anything but ignore needs a feature index from goodflows features sync; without one every change request stays pending.",
+        "merge.lease_ttl: <n>s, <n>m or <n>h, from 1m to 1h. merge.regrade_merge_result: true or false, whether a merge whose lease base moved must grade the merge result first.",
+        "A glob is 1 to 1,024 bytes, relative, without control characters, and matches the whole repository-relative path. ** stands alone as a path segment and matches any number of them, * matches within one segment, and ? one character other than /. [ ] { } and \\ are refused.",
+    ]);
+    let body = lines(&[
+        "Comments start with # and are not stored; put the reason for a version in policy set --note.",
+        "Write only the settings the project changes from version 0, plus any it decided to keep on purpose, so the stored version records the decision.",
+    ]);
+    let handling = lines(&[
+        "goodflows policy get prints the current version as TOML, ready to edit; --effective prints every setting with the defaults filled in, and active_settings names the settings this server applies.",
+        "Writing needs an sk_ key of an account owner or admin. Run goodflows policy set <file> --previous-version <the version you read> --note <why>; a 409 means another write landed first, so read it again and redo the change.",
+        "policy set writes nothing when the file equals the current version. goodflows policy calibration shows which rules fired on merged change requests and which had defects, to tune a policy later.",
     ]);
     Schema {
         template,
