@@ -12,7 +12,7 @@ cargo install --git https://github.com/agoodway/goodflows.git --locked
 
 ## Release archives
 
-[GitHub Releases](https://github.com/agoodway/goodflows/releases) has archives for Linux and macOS, on `x86_64` and `aarch64`. v0.9.0 publishes these names, and [`.github/workflows/release.yml`](../.github/workflows/release.yml) builds the same four targets:
+[GitHub Releases](https://github.com/agoodway/goodflows/releases) has archives for Linux and macOS, on `x86_64` and `aarch64`. v0.10.0 publishes these names, and [`.github/workflows/release.yml`](../.github/workflows/release.yml) builds the same four targets:
 
 - `goodflows-v<VERSION>-x86_64-unknown-linux-gnu.tar.gz`
 - `goodflows-v<VERSION>-aarch64-unknown-linux-gnu.tar.gz`
@@ -24,8 +24,8 @@ Each archive has a `.sha256` file next to it. The release also includes `SHA256S
 Run these in the directory that holds the archive and its `.sha256` file:
 
 ```bash
-sha256sum -c goodflows-v0.9.0-x86_64-unknown-linux-gnu.tar.gz.sha256
-tar -xzf goodflows-v0.9.0-x86_64-unknown-linux-gnu.tar.gz
+sha256sum -c goodflows-v0.10.0-x86_64-unknown-linux-gnu.tar.gz.sha256
+tar -xzf goodflows-v0.10.0-x86_64-unknown-linux-gnu.tar.gz
 mkdir -p ~/.local/bin
 install -m 755 goodflows ~/.local/bin/goodflows
 ```

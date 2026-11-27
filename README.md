@@ -75,8 +75,8 @@ cargo install --git https://github.com/agoodway/goodflows.git --locked
 [GitHub Releases](https://github.com/agoodway/goodflows/releases) also has archives for Linux and macOS, on `x86_64` and `aarch64`. Check the archive against its `.sha256` file, unpack it, and put `goodflows` on your `PATH`:
 
 ```bash
-sha256sum -c goodflows-v0.9.0-x86_64-unknown-linux-gnu.tar.gz.sha256
-tar -xzf goodflows-v0.9.0-x86_64-unknown-linux-gnu.tar.gz
+sha256sum -c goodflows-v0.10.0-x86_64-unknown-linux-gnu.tar.gz.sha256
+tar -xzf goodflows-v0.10.0-x86_64-unknown-linux-gnu.tar.gz
 install -m 755 goodflows ~/.local/bin/goodflows
 ```
 
