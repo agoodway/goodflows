@@ -1,8 +1,8 @@
 //! The small glob dialect of cache `paths` and `key.files`: `/`-separated
 //! segments where `*` and `?` match within one segment, `[...]` matches one
 //! character from a class (`[!...]` negates), and a `**` segment matches
-//! zero or more directories. `**` never descends into `.git`, `.goodflows`
-//! or symlinked directories.
+//! zero or more directories. `**` never descends into `.git`, `.goodflows`,
+//! `goodflows/history` or symlinked directories.
 
 use std::path::{Path, PathBuf};
 
@@ -151,8 +151,10 @@ fn walk(base: &Path, rel: PathBuf, segs: &[&str], out: &mut Vec<PathBuf>) {
     if seg == "**" {
         walk(base, rel.clone(), rest, out);
         for (name, real_dir) in children(&base.join(&rel)) {
-            if real_dir && !SKIPPED.contains(&name.as_str()) {
-                walk(base, rel.join(name), segs, out);
+            let next = rel.join(&name);
+            if real_dir && !SKIPPED.contains(&name.as_str()) && !next.ends_with("goodflows/history")
+            {
+                walk(base, next, segs, out);
             }
         }
     } else if !has_glob(seg) {
@@ -207,14 +209,24 @@ mod tests {
     #[test]
     fn expand_finds_matches_and_skips_git() {
         let dir = tempfile::tempdir().unwrap();
-        for path in ["a/mix.lock", "b/c/mix.lock", ".git/mix.lock", "mix.lock"] {
+        for path in [
+            "a/mix.lock",
+            "b/c/mix.lock",
+            ".git/mix.lock",
+            "sub/goodflows/history/mix.lock",
+            "history/mix.lock",
+            "mix.lock",
+        ] {
             let path = dir.path().join(path);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(path, "x").unwrap();
         }
         let found = expand(dir.path(), "**/mix.lock");
         let found: Vec<_> = found.iter().map(|p| p.to_str().unwrap()).collect();
-        assert_eq!(found, ["a/mix.lock", "b/c/mix.lock", "mix.lock"]);
+        assert_eq!(
+            found,
+            ["a/mix.lock", "b/c/mix.lock", "history/mix.lock", "mix.lock"]
+        );
         assert_eq!(expand(dir.path(), "missing"), Vec::<PathBuf>::new());
         assert_eq!(expand(dir.path(), "a"), [PathBuf::from("a")]);
     }

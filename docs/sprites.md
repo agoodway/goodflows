@@ -218,7 +218,7 @@ computes the manifest (paths, sizes, SHA-256, executable bit) from those
 copies. A file that changes during the copy fails the run.
 
 GoodFlows always excludes the following, and shows a path and reason but
-never contents: `.git`, `.amp`, `.sprite`, `.goodflows`, `.env` and `.env.*`,
+never contents: `.git`, `.amp`, `.sprite`, `.goodflows`, `goodflows/history`, `.env` and `.env.*`,
 `.netrc`, `.npmrc`, `.pypirc`, `.git-credentials`, `credentials*`,
 `secrets.*`, private-key files (`id_rsa`, `id_ed25519`, `*.pem`, `*.key`,
 `*.p12`, `*.pfx`, `*.jks`, `*.keystore`), anything under `.ssh`, `.aws` or

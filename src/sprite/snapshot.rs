@@ -68,6 +68,12 @@ pub fn exclusion_reason(path: &[u8]) -> Option<&'static str> {
             _ => {}
         }
     }
+    if components
+        .windows(2)
+        .any(|pair| pair == [&b"goodflows"[..], b"history"])
+    {
+        return Some("GoodFlows run history");
+    }
     let name = components.last().copied().unwrap_or_default();
     let lower = name.to_ascii_lowercase();
     let starts = |p: &[u8]| lower.starts_with(p);
@@ -793,6 +799,8 @@ mod tests {
             b"app/.env.local",
             b".git/config",
             b"sub/.goodflows/x",
+            b"goodflows/history/ci/run.json",
+            b"apps/web/goodflows/history/ci/run.json",
             b".amp/in/a",
             b"deploy/id_ed25519",
             b"certs/server.pem",
@@ -812,6 +820,8 @@ mod tests {
             b"environment.md",
             b"id_ed25519.pub",
             b"docs/keys.md",
+            b"goodflows/changes/add-login/change.md",
+            b"history/goodflows/x",
         ] {
             assert!(
                 exclusion_reason(path).is_none(),
