@@ -607,7 +607,7 @@ goodflows cancel "$id"
 
 ### Run history
 
-`history = true`, or `--history`, writes one JSON file per run under `goodflows-history/<workflow>/` next to the config file. `history_dir` in the config is relative to the config file. `--history-dir DIR` is relative to the current directory, and it turns history on. `--no-history` turns the file off for that run. The file has timing, queue wait, CPU, peak memory, and host details for each job. It has command text. It has no output and no environment values. `--history-runs N` (default 1000) and `--history-bytes N` (default 10485760) cap what is kept per workflow.
+`history = true`, or `--history`, writes one JSON file per run under `goodflows/history/<workflow>/` next to the config file. `history_dir` in the config is relative to the config file. `--history-dir DIR` is relative to the current directory, and it turns history on. `--no-history` turns the file off for that run. The file has timing, queue wait, CPU, peak memory, and host details for each job. It has command text. It has no output and no environment values. `--history-runs N` (default 1000) and `--history-bytes N` (default 10485760) cap what is kept per workflow.
 
 ```bash
 goodflows --history
@@ -617,10 +617,10 @@ goodflows --history-dir /tmp/goodflows-history --history-runs 100 --history-byte
 Turn history on where the machine stays comparable from run to run, such as the `ci` profile above. A clean-tree check that runs after goodflows will see the new file. To commit the files, mark them generated:
 
 ```gitattributes
-goodflows-history/** text eol=lf linguist-generated
+goodflows/history/** text eol=lf linguist-generated
 ```
 
-Or add `goodflows-history/` to `.gitignore`. [`src/history.rs`](src/history.rs) defines the record layout.
+Or add `goodflows/history/` to `.gitignore`. [`src/history.rs`](src/history.rs) defines the record layout.
 
 #### Linking runs to threads and tickets
 

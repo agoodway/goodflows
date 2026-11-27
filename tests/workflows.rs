@@ -1445,7 +1445,7 @@ command = "touch ran"
     );
     assert!(!p.dir.join("ran").exists() && !p.dir.join("after").exists());
     assert!(!p.dir.join("logs/suite").exists());
-    assert!(!p.dir.join("goodflows-history/suite").exists());
+    assert!(!p.dir.join("goodflows/history/suite").exists());
     // A true output activates the child.
     let p = Project::new(&p.read("goodflows.toml").replace("false", "true"));
     success(&p.run(&["run", "ci"]));

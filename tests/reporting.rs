@@ -3611,7 +3611,7 @@ fn git_checkout(dir: &Path) {
     git(&["init", "-q", "-b", "main"]);
     std::fs::write(
         dir.join(".gitignore"),
-        ".goodflows/\ngoodflows-history/\nfixtures/\n",
+        ".goodflows/\ngoodflows/history/\nfixtures/\n",
     )
     .unwrap();
     git(&["add", "goodflows.toml", ".gitignore"]);
@@ -3870,7 +3870,7 @@ fn run_upload_is_independent_of_the_local_history_file() {
     success(&output);
     let summary = events(&output).pop().unwrap();
     assert!(summary.get("history_file").is_none());
-    assert!(!p.dir.join("goodflows-history").exists());
+    assert!(!p.dir.join("goodflows/history").exists());
     assert_eq!(run_requests(&mock).len(), 1);
 
     // Settings enable local history and --no-history turns the file off only.
@@ -3879,7 +3879,7 @@ fn run_upload_is_independent_of_the_local_history_file() {
     success(&output);
     let summary = events(&output).pop().unwrap();
     assert!(summary.get("history_file").is_none());
-    assert!(!p.dir.join("goodflows-history").exists());
+    assert!(!p.dir.join("goodflows/history").exists());
     let requests = run_requests(&mock);
     assert_eq!(requests.len(), 2);
     assert_eq!(requests[1].json()["run_id"], summary["run_id"]);

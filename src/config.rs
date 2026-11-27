@@ -344,7 +344,7 @@ pub const OUTPUT_ENV: &str = "GOODFLOWS_OUTPUT";
 pub const MAX_PARTITIONS: u32 = 64;
 const DEFAULT_SPOOL_DIR: &str = ".goodflows/reports";
 /// History directory beside the config file when `history_dir` is unset.
-pub const DEFAULT_HISTORY_DIR: &str = "goodflows-history";
+pub const DEFAULT_HISTORY_DIR: &str = "goodflows/history";
 pub const DEFAULT_LOG_RUNS: u64 = 10;
 pub const DEFAULT_HISTORY_RUNS: u64 = 1000;
 /// A default, not a maximum: settings and flags may raise it.

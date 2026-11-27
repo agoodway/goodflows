@@ -46,7 +46,7 @@ fn default_history_file_records_the_run() {
     let output = p.run(&["run", "ci", "--json", "--history", "--log-dir", "logs"]);
     success(&output);
     let summary = summary_of(&output);
-    let files = history_files(&p.dir.join("goodflows-history/ci"));
+    let files = history_files(&p.dir.join("goodflows/history/ci"));
     assert_eq!(files.len(), 1);
     let path = &files[0];
     assert_eq!(summary["history_file"], path.to_str().unwrap());
@@ -144,7 +144,7 @@ fn default_history_file_records_the_run() {
     let output = p.run(&["run", "ci", "--history", "--log-dir", "logs"]);
     success(&output);
     let text = stdout(&output);
-    let files = history_files(&p.dir.join("goodflows-history/ci"));
+    let files = history_files(&p.dir.join("goodflows/history/ci"));
     let newest = files.iter().rev().find(|f| f != &path).unwrap();
     let logs = text.find("\nLogs: logs/ci/").expect("logs line");
     let history = text
@@ -171,7 +171,7 @@ fn history_is_enabled_and_disabled_by_settings_and_flags() {
         "[settings]\nhistory = true\n[[jobs]]\nname='a'\ncommand='true'\n\
          [environments.quiet.settings]\nhistory = false\n",
     );
-    let dir = p.dir.join("goodflows-history/default");
+    let dir = p.dir.join("goodflows/history/default");
     success(&p.run(&["--json"]));
     // Legacy top-level jobs record under `default`.
     assert_eq!(history_files(&dir).len(), 1);
@@ -211,7 +211,7 @@ fn history_directories_resolve_from_config_and_invocation() {
     let files = history_files(&sub.join("runs/default"));
     assert_eq!(files.len(), 1);
     assert_eq!(summary["history_file"], files[0].to_str().unwrap());
-    assert!(!sub.join("goodflows-history").exists());
+    assert!(!sub.join("goodflows/history").exists());
 }
 
 #[test]
@@ -219,8 +219,8 @@ fn retention_caps_keep_the_newest_files_per_workflow() {
     let p = Project::new(&format!(
         "{CI}[[workflows.other.jobs]]\nname='a'\ncommand='true'\n"
     ));
-    let ci = p.dir.join("goodflows-history/ci");
-    let other = p.dir.join("goodflows-history/other");
+    let ci = p.dir.join("goodflows/history/ci");
+    let other = p.dir.join("goodflows/history/other");
     success(&p.run(&["run", "other", "--history"]));
     let other_before = std::fs::read(&history_files(&other)[0]).unwrap();
     success(&p.run(&["run", "ci", "--history"]));
@@ -411,7 +411,7 @@ fn a_run_that_errors_before_the_summary_writes_no_history() {
     assert!(events.iter().all(|e| e["type"] != "summary"));
     assert_eq!(events.last().unwrap()["type"], "error");
     assert!(!p.dir.join("ran").exists());
-    assert!(!p.dir.join("goodflows-history").exists());
+    assert!(!p.dir.join("goodflows/history").exists());
 }
 
 #[test]
@@ -465,7 +465,7 @@ fn non_run_commands_never_write_history() {
         p.run(&["init", "--force", "--history"]).status.code(),
         Some(2)
     );
-    assert!(!p.dir.join("goodflows-history").exists());
+    assert!(!p.dir.join("goodflows/history").exists());
     // Reports upload rejects every history and retention flag, naming it.
     std::fs::create_dir(p.dir.join("spool")).unwrap();
     for (flag, value) in [
@@ -486,7 +486,7 @@ fn non_run_commands_never_write_history() {
             stderr(&output)
         );
     }
-    assert!(!p.dir.join("goodflows-history").exists());
+    assert!(!p.dir.join("goodflows/history").exists());
 }
 
 #[test]
@@ -558,7 +558,7 @@ fn workflow_directories_are_encoded_and_never_escape() {
          [[workflows.\"%43%49\".jobs]]\nname='a'\ncommand='true'\n\
          [[workflows.\"../escape\".jobs]]\nname='a'\ncommand='true'\n",
     );
-    let base = p.dir.join("goodflows-history");
+    let base = p.dir.join("goodflows/history");
     for (workflow, component) in [
         ("ci", "ci"),
         ("CI", "%43%49"),
@@ -589,7 +589,7 @@ fn workflow_directories_are_encoded_and_never_escape() {
         .collect();
     top.sort();
     // `.goodflows` holds the last-run record, which every run writes.
-    assert_eq!(top, [".goodflows", "goodflows-history", "goodflows.toml"]);
+    assert_eq!(top, [".goodflows", "goodflows", "goodflows.toml"]);
 }
 
 #[test]
@@ -626,7 +626,7 @@ fn zero_caps_in_workflow_settings_fail_before_jobs_run() {
         );
         assert!(!p.dir.join("ran").exists(), "{cap}");
         assert!(!p.dir.join("logs").exists(), "{cap}");
-        assert!(!p.dir.join("goodflows-history").exists(), "{cap}");
+        assert!(!p.dir.join("goodflows/history").exists(), "{cap}");
     }
 }
 
@@ -707,8 +707,8 @@ fn child_history_links_its_parent_and_caller_only() {
     let events = events(&output);
     let root = events.last().unwrap();
     assert!(root.get("history_file").is_none());
-    assert!(!p.dir.join("goodflows-history/ci").exists());
-    let files = history_files(&p.dir.join("goodflows-history/suite"));
+    assert!(!p.dir.join("goodflows/history/ci").exists());
+    let files = history_files(&p.dir.join("goodflows/history/suite"));
     assert_eq!(files.len(), 1);
     let child = record(&files[0]);
     assert_eq!(child["parent_run_id"], root["run_id"]);
@@ -754,7 +754,7 @@ fn child_history_links_its_parent_and_caller_only() {
     let output = p.run(&["run", "ci", "--no-history", "--json"]);
     success(&output);
     assert_eq!(
-        history_files(&p.dir.join("goodflows-history/suite")).len(),
+        history_files(&p.dir.join("goodflows/history/suite")).len(),
         1
     );
     assert!(common::events(&output)
@@ -791,7 +791,7 @@ fn call_instances_record_their_target_child_and_no_synthetic_cost() {
     assert_eq!(keys, expected, "{call}");
     assert_eq!(call["workflow"], "suite");
     assert!(call["duration_ms"].is_u64() && call["command"].is_null());
-    let child = record(&history_files(&p.dir.join("goodflows-history/suite"))[0]);
+    let child = record(&history_files(&p.dir.join("goodflows/history/suite"))[0]);
     assert_eq!(call["child_run_id"], child["run_id"]);
     // A waiting call takes no slot: one command at a time, not two.
     assert_eq!(parent["max_in_flight"], 1);
@@ -1023,7 +1023,7 @@ fn runs_link_their_session_branch_and_squash_commits() {
 fn every_invocation_that_records_has_the_runs_links() {
     // A called child records the root's links, also when only it records.
     let p = Project::new(CALLS);
-    let suite = p.dir.join("goodflows-history/suite");
+    let suite = p.dir.join("goodflows/history/suite");
     for (args, root_records) in [
         (&["run", "ci", "--json", "--ticket", "GOO-291"][..], false),
         (
@@ -1128,7 +1128,7 @@ fn links_are_collected_once_and_only_when_a_record_is_built() {
 #[test]
 fn a_scan_past_its_timeout_adds_no_git_links_and_keeps_the_source() {
     let p = Project::new(&format!("[settings]\nticket_prefixes = [\"GOO\"]\n{CI}"));
-    std::fs::write(p.dir.join(".gitignore"), "goodflows-history/\n").unwrap();
+    std::fs::write(p.dir.join(".gitignore"), "goodflows/history/\n").unwrap();
     git_in(&p.dir, &["init", "-q"]);
     git_in(&p.dir, &["add", "."]);
     git_in(&p.dir, &["commit", "-q", "-m", "Base"]);

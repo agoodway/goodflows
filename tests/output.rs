@@ -821,7 +821,7 @@ fn json_summary_carries_duration_log_dir_and_instance_counts() {
         }
         // `test` waits for `compile` (sleep 0.2): that wait is blocked time.
         assert!(summary["results"][1]["blocked_ms"].as_u64().unwrap() >= 150);
-        assert!(!p.dir.join("goodflows-history").exists());
+        assert!(!p.dir.join("goodflows/history").exists());
         for event in events.iter().filter(|e| e["type"] == "job_finished") {
             for field in ["blocked_ms", "queued_ms", "commands", "started"] {
                 assert!(event["result"].get(field).is_none(), "{event}");

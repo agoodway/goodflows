@@ -446,7 +446,7 @@ fn inspection_shows_default_history_settings_without_writing_history() {
     let p = Project::new(
         "[[jobs]]\nname='a'\ncommand='true'\n[[workflows.ci.jobs]]\nname='b'\ncommand='true'\n",
     );
-    let history = p.dir.join("goodflows-history");
+    let history = p.dir.join("goodflows/history");
     let expected = serde_json::json!({
         "history": false,
         "history_dir": history.to_str().unwrap(),
