@@ -6,3 +6,11 @@
 /.goodflows/
 node_modules/
 /.verify/
+# Installed by .agents/setup from this checkout's skills/ with goodflows skills install
+/.agents/skills/create-ci-skill/
+/.agents/skills/gf-change-build/
+/.agents/skills/gf-change-merge/
+/.agents/skills/gf-change-request/
+/.agents/skills/gf-change-write/
+/.agents/skills/gf-setup/
+/.agents/skills/maintain-ci-skill/

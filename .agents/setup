@@ -68,4 +68,9 @@ time {
   cargo build --locked --all-targets
   cargo build --locked --manifest-path reporters/nextest/Cargo.toml
 }
+
+echo 'Installing the goodflows agent skills from this checkout'
+time {
+  ./target/debug/goodflows skills install --harness amp
+}
 echo 'Orb setup ready; run cargo nextest run --locked or ./target/debug/goodflows'
