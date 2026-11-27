@@ -1,0 +1,15 @@
+[profile.default.junit]
+path = "junit.xml"
+report-skipped = "ignored"
+
+[[profile.default.overrides]]
+filter = "test(flaky)"
+retries = 2
+
+[[profile.default.overrides]]
+filter = "test(times_out)"
+slow-timeout = { period = "1s", terminate-after = 1 }
+
+[[profile.default.overrides]]
+filter = "test(fails_on_purpose)"
+retries = 1
