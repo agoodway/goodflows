@@ -318,6 +318,42 @@ decisions:
     by: user
     why: "Accepted recommendation (Q25): the server chose this for its own replaced_version, and one field name meaning two things across the CLI and the server is a trap for scripts."
     rejected: ["Report null on an unchanged push"]
+  - id: D51
+    question: What does pull do when the server's version does not say the latest version's status?
+    answer: "Exit 1 and write nothing, as for an archived change: the latest version's status is status for the latest version and latest_status for --version N, and a missing value is refused."
+    by: agent
+    why: "Found while building: without the status pull cannot tell whether the change is archived (D38), and guessing active could un-archive it on the next push."
+    rejected: ["Treat a missing status as not archived"]
+  - id: D52
+    question: Where does show --version N get the linked change requests?
+    answer: "From one more read, GET /changes/:id, after GET /changes/:id/versions/:n; both are private-key reads."
+    by: agent
+    why: "Found while building: the shipped server's version read (StoredChangeJSON.show_version) carries files and latest_status but no change_requests, so D15's linked change requests for an older version need the change read."
+    rejected: ["Show no linked change requests for an older version"]
+  - id: D53
+    question: What does the change_push event's change object hold?
+    answer: "The server's push answer (change_id, version, status, size, door, capabilities, depends_on, pushed_at, source, pushed_by) without duplicate and replaced_version, which the event carries as status and replaced_version at the top level."
+    by: agent
+    why: "Found while building: the shipped server answers a push with one flat version object, not a separate stored-change object, and keeping the push-result fields out of change keeps change.status the change's own status (D46)."
+    rejected: ["Copy the whole answer, duplicate and replaced_version included"]
+  - id: D54
+    question: What does pull do when the version lists the same path twice?
+    answer: "Refuse the whole version, exit 1, name the path and write nothing, as for a bad path."
+    by: agent
+    why: "Found while building: the shipped server sends a version's files as an array of {path, text}, not an object, so a path can repeat, and picking one copy would write text the version may not mean."
+    rejected: ["Keep the last copy"]
+  - id: D55
+    question: Where does change list get each change's linked change requests?
+    answer: "From the change_requests ([{number, state}]) of each GET /changes row, which pk_ keys may read too; a row without the field shows no numbers (-), as does a row whose list is empty, and the command still succeeds."
+    by: agent
+    why: "Found while building: the first shipped list rows carried no linked change requests; the server thread then amended GET /changes to carry change_requests on each row, and servers already deployed still leave the field out, so list must not depend on it or read each change per row (a pk_ key gets 403 there)."
+    rejected: ["GET /changes/:id per row", "Fail when a row has no change_requests"]
+  - id: D56
+    question: Which fields name a version entry's number and pusher?
+    answer: "The server's: each entry of GET /changes/:id/versions carries its number as version and its pusher as pushed_by.user_id, not number and user_id as D30 says. versions sorts and prints by version, and the change_versions event passes the entries through with the server's names."
+    by: agent
+    why: "Found while building: the shipped server (StoredChangeJSON.data/2) renders version entries with version and pushed_by: {user_id}, and D19 keeps the server's field names in the events."
+    rejected: ["Rename the fields to number and user_id in the event"]
 left_to_builder:
   - "Wording of errors a person reads, with the bar that each names the input or state at fault (the change id, the file, the version) and what to do next."
   - "How each requirement is tested, with the bar that breaking the behavior of any Must scenario fails an automated test."

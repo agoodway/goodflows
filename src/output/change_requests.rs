@@ -46,6 +46,12 @@ pub fn renders(kind: &str) -> bool {
             | "feature_validation"
             | "change_validation"
             | "change_archive"
+            | "change_push"
+            | "change_list"
+            | "change_show"
+            | "change_pull"
+            | "change_versions"
+            | "change_delete"
             | "project_events"
             | "merge_lease"
             | "defect"
@@ -186,6 +192,134 @@ pub fn render(event: &Value, out: &mut impl Write) -> Result<()> {
                 )?;
             }
         }
+        "change_push" => {
+            let unchanged = event["status"] == "unchanged";
+            write!(
+                out,
+                "{} change {} as version {}",
+                if unchanged {
+                    "Already stored, unchanged:"
+                } else {
+                    "Pushed"
+                },
+                s(&event["id"]),
+                s(&event["version"])
+            )?;
+            if !unchanged && !event["replaced_version"].is_null() {
+                write!(out, "; replaced version {}", s(&event["replaced_version"]))?;
+            }
+            writeln!(out, " (status {})", s(&event["change"]["status"]))?;
+            if unchanged {
+                // The kept version keeps the provenance of the push that made it.
+                writeln!(
+                    out,
+                    "  version {} was pushed from {}",
+                    s(&event["version"]),
+                    provenance(&event["change"]["source"])
+                )?;
+                writeln!(
+                    out,
+                    "  this push came from {}",
+                    provenance(&event["source"])
+                )?;
+            } else {
+                writeln!(out, "  from {}", provenance(&event["source"]))?;
+            }
+        }
+        "change_list" => {
+            let changes = event["changes"].as_array().cloned().unwrap_or_default();
+            for change in &changes {
+                writeln!(
+                    out,
+                    "{}  {}  v{}  {}  {}",
+                    s(&change["change_id"]),
+                    s(&change["status"]),
+                    s(&change["version"]),
+                    s(&change["last_pushed_at"]),
+                    linked(&change["change_requests"])
+                )?;
+            }
+        }
+        "change_show" if event["file"].is_string() => {
+            // Lines kept as they are; other control characters escaped.
+            for line in event["text"]
+                .as_str()
+                .unwrap_or_default()
+                .split_inclusive('\n')
+            {
+                let (body, end) = match line.strip_suffix('\n') {
+                    Some(body) => (body, "\n"),
+                    None => (line, ""),
+                };
+                let (body, cr) = match body.strip_suffix('\r') {
+                    Some(body) => (body, "\r"),
+                    None => (body, ""),
+                };
+                write!(out, "{}{cr}{end}", visible(body))?;
+            }
+        }
+        "change_show" => {
+            let v = event;
+            writeln!(
+                out,
+                "{} version {}{}  {}",
+                s(&event["id"]),
+                s(&v["version"]),
+                if v["latest"] == true { " (latest)" } else { "" },
+                s(&v["status"])
+            )?;
+            writeln!(
+                out,
+                "Pushed {} from {}",
+                s(&v["pushed_at"]),
+                provenance(&v["source"])
+            )?;
+            writeln!(out, "Change requests: {}", linked(&v["change_requests"]))?;
+            writeln!(out, "Files:")?;
+            for file in v["files"].as_array().into_iter().flatten() {
+                writeln!(out, "  {}", s(&file["path"]))?;
+            }
+        }
+        "change_pull" => {
+            if event["written"] == true {
+                writeln!(
+                    out,
+                    "Wrote version {} of {} to {} ({} files)",
+                    s(&event["version"]),
+                    s(&event["id"]),
+                    s(&event["dir"]),
+                    event["files"].as_array().map_or(0, Vec::len)
+                )?;
+                if event["deleted"].as_array().is_some_and(|d| !d.is_empty()) {
+                    writeln!(out, "Deleted: {}", list(&event["deleted"]))?;
+                }
+            } else {
+                writeln!(
+                    out,
+                    "{} already matches version {} of {}; nothing written",
+                    s(&event["dir"]),
+                    s(&event["version"]),
+                    s(&event["id"])
+                )?;
+            }
+        }
+        "change_versions" => {
+            for v in event["versions"].as_array().into_iter().flatten() {
+                writeln!(
+                    out,
+                    "v{}  {}  {}{}",
+                    s(&v["version"]),
+                    s(&v["pushed_at"]),
+                    provenance(&v["source"]),
+                    if v["latest"] == true { "  latest" } else { "" }
+                )?;
+            }
+        }
+        "change_delete" => writeln!(
+            out,
+            "Deleted stored change {} and every version",
+            s(&event["id"])
+        )?,
         "feature_validation" => validation(
             &event["files"],
             event["errors"].as_array().map_or(&[][..], Vec::as_slice),
@@ -249,6 +383,39 @@ pub fn render(event: &Value, out: &mut impl Write) -> Result<()> {
         _ => {}
     }
     Ok(())
+}
+
+/// Where a stored version was pushed from: commit, branch and dirty flag.
+fn provenance(source: &Value) -> String {
+    format!(
+        "commit {}  branch {}  {}",
+        short(&source["commit"]),
+        if source["branch"].is_null() {
+            "(detached)".to_owned()
+        } else {
+            s(&source["branch"])
+        },
+        if source["dirty"] == true {
+            "dirty"
+        } else {
+            "clean"
+        }
+    )
+}
+
+/// The numbers of the change requests that link a stored change.
+fn linked(crs: &Value) -> String {
+    let numbers: Vec<String> = crs
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|cr| format!("#{}", s(&cr["number"])))
+        .collect();
+    if numbers.is_empty() {
+        "-".to_owned()
+    } else {
+        numbers.join(", ")
+    }
 }
 
 const LANES: [&str; 3] = ["auto", "reviewed", "bypass"];

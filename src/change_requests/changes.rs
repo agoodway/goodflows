@@ -20,7 +20,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 const FORMAT: &str = "goodflows-change/1";
-const CHANGES: &str = "goodflows/changes";
+pub(super) const CHANGES: &str = "goodflows/changes";
 const SPECS: &str = "goodflows/specs";
 const KEYS: [&str; 12] = [
     "format",
@@ -100,6 +100,116 @@ Examples:
         #[arg(value_name = "ID", value_parser = super::change_id)]
         id: String,
     },
+    /// Store the change's files on the GoodFlows server as a new version, with the commit, branch and dirty flag they came from
+    #[command(
+        after_help = "Reads goodflows/changes/<id>/ as it is on disk, committed or not, or, when that does not
+exist, the one goodflows/changes/archive/<date>-<id>/ directory. The directory may hold only
+change.md, specs/<capability>/spec.md, qa-scenarios.md and verification.md, and no symlinks. An
+active change must pass goodflows change validate <id> without errors; an archived one is checked
+only for those files, UTF-8 text, and a change.md whose id is <id>. Files that match the latest
+stored version are reported unchanged. Uses the config's [reporting] project, URL and key.
+
+Examples:
+  goodflows change validate add-login         # check it first; push refuses on errors
+  goodflows change push add-login             # store add-login's files as a new version
+  goodflows change push add-login --json      # print the version, its status and the version it replaced"
+    )]
+    Push {
+        /// The change id under goodflows/changes/ or goodflows/changes/archive/<date>-<id>/
+        #[arg(value_name = "ID", value_parser = super::change_id)]
+        id: String,
+    },
+    /// List the project's stored changes with their status, latest version and linked change requests
+    #[command(after_help = "Examples:
+  goodflows change list                       # every stored change, one line each
+  goodflows change list --status approved     # only approved changes
+  goodflows change list --json                # every stored change as JSON")]
+    List {
+        /// Show only changes with this status (default: all)
+        #[arg(long, value_enum)]
+        status: Option<StoredStatus>,
+    },
+    /// Show a stored change's version, where it was pushed from, its linked change requests and its files
+    #[command(after_help = "Examples:
+  goodflows change show add-login                       # the latest version
+  goodflows change show add-login --version 1           # version 1
+  goodflows change show add-login --file change.md      # print one file of the latest version")]
+    Show {
+        /// The stored change's id
+        #[arg(value_name = "ID", value_parser = super::change_id)]
+        id: String,
+        /// The version to show (default: the latest)
+        #[arg(long, value_name = "N", value_parser = clap::value_parser!(u64).range(1..))]
+        version: Option<u64>,
+        /// Print this file's text instead, such as qa-scenarios.md or specs/auth/spec.md
+        #[arg(long, value_name = "PATH")]
+        file: Option<String>,
+    },
+    /// Write a stored version into goodflows/changes/<id>/, refusing to overwrite local edits without --force
+    #[command(
+        after_help = "Writes the version's files to goodflows/changes/<id>/ under the checkout's top level and
+stages nothing. Refuses, writing nothing, when the directory has a file that differs from the
+version or that the version does not have; --force writes the version and deletes those files.
+Always refuses a stored change whose latest version is archived, and a checkout that has
+goodflows/changes/archive/<date>-<id>/. A pull writes the whole version or nothing.
+
+Examples:
+  goodflows change pull add-login                       # the latest version
+  goodflows change pull add-login --version 2 --force   # replace the local files with version 2
+  goodflows change pull add-login --json                # print the written and deleted files as JSON"
+    )]
+    Pull {
+        /// The stored change's id
+        #[arg(value_name = "ID", value_parser = super::change_id)]
+        id: String,
+        /// The version to write (default: the latest)
+        #[arg(long, value_name = "N", value_parser = clap::value_parser!(u64).range(1..))]
+        version: Option<u64>,
+        /// Overwrite local files that differ and delete local files the version does not have
+        #[arg(long)]
+        force: bool,
+    },
+    /// List every stored version of a change, newest first, with where each was pushed from
+    #[command(after_help = "Examples:
+  goodflows change versions add-login         # newest first; the latest is marked
+  goodflows change versions add-login --json  # every version as JSON
+  goodflows change show add-login --version 1 # one of them")]
+    Versions {
+        /// The stored change's id
+        #[arg(value_name = "ID", value_parser = super::change_id)]
+        id: String,
+    },
+    /// Delete a stored change and all its versions from the server; refused while a change request links it
+    #[command(after_help = "Examples:
+  goodflows change list                       # find the stored change ids
+  goodflows change delete drop-me --yes       # delete every version of drop-me
+  goodflows change delete drop-me --yes --json # print the deleted id as JSON")]
+    Delete {
+        /// The stored change's id
+        #[arg(value_name = "ID", value_parser = super::change_id)]
+        id: String,
+        /// Confirm the delete; without it nothing is sent and the command exits 2
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+/// A stored change's status, for `change list --status`.
+#[derive(clap::ValueEnum, Clone, Copy, Debug)]
+pub enum StoredStatus {
+    Proposed,
+    Approved,
+    Archived,
+}
+
+impl ChangeCommand {
+    /// Whether the command talks to the server and so reads the config.
+    pub fn stored(&self) -> bool {
+        !matches!(
+            self,
+            Self::Validate { .. } | Self::Verified { .. } | Self::Archive { .. }
+        )
+    }
 }
 
 pub async fn change(command: &ChangeCommand, output: &Output) -> Result<u8> {
@@ -161,6 +271,7 @@ pub async fn change(command: &ChangeCommand, output: &Output) -> Result<u8> {
             output.emit(stamp(&top, id, base, &changed)?).await?;
             Ok(0)
         }
+        _ => unreachable!("stored change commands run in stored::command"),
     }
 }
 
@@ -224,7 +335,7 @@ fn dirs(path: &Path) -> Vec<String> {
 }
 
 /// The change id of an archive directory, `YYYY-MM-DD-<id>`.
-fn archived_id(name: &str) -> Option<String> {
+pub(super) fn archived_id(name: &str) -> Option<String> {
     let date = name.get(..11)?.as_bytes();
     let shape = date.iter().enumerate().all(|(i, b)| match i {
         4 | 7 | 10 => *b == b'-',
@@ -392,13 +503,13 @@ fn base_spec(
 }
 
 #[derive(Default)]
-struct Report {
-    errors: Vec<String>,
+pub(super) struct Report {
+    pub(super) errors: Vec<String>,
     warnings: Vec<String>,
 }
 
 /// What archiving needs from a change that validated.
-struct Checked {
+pub(super) struct Checked {
     status: String,
     text: String,
     merged: Vec<Merged>,
@@ -437,7 +548,7 @@ struct Delta {
 }
 
 /// One change's problems, and what archiving needs when it has none.
-fn check(top: &Path, id: &str) -> (Report, Option<Checked>) {
+pub(super) fn check(top: &Path, id: &str) -> (Report, Option<Checked>) {
     let mut report = Report::default();
     let base = format!("{CHANGES}/{id}");
     let dir = top.join(CHANGES).join(id);
@@ -605,7 +716,7 @@ struct Meta {
     ids: BTreeMap<String, String>,
 }
 
-fn front_matter(text: &str, file: &str, errors: &mut Vec<String>) -> Option<Value> {
+pub(super) fn front_matter(text: &str, file: &str, errors: &mut Vec<String>) -> Option<Value> {
     if text.is_empty() {
         return None;
     }
@@ -811,7 +922,7 @@ fn add_id(
     }
 }
 
-fn capability_name(name: &str) -> bool {
+pub(super) fn capability_name(name: &str) -> bool {
     name.split('/').all(|segment| {
         segment.starts_with(|c: char| c.is_ascii_lowercase() || c.is_ascii_digit())
             && segment

@@ -10,6 +10,7 @@ mod api;
 mod changes;
 mod git;
 pub(crate) mod markdown;
+mod stored;
 pub(crate) mod verify_run;
 
 use crate::config::Reporting;
@@ -26,6 +27,7 @@ use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+pub use stored::command as stored_change;
 use tokio::sync::watch;
 
 /// Exit code of `cr wait` when its timeout passes first, as for `wait`.

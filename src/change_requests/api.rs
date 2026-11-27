@@ -313,4 +313,26 @@ mod tests {
         let empty = http_error("cr ready", StatusCode::NOT_FOUND, &Value::Null);
         assert_eq!(empty, "cr ready failed: not found (HTTP 404)");
     }
+
+    #[test]
+    fn every_path_segment_is_escaped_under_the_project() {
+        let Credentials::Ready(target) =
+            publish::resolve(Some("http://127.0.0.1:1"), Some("sk_test"), "goodcases")
+        else {
+            panic!("loopback credentials resolve");
+        };
+        let api = Api {
+            target,
+            client: reqwest::Client::new(),
+            command: "change show".to_owned(),
+            cancel: watch::channel(None).1,
+            token_env: "GOODFLOWS_API_KEY".to_owned(),
+        };
+        let url = api.url(&["changes", "a/b?c d", "versions", "1#2"], &[]);
+        assert_eq!(
+            url.path(),
+            "/api/v1/projects/goodcases/changes/a%2Fb%3Fc%20d/versions/1%232"
+        );
+        assert_eq!(url.query(), None);
+    }
 }

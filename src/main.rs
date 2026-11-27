@@ -711,7 +711,8 @@ async fn main() -> ExitCode {
                 | Commands::Sprite { .. }
                 | Commands::Mcp
         )
-    ) {
+    ) || matches!(&cli.command, Some(Commands::Change { command }) if command.stored())
+    {
         cancellation()
     } else {
         // Keep the OS default signal behavior for commands that do not spawn jobs,
@@ -926,6 +927,24 @@ async fn run(cli: &Cli, output: &mut Output, cancel: watch::Receiver<Option<i32>
         return sprite::command(cli, command, output, cancel).await;
     }
     if let Some(Commands::Change { command }) = &cli.command {
+        if command.stored() {
+            if let Some(flag) = cli.run_only_flag() {
+                return Err(usage(format!("{flag} cannot be used with change commands")));
+            }
+            if let change_requests::ChangeCommand::Delete { yes: false, id } = command {
+                return Err(usage(format!(
+                    "change delete removes every stored version of {id}; pass --yes to confirm"
+                )));
+            }
+            let (document, _) = Config::load(cli.config.as_deref())?;
+            return change_requests::stored_change(
+                document.reporting.as_ref(),
+                command,
+                output,
+                cancel,
+            )
+            .await;
+        }
         let config = cli.config.is_some().then_some("--config");
         if let Some(flag) = config.or_else(|| cli.run_only_flag()) {
             return Err(usage(format!("{flag} cannot be used with change commands")));
