@@ -1,0 +1,73 @@
+# goodflows review policy, written by gf-setup. Each value that differs
+# from version 0 says what it is based on.
+format = "review-policy/1"
+
+[evidence]
+# Version 0 ignores docs/** and **/*.md. Neither is safe here: src/skills.rs
+# and src/main.rs embed 16 .md files with include_str!, and tests/sprite.rs
+# parses docs/sprites.md. Only files nothing builds, tests or loads remain.
+# README and LICENSE files ship in archives but change no behavior. The
+# verify skill under .agents/skills/ stays out: it decides how a run drives
+# the CLI.
+ignore_paths = [
+  "goodflows/specs/**",
+  "goodflows/changes/**",
+  "openspec/**",
+  "docs/ampcode.md",
+  "docs/development.md",
+  "docs/install.md",
+  "docs/releasing.md",
+  "README.md",
+  "reporters/exunit/README.md",
+  "reporters/jest/README.md",
+  "LICENSE",
+  "reporters/exunit/LICENSE",
+  "reporters/jest/LICENSE",
+]
+# No workflow is required yet: CI does not upload runs, and 4 of the 7
+# uploaded runs of "default" came from a dirty tree.
+required_workflows = []
+
+[size]
+# 90th percentile of the last 132 landings on main is 17 files and 2,253
+# lines; version 0 (40/1500) would flag 22 of them, this 12.
+max_changed_files = 25
+max_changed_lines = 2500
+
+[scenarios]
+# The repo plans its work as goodflows changes (goodflows/changes/).
+require_approved_intent = true
+spec_gaps = "needs_review"
+
+[coverage]
+# No feature file has paths globs, so there is no feature index yet.
+unmapped_areas = "ignore"
+undriven_features = "ignore"
+
+[[paths]]
+glob = "goodflows/review-policy.toml"
+outcome = "needs_review"
+
+[[paths]]
+glob = ".github/workflows/**"
+outcome = "needs_review"
+
+[[paths]]
+glob = "goodflows.toml"
+outcome = "needs_review"
+
+[[paths]]
+glob = "scripts/**"
+outcome = "needs_review"
+
+[[paths]]
+glob = ".cargo/config.toml"
+outcome = "needs_review"
+
+[[paths]]
+glob = "src/secrets.rs"
+outcome = "needs_review"
+
+[[paths]]
+glob = "Cargo.lock"
+outcome = "needs_review"
