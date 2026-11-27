@@ -33,7 +33,11 @@ jobs:
             Linux-ARM64) platform=linux-arm ;;
             macOS-*) platform=mac ;;
           esac
-          curl -LsSf "https://get.nexte.st/latest/$platform" | tar zxf - -C "${CARGO_HOME:-$HOME/.cargo}/bin"
+          # macOS runners have no ~/.cargo/bin (rustup comes from Homebrew).
+          bin="$RUNNER_TEMP/nextest-bin"
+          mkdir -p "$bin"
+          curl -LsSf "https://get.nexte.st/latest/$platform" | tar zxf - -C "$bin"
+          echo "$bin" >> "$GITHUB_PATH"
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo nextest run --locked
