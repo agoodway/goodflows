@@ -100,6 +100,78 @@ fn skills_install_harness_flag_unknown_fallback_and_ambiguity() {
 }
 
 #[test]
+fn skills_update_refreshes_every_installed_directory_and_needs_an_install() {
+    let p = Project::new("");
+    let update = |args: &[&str]| {
+        let mut command = p.command();
+        command.env_clear().env("CLAUDECODE", "1");
+        command
+            .args(["skills", "update"])
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let output = update(&["--json"]);
+    assert_eq!(output.status.code(), Some(2));
+    let event: Value = serde_json::from_str(stdout(&output).trim()).unwrap();
+    assert_eq!(event["code"], "no_skills_installed");
+    assert!(!p.dir.join("AGENTS.md").exists());
+
+    // An older install: a stale and a retired skill in .claude/skills, only a
+    // retired one in .grok/skills, and a project skill in .agents/skills that
+    // is not goodflows's.
+    for (file, text) in [
+        (".claude/skills/gf-change-merge/SKILL.md", "old"),
+        (".claude/skills/gf-change-explore/SKILL.md", "old"),
+        (
+            ".claude/skills/gf-change-explore/builder-check-prompt.md",
+            "old",
+        ),
+        (".grok/skills/gf-change-explore/SKILL.md", "old"),
+        (".agents/skills/run-ci-web/SKILL.md", "mine"),
+    ] {
+        let path = p.dir.join(file);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+    let output = update(&["--json"]);
+    success(&output);
+    let event: Value = serde_json::from_str(stdout(&output).trim()).unwrap();
+    assert_eq!(event["type"], "skills_updated");
+    assert_eq!(
+        event["directories"],
+        json!([".claude/skills", ".grok/skills"])
+    );
+    for dir in [".claude/skills", ".grok/skills"] {
+        for file in ["gf-change-merge/SKILL.md", "gf-setup/SKILL.md"] {
+            let repo = std::fs::read_to_string(format!("skills/{file}")).unwrap();
+            assert_eq!(p.read(&format!("{dir}/{file}")), repo, "{dir}/{file}");
+        }
+    }
+    assert_eq!(
+        event["removed"],
+        json!([
+            ".claude/skills/gf-change-explore",
+            ".grok/skills/gf-change-explore"
+        ])
+    );
+    for dir in [".claude/skills", ".grok/skills"] {
+        assert!(!p.dir.join(dir).join("gf-change-explore").exists(), "{dir}");
+    }
+    assert_eq!(p.read(".agents/skills/run-ci-web/SKILL.md"), "mine");
+    assert!(!p.dir.join(".agents/skills/gf-setup").exists());
+    for file in ["AGENTS.md", "CLAUDE.md"] {
+        assert!(
+            p.read(file).contains("<!-- goodflows:formats -->"),
+            "{file}"
+        );
+    }
+
+    let output = update(&["--harness", "amp"]);
+    assert_eq!(output.status.code(), Some(2));
+}
+
+#[test]
 fn mcp_rejects_flags_it_does_not_use() {
     let p = Project::new("");
     for flag in [

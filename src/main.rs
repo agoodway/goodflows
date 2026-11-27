@@ -289,7 +289,7 @@ enum Commands {
         #[command(subcommand)]
         command: sprite::Command,
     },
-    /// Install goodflows's agent skills where the current coding agent loads them
+    /// Install or update goodflows's agent skills where coding agents load them
     #[command(after_help = SKILLS_EXAMPLES)]
     Skills {
         #[command(subcommand)]
@@ -336,6 +336,7 @@ enum ReportsCommand {
 const SKILLS_EXAMPLES: &str = "Examples:
   goodflows skills install                    # install into the directory this harness loads
   goodflows skills install --harness claude   # install into .claude/skills
+  goodflows skills update                     # refresh the skills already installed in this repository
   goodflows skills install --json             # print the files written as a JSON event";
 
 #[derive(Subcommand)]
@@ -347,6 +348,9 @@ enum SkillsCommand {
         #[arg(long, value_enum)]
         harness: Option<skills::Harness>,
     },
+    /// Rewrite the bundled skills in every skills directory that already has goodflows skills (.agents/skills, .claude/skills, .grok/skills), adding new ones and deleting retired ones such as gf-change-explore, and refresh the AGENTS.md (and CLAUDE.md) block; fails when none are installed
+    #[command(after_help = SKILLS_EXAMPLES)]
+    Update,
 }
 
 #[derive(Subcommand)]
@@ -937,6 +941,16 @@ async fn run(cli: &Cli, output: &mut Output, cancel: watch::Receiver<Option<i32>
             return Err(usage(format!("{flag} cannot be used with skills install")));
         }
         return skills::install(*harness, output).await;
+    }
+    if let Some(Commands::Skills {
+        command: SkillsCommand::Update,
+    }) = &cli.command
+    {
+        let config = cli.config.is_some().then_some("--config");
+        if let Some(flag) = config.or_else(|| cli.run_only_flag()) {
+            return Err(usage(format!("{flag} cannot be used with skills update")));
+        }
+        return skills::update(output).await;
     }
     if let Some(Commands::Agents) = &cli.command {
         let rejected = [
@@ -2386,7 +2400,7 @@ mod tests {
         let mut paths = Vec::new();
         command_paths(&Cli::parser(), Vec::new(), &mut paths);
         assert!(paths.len() > 10, "{paths:?}");
-        for command in [&["skills", "install"][..], &["mcp"]] {
+        for command in [&["skills", "install"][..], &["skills", "update"], &["mcp"]] {
             assert!(paths.iter().any(|path| path == command), "{command:?}");
         }
         for path in paths {

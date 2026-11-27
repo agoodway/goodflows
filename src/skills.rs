@@ -1,5 +1,6 @@
 //! `goodflows skills install`: write the bundled agent skills into the
 //! directory the current coding agent harness loads skills from.
+//! `goodflows skills update`: rewrite them wherever they are installed.
 
 use crate::config::ConfigError;
 use crate::output::Output;
@@ -102,6 +103,10 @@ const SKILLS: [(&str, &[(&str, &str)]); 7] = [
         )],
     ),
 ];
+
+/// Skills earlier versions installed that this one no longer ships, such as
+/// gf-change-explore, renamed to gf-change-write. `skills update` deletes them.
+const RETIRED: [&str; 1] = ["gf-change-explore"];
 
 /// The directory for an unknown harness.
 const DEFAULT_DIR: &str = ".agents/skills";
@@ -368,6 +373,66 @@ fn write_guidance(root: &Path, harnesses: &[Harness]) -> Result<Vec<String>> {
         }
     }
     Ok(written)
+}
+
+/// The skills directories under `root` that hold at least one bundled or
+/// retired skill, one per distinct harness directory.
+fn installed_dirs(root: &Path) -> Vec<&'static str> {
+    let mut dirs: Vec<_> = <Harness as clap::ValueEnum>::value_variants()
+        .iter()
+        .map(|h| h.dir())
+        .collect();
+    dirs.sort();
+    dirs.dedup();
+    dirs.retain(|dir| {
+        SKILLS
+            .iter()
+            .map(|(name, _)| *name)
+            .chain(RETIRED)
+            .any(|name| root.join(dir).join(name).join("SKILL.md").is_file())
+    });
+    dirs
+}
+
+/// `goodflows skills update`, in the current directory: rewrite every
+/// bundled skill in each directory that already has goodflows skills,
+/// delete retired ones there, and refresh the formats block.
+pub async fn update(output: &Output) -> Result<u8> {
+    let root = std::env::current_dir()?;
+    let dirs = installed_dirs(&root);
+    if dirs.is_empty() {
+        let mut error = ConfigError::new(
+            "no_skills_installed",
+            "no goodflows skills are installed in .agents/skills, .claude/skills or .grok/skills",
+        );
+        error.hint = Some("run goodflows skills install to install them".into());
+        return Err(error.into());
+    }
+    let mut files = Vec::new();
+    let mut removed = Vec::new();
+    for dir in &dirs {
+        files.extend(write(&root, dir)?);
+        for name in RETIRED {
+            let skill = root.join(dir).join(name);
+            if skill.is_dir() {
+                std::fs::remove_dir_all(&skill)
+                    .with_context(|| format!("remove {}", skill.display()))?;
+                removed.push(format!("{dir}/{name}"));
+            }
+        }
+    }
+    let claude: &[Harness] = if dirs.contains(&Harness::Claude.dir()) {
+        &[Harness::Claude]
+    } else {
+        &[]
+    };
+    files.extend(write_guidance(&root, claude)?);
+    output
+        .emit(
+            json!({"type":"skills_updated", "directories":dirs, "files":files, "removed":removed}),
+        )
+        .await?;
+    Ok(0)
 }
 
 /// `goodflows skills install`, in the current directory.

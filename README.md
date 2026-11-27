@@ -27,6 +27,7 @@ goodflows cancel "$id"             # stop the run
 goodflows agents                   # print the guide for coding agents
 goodflows schema list              # the formats of the files goodflows reads, and their validators
 goodflows skills install           # install the agent skills into this repository
+goodflows skills update            # refresh them after upgrading goodflows
 goodflows mcp                      # serve goodflows to a coding agent over MCP
 ```
 
@@ -969,7 +970,10 @@ npx skills add agoodway/goodflows --skill gf-setup
 ```bash
 goodflows skills install
 goodflows skills install --harness claude
+goodflows skills update
 ```
+
+After upgrading goodflows, `goodflows skills update` refreshes an existing install without detecting a harness. It finds every directory among `.agents/skills`, `.claude/skills` and `.grok/skills` that holds at least one goodflows skill, rewrites all the built-in skills there (adding skills the new version ships), deletes skills goodflows no longer ships, such as `gf-change-explore` (renamed `gf-change-write`), and refreshes the formats block in `AGENTS.md`, and in `CLAUDE.md` when `.claude/skills` was updated. Skills directories without a goodflows skill are left alone. When no directory has one, it exits 2 with `no_skills_installed`; run `goodflows skills install` first.
 
 | `--harness` | Directory | Detected from |
 | --- | --- | --- |

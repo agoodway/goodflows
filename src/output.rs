@@ -624,6 +624,19 @@ fn render(
                     writeln!(out, "  {}", file.as_str().unwrap_or_default())?;
                 }
             }
+            "skills_updated" => {
+                writeln!(out, "Updated skills in {}", names(&event["directories"]))?;
+                for file in event["files"].as_array().into_iter().flatten() {
+                    writeln!(out, "  {}", file.as_str().unwrap_or_default())?;
+                }
+                for skill in event["removed"].as_array().into_iter().flatten() {
+                    writeln!(
+                        out,
+                        "Removed retired skill {}",
+                        skill.as_str().unwrap_or_default()
+                    )?;
+                }
+            }
             "workflows" => {
                 writeln!(
                     out,
