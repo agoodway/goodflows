@@ -11,7 +11,7 @@ use std::path::Path;
 
 /// The skills this binary installs, embedded as they are in `skills/`: each
 /// skill's name and its files, `SKILL.md` first.
-const SKILLS: [(&str, &[(&str, &str)]); 6] = [
+const SKILLS: [(&str, &[(&str, &str)]); 7] = [
     (
         "create-ci-skill",
         &[(
@@ -85,6 +85,13 @@ const SKILLS: [(&str, &[(&str, &str)]); 6] = [
                 "review-check-prompt.md",
                 include_str!("../skills/gf-change-write/review-check-prompt.md"),
             ),
+        ],
+    ),
+    (
+        "gf-setup",
+        &[
+            ("SKILL.md", include_str!("../skills/gf-setup/SKILL.md")),
+            ("replay.py", include_str!("../skills/gf-setup/replay.py")),
         ],
     ),
     (
@@ -531,6 +538,8 @@ mod tests {
                     ".claude/skills/gf-change-write/builder-check-prompt.md",
                     ".claude/skills/gf-change-write/over-spec-check-prompt.md",
                     ".claude/skills/gf-change-write/review-check-prompt.md",
+                    ".claude/skills/gf-setup/SKILL.md",
+                    ".claude/skills/gf-setup/replay.py",
                     ".claude/skills/maintain-ci-skill/SKILL.md"
                 ]
             );
