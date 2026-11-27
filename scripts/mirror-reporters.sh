@@ -3,8 +3,8 @@
 #
 #   scripts/mirror-reporters.sh <tag> [--verify | --dry-run | --check-keys]
 #
-# The tag names the reporter and its version: `exunit-reporter-v<version>` or
-# `jest-reporter-v<version>`. Each reporter is versioned on its own, apart from
+# The tag names the reporter and its version: `exunit-reporter-v<version>`,
+# `jest-reporter-v<version>` or `nextest-reporter-v<version>`. Each reporter is versioned on its own, apart from
 # the CLI, and its mirror is tagged with the plain `v<version>`.
 #
 # `git subtree split` produces the reporter's history as a standalone branch
@@ -29,8 +29,8 @@
 #                 checks only warn.
 #   --check-keys  only check that the reporter's deploy key is set.
 #
-# Deploy keys come from EXUNIT_REPORTER_DEPLOY_KEY and JEST_REPORTER_DEPLOY_KEY
-# (private keys with write access to one mirror each, stored as secrets of the
+# Deploy keys come from EXUNIT_REPORTER_DEPLOY_KEY, JEST_REPORTER_DEPLOY_KEY and
+# NEXTEST_REPORTER_DEPLOY_KEY (private keys with write access to one mirror each, stored as secrets of the
 # `reporter-mirrors` environment). A push or --verify fails before splitting
 # anything when the released reporter's key is missing, naming the secret.
 #
@@ -66,8 +66,11 @@ case "$tag" in
   jest-reporter-v[0-9]*)
     prefix=reporters/jest mirror=agoodway/goodflows-jest-reporter var=JEST_REPORTER_DEPLOY_KEY
     ;;
+  nextest-reporter-v[0-9]*)
+    prefix=reporters/nextest mirror=agoodway/goodflows-nextest-reporter var=NEXTEST_REPORTER_DEPLOY_KEY
+    ;;
   *)
-    echo "error: $tag is not a reporter release tag (exunit-reporter-v<version> or jest-reporter-v<version>)" >&2
+    echo "error: $tag is not a reporter release tag (exunit-reporter-v<version>, jest-reporter-v<version> or nextest-reporter-v<version>)" >&2
     exit 2
     ;;
 esac

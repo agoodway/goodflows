@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Tests scripts/verify-versions.sh and scripts/mirror-reporters.sh without
-# GitHub: versions are checked in a scratch copy of the three manifests, and
+# GitHub: versions are checked in a scratch copy of the four manifests, and
 # mirrors are local bare repositories reached through MIRROR_URL_BASE, with a
 # local bare repository as the source `origin`. Covers independent CLI and
 # reporter versions, tags that do not match what they release, missing deploy
@@ -22,7 +22,7 @@ git config --global user.name "release script test"
 git config --global user.email "release-test@example.invalid"
 git config --global init.defaultBranch main
 git config --global advice.detachedHead false
-unset GITHUB_ACTIONS EXUNIT_REPORTER_DEPLOY_KEY JEST_REPORTER_DEPLOY_KEY \
+unset GITHUB_ACTIONS EXUNIT_REPORTER_DEPLOY_KEY JEST_REPORTER_DEPLOY_KEY NEXTEST_REPORTER_DEPLOY_KEY \
   MIRROR_URL_BASE MIRROR_SOURCE_REMOTE MIRROR_SOURCE_BRANCH
 
 passed=0
@@ -62,17 +62,18 @@ check() {
 # ---- verify-versions.sh ----
 
 versions="$work/versions"
-mkdir -p "$versions/scripts" "$versions/reporters/exunit" "$versions/reporters/jest"
+mkdir -p "$versions/scripts" "$versions/reporters/exunit" "$versions/reporters/jest" "$versions/reporters/nextest"
 cp "$root/scripts/verify-versions.sh" "$versions/scripts/"
-# Writes the three manifests with the given CLI, ExUnit and Jest versions.
+# Writes the four manifests with the given CLI, ExUnit, Jest and nextest versions.
 manifests() {
   printf '[package]\nname = "goodflows"\nversion = "%s"\n' "$1" >"$versions/Cargo.toml"
   printf 'defmodule X.MixProject do\n  @version "%s"\nend\n' "$2" >"$versions/reporters/exunit/mix.exs"
   printf '{"name": "goodflows-jest-reporter", "version": "%s"}\n' "$3" >"$versions/reporters/jest/package.json"
+  printf '[package]\nname = "goodflows-nextest-reporter"\nversion = "%s"\n' "$4" >"$versions/reporters/nextest/Cargo.toml"
 }
 verify="$versions/scripts/verify-versions.sh"
 
-manifests 0.7.0 0.6.1 0.6.0
+manifests 0.7.0 0.6.1 0.6.0 0.1.0
 expect 0 "Cargo.toml: 0.7.0" "independent versions pass without a tag" -- bash "$verify"
 expect 0 "tag: v0.7.0" "a CLI tag that names the CLI version passes" -- bash "$verify" v0.7.0
 expect 1 "tag v0.6.0 does not match Cargo.toml version v0.7.0" "a CLI tag that does not match the CLI version fails" -- \
@@ -85,8 +86,14 @@ expect 0 "tag: jest-reporter-v0.6.0" "a Jest reporter tag that names its version
   bash "$verify" jest-reporter-v0.6.0
 expect 1 "does not match reporters/jest/package.json version jest-reporter-v0.6.0" \
   "a Jest reporter tag does not take the CLI version" -- bash "$verify" jest-reporter-v0.7.0
+expect 0 "tag: nextest-reporter-v0.1.0" "a nextest reporter tag that names its version passes" -- \
+  bash "$verify" nextest-reporter-v0.1.0
+expect 1 "does not match reporters/nextest/Cargo.toml version nextest-reporter-v0.1.0" \
+  "a nextest reporter tag does not take the CLI version" -- bash "$verify" nextest-reporter-v0.7.0
 expect 1 "is not a release tag" "a tag of no release fails" -- bash "$verify" nightly
-manifests 0.7.0 "" 0.6.0
+manifests 0.7.0 "" 0.6.0 0.1.0
+expect 1 "every version must be set" "a missing version fails" -- bash "$verify"
+manifests 0.7.0 0.6.1 0.6.0 ""
 expect 1 "every version must be set" "a missing version fails" -- bash "$verify"
 expect 0 "" "this checkout's versions are set" -- bash "$root/scripts/verify-versions.sh"
 
@@ -101,6 +108,8 @@ expect 1 "missing secret: EXUNIT_REPORTER_DEPLOY_KEY" "an ExUnit release needs t
   env JEST_REPORTER_DEPLOY_KEY=y bash "$mirror" exunit-reporter-v0.1.0 --check-keys
 expect 1 "missing secret" "a GitHub push without its key fails before splitting" -- bash "$mirror" exunit-reporter-v0.1.0
 expect 1 "missing secret" "a GitHub --verify without its key fails" -- bash "$mirror" exunit-reporter-v0.1.0 --verify
+expect 1 "missing secret: NEXTEST_REPORTER_DEPLOY_KEY" "a nextest release needs the nextest key" -- \
+  env JEST_REPORTER_DEPLOY_KEY=y EXUNIT_REPORTER_DEPLOY_KEY=y bash "$mirror" nextest-reporter-v0.1.0 --check-keys
 expect 2 "usage" "an unknown mode is a usage error" -- bash "$mirror" exunit-reporter-v0.1.0 --force
 expect 2 "is not a reporter release tag" "a CLI tag mirrors nothing" -- bash "$mirror" v0.1.0 --check-keys
 
@@ -109,7 +118,7 @@ expect 2 "is not a reporter release tag" "a CLI tag mirrors nothing" -- bash "$m
 git init --quiet --bare "$work/origin.git"
 git clone --quiet "$work/origin.git" "$work/src" 2>/dev/null
 mkdir -p "$work/mirrors/agoodway"
-for name in exunit jest; do
+for name in exunit jest nextest; do
   git init --quiet --bare "$work/mirrors/agoodway/goodflows-$name-reporter.git"
 done
 export MIRROR_URL_BASE="$work/mirrors/"
@@ -149,6 +158,13 @@ in_src git tag jest-reporter-v0.1.0
 expect 0 "pushed main and v0.1.0" "the Jest reporter releases from the same commit on its own tag" -- \
   in_src bash "$mirror" jest-reporter-v0.1.0
 check "the jest mirror holds only its reporter's files" test "$(mirror_git jest ls-tree --name-only main)" = VERSION
+
+# The nextest reporter releases to its own mirror on its own tag.
+release nextest-reporter-v0.1.0 nextest
+expect 0 "pushed main and v0.1.0" "the nextest reporter releases to its own mirror" -- \
+  in_src bash "$mirror" nextest-reporter-v0.1.0
+check "the nextest mirror holds only its reporter's files" test "$(mirror_git nextest ls-tree --name-only main)" = VERSION
+check "a nextest release leaves the Jest mirror at v0.1.0" lacks_tag jest v0.2.0
 
 # A release that changes only the Jest reporter.
 release jest-reporter-v0.2.0 jest

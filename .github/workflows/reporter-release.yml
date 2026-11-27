@@ -2,13 +2,13 @@ name: Reporter release
 
 on:
   push:
-    tags: ["exunit-reporter-v[0-9]*", "jest-reporter-v[0-9]*"]
+    tags: ["exunit-reporter-v[0-9]*", "jest-reporter-v[0-9]*", "nextest-reporter-v[0-9]*"]
   workflow_dispatch:
     inputs:
       reporter:
         description: Reporter to dry-run the mirror split for
         type: choice
-        options: [exunit, jest]
+        options: [exunit, jest, nextest]
         required: true
 
 permissions:
@@ -22,7 +22,8 @@ permissions:
 # keys.
 jobs:
   # exunit-reporter-v<version> must name reporters/exunit/mix.exs's version,
-  # and jest-reporter-v<version> reporters/jest/package.json's.
+  # jest-reporter-v<version> reporters/jest/package.json's, and
+  # nextest-reporter-v<version> reporters/nextest/Cargo.toml's.
   verify-versions:
     if: github.event_name == 'push' && github.ref_type == 'tag'
     runs-on: ubuntu-24.04
@@ -51,12 +52,14 @@ jobs:
         env:
           EXUNIT_REPORTER_DEPLOY_KEY: ${{ secrets.EXUNIT_REPORTER_DEPLOY_KEY }}
           JEST_REPORTER_DEPLOY_KEY: ${{ secrets.JEST_REPORTER_DEPLOY_KEY }}
+          NEXTEST_REPORTER_DEPLOY_KEY: ${{ secrets.NEXTEST_REPORTER_DEPLOY_KEY }}
           REF_NAME: ${{ github.ref_name }}
         run: scripts/mirror-reporters.sh "$REF_NAME" --check-keys
       - name: Verify the mirror can take the tag
         env:
           EXUNIT_REPORTER_DEPLOY_KEY: ${{ secrets.EXUNIT_REPORTER_DEPLOY_KEY }}
           JEST_REPORTER_DEPLOY_KEY: ${{ secrets.JEST_REPORTER_DEPLOY_KEY }}
+          NEXTEST_REPORTER_DEPLOY_KEY: ${{ secrets.NEXTEST_REPORTER_DEPLOY_KEY }}
           REF_NAME: ${{ github.ref_name }}
         run: scripts/mirror-reporters.sh "$REF_NAME" --verify
 
@@ -82,6 +85,7 @@ jobs:
         env:
           EXUNIT_REPORTER_DEPLOY_KEY: ${{ secrets.EXUNIT_REPORTER_DEPLOY_KEY }}
           JEST_REPORTER_DEPLOY_KEY: ${{ secrets.JEST_REPORTER_DEPLOY_KEY }}
+          NEXTEST_REPORTER_DEPLOY_KEY: ${{ secrets.NEXTEST_REPORTER_DEPLOY_KEY }}
           REF_NAME: ${{ github.ref_name }}
         run: scripts/mirror-reporters.sh "$REF_NAME"
 
@@ -104,5 +108,6 @@ jobs:
           case "$REPORTER" in
             exunit) version="$(sed -n 's/^  @version "\(.*\)"$/\1/p' reporters/exunit/mix.exs | head -n 1)" ;;
             jest) version="$(node -p 'require("./reporters/jest/package.json").version')" ;;
+            nextest) version="$(sed -n 's/^version = "\(.*\)"$/\1/p' reporters/nextest/Cargo.toml | head -n 1)" ;;
           esac
           scripts/mirror-reporters.sh "$REPORTER-reporter-v$version" --dry-run

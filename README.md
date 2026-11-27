@@ -776,9 +776,9 @@ goodflows reports upload .goodflows/reports/<run-id> --budget 120
 
 With [`[reporting] history = true`](#uploading-run-history), and the key and URL set, goodflows creates each invocation's run directory even when no job lists `reports`. It holds `run-record.json`, the exact run record to send, and the manifest is version 3. Without a run record the manifest is version 1, or version 2 when a job is partitioned. `reports upload` sends the reports first, then the run record within the same budget. When the server stores the record, it writes `run-record.ack.json` and later replays send nothing for it. HTTP 400, 409, and 415 write `run-record.rejected.json`, and goodflows does not send the record again. HTTP 413 and 422 leave it pending, so the next `reports upload` sends it again. `reports upload` exits nonzero while the record is pending, rejected, or invalid, and its text output ends with `Run history: acknowledged`, `pending`, `rejected`, or `invalid`. A tampered, missing, or symlinked `run-record.json`, or one whose run id, workflow, or environment differs from the manifest, counts as invalid. Older goodflows releases refuse a version 3 manifest as an unsupported version.
 
-[`src/reporting/contract.rs`](src/reporting/contract.rs) defines the wire format. Each reporter's README covers its setup and behavior: [ExUnit](reporters/exunit/README.md) and [Jest](reporters/jest/README.md).
+[`src/reporting/contract.rs`](src/reporting/contract.rs) defines the wire format. Each reporter's README covers its setup and behavior: [ExUnit](reporters/exunit/README.md), [Jest](reporters/jest/README.md) and [nextest](reporters/nextest/README.md).
 
-Each reporter has its own version. Pin a tag. Every release writes `test-timings/1`, which goodflows v0.6.0 and later accept. v0.6.0 is the tag in this repository.
+Each reporter has its own version. Pin a tag. Every release writes `test-timings/1`, which goodflows v0.6.0 and later accept. The ExUnit and Jest reporters start at v0.6.0, the nextest reporter at v0.1.0.
 
 ExUnit (Elixir 1.18 or newer), from [agoodway/goodflows-exunit-reporter](https://github.com/agoodway/goodflows-exunit-reporter):
 
@@ -801,6 +801,21 @@ Jest (Jest 29.6 or newer, Node.js 18 or newer), from [agoodway/goodflows-jest-re
 //   "goodflows-jest-reporter": "github:agoodway/goodflows-jest-reporter#v0.6.0"
 // jest.config.js
 module.exports = { reporters: ['default', 'goodflows-jest-reporter'] };
+```
+
+Rust, through [cargo-nextest](https://nexte.st) with JUnit enabled for the profile you run (`[profile.default.junit] path = "junit.xml"` in `.config/nextest.toml`). The reporter wraps the run and converts the JUnit report. It installs from [agoodway/goodflows-nextest-reporter](https://github.com/agoodway/goodflows-nextest-reporter):
+
+```bash
+cargo install --locked --git https://github.com/agoodway/goodflows-nextest-reporter \
+  --tag v0.1.0 goodflows-nextest-reporter
+```
+
+```toml
+# goodflows.toml
+[[jobs]]
+name = "test"
+command = "goodflows-nextest-reporter -- cargo nextest run"
+reports = ["test-timings"]
 ```
 
 Other runners can write `test-timings/1` themselves. The suite id for the ExUnit reporter is the `:test_timing_suite_id` option, or `TEST_TIMING_SUITE_ID`.

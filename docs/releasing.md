@@ -16,11 +16,12 @@ runs on Ampcode orbs (glibc 2.36).
 The CLI and each reporter have their own versions and their own releases, each
 from its own tag:
 
-| Tag                          | Releases            | Version in                              |
-| ---------------------------- | ------------------- | --------------------------------------- |
-| `v<version>`                 | the CLI             | `Cargo.toml`                            |
-| `exunit-reporter-v<version>` | the ExUnit reporter | `reporters/exunit/mix.exs` (`@version`) |
-| `jest-reporter-v<version>`   | the Jest reporter   | `reporters/jest/package.json`           |
+| Tag                           | Releases             | Version in                              |
+| ----------------------------- | -------------------- | --------------------------------------- |
+| `v<version>`                  | the CLI              | `Cargo.toml`                            |
+| `exunit-reporter-v<version>`  | the ExUnit reporter  | `reporters/exunit/mix.exs` (`@version`) |
+| `jest-reporter-v<version>`    | the Jest reporter    | `reporters/jest/package.json`           |
+| `nextest-reporter-v<version>` | the nextest reporter | `reporters/nextest/Cargo.toml`          |
 
 A CLI release never touches the reporter mirrors, so a reporter only gets a new
 version when it changes. The reporters write `test-timings/1`, which every
@@ -53,7 +54,8 @@ To cut a CLI release:
 ## Reporter releases
 
 The Reporter release workflow publishes one reporter to its read-only mirror
-(`agoodway/goodflows-exunit-reporter` or `agoodway/goodflows-jest-reporter`). It
+(`agoodway/goodflows-exunit-reporter`, `agoodway/goodflows-jest-reporter` or
+`agoodway/goodflows-nextest-reporter`). It
 pushes the mirror's `main` and a plain `v<version>` tag, so users pin, for
 example, `tag: "v0.6.1"`. If you dispatch it manually and choose a reporter, it
 runs `mirror-dry-run`, which prints the split and pushes nothing.
@@ -75,16 +77,36 @@ A fix for an older reporter release ships as its next patch version from `main`.
 
 To cut a reporter release:
 
-1. Bump the reporter's version, which is `@version` in `reporters/exunit/mix.exs`
-   or `version` in `reporters/jest/package.json`. Check locally with
+1. Bump the reporter's version, which is `@version` in `reporters/exunit/mix.exs`,
+   `version` in `reporters/jest/package.json`, or `version` in
+   `reporters/nextest/Cargo.toml` (then run `cargo update -p
+   goodflows-nextest-reporter` in `reporters/nextest`). Check locally with
    `scripts/verify-versions.sh exunit-reporter-v<version>` (or
-   `jest-reporter-v<version>`).
+   `jest-reporter-v<version>`, `nextest-reporter-v<version>`).
 2. Review CI on `main`, including the `reporters` and `release-scripts` jobs.
 3. Make sure the `reporter-mirrors` environment, the mirror's deploy key and the
    tag ruleset cover reporter tags.
 4. Push the tag from `main`. For example, run
    `git tag jest-reporter-v<version> origin/main`, then
    `git push origin jest-reporter-v<version>`.
+
+### Setting up a new mirror
+
+A reporter's first release needs its mirror set up once. For the nextest
+reporter:
+
+1. Create the empty public repository `agoodway/goodflows-nextest-reporter`,
+   with no README, license or other initial commit, so its `main` starts at the
+   first split.
+2. Generate a key pair with
+   `ssh-keygen -t ed25519 -N '' -C goodflows-nextest-reporter-mirror -f mirror_key`.
+   Add `mirror_key.pub` to the mirror as a deploy key with write access.
+3. Add the private half, `mirror_key`, as the secret
+   `NEXTEST_REPORTER_DEPLOY_KEY` of the `reporter-mirrors` environment in
+   `agoodway/goodflows`, then delete both files.
+4. Check that the environment's deployment policy and the tag ruleset allow
+   `nextest-reporter-v*` tags.
+5. Dispatch Reporter release with `nextest` to dry-run the split.
 
 CI runs `scripts/test-release-scripts.sh`, which tests `verify-versions.sh` and
 `mirror-reporters.sh` against local bare repositories.
