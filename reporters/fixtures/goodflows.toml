@@ -32,3 +32,10 @@ reports = ["test-timings"]
 name = "jest-bail"
 command = "cd jest && npx --no-install jest -c jest.bail.config.js"
 reports = ["test-timings"]
+
+# The nextest reporter wraps the run. A test fails, one aborts, one times out,
+# a flaky one passes on its retry and a failing one fails its retry too.
+[[jobs]]
+name = "nextest"
+command = "cd nextest && ../../nextest/target/debug/goodflows-nextest-reporter -- cargo nextest run --locked --no-fail-fast"
+reports = ["test-timings"]

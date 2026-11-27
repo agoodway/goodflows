@@ -11,8 +11,9 @@
 # is ignored. No credentials are passed, so collection validates every report
 # locally and nothing is uploaded.
 #
-# Prerequisites: Elixir (reporters/fixtures/exunit) and the Jest fixture's
-# dependencies (`npm ci` in reporters/fixtures/jest).
+# Prerequisites: Elixir (reporters/fixtures/exunit), the Jest fixture's
+# dependencies (`npm ci` in reporters/fixtures/jest) and cargo-nextest. The
+# nextest reporter is built from this checkout.
 # Set GOODFLOWS_BIN to use an already built CLI instead of `cargo build`.
 set -euo pipefail
 
@@ -21,6 +22,7 @@ if [ -z "${GOODFLOWS_BIN:-}" ]; then
   cargo build --locked --quiet --manifest-path "$root/Cargo.toml"
   GOODFLOWS_BIN="$root/target/debug/goodflows"
 fi
+cargo build --locked --quiet --manifest-path "$root/reporters/nextest/Cargo.toml"
 
 events="$(mktemp)"
 trap 'rm -f "$events"' EXIT
@@ -78,6 +80,23 @@ const expected = {
     counts: { failed: 2 },
     groups: [['bail/__tests__/fails.test.js', 'failed', { failed: 2 }]],
   },
+  // Every attempt is written: the flaky test's failed first try and the
+  // failing test's failed retry are two of the 11, but are not counted.
+  nextest: {
+    aborted: false,
+    counts: { passed: 5, failed: 3, skipped: 1 },
+    tests: 11,
+    groups: [
+      ['nextest-fixture', 'passed', { passed: 1 }],
+      ['nextest-fixture::bin/tool', 'passed', { passed: 1 }],
+      ['nextest-fixture::outcomes', 'failed', { passed: 3, failed: 3, skipped: 1 }],
+    ],
+    files: [
+      ['nextest-fixture', 'src/lib.rs'],
+      ['nextest-fixture::bin/tool', 'src/bin/tool.rs'],
+      ['nextest-fixture::outcomes', 'tests/outcomes.rs'],
+    ],
+  },
 };
 
 // Order-insensitive JSON, so counts compare by content.
@@ -133,6 +152,11 @@ function checkReport(want, file, problems) {
   if (want.tests !== undefined) {
     const tests = records.filter((r) => r.event === 'test_finished').length;
     if (tests !== want.tests) problems.push(`${tests} test_finished records, expected ${want.tests}`);
+  }
+  if (want.files) {
+    const got = sorted(groups.map((r) => [r.group, r.file]));
+    const exp = sorted(want.files);
+    if (canonical(got) !== canonical(exp)) problems.push(`group files ${got.join(' ')}, expected ${exp.join(' ')}`);
   }
   if (want.projects) {
     const projects = [...new Set(groups.map((r) => r.meta && r.meta.project))].sort();

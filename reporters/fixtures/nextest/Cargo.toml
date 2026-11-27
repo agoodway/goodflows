@@ -1,0 +1,9 @@
+[package]
+name = "nextest-fixture"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Fixture suite for the goodflows nextest reporter drift guard. Fails on purpose."
+
+# Its own workspace, so it never joins the goodflows CLI's.
+[workspace]

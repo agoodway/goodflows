@@ -1,0 +1,20 @@
+[package]
+name = "goodflows-nextest-reporter"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+description = "Runs cargo-nextest and writes its JUnit results as a goodflows test-timings/1 report"
+license = "MIT"
+repository = "https://github.com/agoodway/goodflows"
+publish = false
+
+[dependencies]
+roxmltree = "0.20"
+serde_json = "1"
+toml = "0.8"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# Its own workspace, so it never joins the goodflows CLI's.
+[workspace]
