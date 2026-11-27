@@ -11,10 +11,10 @@ The config is `goodflows.toml` at the repository root. It has one workflow, the 
 
 1. `fmt`: `cargo fmt --check`
 2. `clippy`: `cargo clippy --locked --all-targets -- -D warnings`, after `fmt`
-3. `test`: `cargo test --locked --all`, after `fmt`
+3. `test`: builds `reporters/nextest`, then `goodflows-nextest-reporter -- cargo nextest run --locked --workspace`, after `fmt`. It lists `reports = ["test-timings"]`, so the reporter's `test-timings/1` report is collected and uploaded. It needs cargo-nextest installed and JUnit enabled in `.config/nextest.toml`
 4. `doc`: `cargo doc --locked --no-deps`, after `fmt`
 
-`[reporting]` names the project `goodflows` with `history = true`, so each run is uploaded to the server that `GOODFLOWS_URL` and `GOODFLOWS_API_KEY` name.
+`[reporting]` names the project `goodflows` with `history = true`, so each run, and the `test` job's test-timings report, is uploaded to the server that `GOODFLOWS_URL` and `GOODFLOWS_API_KEY` name.
 
 ## Scenarios
 
@@ -37,7 +37,7 @@ From the repository root, after `cargo build --release --locked`:
 |---|---|---|
 | fmt | `cargo fmt --check` | `./target/release/goodflows` |
 | clippy | `cargo clippy --locked --all-targets -- -D warnings` | `./target/release/goodflows` |
-| test | `cargo test --locked --all` | `./target/release/goodflows` |
+| test | `goodflows-nextest-reporter -- cargo nextest run --locked --workspace` | `./target/release/goodflows` |
 | doc | `cargo doc --locked --no-deps` | `./target/release/goodflows` |
 
 ## Read a failure

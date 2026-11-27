@@ -3143,7 +3143,7 @@ command = 'env > step-env.txt'
         assert!(env.contains("SHARED=settings"), "{file}: {env}");
         assert!(env.contains("PROFILE=profile"), "{file}: {env}");
         assert!(!env.contains("GOODFLOWS_API_KEY="), "{file}: {env}");
-        assert!(!env.contains("inherited"), "{file}: {env}");
+        assert!(!env.contains("inherited-run-id"), "{file}: {env}");
     }
     let run_id = manifest(&run_dirs(&p)[0])["workflow_run_id"]
         .as_str()

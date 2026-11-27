@@ -9,6 +9,11 @@ cd "$root"
 
 cargo fetch --locked
 
+# The `test` job in goodflows.toml runs cargo-nextest.
+if ! cargo nextest --version >/dev/null 2>&1; then
+  curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C "${CARGO_HOME:-$HOME/.cargo}/bin"
+fi
+
 # Hex and rebar live in the agent's home. The reporter itself has no Hex
 # packages; the fixture depends on it with `only: :test`.
 mix local.hex --force

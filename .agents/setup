@@ -54,9 +54,18 @@ EOF
   cargo --version
 }
 
+echo 'Installing cargo-nextest'
+time {
+  if ! cargo nextest --version >/dev/null 2>&1; then
+    curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C "$CARGO_HOME/bin"
+  fi
+  cargo nextest --version
+}
+
 echo 'Caching locked dependencies and compiling development/test targets'
 time {
   cargo fetch --locked
   cargo build --locked --all-targets
+  cargo build --locked --manifest-path reporters/nextest/Cargo.toml
 }
-echo 'Orb setup ready; run cargo test --locked or ./target/debug/goodflows'
+echo 'Orb setup ready; run cargo nextest run --locked or ./target/debug/goodflows'

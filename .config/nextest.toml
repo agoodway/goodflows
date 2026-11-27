@@ -1,0 +1,5 @@
+# The `test` job in goodflows.toml runs nextest through the nextest reporter
+# (reporters/nextest), which converts this JUnit file to test-timings/1.
+[profile.default.junit]
+path = "junit.xml"
+report-skipped = "ignored"

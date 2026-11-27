@@ -20,8 +20,12 @@ depends_on = ["fmt"]
 
 [[jobs]]
 name = "test"
-command = "cargo test --locked --all"
+command = """
+cargo build --locked --quiet --manifest-path reporters/nextest/Cargo.toml \
+  && reporters/nextest/target/debug/goodflows-nextest-reporter -- cargo nextest run --locked --workspace
+"""
 depends_on = ["fmt"]
+reports = ["test-timings"]
 
 [[jobs]]
 name = "doc"

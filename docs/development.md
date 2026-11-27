@@ -7,11 +7,11 @@ Run these from the repository root before you open a pull request:
 ```bash
 cargo fmt --check
 cargo clippy --locked --all-targets -- -D warnings
-cargo test --locked
+cargo nextest run --locked
 node --test tests/amp-plugin.test.mjs
 ```
 
-The Node test needs Node.js 22.18 or newer. Run `cargo build` first, because the test runs `target/debug/goodflows`. CI on this repository also runs `./target/release/goodflows`, which executes this repository's own `goodflows.toml`.
+The tests run with [cargo-nextest](https://nexte.st) (`curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ~/.cargo/bin`); this crate has no doctests, so nextest covers the whole suite. The Node test needs Node.js 22.18 or newer. Run `cargo build` first, because the test runs `target/debug/goodflows`. CI on this repository also runs `./target/release/goodflows`, which executes this repository's own `goodflows.toml`. Its `test` job runs nextest through the in-repo [nextest reporter](../reporters/nextest/README.md), which converts the JUnit file `.config/nextest.toml` enables into a `test-timings/1` report, and goodflows uploads it when `GOODFLOWS_URL` and `GOODFLOWS_API_KEY` are set.
 
 When the README and `docs/` say nothing about a behavior, the code defines it and the tests in [`tests/`](../tests/) pin it.
 

@@ -61,9 +61,17 @@ jobs:
         run: |
           rustup toolchain install 1.88.0 --profile minimal --component rustfmt --component clippy --target "$TARGET"
           rustup override set 1.88.0
+      - name: Install cargo-nextest
+        run: |
+          case "$RUNNER_OS-$RUNNER_ARCH" in
+            Linux-X64) platform=linux ;;
+            Linux-ARM64) platform=linux-arm ;;
+            macOS-*) platform=mac ;;
+          esac
+          curl -LsSf "https://get.nexte.st/latest/$platform" | tar zxf - -C "${CARGO_HOME:-$HOME/.cargo}/bin"
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-targets -- -D warnings
-      - run: cargo test --locked
+      - run: cargo nextest run --locked
       - name: Build and package
         # Linux targets link in Debian 12. See scripts/package-release.sh.
         env:
