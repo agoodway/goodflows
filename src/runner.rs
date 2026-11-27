@@ -680,13 +680,16 @@ pub async fn execute(
     });
     // Cache saves run after their job's result is recorded, in its slot.
     let mut saves: JoinSet<(usize, Vec<cache::Report>)> = JoinSet::new();
+    // Saves of finished units, held until the next launch pass has started
+    // the dependents their results made ready.
+    let mut held: Vec<HeldSave> = Vec::new();
 
     loop {
         // Consume completed jobs before deciding whether to launch queued work.
         while let Some(completed) = running.try_join_next() {
             let (index, mut result, slot, pending): Done = completed?;
             (result.blocked_ms, result.queued_ms) = launch_waits[index];
-            let slot = spawn_save(&mut saves, index, &result, pending, slot, scope);
+            let slot = hold_save(&mut held, index, &result, pending, slot);
             finish(scope, &mut results, index, result, slot, &options.output).await?;
         }
         while let Some(saved) = saves.try_join_next() {
@@ -848,6 +851,9 @@ pub async fn execute(
                     (result.name.clone(), result.outputs.clone())
                 })
                 .collect();
+            // Counted before the task first runs, so a save spawned after
+            // this pass sees the unit executing.
+            let inside = job.workflow.is_none().then(|| scope.enter());
             let scope = scope.clone();
             let calls = options.calls.clone();
             running.spawn(async move {
@@ -858,7 +864,6 @@ pub async fn execute(
                         run_call(unit.job, &job, &shared, cancel, needs, slot, calls, &scope).await;
                     (result, slot, None)
                 } else {
-                    let inside = scope.enter();
                     let (result, pending) =
                         run_job(unit.job, unit.partition, &job, &shared, cancel, needs).await;
                     drop(inside);
@@ -866,6 +871,9 @@ pub async fn execute(
                 };
                 (index, result, slot, pending)
             });
+        }
+        for save in held.drain(..) {
+            spawn_save(&mut saves, save, scope);
         }
         if results.iter().all(Option::is_some) {
             if saves.is_empty() {
@@ -896,7 +904,7 @@ pub async fn execute(
             completed = running.join_next(), if !running.is_empty() => {
                 let (index, mut result, slot, pending) = completed.context("job scheduler stopped")??;
                 (result.blocked_ms, result.queued_ms) = launch_waits[index];
-                let slot = spawn_save(&mut saves, index, &result, pending, slot, scope);
+                let slot = hold_save(&mut held, index, &result, pending, slot);
                 finish(scope, &mut results, index, result, slot, &options.output).await?;
             }
             saved = saves.join_next(), if !saves.is_empty() => {
@@ -918,30 +926,41 @@ pub async fn execute(
 /// A finished unit: its index, result, slot and caches waiting to save.
 type Done = (usize, JobResult, Option<Slot>, Option<cache::Pending>);
 
-/// Start saving a unit's caches once its result is final; the scheduler
-/// records the result meanwhile, so dependents may start. The save takes
-/// the unit's slot and frees it only while it waits for the run to go quiet
-/// (see `cache::Pending::save`). Returns the slot when there is nothing to
-/// save.
-fn spawn_save(
-    saves: &mut JoinSet<(usize, Vec<cache::Report>)>,
+/// A finished unit's caches waiting to save, with its slot.
+type HeldSave = (usize, Status, cache::Pending, Option<Slot>);
+
+/// Hold a unit's caches to save once its result is final, with the unit's
+/// slot. Returns the slot when there is nothing to save.
+fn hold_save(
+    held: &mut Vec<HeldSave>,
     index: usize,
     result: &JobResult,
     pending: Option<cache::Pending>,
     slot: Option<Slot>,
-    scope: &Arc<Scope>,
 ) -> Option<Slot> {
     let Some(pending) = pending else {
         return slot;
     };
-    let status = result.status;
+    held.push((index, result.status, pending, slot));
+    None
+}
+
+/// Start a held save. The scheduler spawns it after the launch pass that
+/// follows the result, so the dependents that result made ready already
+/// count as executing and the save waits for them. The save takes the
+/// unit's slot and frees it only while it waits for the run to go quiet
+/// (see `cache::Pending::save`).
+fn spawn_save(
+    saves: &mut JoinSet<(usize, Vec<cache::Report>)>,
+    (index, status, pending, slot): HeldSave,
+    scope: &Arc<Scope>,
+) {
     let activity: Arc<dyn cache::Activity> = Arc::new(scope.clone());
     let slot = slot.map(|slot| Box::new(slot) as cache::Slot);
     saves.spawn(async move {
         let reports = pending.save(status, Some(activity), slot).await;
         (index, reports)
     });
-    None
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
