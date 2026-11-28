@@ -29,6 +29,7 @@ STATUS: done|blocked
 REPORT: <REPORT>
 CHANGE_REQUEST: #<number> in project <[reporting] project from the goodflows config>
 URL: <url from goodflows cr status --json, or none when it is null>
+BRANCH: <the branch pushed>
 HEAD: <sha pushed>
 VERDICT: pending|blocked|needs_review|mergeable
 REASONS:
