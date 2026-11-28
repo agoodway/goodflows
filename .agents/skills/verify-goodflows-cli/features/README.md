@@ -37,4 +37,5 @@ Each feature file starts with an H1 title and one paragraph describing the behav
 - [Diff-only change requests](./diff-only.md) covers a change request with no linked change under `scenarios.diff_only = "weakening"`: the default diff set path, `cr scenarios list`, `cr scenarios diff --source diff` against the baseline, accepting a weakened diff set through `cr answer`, and a docs-only push. Drive it in its own run.
 - [Verify runs](./verify-runs.md) covers `cr runs upload` of a `.verify` run folder, with and without evidence files.
 - [Review policy](./review-policy.md) covers `policy get|set|history`, `features sync`, how a policy version changes the verdict, and `cr defect` with `policy calibration`.
+- [Stored changes](./stored-changes.md) covers `change push|list|show|versions|pull|delete` on a server with the stored-changes routes, and `change push|list` against `$C old-server`, a stub of a server without them. Drive it in its own run: it links change request 1 to `add-login`.
 - [Review and events](./review-and-events.md) covers `cr review`, `cr answer`, `cr tasks`, `cr wait`, `events`, `cr lease` and `cr merged`.

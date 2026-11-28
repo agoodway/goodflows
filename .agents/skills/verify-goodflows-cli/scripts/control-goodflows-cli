@@ -9,6 +9,8 @@
 #   control-goodflows-cli cli <name> <goodflows args...>   # in the scratch checkout
 #   control-goodflows-cli git <git args...>               # in the scratch checkout
 #   control-goodflows-cli api <name> <METHOD> <path> [json-body]
+#   control-goodflows-cli old-server                      # stub of a released server, no /changes routes
+#   control-goodflows-cli old-cli <name> <goodflows args...>  # cli, against that stub
 #   control-goodflows-cli record <feature-id> <entry-point> <pass|fail> <artifact>...
 #   control-goodflows-cli finish <pass|fail|partial> [note]
 #   control-goodflows-cli cleanup
@@ -211,13 +213,64 @@ cmd_cli() {
   shift
   mkdir -p "$run_dir/cli"
   printf 'goodflows %s\n' "$*" >"$out.cmd"
-  (cd "$GF_CHECKOUT" && GOODFLOWS_URL=$GF_URL GOODFLOWS_API_KEY=$GOODFLOWS_API_KEY NO_COLOR=1 \
+  (cd "$GF_CHECKOUT" && GOODFLOWS_URL=${cli_url:-$GF_URL} GOODFLOWS_API_KEY=$GOODFLOWS_API_KEY NO_COLOR=1 \
     "$binary" "$@") >"$out.stdout" 2>"$out.stderr" || code=$?
   echo "$code" >"$out.exit"
   echo "exit $code  ($out.stdout)"
   cat "$out.stdout"
   [[ -s $out.stderr ]] && sed 's/^/stderr: /' "$out.stderr"
   return 0
+}
+
+# A released GoodFlows Web server has no /changes routes and answers an
+# unknown route and an unknown project with the same JSON 404. The stub
+# answers the run project's change request list with 200 and everything else
+# with that 404, and logs only the method, path and status, never the headers.
+old_server_py='
+import json, sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
+port, project, log = int(sys.argv[1]), sys.argv[2], sys.argv[3]
+class H(BaseHTTPRequestHandler):
+    def any(self):
+        if self.path.split("?")[0] == f"/api/v1/projects/{project}/change-requests" and self.command == "GET":
+            status, body = 200, {"data": [], "next_cursor": None}
+        else:
+            status, body = 404, {"errors": {"detail": "Not Found"}}
+        with open(log, "a") as f:
+            f.write(f"{self.command} {self.path} {status}\n")
+        data = json.dumps(body).encode()
+        self.send_response(status)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+    do_GET = do_POST = do_DELETE = do_PUT = do_PATCH = any
+    def log_message(self, *a): pass
+HTTPServer(("127.0.0.1", port), H).serve_forever()
+'
+
+cmd_old_server() {
+  load_run
+  if [[ -n ${GF_OLD_PID:-} ]] && kill -0 "$GF_OLD_PID" 2>/dev/null; then
+    echo "control-goodflows-cli: old server already at $GF_OLD_URL" >&2
+    return
+  fi
+  local port
+  port=$(free_port 4600 4699)
+  setsid python3 -c "$old_server_py" "$port" "$GF_PROJECT" "$run_dir/old-server.log" \
+    >"$run_dir/old-server.stderr" 2>&1 </dev/null &
+  local pid=$!
+  for _ in $(seq 50); do (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null && break; sleep 0.2; done
+  (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null || die "the old-server stub did not start; see $run_dir/old-server.stderr"
+  sed -i '/^GF_OLD_/d' "$run_dir/instance.env"
+  printf 'GF_OLD_URL=http://127.0.0.1:%s\nGF_OLD_PID=%s\n' "$port" "$pid" >>"$run_dir/instance.env"
+  echo "control-goodflows-cli: old server (no /changes routes) at http://127.0.0.1:$port; requests in $run_dir/old-server.log" >&2
+}
+
+cmd_old_cli() {
+  load_run
+  [[ -n ${GF_OLD_URL:-} ]] || die "no old server; run: control-goodflows-cli old-server"
+  cli_url=$GF_OLD_URL cmd_cli "$@"
 }
 
 cmd_git() {
@@ -264,6 +317,7 @@ cmd_cleanup() {
   # setsid made versitygw its own group leader: stop only that group.
   [[ -n ${GF_S3_PID:-} ]] && { kill -- "-$GF_S3_PID" 2>/dev/null || true; }
   [[ ${GF_S3_DIR:-} == /tmp/verify-goodflows-cli-s3-* ]] && rm -rf "$GF_S3_DIR"
+  [[ -n ${GF_OLD_PID:-} ]] && { kill -- "-$GF_OLD_PID" 2>/dev/null || true; }
   # The key died with the run database; drop it from the kept evidence anyway.
   sed -i 's/^GOODFLOWS_API_KEY=.*/GOODFLOWS_API_KEY=/' "$run_dir/instance.env"
   echo "- Cleaned up: $(date -u +%Y-%m-%dT%H:%M:%SZ) (server and versitygw stopped, database dropped, scratch checkout and bucket removed)" >>"$run_dir/run.md"
@@ -274,5 +328,6 @@ command=${1:-}
 shift || true
 case $command in
   launch | doctor | cli | git | api | record | finish | cleanup) "cmd_$command" "$@" ;;
-  *) sed -n '2,18p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 2 ;;
+  old-server | old-cli) "cmd_${command//-/_}" "$@" ;;
+  *) sed -n '2,20p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac

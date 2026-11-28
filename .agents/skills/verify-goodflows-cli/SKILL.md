@@ -1,11 +1,11 @@
 ---
 name: verify-goodflows-cli
-description: Builds this checkout's goodflows CLI and drives its change request commands (cr open, cr claims, cr push, cr scenarios, cr runs upload, cr verdict, cr review, policy, features sync, events) end to end against a fresh, isolated GoodFlows Web server, in a scratch git checkout, capturing proof under .verify/goodflows-cli/. Use to prove a CLI change that talks to the server works against the real server, not just the mock in tests/change_requests.rs. Replaces goodflows_web's scripts/e2e-cli-smoke.sh for change requests.
+description: Builds this checkout's goodflows CLI and drives its change request commands (cr open, cr claims, cr push, cr scenarios, cr runs upload, cr verdict, cr review, policy, features sync, events, change push|list|show|pull|versions|delete) end to end against a fresh, isolated GoodFlows Web server, in a scratch git checkout, capturing proof under .verify/goodflows-cli/. Use to prove a CLI change that talks to the server works against the real server, not just the mock in tests/change_requests.rs. Replaces goodflows_web's scripts/e2e-cli-smoke.sh for change requests.
 ---
 
 # Verify the goodflows CLI against GoodFlows Web
 
-The goodflows CLI's server surface is a set of commands a coding agent runs in a git checkout: `cr …`, `policy …`, `features sync` and `events`. They read the checkout's git state and files, call `/api/v1/projects/<project>/…` with the `[reporting]` URL and key, and print text or, with `--json`, one JSON event. `cargo test --test change_requests` covers them against a mock; this skill drives them against the real server.
+The goodflows CLI's server surface is a set of commands a coding agent runs in a git checkout: `cr …`, `policy …`, `features sync`, `events` and the stored-change commands `change push|list|show|pull|versions|delete`. They read the checkout's git state and files, call `/api/v1/projects/<project>/…` with the `[reporting]` URL and key, and print text or, with `--json`, one JSON event. `cargo test --test change_requests` covers them against a mock; this skill drives them against the real server.
 
 The server is goodflows_web. This skill does not start it by hand: it calls goodflows_web's own `verify-goodflows` launch, which gives a free port in 4400–4499 and a freshly created, migrated and seeded database, and its cleanup, which stops that server and drops that database.
 
@@ -62,6 +62,7 @@ $C api cr-1 GET /api/v1/projects/{project}/change-requests/1
 - `cli <name> <args…>` runs `target/debug/goodflows <args…>` in the scratch checkout with `GOODFLOWS_URL` and `GOODFLOWS_API_KEY` set, and saves `cli/<name>.cmd`, `.stdout`, `.stderr` and `.exit`. It prints the exit code and both streams. Use `--json` when you assert on fields (`jq` the `.stdout` file); run the same command without it once per feature to capture the text output a person reads.
 - `git <args…>` runs git in the scratch checkout, to commit, edit and check out branches between commands.
 - `api <name> <METHOD> <path> [body]` is the second view: it reads what the server stored. `{project}` in the path becomes the run's project. It saves `api/<name>.request`, `.status` and `.json`.
+- `old-server` starts a stub of a released server, without `/changes` routes, on a free port in 4600–4699: it answers `GET /api/v1/projects/<run project>/change-requests` with `200` and every other request with the JSON 404 released servers send, and logs each request's method, path and status (never its headers) to `old-server.log`. `old-cli <name> <args…>` is `cli` against that stub. Cleanup stops it.
 
 Write files into the scratch checkout (claims, scenario sets, run folders) with ordinary shell redirection into `$GF_CHECKOUT`. The feature files give the exact content.
 
@@ -92,7 +93,7 @@ Proof standards:
 $C cleanup
 ```
 
-It runs goodflows_web's cleanup (closes its browser session, stops the server process group that launch started, drops the run database), stops versitygw and removes its bucket, removes the scratch checkout under `/tmp/verify-goodflows-cli-*`, blanks the key in `instance.env`, and appends a `Cleaned up` line to `run.md`. It never removes `.verify/`. Run it after failed attempts too. If the shell lost `RUN_ID`, pick it from `ls .verify/goodflows-cli/` and `export RUN_ID=<id>` first.
+It runs goodflows_web's cleanup (closes its browser session, stops the server process group that launch started, drops the run database), stops versitygw and removes its bucket, stops the `old-server` stub when one runs, removes the scratch checkout under `/tmp/verify-goodflows-cli-*`, blanks the key in `instance.env`, and appends a `Cleaned up` line to `run.md`. It never removes `.verify/`. Run it after failed attempts too. If the shell lost `RUN_ID`, pick it from `ls .verify/goodflows-cli/` and `export RUN_ID=<id>` first.
 
 ## Helpers
 
