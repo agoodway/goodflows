@@ -615,6 +615,9 @@ fn change_request(event: &Value, out: &mut impl Write) -> Result<()> {
         details.push(format!("parent #{parent}"));
     }
     writeln!(out, "  {}", details.join("  "))?;
+    if let Some(url) = cr["url"].as_str() {
+        writeln!(out, "  {}", visible(url))?;
+    }
     if cr["merge"].is_object() {
         let merge = &cr["merge"];
         writeln!(
@@ -1225,6 +1228,19 @@ mod tests {
         assert_eq!(
             rendered,
             "#7 merged  feat -> main  Exports\n  head cccccccccccc\nVerdict: pending  (head -, policy v1)\n  coverage: feature index v4; 1 of 2 features not driven\n  2026-11-21T10:00:00Z  open -> merged  -\n"
+        );
+    }
+
+    #[test]
+    fn change_request_prints_the_server_url_escaped() {
+        let rendered = text(
+            json!({"type": "change_request", "action": "open", "created": true,
+            "change_request": {"number": 7, "state": "draft", "source_branch": "feat", "target_branch": "main",
+                "title": "Exports", "head": null, "url": "https://gf.example/cr/7\u{1b}[2J"}}),
+        );
+        assert_eq!(
+            rendered,
+            "Created change request #7\n#7 draft  feat -> main  Exports\n  head -\n  https://gf.example/cr/7\\u{1b}[2J\n"
         );
     }
 

@@ -313,6 +313,58 @@ fn open_without_claims_creates_a_linked_draft_before_code() {
 }
 
 #[test]
+fn status_and_open_link_the_change_request_page_when_the_server_sends_one() {
+    let p = checkout();
+    let link = "https://goodflows.example/acme/goodcases/change-requests/7";
+    let mut linked = cr(7, "draft", None);
+    linked["url"] = json!(link);
+
+    let json_status = run(
+        &p,
+        &server(vec![linked.clone()]),
+        &["cr", "status", "-n", "7", "--json"],
+    );
+    success(&json_status);
+    assert_eq!(last_event(&json_status)["change_request"]["url"], link);
+    for args in [&["cr", "status", "-n", "7"][..], &["cr", "open"][..]] {
+        let output = run(&p, &server(vec![linked.clone()]), args);
+        success(&output);
+        assert!(
+            stdout(&output).contains(&format!("\n  {link}\n")),
+            "{args:?}: {}",
+            stdout(&output)
+        );
+    }
+
+    // A server without the field, or with null, gets null in --json and no link.
+    let mut null_url = cr(7, "draft", None);
+    null_url["url"] = Value::Null;
+    for record in [cr(7, "draft", None), null_url] {
+        let json_status = run(
+            &p,
+            &server(vec![record.clone()]),
+            &["cr", "status", "-n", "7", "--json"],
+        );
+        success(&json_status);
+        let event = last_event(&json_status);
+        assert!(event["change_request"]
+            .as_object()
+            .unwrap()
+            .contains_key("url"));
+        assert_eq!(event["change_request"]["url"], Value::Null);
+        for args in [&["cr", "status", "-n", "7"][..], &["cr", "open"][..]] {
+            let output = run(&p, &server(vec![record.clone()]), args);
+            success(&output);
+            assert!(
+                !stdout(&output).contains("http"),
+                "{args:?}: {}",
+                stdout(&output)
+            );
+        }
+    }
+}
+
+#[test]
 fn open_reuses_the_branch_change_request_and_refuses_ambiguity() {
     let p = checkout();
     let reuse = server(vec![cr(3, "draft", Some("add-login"))]);

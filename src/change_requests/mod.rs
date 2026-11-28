@@ -746,7 +746,14 @@ impl<'a> Ctx<'a> {
         Ok(Self { api, git, output })
     }
 
-    async fn emit(&self, event: Value) -> Result<()> {
+    /// Emit `event`. A change request always has `url`: servers before it
+    /// existed leave it out, which `--json` shows as null.
+    async fn emit(&self, mut event: Value) -> Result<()> {
+        if event["type"] == "change_request" {
+            if let Some(cr) = event["change_request"].as_object_mut() {
+                cr.entry("url").or_insert(Value::Null);
+            }
+        }
         self.output.emit(event).await
     }
 
