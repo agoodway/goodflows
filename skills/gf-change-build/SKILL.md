@@ -89,7 +89,7 @@ Stop when the verdict is `mergeable`, or when no agent reason remains, whatever 
 
 Write it from the status blocks and `held.md`, through the `gs-unslop` skill when it is installed, in this order:
 
-1. The change request number, the verdict state, and each reason with who clears it.
+1. The change request as ship's `CHANGE_REQUEST` and `URL` give it, such as `change request #2 in project acme (https://…/change-requests/2)`, with the link left out when `URL` is `none`; then the verdict state, and each reason with who clears it.
 2. Every line of `held.md`, most important first, each numbered and worded so "yes" accepts the recommendation when there is one: requirement or intent set edits the build needed, `by: user` conflicts, checks that could not run, tests the review would delete, unapproved scenario sets, dependencies, and the review packet's items with the answers each allows.
 3. Whether the change was archived; what `verification.md` lists under `open` if not; and, when fixes landed after archiving, that its hashes predate them.
 4. What the run fixed, the heads it pushed, and any blocker with its evidence. When `gs-review` was not installed, say that no production-risk review ran.

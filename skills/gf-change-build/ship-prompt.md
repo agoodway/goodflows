@@ -27,7 +27,8 @@ Write every command and result to <REPORT>, ending with the same block you retur
 
 STATUS: done|blocked
 REPORT: <REPORT>
-CHANGE_REQUEST: <number>
+CHANGE_REQUEST: #<number> in project <[reporting] project from the goodflows config>
+URL: <url from goodflows cr status --json, or none when it is null>
 HEAD: <sha pushed>
 VERDICT: pending|blocked|needs_review|mergeable
 REASONS:
