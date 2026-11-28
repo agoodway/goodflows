@@ -1,7 +1,7 @@
 ---
 format: goodflows-change/1
 id: add-stored-changes
-status: approved
+status: archived
 size: project
 door: one_way
 capabilities: [stored-changes, change-requests]

@@ -7,7 +7,7 @@ Defines the rules every change request, policy, feature index and events command
 ## Requirements
 
 ### Requirement: Commands use the reporting project, URL and key
-Every `cr`, `policy`, `features` and `events` command that talks to the server SHALL use the config's top-level `[reporting]` block, as `history` does: its `project`, the URL in the variable named by `url_env` and the key in the variable named by `token_env` (`GOODFLOWS_URL` and `GOODFLOWS_API_KEY` by default). Each request SHALL go to `/api/v1/projects/<project>/...` with each path segment escaped and the key sent as `Authorization: Bearer <key>`.
+Every `cr`, `policy`, `features` and `events` command that talks to the server, and `change push`, `change list`, `change show`, `change pull`, `change versions` and `change delete`, SHALL use the config's top-level `[reporting]` block, as `history` does: its `project`, the URL in the variable named by `url_env` and the key in the variable named by `token_env` (`GOODFLOWS_URL` and `GOODFLOWS_API_KEY` by default). Each request SHALL go to `/api/v1/projects/<project>/...` with each path segment escaped and the key sent as `Authorization: Bearer <key>`.
 
 #### Scenario: Key and path
 - **WHEN** `[reporting]` names project `goodcases`, `GOODFLOWS_API_KEY` is `sk_test` and `goodflows cr ready -n 4` runs

@@ -13,12 +13,7 @@ files:
   "src/main.rs": bd7c2044de306d543684d346fcb8574c64ffe74cc8f9e22ebacef04549bc81c0
   "src/output/change_requests.rs": c1e2357245c50bd04978184c307992d178dd3d31b7dbe20384b5679b97c9e542
   "tests/stored_changes.rs": 0e4370a12786dc6f08b13e384fd762a4d096924a73078a31aac4fd98f36f3fdb
-open:
-  - "change push reports the version it created or kept | question | .goodflows/build/add-stored-changes/verify-bars-1.md | D53 (by: agent, one_way door) defines change_push.change as the server's push answer without duplicate and replaced_version, refining D46. Keep that definition? | Recommend: yes, keep D53"
-  - "change show prints one version or one of its files | question | .goodflows/build/add-stored-changes/verify-bars-1.md | D52 (by: agent, one_way door) makes show --version N send a second read, GET /changes/:id, because the server's version read carries no linked change requests. Keep it? | Recommend: yes, keep D52"
-  - "change list shows every stored change | not_verified | .goodflows/build/add-stored-changes/verify-qa-1.md | Linked change request numbers on list rows were checked only against the mock; the server copy's GET /changes rows do not carry change_requests yet (agreed with the server thread, not shipped) | Recommend: re-drive scenario 5 step 1 once the server ships it"
-  - "scenario 15 | not_verified | .goodflows/build/add-stored-changes/verify-qa-1.md | The pk_ 403 path for show --file and pull was not driven live: the verify skill mints only sk_ keys | Recommend: none"
-  - ".agents/skills/verify-goodflows-cli/features/README.md | question | .goodflows/build/add-stored-changes/verify-qa-1.md | The verify skill has no stored-changes feature file; scenarios were driven ad hoc. Add one through gs-maintain-verification-skill? | Recommend: yes, as part of ship's features step"
+open: []
 ---
 
 # Verification: add-stored-changes
@@ -41,3 +36,10 @@ open:
 - **Linked change request numbers on `change list` rows:** checked only against the mock. The server build's `GET /changes` rows do not carry `change_requests` yet (agreed with the server thread, not shipped), so the live run showed `-` (verify-spec-1 spec-3, verify-drift-1 drift-3, verify-qa-1 qa-1).
 - **Scenario 15, the pk_ 403 path for `show --file` and `pull`:** not driven live, because the verify skill mints only sk_ keys (verify-qa-1 qa-2).
 - **The root skip in the read-only pull test:** not run as root, so the skip itself was not watched (fix-2).
+
+## Settled by tbrewer on change request #2
+
+- **D52 and D53:** kept, as recommended (review questions Q1 and Q2).
+- **Linked change request numbers on `change list` rows:** accepted as a risk. Merge now, and drive scenario 5 step 1 again once the server's `GET /changes` rows carry `change_requests` (Q3).
+- **No stored-changes feature file in the verify skill:** accepted as a risk; it is follow-up work for gs-maintain-verification-skill.
+- **Scenario 15:** driven at head 43d708d with a `pk_` key in `.verify/goodflows-cli/20261127T191441Z-43d708d/` and passed.
