@@ -15,6 +15,7 @@ A review policy is a project's `review-policy/1` document on the GoodFlows serve
 - **The user decides; you find facts.** Look up everything the code, config and git history can answer. Ask the user only for decisions, in rounds, each question with your recommendation worded so "yes" accepts it.
 - **Write the server policy only with approval.** `goodflows policy set` changes shared server state for everyone on the project. Run it only after the user approves the final file in a message of their own. Accepting recommendations is not that approval.
 - **Never print a key.** Check that the variable `token_env` names is set and starts with `sk_`; never echo its value.
+- **Write prose through `gs-unslop`.** When the skill is installed, write the survey playback, the questions, the policy file's comment lines, the `--note`, the commit message and the report through it. It changes wording only: keys, globs, values and commands stay as they are.
 - **Do not redo other tools' setup.** `goodflows init` writes the config, `goodflows skills install` installs skills, create-ci-skill writes the `run-ci-<app>` skill. Point at them; do not reimplement them.
 
 ## 1. Check the setup

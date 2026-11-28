@@ -87,7 +87,7 @@ Stop when the verdict is `mergeable`, or when no agent reason remains, whatever 
 
 ## 9. Final report
 
-Write it from the status blocks and `held.md`, in this order:
+Write it from the status blocks and `held.md`, through the `gs-unslop` skill when it is installed, in this order:
 
 1. The change request number, the verdict state, and each reason with who clears it.
 2. Every line of `held.md`, most important first, each numbered and worded so "yes" accepts the recommendation when there is one: requirement or intent set edits the build needed, `by: user` conflicts, checks that could not run, unapproved scenario sets, dependencies, and the review packet's items with the answers each allows.

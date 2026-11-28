@@ -8,7 +8,7 @@ You fix every finding in <FINDINGS> for the goodflows change <CHANGE_ID>. Expect
 Read <CHANGE_DIR> and the section "Who owns the spec" in <SKILL_DIR>/SKILL.md first. <HELD>, when it exists, lists what waits on a person: build nothing and edit nothing for a subject it lists as a question.
 
 - route code: change the code, and add or fix the test that would have caught it.
-- route spec: change the text of the requirement already in the delta, and record a by: agent decision whose why starts with "Found while building:", cited on the Refs: line of the requirement it changed. When the change is archived (<CHANGE_DIR> is under goodflows/changes/archive/), edit goodflows/specs/<capability>/spec.md directly instead, and say so in your report.
+- route spec: change the text of the requirement already in the delta, and record a by: agent decision whose why starts with "Found while building:", cited on the Refs: line of the requirement it changed. When the change is archived (<CHANGE_DIR> is under goodflows/changes/archive/), edit goodflows/specs/<capability>/spec.md directly instead, and say so in your report. Write the requirement text and the decision through the gs-unslop skill when it is installed; it changes wording only, never an id, a name or SHALL.
 - When the current code or spec already does what a row asks, say so and count it as fixed.
 - When a fix turns out to need an edit "Who owns the spec" gives a person, such as adding a requirement or editing qa-scenarios.md, do not make it: list the row as unfixed with the question and the text you would recommend.
 

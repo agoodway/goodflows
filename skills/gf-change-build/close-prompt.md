@@ -12,9 +12,9 @@ When <CHANGE_DIR> is under goodflows/changes/archive/, the change is already arc
 3. Run goodflows change verified <CHANGE_ID>. It writes <CHANGE_DIR>/verification.md with the hashes of the deltas and of every file the branch changed, and keeps an existing open list and body. Then edit only its open list and its body:
    - open lists each line of <HELD> as one string, or is open: [] when <HELD> does not exist or is empty;
    - the body is a short summary of what each verifier checked, from <VERIFY_REPORTS>, and every check reported not_verified with its reason.
-   Editing these does not change the recorded hashes; goodflows change verified keeps them on a later run.
+   Write the body through the gs-unslop skill when it is installed. Editing these does not change the recorded hashes; goodflows change verified keeps them on a later run.
 4. When open is empty, run goodflows change archive <CHANGE_ID>. It merges the deltas into goodflows/specs/ and moves the change to goodflows/changes/archive/<date>-<CHANGE_ID>/. When it refuses, report its error as a blocker; do not edit verification.md hashes by hand. When open is not empty, do not archive.
-5. Commit everything the build changed, the change directory and goodflows/specs/ included, with a conventional commit whose subject names the change, such as "feat: add login (add-login)". Leave out .goodflows/, .verify/ and anything .gitignore covers. Add no AI attribution.
+5. Commit everything the build changed, the change directory and goodflows/specs/ included, with a conventional commit whose subject names the change, such as "feat: add login (add-login)", and write its body through the gs-unslop skill when it is installed. Leave out .goodflows/, .verify/ and anything .gitignore covers. Add no AI attribution.
 
 Write what you ran and its results to <REPORT>, ending with the same block you return. Then end with exactly this block:
 

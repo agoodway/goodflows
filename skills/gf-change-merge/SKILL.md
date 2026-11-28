@@ -111,7 +111,7 @@ After it succeeds, stop the loop and remove the worktree. Do not delete the chan
 
 ## 7. Report
 
-Say, in this order:
+Write it through the `gs-unslop` skill when it is installed. Say, in this order:
 
 1. The change request number, the change id, and the merged commit on the target, with how it merged (fast-forward or merge commit).
 2. The verdict at merge, and each merge-result run when step 5 ran.

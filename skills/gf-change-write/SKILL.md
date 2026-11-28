@@ -73,6 +73,8 @@ The plan is done when the frontier is empty: every branch visited, every quality
 
 After the user says to write it, write all three files in one pass. Re-read every spec file you cite from disk first; the user may have edited it.
 
+Write the prose through the `gs-unslop` skill when it is installed: the `change.md` body, the text of goals, decisions and `left_to_builder` entries, requirement text, and scenario steps. It changes wording only: ids, requirement and scenario names, `SHALL`, and anything a program parses stay as they are. Without it, keep to these rules: sentence-case headings, straight quotes, no em dashes or emoji, and a named actor.
+
 The id is kebab-case (`a-z`, `0-9` and `-`, at most 64 characters) and starts with a verb, such as `add-review-answer-reapply`. Pick an id no other change uses: not in `goodflows/changes/`, and not at the end of a dated folder name in `goodflows/changes/archive/`.
 
 `goodflows agents` documents the `goodflows-change/1` format, and `goodflows change validate` checks it. Both are newer than some installs; when the installed `goodflows` has them, they are the authority over this section.
