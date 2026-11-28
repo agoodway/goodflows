@@ -16,7 +16,7 @@ Check each of these:
 5. The goodflows config (goodflows.toml or .goodflows.toml) has a [reporting] block with a project, and the variable its token_env names (GOODFLOWS_API_KEY by default) is set. Check that it is set; never print its value.
    The server must also accept what ship sends. Fetch its API description with curl -fsS "<server URL>/api/v1/openapi" (the config's [reporting] url, else GOODFLOWS_URL, with surrounding whitespace stripped). components.schemas.ChangeRequestCreateRequest.properties must have change_id, which goodflows cr open --change sends, and .paths must have /api/v1/projects/{project}/change-requests/{number}/dependencies, which syncs depends_on. A missing one is a blocker: the server is older than this CLI and refuses cr open --change with HTTP 422 "unknown field", so the server needs to be upgraded first. When the document cannot be fetched, record that the server version is unchecked; that is not a blocker.
 6. goodflows cr status --json for the current branch. With no change request, record none. With one, its change_id must be <CHANGE_ID>: the link is set only when a change request is created, so a change request that links nothing or another change is a blocker. With one, also read goodflows cr scenarios list --json and record whether the intent set is missing, uploaded, or approved. An unapproved intent set is not a blocker.
-7. The writer skills are installed. Search the harness's installed skills, then .agents/skills/, .claude/skills/ and .cursor/skills/ in this repository, then the user's skill directories, for: gf-change-request (writes the claims), a verify-<app> skill for this repository (drives QA scenarios), a run-ci-<app> skill for this repository (runs the goodflows workflows), and, when any verify-<app> skill has a features/ directory, gs-maintain-verification-skill. Record the path of each SKILL.md. A missing one is a blocker that names the skill and the file it writes.
+7. The writer skills are installed. Search the harness's installed skills, then .agents/skills/, .claude/skills/ and .cursor/skills/ in this repository, then the user's skill directories, for: gf-change-request (writes the claims), a verify-<app> skill for this repository (drives QA scenarios), a run-ci-<app> skill for this repository (runs the goodflows workflows), and, when any verify-<app> skill has a features/ directory, gs-maintain-verification-skill. Record the path of each SKILL.md. A missing one is a blocker that names the skill and the file it writes. Search the same places for gs-review and record its SKILL.md path; it writes no file, so a missing gs-review is not a blocker: record not installed.
 8. For a resume, read the last line of .goodflows/build/<CHANGE_ID>/log.md: it names the last finished step, its report and its status.
 
 Write what you checked and found to <REPORT>, ending with the same block you return. Then end with exactly this block:
@@ -33,6 +33,7 @@ INTENT_SET: missing|uploaded|approved
 SIZE: <small or project, from change.md>
 CAPABILITIES: <the capabilities list from change.md>
 WRITERS: gf-change-request=<path>; verify=<path>; run-ci=<path>; maintain-verification=<path or not needed>
+REVIEW_SKILL: <path to gs-review's SKILL.md, or not installed>
 RESUME: <the last line of log.md, or none>
 BLOCKERS:
 - <each blocker with the command and its decisive output, or none>

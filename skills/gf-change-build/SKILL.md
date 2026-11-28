@@ -13,7 +13,7 @@ You are the orchestrator. Every step runs in a fresh subagent from a prompt file
 
 - **Keep your context small.** Never read code, diffs or full reports yourself. Each subagent writes its full report to `.goodflows/build/<id>/<step>-<n>.md` (`<n>` counts that step's runs), ends that file with its status block, and returns only the status block. Hand the next subagent report paths, not their contents. Before each step, tell the user one line, such as `add-login · verify 2`.
 - **Log each step.** After every step except preflight, append one line to `.goodflows/build/<id>/log.md`: `<step> | <report path> | <STATUS>`. Its last line is where a resumed run starts.
-- **Hold what waits on a person in one file.** `.goodflows/build/<id>/held.md` lists what is waiting on a person, one line each: `<subject> | <kind> | <source report> | <the question> | Recommend: <option, or none>`. `subject` names the thing a person decides on, in one of these forms: the requirement name, for a requirement's behavior or text; `scenario <n>` or `scenario <n>.<step>`, for a QA scenario; `review <item id>`, for a review item; `<rule>`, or `<rule> <scenario or subject>` when the verdict reason names one, for a verdict reason; or a file path or a short noun for a deliverable outside the code, such as `release notes`. Never use a requirement name for something that is not that requirement's behavior, because sort and later rounds match on subject. `kind` is `question` (a build set-aside, a `person` row, or an unfixed row that carries a question), `not_verified` (a check that could not run), or `verdict` (a person's verdict reason or review item). Add a line only when no line has the same subject and kind. Remove a line once it is settled: a `question` once the person's answer has been applied, a `not_verified` once a later verify round runs that check without reporting the subject, and all `verdict` lines each time ship returns, replaced by the current verdict's. Close and the final report read this file, so a resumed run loses nothing.
+- **Hold what waits on a person in one file.** `.goodflows/build/<id>/held.md` lists what is waiting on a person, one line each: `<subject> | <kind> | <source report> | <the question> | Recommend: <option, or none>`. `subject` names the thing a person decides on, in one of these forms: the requirement name, for a requirement's behavior or text; `scenario <n>` or `scenario <n>.<step>`, for a QA scenario; `review <item id>`, for a review item; `test <file>::<test name>`, for a test the `review` check would delete; `<rule>`, or `<rule> <scenario or subject>` when the verdict reason names one, for a verdict reason; or a file path or a short noun for a deliverable outside the code, such as `release notes`. Never use a requirement name for something that is not that requirement's behavior, because sort and later rounds match on subject. `kind` is `question` (a build set-aside, a `person` row, or an unfixed row that carries a question), `not_verified` (a check that could not run), or `verdict` (a person's verdict reason or review item). Add a line only when no line has the same subject and kind. Remove a line once it is settled: a `question` once the person's answer has been applied, a `not_verified` once a later verify round runs that check without reporting the subject, and all `verdict` lines each time ship returns, replaced by the current verdict's. Close and the final report read this file, so a resumed run loses nothing.
 - **Never ask in the middle.** Subagents never ask the user anything. The only question before the run is which change to build, when the user named none and more than one change qualifies.
 - **The spec follows the code.** While the change is built, its deltas must describe what the code does. Who may edit which part is in "Who owns the spec" below; route every finding and question by it.
 - **Never clear a verdict the wrong way.** Do not lower or edit the policy, weaken, remove or demote a scenario, mark a scenario not run, drop a feature glob, approve a scenario set, answer a review item, or merge. A person does each of those, and the final report asks them.
@@ -32,7 +32,7 @@ You are the orchestrator. Every step runs in a fresh subagent from a prompt file
 
 Use the id the user gave. Otherwise use the one change that is `approved` in `goodflows/changes/` or has reports under `.goodflows/build/<id>/`; with several, ask which, and with none, say so and stop.
 
-Run `preflight-prompt.md`. It checks the change, the branch, the CLI and its config, finds the writer skills, saves the approved `change.md` for the bars check, and reads the step log. Keep its `CHANGE_DIR`, `BASE`, `TITLE`, `APPROVED` and `WRITERS` for the later steps; `CHANGE_DIR` changes to the archived path once close archives. A `blocked` preflight goes straight to the final report.
+Run `preflight-prompt.md`. It checks the change, the branch, the CLI and its config, finds the writer skills, saves the approved `change.md` for the bars check, and reads the step log. Keep its `CHANGE_DIR`, `BASE`, `TITLE`, `APPROVED`, `WRITERS` and `REVIEW_SKILL` for the later steps; `CHANGE_DIR` changes to the archived path once close archives. A `blocked` preflight goes straight to the final report.
 
 On a resume, continue after the step `RESUME` names. When that step is ship, or a step the verdict loop started, run ship again first, so the verdict is read fresh from the server, not from an old report.
 
@@ -44,11 +44,11 @@ Add the build's `QUESTIONS` to `held.md` as `question` lines. A slice that retur
 
 ## 3. Verify
 
-Run the four checks in `verify-prompt.md` at the same time, each in its own subagent: spec to code, code to spec, decisions and bars, and the QA scenarios. They only read and drive, so they cannot conflict. Each returns finding rows. A check that returns `blocked` counts as a `not_verified` row with its reason.
+Run the checks in `verify-prompt.md` at the same time, each in its own subagent: spec to code, code to spec, decisions and bars, the QA scenarios, and a production-risk review through the `gs-review` skill. They only read and drive, so they cannot conflict. When preflight found no `gs-review`, run the other four, and the final report says the review did not run. Each returns finding rows. A check that returns `blocked` counts as a `not_verified` row with its reason.
 
 ## 4. Sort
 
-Merge the rows of all four checks and drop duplicates: two rows with the same subject and the same problem are one. Check each row's route against "Who owns the spec":
+Merge the rows of all the checks and drop duplicates: two rows with the same subject and the same problem are one. Check each row's route against "Who owns the spec":
 
 - `code` and `spec` rows go to the fix step, except a row whose subject `held.md` already lists as a `question`: that waits on the person, so drop the row.
 - `person` rows go to `held.md` as `question` lines, and `not_verified` rows as `not_verified` lines.
@@ -90,9 +90,9 @@ Stop when the verdict is `mergeable`, or when no agent reason remains, whatever 
 Write it from the status blocks and `held.md`, through the `gs-unslop` skill when it is installed, in this order:
 
 1. The change request number, the verdict state, and each reason with who clears it.
-2. Every line of `held.md`, most important first, each numbered and worded so "yes" accepts the recommendation when there is one: requirement or intent set edits the build needed, `by: user` conflicts, checks that could not run, unapproved scenario sets, dependencies, and the review packet's items with the answers each allows.
+2. Every line of `held.md`, most important first, each numbered and worded so "yes" accepts the recommendation when there is one: requirement or intent set edits the build needed, `by: user` conflicts, checks that could not run, tests the review would delete, unapproved scenario sets, dependencies, and the review packet's items with the answers each allows.
 3. Whether the change was archived; what `verification.md` lists under `open` if not; and, when fixes landed after archiving, that its hashes predate them.
-4. What the run fixed, the heads it pushed, and any blocker with its evidence.
+4. What the run fixed, the heads it pushed, and any blocker with its evidence. When `gs-review` was not installed, say that no production-risk review ran.
 
 Merging is not part of this run. When the verdict is `mergeable`, say that the `gf-change-merge` skill merges it when the person asks.
 
